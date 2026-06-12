@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.strategy import default_strategy_groups, StrategyConfig
@@ -7,6 +8,7 @@ from mu_strategy.walk_forward import (
     WindowBacktest,
     render_strategy_group_report,
     render_walk_forward_report,
+    run_walk_forward_backtests,
     split_into_windows,
 )
 
@@ -76,6 +78,35 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("二次回踩", report)
         self.assertIn("半保护", report)
         self.assertIn("反向 Fibonacci", report)
+
+    def test_walk_forward_context_includes_hour_covering_segment_start(self):
+        candles_15m = [
+            Candle(900_000, 100, 101, 99, 100.5, 1000),
+            Candle(1_800_000, 101, 102, 100, 101.5, 1000),
+            Candle(2_700_000, 102, 103, 101, 102.5, 1000),
+            Candle(3_600_000, 103, 104, 102, 103.5, 1000),
+        ]
+        candles_1h = [
+            Candle(0, 100, 101, 99, 100.5, 1000),
+            Candle(3_600_000, 101, 102, 100, 101.5, 1000),
+        ]
+        captured_hourly_segments: list[list[int]] = []
+
+        def fake_context(segment, hourly_segment):
+            captured_hourly_segments.append([bar.open_time_ms for bar in hourly_segment])
+            return {bar.open_time_ms: "yellow" for bar in segment}
+
+        with patch("mu_strategy.walk_forward.build_hourly_context", side_effect=fake_context):
+            results = run_walk_forward_backtests(
+                candles_15m,
+                candles_1h,
+                config=StrategyConfig(),
+                window_days=1,
+                windows=1,
+            )
+
+        self.assertEqual(1, len(results))
+        self.assertEqual([0, 3_600_000], captured_hourly_segments[0])
 
 
 def _candle(day: int) -> Candle:

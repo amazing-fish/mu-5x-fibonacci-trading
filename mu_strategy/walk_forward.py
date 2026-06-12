@@ -63,6 +63,7 @@ def run_walk_forward_backtests(
 ) -> list[WindowBacktest]:
     segments = split_into_windows(candles_15m, window_days=window_days, windows=windows)
     interval_ms = _infer_interval_ms(candles_15m) if candles_15m else 0
+    hourly_interval_ms = _infer_interval_ms(candles_1h) if candles_1h else 0
     results: list[WindowBacktest] = []
 
     for index, segment in enumerate(segments, start=1):
@@ -72,7 +73,11 @@ def run_walk_forward_backtests(
 
         start_time_ms = segment[0].open_time_ms
         end_time_ms = segment[-1].open_time_ms + interval_ms
-        hourly_segment = [bar for bar in candles_1h if start_time_ms <= bar.open_time_ms < end_time_ms]
+        hourly_segment = [
+            bar
+            for bar in candles_1h
+            if _overlaps_range(bar.open_time_ms, hourly_interval_ms, start_time_ms, end_time_ms)
+        ]
         context = build_hourly_context(segment, hourly_segment)
         result = run_backtest(segment, context, config=config)
         results.append(WindowBacktest(index, start_time_ms, end_time_ms, result, len(segment)))
@@ -270,6 +275,12 @@ def _infer_interval_ms(candles: list[Candle]) -> int:
         if candles[index].open_time_ms > candles[index - 1].open_time_ms
     ]
     return min(diffs) if diffs else 0
+
+
+def _overlaps_range(open_time_ms: int, interval_ms: int, start_time_ms: int, end_time_ms: int) -> bool:
+    if interval_ms <= 0:
+        return start_time_ms <= open_time_ms < end_time_ms
+    return open_time_ms < end_time_ms and open_time_ms + interval_ms > start_time_ms
 
 
 def _infer_window_days(window_results: list[WindowBacktest]) -> int:
