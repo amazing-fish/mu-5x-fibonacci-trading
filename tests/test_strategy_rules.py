@@ -105,6 +105,11 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertEqual("wide", groups[6].config.green_stop_tightening)
         self.assertEqual("half_protect_green_wide", groups[7].config.stop_tightening)
         self.assertTrue(groups[8].config.block_reverse_fib_resistance)
+        self.assertEqual("二次回踩限价", groups[1].components.entry)
+        self.assertEqual("5x 金字塔 20/20/20/40", groups[1].components.position)
+        self.assertEqual("baseline 抬止损", groups[1].components.exit)
+        self.assertIn("1h regime", groups[1].components.filters)
+        self.assertIn("反向 Fibonacci 压力过滤", groups[8].components.filters)
 
     def test_selected_strategy_groups_loads_requested_names(self):
         groups = selected_strategy_groups("MUUSDT", ["legacy_break_high,baseline", "second_pullback_limit_8"])

@@ -8,25 +8,34 @@ from mu_strategy.data import cached_historical
 from mu_strategy.indicators import ema, macd, rsi
 from mu_strategy.models import Candle
 from mu_strategy.reporting import render_markdown_report
-from mu_strategy.strategy import StrategyConfig, one_hour_regime
+from mu_strategy.strategy import StrategyConfig, one_hour_regime, selected_strategy_groups
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest the MU 5x Fibonacci strategy.")
-    parser.add_argument("--symbol", default="MUUSDT")
+    parser.add_argument("--symbol", default="MU-USDT-SWAP")
+    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--report", type=Path, default=Path("reports/mu_backtest.md"))
+    parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_backtest.md"))
+    parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
     args = parser.parse_args()
 
-    config = StrategyConfig(symbol=args.symbol)
+    try:
+        groups = selected_strategy_groups(args.symbol, [args.strategy])
+    except ValueError as exc:
+        parser.error(str(exc))
+    if len(groups) != 1:
+        parser.error("--strategy must resolve to exactly one strategy group")
+    config = groups[0].config
     candles_15m, file_15m = cached_historical(
         args.symbol,
         "15m",
         days=args.days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     candles_1h, file_1h = cached_historical(
         args.symbol,
@@ -34,6 +43,7 @@ def main() -> None:
         days=args.days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)

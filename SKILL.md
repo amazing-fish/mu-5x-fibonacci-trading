@@ -9,7 +9,7 @@ This is a research workflow, not financial advice. Use it to turn discretionary 
 
 ## Contract
 
-- Symbol focus: `MU` / `MUUSDT`.
+- Symbol focus: `MU` / OKX `MU-USDT-SWAP` by default; Binance `MUUSDT` remains a comparison source.
 - Direction: long-only.
 - Leverage: `5x`.
 - Position plan: `20% -> 20% -> 20% -> 40%` margin steps.
@@ -69,8 +69,9 @@ Before treating this as usable, run:
 
 ```powershell
 python -m unittest discover -s tests
-python -m mu_strategy.cli --symbol MUUSDT --days 14 --refresh
-python -m mu_strategy.visualize --symbol MUUSDT --days 14 --output reports/mu_backtest.html
+python -m mu_strategy.cli --days 180 --refresh
+python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report reports/mu_okx_strategy_group_review.md --html-report reports/mu_okx_strategy_components.html
+python -m mu_strategy.visualize --days 180 --output reports/mu_okx_baseline_backtest.html
 ```
 
-Review the generated `reports/mu_backtest.md` and `reports/mu_backtest.html`. Do not infer future validity from one backtest window; extend the data window and compare with a buy-and-hold baseline before using capital.
+Review the generated Markdown and HTML reports. Do not infer future validity from one backtest window; extend the data window and compare with a buy-and-hold baseline before using capital. OKX incremental cache must ignore unconfirmed rows because the latest K line may still be incomplete.

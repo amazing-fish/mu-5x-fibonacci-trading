@@ -17,7 +17,8 @@ from mu_strategy.strategy import StrategyConfig, selected_strategy_groups
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate an HTML visualization for the MU strategy backtest.")
-    parser.add_argument("--symbol", default="MUUSDT")
+    parser.add_argument("--symbol", default="MU-USDT-SWAP")
+    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -40,6 +41,7 @@ def main() -> None:
         days=args.days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     candles_1h, _ = cached_historical(
         args.symbol,
@@ -47,6 +49,7 @@ def main() -> None:
         days=args.days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)

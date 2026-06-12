@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,10 +129,12 @@ def render_strategy_group_report(
     for group_result in group_results:
         lines.extend(_strategy_group_lines(group_result.group))
 
+    lines.extend(_strategy_component_matrix_lines(group_results))
+
     lines.extend(
         [
             "",
-            "## 两段结果",
+            "## 分段结果",
             "",
             "| 策略组 | 样本 | UTC 区间 | K线数 | 总收益 | 最大回撤 | 交易数 | 胜率 | 首仓止损 | 加仓后胜率 | 最佳单笔 |",
             "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -158,6 +161,115 @@ def render_strategy_group_report(
         ]
     )
     return "\n".join(lines)
+
+
+def render_strategy_group_html_dashboard(
+    group_results: list[StrategyGroupBacktest],
+    *,
+    symbol: str,
+    data_files: list[Path],
+) -> str:
+    rows = "\n".join(_strategy_group_html_row(group_result) for group_result in group_results)
+    data_file_text = html.escape(", ".join(str(path) for path in data_files) if data_files else "-")
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(symbol)} 策略组件矩阵</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #687386;
+      --border: #d9dfe8;
+      --good: #0f766e;
+      --bad: #b42318;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", Arial, sans-serif;
+    }}
+    main {{
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px;
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 26px;
+    }}
+    .subtitle {{
+      color: var(--muted);
+      margin-bottom: 18px;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }}
+    table {{
+      width: 100%;
+      min-width: 1120px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--border);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }}
+    th {{
+      background: #eef2f6;
+      font-weight: 650;
+      white-space: nowrap;
+    }}
+    td.metric {{
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }}
+    .good {{ color: var(--good); }}
+    .bad {{ color: var(--bad); }}
+    .muted {{ color: var(--muted); }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>{html.escape(symbol)} 策略组件矩阵</h1>
+  <div class="subtitle">数据文件：{data_file_text}。按入场策略、加减仓策略、出场策略、过滤策略拆分，方便持续组合回测。</div>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>策略组</th>
+          <th>入场策略</th>
+          <th>加减仓策略</th>
+          <th>出场策略</th>
+          <th>过滤策略</th>
+          <th>总收益</th>
+          <th>最大回撤</th>
+          <th>交易数</th>
+          <th>胜率</th>
+          <th>加仓后胜率</th>
+          <th>首仓止损</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+</main>
+</body>
+</html>"""
 
 
 def render_walk_forward_report(
@@ -221,12 +333,14 @@ def render_walk_forward_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run strategy-group walk-forward backtests.")
-    parser.add_argument("--symbol", default="MUUSDT")
+    parser.add_argument("--symbol", default="MU-USDT-SWAP")
+    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--windows", type=int, default=2)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--report", type=Path, default=Path("reports/mu_strategy_group_review.md"))
+    parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_strategy_group_review.md"))
+    parser.add_argument("--html-report", type=Path, default=Path("reports/mu_okx_strategy_components.html"))
     parser.add_argument(
         "--strategy",
         action="append",
@@ -241,6 +355,7 @@ def main() -> None:
         days=total_days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     candles_1h, file_1h = cached_historical(
         args.symbol,
@@ -248,6 +363,7 @@ def main() -> None:
         days=total_days,
         data_dir=args.data_dir,
         refresh=args.refresh,
+        source=args.source,
     )
     group_results = run_strategy_group_walk_forward_backtests(
         candles_15m,
@@ -263,6 +379,14 @@ def main() -> None:
     )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")
+    if args.html_report:
+        dashboard = render_strategy_group_html_dashboard(
+            group_results,
+            symbol=args.symbol,
+            data_files=[file_15m, file_1h],
+        )
+        args.html_report.parent.mkdir(parents=True, exist_ok=True)
+        args.html_report.write_text(dashboard, encoding="utf-8")
     print(report)
 
 
@@ -321,6 +445,58 @@ def _format_pct(value: float | None) -> str:
 
 def _stage1_stop_count(trades: list[Trade]) -> int:
     return sum(1 for trade in trades if trade.max_stage == 1 and trade.exit_reason == "stop")
+
+
+def _strategy_component_matrix_lines(group_results: list[StrategyGroupBacktest]) -> list[str]:
+    lines = [
+        "",
+        "## 策略组件矩阵",
+        "",
+        "| 策略组 | 入场策略 | 加减仓策略 | 出场策略 | 过滤策略 |",
+        "|---|---|---|---|---|",
+    ]
+    for group_result in group_results:
+        group = group_result.group
+        components = group.components
+        lines.append(
+            f"| {group.name} | {components.entry} | {components.position} | {components.exit} | "
+            f"{'<br>'.join(components.filters)} |"
+        )
+    return lines
+
+
+def _strategy_group_html_row(group_result: StrategyGroupBacktest) -> str:
+    group = group_result.group
+    result = _combined_result(group_result)
+    components = group.components
+    total_return_class = "good" if result.total_return_pct >= 0 else "bad"
+    return (
+        "<tr>"
+        f"<td><strong>{html.escape(group.name)}</strong><br><span class=\"muted\">{html.escape(group.label)}</span></td>"
+        f"<td>{html.escape(components.entry)}</td>"
+        f"<td>{html.escape(components.position)}</td>"
+        f"<td>{html.escape(components.exit)}</td>"
+        f"<td>{'<br>'.join(html.escape(value) for value in components.filters)}</td>"
+        f"<td class=\"metric {total_return_class}\">{result.total_return_pct:.2%}</td>"
+        f"<td class=\"metric bad\">{result.max_drawdown_pct:.2%}</td>"
+        f"<td class=\"metric\">{result.trade_count}</td>"
+        f"<td class=\"metric\">{result.win_rate:.2%}</td>"
+        f"<td class=\"metric\">{_format_pct(_added_win_rate(result))}</td>"
+        f"<td class=\"metric\">{_stage1_stop_count(result.trades)}</td>"
+        "</tr>"
+    )
+
+
+def _combined_result(group_result: StrategyGroupBacktest) -> BacktestResult:
+    if not group_result.windows:
+        return BacktestResult(10_000, 10_000, [], [])
+    starting = sum(window.result.starting_equity for window in group_result.windows)
+    ending = sum(window.result.ending_equity for window in group_result.windows)
+    trades = [trade for window in group_result.windows for trade in window.result.trades]
+    equity_curve: list[tuple[int, float]] = []
+    for window in group_result.windows:
+        equity_curve.extend(window.result.equity_curve)
+    return BacktestResult(starting, ending, trades, equity_curve)
 
 
 def _strategy_group_lines(group: StrategyGroup) -> list[str]:

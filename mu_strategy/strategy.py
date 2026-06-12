@@ -19,6 +19,15 @@ class StrategyGroup:
     name: str
     label: str
     config: "StrategyConfig"
+    components: "StrategyComponents" = field(default_factory=lambda: StrategyComponents())
+
+
+@dataclass(frozen=True)
+class StrategyComponents:
+    entry: str = "突破前高确认"
+    position: str = "5x 金字塔 20/20/20/40"
+    exit: str = "baseline 抬止损"
+    filters: tuple[str, ...] = ("1h regime", "15m RSI/MACD", "美股现金盘窗口")
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,7 @@ def baseline_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
         "baseline",
         "新baseline：二次回踩确认买入",
         StrategyConfig(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+        StrategyComponents(entry="二次回踩限价"),
     )
 
 
@@ -74,6 +84,7 @@ def direct_next_open_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
         "direct_next_open",
         "回踩确认后下一根开盘买入",
         StrategyConfig(symbol=symbol, entry_execution="direct_next_open"),
+        StrategyComponents(entry="下一根开盘直接买入"),
     )
 
 
@@ -82,6 +93,7 @@ def second_pullback_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
         "second_pullback_limit_8",
         "回踩确认后等待二次回踩买入",
         StrategyConfig(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+        StrategyComponents(entry="二次回踩限价"),
     )
 
 
@@ -95,6 +107,7 @@ def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGrou
             second_pullback_wait_bars=8,
             stop_tightening="half_protect",
         ),
+        StrategyComponents(entry="二次回踩限价", exit="半保护止损"),
     )
 
 
@@ -109,6 +122,7 @@ def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
             yellow_stop_tightening="baseline",
             green_stop_tightening="wide",
         ),
+        StrategyComponents(entry="二次回踩限价", exit="yellow baseline / green 宽止损"),
     )
 
 
@@ -123,6 +137,7 @@ def baseline_yellow_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup
             yellow_stop_tightening="wide",
             green_stop_tightening="baseline",
         ),
+        StrategyComponents(entry="二次回踩限价", exit="yellow 宽止损 / green baseline"),
     )
 
 
@@ -137,6 +152,7 @@ def baseline_yellow_green_wide_strategy_group(symbol: str = "MUUSDT") -> Strateg
             yellow_stop_tightening="wide",
             green_stop_tightening="wide",
         ),
+        StrategyComponents(entry="二次回踩限价", exit="yellow/green 均宽止损"),
     )
 
 
@@ -150,6 +166,7 @@ def baseline_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyG
             second_pullback_wait_bars=8,
             stop_tightening="half_protect_green_wide",
         ),
+        StrategyComponents(entry="二次回踩限价", exit="半保护 + green 宽止损"),
     )
 
 
@@ -164,6 +181,16 @@ def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
             max_signal_range_pct=0.015,
             max_entry_above_signal_close_pct=0.006,
             block_reverse_fib_resistance=True,
+        ),
+        StrategyComponents(
+            filters=(
+                "1h regime",
+                "15m RSI/MACD",
+                "美股现金盘窗口",
+                "首仓追价限制",
+                "信号K宽度限制",
+                "反向 Fibonacci 压力过滤",
+            )
         ),
     )
 

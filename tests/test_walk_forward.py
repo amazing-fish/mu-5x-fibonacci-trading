@@ -78,6 +78,30 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("二次回踩", report)
         self.assertIn("半保护", report)
         self.assertIn("反向 Fibonacci", report)
+        self.assertIn("## 策略组件矩阵", report)
+        self.assertIn("入场策略", report)
+        self.assertIn("加减仓策略", report)
+        self.assertIn("出场策略", report)
+        self.assertIn("过滤策略", report)
+
+    def test_strategy_group_html_dashboard_visualizes_components(self):
+        groups = default_strategy_groups("MU-USDT-SWAP")
+        group_results = [
+            StrategyGroupBacktest(group, [WindowBacktest(1, 0, 14 * DAY_MS, BacktestResult(10_000, 11_000, [], []), 14)])
+            for group in groups[:2]
+        ]
+
+        from mu_strategy.walk_forward import render_strategy_group_html_dashboard
+
+        html = render_strategy_group_html_dashboard(group_results, symbol="MU-USDT-SWAP", data_files=[])
+
+        self.assertIn("<html lang=\"zh-CN\">", html)
+        self.assertIn("策略组件矩阵", html)
+        self.assertIn("入场策略", html)
+        self.assertIn("加减仓策略", html)
+        self.assertIn("出场策略", html)
+        self.assertIn("过滤策略", html)
+        self.assertIn("baseline", html)
 
     def test_walk_forward_context_includes_hour_covering_segment_start(self):
         candles_15m = [
