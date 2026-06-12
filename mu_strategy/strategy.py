@@ -56,7 +56,15 @@ class StrategyConfig:
 
 
 def baseline_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return StrategyGroup("baseline", "原策略", StrategyConfig(symbol=symbol))
+    return StrategyGroup(
+        "baseline",
+        "新baseline：二次回踩确认买入",
+        StrategyConfig(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+    )
+
+
+def legacy_break_high_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup("legacy_break_high", "旧突破前高baseline备用", StrategyConfig(symbol=symbol))
 
 
 def direct_next_open_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
@@ -75,13 +83,40 @@ def second_pullback_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     )
 
 
-def direct_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
-        "direct_half_green_wide",
-        "直接买入 + 半保护 + green宽止损",
+        "baseline_half_protect",
+        "新baseline + 半保护止损",
         StrategyConfig(
             symbol=symbol,
-            entry_execution="direct_next_open",
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            stop_tightening="half_protect",
+        ),
+    )
+
+
+def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_green_wide",
+        "新baseline + green宽止损",
+        StrategyConfig(
+            symbol=symbol,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            stop_tightening="green_wide",
+        ),
+    )
+
+
+def baseline_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_half_green_wide",
+        "新baseline + 半保护 + green宽止损",
+        StrategyConfig(
+            symbol=symbol,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
             stop_tightening="half_protect_green_wide",
         ),
     )
@@ -104,10 +139,12 @@ def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
 
 def default_strategy_groups(symbol: str = "MUUSDT") -> list[StrategyGroup]:
     return [
+        legacy_break_high_strategy_group(symbol),
         baseline_strategy_group(symbol),
         direct_next_open_strategy_group(symbol),
-        second_pullback_strategy_group(symbol),
-        direct_half_green_wide_strategy_group(symbol),
+        baseline_half_protect_strategy_group(symbol),
+        baseline_green_wide_strategy_group(symbol),
+        baseline_half_green_wide_strategy_group(symbol),
         optimized_strategy_group(symbol),
     ]
 
@@ -117,6 +154,7 @@ def selected_strategy_groups(symbol: str, names: list[str] | None = None) -> lis
     if not names:
         return groups
     by_name = {group.name: group for group in groups}
+    by_name["second_pullback_limit_8"] = baseline_strategy_group(symbol)
     selected_names: list[str] = []
     for value in names:
         selected_names.extend(name.strip() for name in value.split(",") if name.strip())

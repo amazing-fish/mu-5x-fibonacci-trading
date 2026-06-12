@@ -79,25 +79,31 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertEqual(
             [
+                "legacy_break_high",
                 "baseline",
                 "direct_next_open",
-                "second_pullback_limit_8",
-                "direct_half_green_wide",
+                "baseline_half_protect",
+                "baseline_green_wide",
+                "baseline_half_green_wide",
                 "optimized_v2",
             ],
             [group.name for group in groups],
         )
         self.assertIsInstance(groups[0], StrategyGroup)
         self.assertEqual("break_high", groups[0].config.entry_execution)
-        self.assertEqual("direct_next_open", groups[1].config.entry_execution)
-        self.assertEqual("second_pullback", groups[2].config.entry_execution)
-        self.assertEqual("half_protect_green_wide", groups[3].config.stop_tightening)
-        self.assertTrue(groups[4].config.block_reverse_fib_resistance)
+        self.assertEqual("second_pullback", groups[1].config.entry_execution)
+        self.assertEqual("direct_next_open", groups[2].config.entry_execution)
+        self.assertEqual("second_pullback", groups[3].config.entry_execution)
+        self.assertEqual("half_protect", groups[3].config.stop_tightening)
+        self.assertEqual("green_wide", groups[4].config.stop_tightening)
+        self.assertEqual("half_protect_green_wide", groups[5].config.stop_tightening)
+        self.assertTrue(groups[6].config.block_reverse_fib_resistance)
 
     def test_selected_strategy_groups_loads_requested_names(self):
-        groups = selected_strategy_groups("MUUSDT", ["baseline,direct_next_open", "second_pullback_limit_8"])
+        groups = selected_strategy_groups("MUUSDT", ["legacy_break_high,baseline", "second_pullback_limit_8"])
 
-        self.assertEqual(["baseline", "direct_next_open", "second_pullback_limit_8"], [group.name for group in groups])
+        self.assertEqual(["legacy_break_high", "baseline", "baseline"], [group.name for group in groups])
+        self.assertEqual("second_pullback", groups[1].config.entry_execution)
 
     def test_optimized_execution_rejects_chasing_too_far_above_fib(self):
         config = optimized_strategy_group().config
