@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>策略迁移深度分析报告</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f2f0eb;
+      --ink: #161616;
+      --muted: #66635d;
+      --line: #d3cec3;
+      --panel: #fffdf8;
+      --panel-2: #ebe7de;
+      --red: #b43b3b;
+      --green: #17795d;
+      --blue: #265d8f;
+      --gold: #9a6a20;
+      --charcoal: #252525;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "Aptos", "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 28px 48px;
+    }
+    header {
+      border-bottom: 3px solid var(--charcoal);
+      padding: 18px 0 22px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+      gap: 28px;
+      align-items: end;
+    }
+    h1 {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: clamp(32px, 4vw, 58px);
+      line-height: 0.98;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .dek {
+      margin: 16px 0 0;
+      max-width: 860px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+    .meta {
+      border-left: 2px solid var(--charcoal);
+      padding-left: 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    section {
+      padding: 26px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+    h3 {
+      margin: 18px 0 8px;
+      font-size: 16px;
+    }
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 138px;
+    }
+    .metric .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .metric .value {
+      margin-top: 6px;
+      font-size: 28px;
+      font-weight: 720;
+      line-height: 1.1;
+    }
+    .metric p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .callout {
+      background: var(--panel-2);
+      border-left: 5px solid var(--charcoal);
+      padding: 14px 16px;
+      margin: 12px 0 18px;
+    }
+    .chart-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 420px;
+    }
+    .chart {
+      width: 100%;
+      min-height: 390px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:first-child, td:first-child,
+    th:nth-child(2), td:nth-child(2) {
+      text-align: left;
+    }
+    th {
+      background: #e4dfd4;
+      font-weight: 700;
+      color: var(--charcoal);
+    }
+    .tag {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      margin: 2px 3px 2px 0;
+      font-size: 12px;
+      background: #fffaf0;
+    }
+    .good { color: var(--green); font-weight: 700; }
+    .bad { color: var(--red); font-weight: 700; }
+    .note {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 10px;
+    }
+    ul {
+      margin: 8px 0 0;
+      padding-left: 20px;
+    }
+    li { margin: 6px 0; }
+    @media (max-width: 960px) {
+      header, .grid-4, .grid-2 {
+        grid-template-columns: 1fr;
+      }
+      main { padding: 18px; }
+      th, td { white-space: normal; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>策略迁移深度分析报告</h1>
+      <p class="dek">基于 MU、BTC 以及一篮子美股类 USDT 合约的回测结果，评估当前 Fibonacci 二次回踩策略在不同标的上的可迁移性、止损选择和下一步优化优先级。</p>
+    </div>
+    <div class="meta">
+      <div>生成日期：2026-06-12</div>
+      <div>数据源：Binance Futures REST、OKX public API</div>
+      <div>策略主线：MU 当前仅保留 <strong>baseline</strong></div>
+      <div>用途：研究分析，不构成投资建议</div>
+    </div>
+  </header>
+
+  <section>
+    <h2>执行摘要</h2>
+    <div class="grid-4">
+      <div class="metric">
+        <div class="label">MU 主策略</div>
+        <div class="value">baseline</div>
+        <p>OKX 约 100 天样本：baseline 69.30%，半保护 37.68%。半保护胜率更高，但平均亏损更大。</p>
+      </div>
+      <div class="metric">
+        <div class="label">BTC 迁移</div>
+        <div class="value bad">不直接迁移</div>
+        <p>180 天样本里 baseline -37.53%，optimized_v2 -2.72%。BTC 需要重设 24/7 交易窗口与波动参数。</p>
+      </div>
+      <div class="metric">
+        <div class="label">美股类合约</div>
+        <div class="value good">可筛选</div>
+        <p>INTC、META、MSTR、TSM、COIN、TSLA 的 baseline 均为正，但样本长度和回撤差异较大。</p>
+      </div>
+      <div class="metric">
+        <div class="label">下一步重点</div>
+        <div class="value">入场质量</div>
+        <p>止损不是唯一矛盾。更关键的是首仓位置、加仓失败识别、以及标的级参数分层。</p>
+      </div>
+    </div>
+    <div class="callout">
+      <strong>核心判断：</strong>当前策略不是“一个参数打天下”。MU 可先固定 baseline；BTC 需要重新建交易时间框架；美股类合约则应进入“标的筛选 + 局部策略组消融”的路径。
+    </div>
+  </section>
+
+  <section>
+    <h2>MU：主策略收敛</h2>
+    <div class="grid-2">
+      <div>
+        <h3>为什么只保留 baseline</h3>
+        <ul>
+          <li>OKX 约 100 天样本中，baseline 总收益 69.30%，明显高于半保护的 37.68%。</li>
+          <li>半保护提升胜率和加仓后胜率，但平均亏损扩大到 -3.83%，baseline 平均亏损为 -2.21%。</li>
+          <li>半保护适合趋势延续，但如果进场/加仓质量不够，会把错误交易拖成更大亏损。</li>
+        </ul>
+      </div>
+      <div>
+        <table>
+          <thead>
+            <tr><th>MU 数据源/策略</th><th>收益</th><th>回撤</th><th>交易</th><th>胜率</th><th>加仓后胜率</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>OKX baseline</td><td class="good">69.30%</td><td>-23.92%</td><td>45</td><td>22.22%</td><td>34.48%</td></tr>
+            <tr><td>OKX half_protect</td><td class="good">37.68%</td><td>-23.88%</td><td>41</td><td>29.27%</td><td>46.15%</td></tr>
+            <tr><td>Binance baseline</td><td class="good">51.18%</td><td>-26.88%</td><td>40</td><td>20.00%</td><td>30.77%</td></tr>
+            <tr><td>Binance half_protect</td><td class="good">41.61%</td><td>-24.71%</td><td>33</td><td>30.30%</td><td>45.45%</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p class="note">数据限制：OKX 当前可用最早 15m K 为 2026-03-04，Binance 为 2026-04-07，均不足完整自然半年。</p>
+  </section>
+
+  <section>
+    <h2>美股类合约：baseline 篮子排名</h2>
+    <div class="grid-2">
+      <div class="chart-panel"><div id="basketReturnChart" class="chart"></div></div>
+      <div class="chart-panel"><div id="riskReturnChart" class="chart"></div></div>
+    </div>
+    <p class="note">左图按收益排序；右图横轴为最大回撤绝对值，纵轴为收益，点大小代表交易数。样本天数不同，排名只用于筛选下一轮研究对象。</p>
+  </section>
+
+  <section>
+    <h2>精选标的：策略组热力图</h2>
+    <div class="grid-2">
+      <div class="chart-panel"><div id="strategyHeatmap" class="chart"></div></div>
+      <div class="chart-panel"><div id="drawdownHeatmap" class="chart"></div></div>
+    </div>
+    <p class="note">收益热力图越绿越好；回撤热力图越红代表风险越深。半保护与 optimized_v2 的有效性有明显标的差异。</p>
+  </section>
+
+  <section>
+    <h2>跨标的诊断</h2>
+    <table>
+      <thead>
+        <tr><th>层级</th><th>标的</th><th>证据</th><th>下一步</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="tag">主线保留</span></td>
+          <td>MU</td>
+          <td>OKX 与 Binance 样本均显示 baseline 总收益更稳，半保护会扩大错误加仓亏损。</td>
+          <td>继续优化首仓/加仓位置，不先放宽止损。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">优先深挖</span></td>
+          <td>INTC / COIN / MSTR / META / TSM</td>
+          <td>baseline 为正且交易次数相对可用；但部分依赖大单右尾收益。</td>
+          <td>做分段 walk-forward、交易明细归因、去除单笔最大盈利后的稳健性测试。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">策略组分化</span></td>
+          <td>NVDA / GOOGL</td>
+          <td>NVDA 上 half_protect 与 optimized_v2 明显优于 baseline；GOOGL 上 optimized_v2 最强。</td>
+          <td>分别研究“更宽持有”和“压力过滤”哪个贡献更大。</td>
+        </tr>
+        <tr>
+          <td><span class="tag">暂缓</span></td>
+          <td>BTC / BABA / PLTR</td>
+          <td>BTC 直接迁移大幅为负；BABA 三策略均弱；PLTR baseline 为负。</td>
+          <td>不直接沿用 MU 参数。BTC 先重构 24/7 时间窗；BABA/PLTR 暂不调参。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>策略行为结论</h2>
+    <div class="grid-2">
+      <div>
+        <h3>baseline 的优势</h3>
+        <ul>
+          <li>亏损切得快，能释放仓位重新进场。</li>
+          <li>在 MU、INTC、META、MSTR、COIN、TSM 等标的上，右尾盈利足以覆盖低胜率。</li>
+          <li>更适合作为主线基准，因为失败交易的损失边界更清楚。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>baseline 的弱点</h3>
+        <ul>
+          <li>胜率普遍不高，说明首仓和加仓时机仍偏粗。</li>
+          <li>在 BTC 上直接迁移失效，证明交易窗口和波动假设不是通用的。</li>
+          <li>部分标的收益依赖少数大盈利单，需要做去极值稳定性测试。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>半保护的适用条件</h3>
+        <ul>
+          <li>适用于趋势延续更强、加仓失败率较低的标的，例如 NVDA、GOOGL 的样本表现。</li>
+          <li>不适合错误加仓多的标的，TSLA、MSTR、TSM 上会明显拖累收益或扩大回撤。</li>
+        </ul>
+      </div>
+      <div>
+        <h3>optimized_v2 的适用条件</h3>
+        <ul>
+          <li>在 BTC、GOOGL、COIN、MSTR 上有降低坏交易或改善风险收益的迹象。</li>
+          <li>在 META、TSM、BABA 上可能过度过滤或过滤方向不匹配，不能作为统一替代 baseline。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>建议路线图</h2>
+    <table>
+      <thead>
+        <tr><th>优先级</th><th>动作</th><th>目标</th><th>通过标准</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>MU 固定 baseline，做入场/加仓位置优化</td><td>减少错误加仓与高点首仓</td><td>OKX 与 Binance 样本都不恶化，平均亏损不扩大</td></tr>
+        <tr><td>2</td><td>对 INTC/MSTR/COIN 做分段 walk-forward</td><td>确认收益不是单段行情或单笔极值驱动</td><td>至少两个独立样本为正，回撤不显著扩大</td></tr>
+        <tr><td>3</td><td>对 NVDA/GOOGL 拆解 half_protect 与 optimized_v2</td><td>确认更宽止损或压力过滤的真实贡献</td><td>消融后保留主因，剔除无效复杂度</td></tr>
+        <tr><td>4</td><td>BTC 单独建模</td><td>重设 24/7 时间窗与 BTC 波动参数</td><td>不再使用美股现金盘窗口作为默认过滤</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const basket = [
+  {symbol:"INTCUSDT", days:129.6, ret:70.55, dd:-26.79, trades:49, win:14.29},
+  {symbol:"METAUSDT", days:77.6, ret:41.27, dd:-13.84, trades:16, win:31.25},
+  {symbol:"MSTRUSDT", days:122.6, ret:41.18, dd:-25.00, trades:44, win:20.45},
+  {symbol:"TSMUSDT", days:66.6, ret:40.90, dd:-17.37, trades:23, win:26.09},
+  {symbol:"COINUSDT", days:122.6, ret:37.36, dd:-22.44, trades:42, win:21.43},
+  {symbol:"TSLAUSDT", days:134.6, ret:25.17, dd:-21.33, trades:31, win:19.35},
+  {symbol:"GOOGLUSDT", days:77.6, ret:21.65, dd:-20.56, trades:14, win:14.29},
+  {symbol:"ORCLUSDT", days:27.6, ret:20.82, dd:-20.53, trades:10, win:20.00},
+  {symbol:"AMDUSDT", days:36.6, ret:20.30, dd:-17.31, trades:16, win:25.00},
+  {symbol:"ARMUSDT", days:16.6, ret:20.01, dd:-14.86, trades:7, win:28.57},
+  {symbol:"NVDAUSDT", days:77.6, ret:13.15, dd:-20.61, trades:19, win:21.05},
+  {symbol:"MSFTUSDT", days:52.6, ret:8.44, dd:-8.74, trades:11, win:18.18},
+  {symbol:"AVGOUSDT", days:52.6, ret:5.60, dd:-17.04, trades:22, win:18.18},
+  {symbol:"AMZNUSDT", days:122.6, ret:3.48, dd:-20.22, trades:25, win:20.00},
+  {symbol:"AAPLUSDT", days:66.6, ret:3.42, dd:-12.28, trades:7, win:28.57},
+  {symbol:"NFLXUSDT", days:2.8, ret:-0.29, dd:-2.99, trades:1, win:0.00},
+  {symbol:"PLTRUSDT", days:122.6, ret:-2.25, dd:-23.23, trades:35, win:14.29},
+  {symbol:"BABAUSDT", days:52.6, ret:-7.97, dd:-16.43, trades:11, win:9.09}
+];
+
+const selectedSymbols = ["INTCUSDT","METAUSDT","MSTRUSDT","COINUSDT","TSMUSDT","TSLAUSDT","NVDAUSDT","GOOGLUSDT","AMDUSDT","BABAUSDT"];
+const strategies = ["baseline","baseline_half_protect","optimized_v2"];
+const returnMatrix = [
+  [70.55,72.06,56.63],
+  [41.27,34.25,0.14],
+  [41.18,16.62,40.70],
+  [37.36,33.40,38.44],
+  [40.90,13.49,-20.70],
+  [25.17,-12.85,14.95],
+  [13.15,38.41,32.01],
+  [21.65,47.81,60.84],
+  [20.30,18.95,5.90],
+  [-7.97,-9.89,-19.32]
+];
+const drawdownMatrix = [
+  [-26.79,-37.96,-24.99],
+  [-13.84,-18.73,-20.65],
+  [-25.00,-37.07,-13.73],
+  [-22.44,-28.30,-19.38],
+  [-17.37,-23.42,-27.46],
+  [-21.33,-35.64,-27.59],
+  [-20.61,-16.85,-16.27],
+  [-20.56,-19.97,-17.02],
+  [-17.31,-19.30,-11.41],
+  [-16.43,-20.56,-19.68]
+];
+
+const layoutBase = {
+  paper_bgcolor: "#fffdf8",
+  plot_bgcolor: "#fffdf8",
+  font: { family: "Aptos, Segoe UI, Microsoft YaHei, sans-serif", color: "#161616" },
+  margin: { l: 88, r: 22, t: 42, b: 54 },
+  xaxis: { gridcolor: "#e1dacc", zerolinecolor: "#c7bda9" },
+  yaxis: { gridcolor: "#e1dacc", zerolinecolor: "#c7bda9" }
+};
+const config = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ["lasso2d", "select2d"] };
+
+Plotly.newPlot("basketReturnChart", [{
+  type: "bar",
+  orientation: "h",
+  x: basket.map(d => d.ret).reverse(),
+  y: basket.map(d => d.symbol).reverse(),
+  marker: { color: basket.map(d => d.ret >= 0 ? "#17795d" : "#b43b3b").reverse() },
+  hovertemplate: "%{y}<br>收益 %{x:.2f}%<extra></extra>"
+}], {
+  ...layoutBase,
+  title: "baseline 收益排名",
+  xaxis: { ...layoutBase.xaxis, title: "总收益 %" },
+  yaxis: { automargin: true }
+}, config);
+
+Plotly.newPlot("riskReturnChart", [{
+  type: "scatter",
+  mode: "markers+text",
+  x: basket.map(d => Math.abs(d.dd)),
+  y: basket.map(d => d.ret),
+  text: basket.map(d => d.symbol.replace("USDT","")),
+  textposition: "top center",
+  marker: {
+    size: basket.map(d => Math.max(8, Math.min(28, d.trades / 2))),
+    color: basket.map(d => d.days),
+    colorscale: [[0, "#9a6a20"], [0.5, "#265d8f"], [1, "#17795d"]],
+    showscale: true,
+    colorbar: { title: "实际天数" },
+    line: { color: "#252525", width: 1 }
+  },
+  hovertemplate: "%{text}<br>收益 %{y:.2f}%<br>回撤 %{x:.2f}%<extra></extra>"
+}], {
+  ...layoutBase,
+  title: "收益-回撤分布",
+  xaxis: { ...layoutBase.xaxis, title: "最大回撤绝对值 %" },
+  yaxis: { ...layoutBase.yaxis, title: "总收益 %" },
+  shapes: [{ type: "line", xref: "paper", yref: "y", x0: 0, x1: 1, y0: 0, y1: 0, line: { color: "#b43b3b", width: 1, dash: "dot" } }]
+}, config);
+
+Plotly.newPlot("strategyHeatmap", [{
+  type: "heatmap",
+  x: strategies,
+  y: selectedSymbols,
+  z: returnMatrix,
+  colorscale: [[0, "#8d2f2f"], [0.48, "#efe6d5"], [1, "#14684f"]],
+  zmid: 0,
+  text: returnMatrix.map(row => row.map(v => `${v.toFixed(2)}%`)),
+  texttemplate: "%{text}",
+  hovertemplate: "%{y}<br>%{x}<br>收益 %{z:.2f}%<extra></extra>"
+}], {
+  ...layoutBase,
+  title: "精选标的策略收益热力图",
+  xaxis: { side: "top" },
+  yaxis: { automargin: true }
+}, config);
+
+Plotly.newPlot("drawdownHeatmap", [{
+  type: "heatmap",
+  x: strategies,
+  y: selectedSymbols,
+  z: drawdownMatrix.map(row => row.map(v => Math.abs(v))),
+  colorscale: [[0, "#e8f1eb"], [0.55, "#c99f54"], [1, "#9b2f2f"]],
+  text: drawdownMatrix.map(row => row.map(v => `${v.toFixed(2)}%`)),
+  texttemplate: "%{text}",
+  hovertemplate: "%{y}<br>%{x}<br>最大回撤 %{text}<extra></extra>"
+}], {
+  ...layoutBase,
+  title: "精选标的最大回撤热力图",
+  xaxis: { side: "top" },
+  yaxis: { automargin: true }
+}, config);
+</script>
+</body>
+</html>
