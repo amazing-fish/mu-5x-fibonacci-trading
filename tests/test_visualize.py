@@ -27,7 +27,15 @@ class VisualizationTests(unittest.TestCase):
         )
         result = BacktestResult(10_000, 10_198, [trade], [(0, 10_000), (1_800_000, 10_198)])
 
-        html = render_html_visualization(candles, result, config=StrategyConfig(), symbol="MUUSDT", chart_interval="1h")
+        html = render_html_visualization(
+            candles,
+            result,
+            config=StrategyConfig(),
+            symbol="MUUSDT",
+            chart_interval="1h",
+            strategy_name="baseline",
+            strategy_label="新baseline：二次回踩确认买入",
+        )
 
         self.assertIn("id=\"price-chart\"", html)
         self.assertIn("id=\"volume-chart\"", html)
@@ -42,6 +50,8 @@ class VisualizationTests(unittest.TestCase):
         self.assertIn('"name": "成交量"', html)
         self.assertIn("1h K线", html)
         self.assertIn("策略可视化", html)
+        self.assertIn("baseline", html)
+        self.assertIn("新baseline：二次回踩确认买入", html)
         self.assertIn("同步缩放", html)
         self.assertIn("linkXAxis", html)
         self.assertIn("竖向虚线", html)

@@ -237,7 +237,7 @@ def _tighten_stop(
 ) -> None:
     initial_stop = position.initial_stop_price or position.stop_price
     first_entry = position.fills[0].price
-    mode = config.stop_tightening
+    mode = _resolved_stop_tightening(regime, config)
 
     if mode == "baseline":
         _tighten_stop_baseline(position, index, candles, config)
@@ -247,21 +247,24 @@ def _tighten_stop(
         _tighten_stop_half_protect(position, index, candles, config, initial_stop, first_entry)
         return
 
-    if mode == "green_wide":
-        if regime == "green":
-            _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
-        else:
-            _tighten_stop_baseline(position, index, candles, config)
-        return
-
-    if mode == "half_protect_green_wide":
-        if regime == "green":
-            _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
-        else:
-            _tighten_stop_half_protect(position, index, candles, config, initial_stop, first_entry)
+    if mode == "wide":
+        _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
         return
 
     raise ValueError(f"unsupported stop_tightening: {mode}")
+
+
+def _resolved_stop_tightening(regime: str, config: StrategyConfig) -> str:
+    if regime == "yellow" and config.yellow_stop_tightening is not None:
+        return config.yellow_stop_tightening
+    if regime == "green" and config.green_stop_tightening is not None:
+        return config.green_stop_tightening
+
+    if config.stop_tightening == "green_wide":
+        return "wide" if regime == "green" else "baseline"
+    if config.stop_tightening == "half_protect_green_wide":
+        return "wide" if regime == "green" else "half_protect"
+    return config.stop_tightening
 
 
 def _tighten_stop_baseline(

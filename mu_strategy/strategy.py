@@ -44,6 +44,8 @@ class StrategyConfig:
     block_reverse_fib_resistance: bool = False
     reverse_fib_lookback: int = 64
     reverse_fib_tolerance_pct: float = 0.003
+    yellow_stop_tightening: str | None = None
+    green_stop_tightening: str | None = None
     green_wide_stop_buffer_pct: float = 0.01
     allowed_regimes: tuple[str, ...] = ("green", "yellow")
     full_size_regime: str = "green"
@@ -99,12 +101,41 @@ def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGrou
 def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
         "baseline_green_wide",
-        "新baseline + green宽止损",
+        "新baseline + green宽止损（yellow窄）",
         StrategyConfig(
             symbol=symbol,
             entry_execution="second_pullback",
             second_pullback_wait_bars=8,
-            stop_tightening="green_wide",
+            yellow_stop_tightening="baseline",
+            green_stop_tightening="wide",
+        ),
+    )
+
+
+def baseline_yellow_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_yellow_wide",
+        "新baseline + yellow宽止损（green窄）",
+        StrategyConfig(
+            symbol=symbol,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            yellow_stop_tightening="wide",
+            green_stop_tightening="baseline",
+        ),
+    )
+
+
+def baseline_yellow_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_yellow_green_wide",
+        "新baseline + yellow/green均宽止损",
+        StrategyConfig(
+            symbol=symbol,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            yellow_stop_tightening="wide",
+            green_stop_tightening="wide",
         ),
     )
 
@@ -144,6 +175,8 @@ def default_strategy_groups(symbol: str = "MUUSDT") -> list[StrategyGroup]:
         direct_next_open_strategy_group(symbol),
         baseline_half_protect_strategy_group(symbol),
         baseline_green_wide_strategy_group(symbol),
+        baseline_yellow_wide_strategy_group(symbol),
+        baseline_yellow_green_wide_strategy_group(symbol),
         baseline_half_green_wide_strategy_group(symbol),
         optimized_strategy_group(symbol),
     ]

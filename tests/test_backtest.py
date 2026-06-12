@@ -96,6 +96,35 @@ class BacktestTests(unittest.TestCase):
         self.assertAlmostEqual(99, position.stop_price)
         self.assertLess(position.stop_price, first.price)
 
+    def test_regime_specific_wide_stop_can_apply_to_yellow_only(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            yellow_stop_tightening="wide",
+            green_stop_tightening="baseline",
+        )
+        first = _make_fill(0, 100, 0.2, 10_000, config)
+        second = _make_fill(900_000, 102, 0.2, 10_000, config)
+        yellow_position = OpenPosition(
+            [first, second],
+            stop_price=98,
+            entry_anchor=100,
+            initial_stop_price=98,
+            max_stage=2,
+        )
+        green_position = OpenPosition(
+            [first, second],
+            stop_price=98,
+            entry_anchor=100,
+            initial_stop_price=98,
+            max_stage=2,
+        )
+
+        _tighten_stop(yellow_position, candle(2, 102, 103, 101, 102.5), 2, [], "yellow", config)
+        _tighten_stop(green_position, candle(2, 102, 103, 101, 102.5), 2, [], "green", config)
+
+        self.assertAlmostEqual(99, yellow_position.stop_price)
+        self.assertAlmostEqual(100, green_position.stop_price)
+
 
 if __name__ == "__main__":
     unittest.main()

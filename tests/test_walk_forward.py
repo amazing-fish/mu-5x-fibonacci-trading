@@ -66,6 +66,8 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("direct_next_open", report)
         self.assertIn("baseline_half_protect", report)
         self.assertIn("baseline_green_wide", report)
+        self.assertIn("baseline_yellow_wide", report)
+        self.assertIn("baseline_yellow_green_wide", report)
         self.assertIn("baseline_half_green_wide", report)
         self.assertIn("optimized_v2", report)
         self.assertIn("旧突破前高", report)

@@ -41,6 +41,7 @@
 - `baseline_half_protect` 是当前最均衡的止损变体：两段都为正收益，但第2段收益低于原 baseline，说明半保护减少了部分趋势延展。
 - `baseline_green_wide` 没改善第1段，且第2段收益低于 baseline、回撤扩大；单独 green 更宽不是优先方向。
 - `baseline_half_green_wide` 两段都为正，但第2段收益/回撤都弱于 `baseline_half_protect`，说明 green 宽止损叠加后没有带来额外优势。
+- 补充黄/绿分档宽窄消融见 `reports/mu_yellow_green_stop_ablation.md`：单独放宽 yellow 基本不改变结果；单独放宽 green 会明显削弱第2段；yellow+green 同宽能改善第1段但仍牺牲第2段。
 
 ## 当前建议
 

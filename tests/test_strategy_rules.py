@@ -84,6 +84,8 @@ class StrategyRuleTests(unittest.TestCase):
                 "direct_next_open",
                 "baseline_half_protect",
                 "baseline_green_wide",
+                "baseline_yellow_wide",
+                "baseline_yellow_green_wide",
                 "baseline_half_green_wide",
                 "optimized_v2",
             ],
@@ -95,9 +97,14 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertEqual("direct_next_open", groups[2].config.entry_execution)
         self.assertEqual("second_pullback", groups[3].config.entry_execution)
         self.assertEqual("half_protect", groups[3].config.stop_tightening)
-        self.assertEqual("green_wide", groups[4].config.stop_tightening)
-        self.assertEqual("half_protect_green_wide", groups[5].config.stop_tightening)
-        self.assertTrue(groups[6].config.block_reverse_fib_resistance)
+        self.assertEqual("wide", groups[4].config.green_stop_tightening)
+        self.assertEqual("baseline", groups[4].config.yellow_stop_tightening)
+        self.assertEqual("wide", groups[5].config.yellow_stop_tightening)
+        self.assertEqual("baseline", groups[5].config.green_stop_tightening)
+        self.assertEqual("wide", groups[6].config.yellow_stop_tightening)
+        self.assertEqual("wide", groups[6].config.green_stop_tightening)
+        self.assertEqual("half_protect_green_wide", groups[7].config.stop_tightening)
+        self.assertTrue(groups[8].config.block_reverse_fib_resistance)
 
     def test_selected_strategy_groups_loads_requested_names(self):
         groups = selected_strategy_groups("MUUSDT", ["legacy_break_high,baseline", "second_pullback_limit_8"])

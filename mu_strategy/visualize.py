@@ -12,7 +12,7 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.data import cached_historical
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import StrategyConfig, selected_strategy_groups
 
 
 def main() -> None:
@@ -23,9 +23,17 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output", type=Path, default=Path("reports/mu_backtest.html"))
     parser.add_argument("--chart-interval", choices=("15m", "1h"), default="1h")
+    parser.add_argument("--strategy", default="baseline", help="Single strategy group name to visualize.")
     args = parser.parse_args()
 
-    config = StrategyConfig(symbol=args.symbol)
+    try:
+        groups = selected_strategy_groups(args.symbol, [args.strategy])
+    except ValueError as exc:
+        parser.error(str(exc))
+    if len(groups) != 1:
+        parser.error("--strategy must resolve to exactly one strategy group")
+    group = groups[0]
+    config = group.config
     candles_15m, _ = cached_historical(
         args.symbol,
         "15m",
@@ -49,6 +57,8 @@ def main() -> None:
         config=config,
         symbol=args.symbol,
         chart_interval=args.chart_interval,
+        strategy_name=group.name,
+        strategy_label=group.label,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_text, encoding="utf-8")
@@ -62,9 +72,20 @@ def render_html_visualization(
     config: StrategyConfig,
     symbol: str,
     chart_interval: str = "15m",
+    strategy_name: str | None = None,
+    strategy_label: str | None = None,
 ) -> str:
     interval_label = "1h" if chart_interval == "1h" else "15m"
-    title = f"{html.escape(symbol)} 策略可视化"
+    strategy_title = f" {html.escape(strategy_name)}" if strategy_name else ""
+    title = f"{html.escape(symbol)}{strategy_title} 策略可视化"
+    strategy_note = ""
+    if strategy_name:
+        escaped_name = html.escape(strategy_name)
+        escaped_label = html.escape(strategy_label or "")
+        strategy_note = f"策略组：<strong>{escaped_name}</strong>"
+        if escaped_label:
+            strategy_note += f"（{escaped_label}）"
+        strategy_note += "。"
     chart_data = _plotly_data(candles, result)
     rows = "\n".join(_trade_row(trade) for trade in result.trades) or (
         "<tr><td colspan=\"7\">当前规则没有产生交易。</td></tr>"
@@ -183,7 +204,7 @@ def render_html_visualization(
 <body>
 <main>
   <h1>{title}</h1>
-  <div class="subtitle">当前规则：1h 结构过滤、15m Fibonacci 回踩确认、5x 金字塔加仓、美股现金盘窗口。K线展示周期：{interval_label}。</div>
+  <div class="subtitle">{strategy_note}当前规则：1h 结构过滤、15m Fibonacci 回踩确认、5x 金字塔加仓、美股现金盘窗口。K线展示周期：{interval_label}。</div>
   <div class="cards">
     {_metric_card("总收益", f"{result.total_return_pct:.2%}")}
     {_metric_card("最大回撤", f"{result.max_drawdown_pct:.2%}")}

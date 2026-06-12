@@ -325,7 +325,11 @@ def _strategy_group_lines(group: StrategyGroup) -> list[str]:
         )
     else:
         output.append(f"  - 规则：entry_execution={config.entry_execution}")
-    if config.stop_tightening == "baseline":
+    if config.yellow_stop_tightening is not None or config.green_stop_tightening is not None:
+        yellow_mode = config.yellow_stop_tightening or config.stop_tightening
+        green_mode = config.green_stop_tightening or config.stop_tightening
+        output.append(f"  - 止损：yellow={_stop_policy_label(yellow_mode)}，green={_stop_policy_label(green_mode)}。")
+    elif config.stop_tightening == "baseline":
         output.append("  - 止损：baseline 抬止损。")
     elif config.stop_tightening == "half_protect_green_wide":
         output.append("  - 止损：半保护；1h green 时更宽，不立即抬到首仓成本/均价。")
@@ -351,6 +355,16 @@ def _strategy_group_lines(group: StrategyGroup) -> list[str]:
         output.append(f"  - max entry above signal close: {config.max_entry_above_signal_close_pct:.2%}")
     output.append(f"  - reverse Fibonacci resistance filter: {config.block_reverse_fib_resistance}")
     return output
+
+
+def _stop_policy_label(mode: str) -> str:
+    return {
+        "baseline": "窄止损/baseline",
+        "half_protect": "半保护",
+        "wide": "宽止损",
+        "green_wide": "green宽止损",
+        "half_protect_green_wide": "半保护+green宽止损",
+    }.get(mode, mode)
 
 
 if __name__ == "__main__":
