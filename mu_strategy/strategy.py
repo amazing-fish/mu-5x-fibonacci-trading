@@ -24,6 +24,9 @@ class StrategyGroup:
 @dataclass(frozen=True)
 class StrategyConfig:
     symbol: str = "MUUSDT"
+    entry_execution: str = "break_high"
+    second_pullback_wait_bars: int = 8
+    stop_tightening: str = "baseline"
     leverage: float = 5.0
     margin_steps: tuple[float, ...] = (0.20, 0.20, 0.20, 0.40)
     initial_stop_pct: float = 0.02
@@ -41,6 +44,7 @@ class StrategyConfig:
     block_reverse_fib_resistance: bool = False
     reverse_fib_lookback: int = 64
     reverse_fib_tolerance_pct: float = 0.003
+    green_wide_stop_buffer_pct: float = 0.01
     allowed_regimes: tuple[str, ...] = ("green", "yellow")
     full_size_regime: str = "green"
     trading_windows_bjt: tuple[tuple[str, str], ...] = field(
@@ -53,6 +57,34 @@ class StrategyConfig:
 
 def baseline_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup("baseline", "原策略", StrategyConfig(symbol=symbol))
+
+
+def direct_next_open_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "direct_next_open",
+        "回踩确认后下一根开盘买入",
+        StrategyConfig(symbol=symbol, entry_execution="direct_next_open"),
+    )
+
+
+def second_pullback_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "second_pullback_limit_8",
+        "回踩确认后等待二次回踩买入",
+        StrategyConfig(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+    )
+
+
+def direct_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "direct_half_green_wide",
+        "直接买入 + 半保护 + green宽止损",
+        StrategyConfig(
+            symbol=symbol,
+            entry_execution="direct_next_open",
+            stop_tightening="half_protect_green_wide",
+        ),
+    )
 
 
 def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
@@ -71,7 +103,27 @@ def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
 
 
 def default_strategy_groups(symbol: str = "MUUSDT") -> list[StrategyGroup]:
-    return [baseline_strategy_group(symbol), optimized_strategy_group(symbol)]
+    return [
+        baseline_strategy_group(symbol),
+        direct_next_open_strategy_group(symbol),
+        second_pullback_strategy_group(symbol),
+        direct_half_green_wide_strategy_group(symbol),
+        optimized_strategy_group(symbol),
+    ]
+
+
+def selected_strategy_groups(symbol: str, names: list[str] | None = None) -> list[StrategyGroup]:
+    groups = default_strategy_groups(symbol)
+    if not names:
+        return groups
+    by_name = {group.name: group for group in groups}
+    selected_names: list[str] = []
+    for value in names:
+        selected_names.extend(name.strip() for name in value.split(",") if name.strip())
+    unknown = [name for name in selected_names if name not in by_name]
+    if unknown:
+        raise ValueError(f"unknown strategy group(s): {', '.join(unknown)}")
+    return [by_name[name] for name in selected_names]
 
 
 def fibonacci_levels(low: float, high: float) -> dict[str, float]:
@@ -138,10 +190,17 @@ def should_execute_entry(
     config: StrategyConfig,
 ) -> EntryExecution:
     candle = candles[index]
-    if next_candle.high <= candle.high:
-        return EntryExecution(False, "next candle does not break signal high")
+    if config.entry_execution == "direct_next_open":
+        entry_price = next_candle.open
+    elif config.entry_execution == "break_high":
+        if next_candle.high <= candle.high:
+            return EntryExecution(False, "next candle does not break signal high")
+        entry_price = max(next_candle.open, candle.high)
+    elif config.entry_execution == "second_pullback":
+        return EntryExecution(False, "waiting for second pullback")
+    else:
+        raise ValueError(f"unsupported entry_execution: {config.entry_execution}")
 
-    entry_price = max(next_candle.open, candle.high)
     signal_range_pct = (candle.high - candle.low) / candle.close if candle.close else 0.0
     if config.max_signal_range_pct is not None and signal_range_pct > config.max_signal_range_pct:
         return EntryExecution(False, "signal candle too wide")

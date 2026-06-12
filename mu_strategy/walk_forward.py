@@ -10,7 +10,7 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.data import cached_historical
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
-from mu_strategy.strategy import StrategyConfig, StrategyGroup, default_strategy_groups
+from mu_strategy.strategy import StrategyConfig, StrategyGroup, selected_strategy_groups
 
 
 DAY_MS = 86_400_000
@@ -111,7 +111,7 @@ def render_strategy_group_report(
     lines = [
         f"# {symbol} 策略组对比",
         "",
-        "目的：保留 baseline 原策略，同时把 optimized_v2 作为候选策略组并排回测，避免直接丢弃原策略或只看单段过拟合结果。",
+        "目的：保留 baseline 原策略，同时把候选策略组并排回测；后续可按名称加载策略组，避免直接丢弃备用策略或只看单段过拟合结果。",
         "",
         "## 数据",
         "",
@@ -222,6 +222,11 @@ def main() -> None:
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=Path("reports/mu_strategy_group_review.md"))
+    parser.add_argument(
+        "--strategy",
+        action="append",
+        help="Strategy group name to run. Repeat or pass comma-separated names. Defaults to all registered groups.",
+    )
     args = parser.parse_args()
 
     total_days = args.window_days * args.windows
@@ -242,7 +247,7 @@ def main() -> None:
     group_results = run_strategy_group_walk_forward_backtests(
         candles_15m,
         candles_1h,
-        groups=default_strategy_groups(args.symbol),
+        groups=selected_strategy_groups(args.symbol, args.strategy),
         window_days=args.window_days,
         windows=args.windows,
     )
@@ -310,11 +315,32 @@ def _stage1_stop_count(trades: list[Trade]) -> int:
 def _strategy_group_lines(group: StrategyGroup) -> list[str]:
     config = group.config
     output = [f"- {group.name} ({group.label})"]
-    if config.max_entry_above_fib_pct is None:
+    if config.entry_execution == "break_high":
         output.append("  - 规则：原始 Fib 回踩确认 + 下一根突破前高执行。")
+    elif config.entry_execution == "direct_next_open":
+        output.append("  - 规则：Fib 回踩确认后下一根开盘直接买入，不等待突破前高。")
+    elif config.entry_execution == "second_pullback":
+        output.append(
+            f"  - 规则：Fib 回踩确认后等待二次回踩买入，最多等待 {config.second_pullback_wait_bars} 根 15m K。"
+        )
+    else:
+        output.append(f"  - 规则：entry_execution={config.entry_execution}")
+    if config.stop_tightening == "baseline":
+        output.append("  - 止损：baseline 抬止损。")
+    elif config.stop_tightening == "half_protect_green_wide":
+        output.append("  - 止损：半保护；1h green 时更宽，不立即抬到首仓成本/均价。")
+    elif config.stop_tightening == "half_protect":
+        output.append("  - 止损：半保护。")
+    elif config.stop_tightening == "green_wide":
+        output.append("  - 止损：1h green 更宽。")
+    if (
+        config.max_entry_above_fib_pct is None
+        and config.max_signal_range_pct is None
+        and not config.block_reverse_fib_resistance
+    ):
         return output
     output.append(
-        "  - 规则：限制首仓追价、限制信号 K 过宽、yellow 更严格，并启用反向 Fibonacci 压力位过滤。"
+        "  - 过滤：限制首仓追价、限制信号 K 过宽、yellow 更严格，并可启用反向 Fibonacci 压力位过滤。"
     )
     output.append(f"  - max entry above Fib: {config.max_entry_above_fib_pct:.2%}")
     if config.yellow_max_entry_above_fib_pct is not None:

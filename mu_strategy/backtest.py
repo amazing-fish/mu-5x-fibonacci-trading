@@ -19,6 +19,7 @@ class OpenPosition:
     fills: list[Fill]
     stop_price: float
     entry_anchor: float
+    initial_stop_price: float = 0.0
     max_stage: int = 1
 
     @property
@@ -34,6 +35,12 @@ class OpenPosition:
     @property
     def fees(self) -> float:
         return sum(fill.fee for fill in self.fills)
+
+
+@dataclass
+class PendingEntry:
+    fib_level: float
+    expires_index: int
 
 
 def run_backtest(
@@ -55,6 +62,7 @@ def run_backtest(
     equity_curve: list[tuple[int, float]] = [(candles_15m[0].open_time_ms, equity)]
     trades: list[Trade] = []
     position: OpenPosition | None = None
+    pending_entry: PendingEntry | None = None
 
     index = 1
     while index < len(candles_15m) - 1:
@@ -62,6 +70,34 @@ def run_backtest(
         next_candle = candles_15m[index + 1]
 
         if position is None:
+            if config.entry_execution == "second_pullback" and pending_entry is not None:
+                if index > pending_entry.expires_index:
+                    pending_entry = None
+                elif candle.low <= pending_entry.fib_level * (1 + config.fib_tolerance_pct):
+                    entry_price = pending_entry.fib_level
+                    fill = _make_fill(candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
+                    stop_price = entry_price * (1 - config.initial_stop_pct)
+                    position = OpenPosition([fill], stop_price, entry_price, stop_price)
+                    pending_entry = None
+                    if candle.low <= position.stop_price:
+                        equity, trade = _close_position(
+                            position,
+                            candle,
+                            position.stop_price,
+                            equity,
+                            starting_equity,
+                            "initial_stop",
+                            config,
+                        )
+                        trades.append(trade)
+                        position = None
+                        equity_curve.append((candle.open_time_ms, equity))
+                    index += 1
+                    continue
+                else:
+                    index += 1
+                    continue
+
             if not is_preferred_us_cash_window(candle.open_time_ms, config):
                 index += 1
                 continue
@@ -84,6 +120,14 @@ def run_backtest(
                 index += 1
                 continue
 
+            if config.entry_execution == "second_pullback":
+                pending_entry = PendingEntry(
+                    fib_level=fib_level,
+                    expires_index=min(len(candles_15m) - 2, index + config.second_pullback_wait_bars),
+                )
+                index += 1
+                continue
+
             execution = should_execute_entry(candles_15m, index, next_candle, fib_level, regime, config)
             if not execution.allowed or execution.entry_price is None:
                 index += 1
@@ -91,7 +135,8 @@ def run_backtest(
 
             entry_price = execution.entry_price
             fill = _make_fill(next_candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
-            position = OpenPosition([fill], entry_price * (1 - config.initial_stop_pct), entry_price)
+            stop_price = entry_price * (1 - config.initial_stop_pct)
+            position = OpenPosition([fill], stop_price, entry_price, stop_price)
             if next_candle.low <= position.stop_price:
                 equity, trade = _close_position(
                     position,
@@ -125,7 +170,7 @@ def run_backtest(
             continue
 
         _maybe_add(position, candle, index, candles_15m, hourly_context, hist_values, rsi_values, equity, config)
-        _tighten_stop(position, candle, index, candles_15m, config)
+        _tighten_stop(position, candle, index, candles_15m, hourly_context.get(candle.open_time_ms, "yellow"), config)
         equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
         index += 1
 
@@ -187,6 +232,42 @@ def _tighten_stop(
     candle: Candle,
     index: int,
     candles: list[Candle],
+    regime: str,
+    config: StrategyConfig,
+) -> None:
+    initial_stop = position.initial_stop_price or position.stop_price
+    first_entry = position.fills[0].price
+    mode = config.stop_tightening
+
+    if mode == "baseline":
+        _tighten_stop_baseline(position, index, candles, config)
+        return
+
+    if mode == "half_protect":
+        _tighten_stop_half_protect(position, index, candles, config, initial_stop, first_entry)
+        return
+
+    if mode == "green_wide":
+        if regime == "green":
+            _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
+        else:
+            _tighten_stop_baseline(position, index, candles, config)
+        return
+
+    if mode == "half_protect_green_wide":
+        if regime == "green":
+            _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
+        else:
+            _tighten_stop_half_protect(position, index, candles, config, initial_stop, first_entry)
+        return
+
+    raise ValueError(f"unsupported stop_tightening: {mode}")
+
+
+def _tighten_stop_baseline(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
     config: StrategyConfig,
 ) -> None:
     if position.max_stage >= 2:
@@ -197,6 +278,42 @@ def _tighten_stop(
         higher_low = recent_higher_low(candles, index)
         if higher_low:
             position.stop_price = max(position.stop_price, higher_low * (1 - config.stop_buffer_pct))
+
+
+def _tighten_stop_half_protect(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
+    config: StrategyConfig,
+    initial_stop: float,
+    first_entry: float,
+) -> None:
+    if position.max_stage >= 2:
+        position.stop_price = max(position.stop_price, (initial_stop + first_entry) / 2)
+    if position.max_stage >= 3:
+        position.stop_price = max(position.stop_price, first_entry)
+    if position.max_stage >= 4:
+        higher_low = recent_higher_low(candles, index)
+        if higher_low:
+            position.stop_price = max(position.stop_price, position.entry_price, higher_low * (1 - config.stop_buffer_pct))
+
+
+def _tighten_stop_green_wide(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
+    config: StrategyConfig,
+    initial_stop: float,
+    first_entry: float,
+) -> None:
+    if position.max_stage >= 2:
+        position.stop_price = max(position.stop_price, (initial_stop + first_entry) / 2)
+    if position.max_stage >= 3:
+        position.stop_price = max(position.stop_price, first_entry)
+    if position.max_stage >= 4:
+        higher_low = recent_higher_low(candles, index)
+        if higher_low:
+            position.stop_price = max(position.stop_price, first_entry, higher_low * (1 - config.green_wide_stop_buffer_pct))
 
 
 def _marked_equity(equity: float, position: OpenPosition | None, mark_price: float) -> float:

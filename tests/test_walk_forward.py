@@ -54,16 +54,22 @@ class WalkForwardTests(unittest.TestCase):
     def test_strategy_group_report_keeps_baseline_and_optimized_side_by_side(self):
         groups = default_strategy_groups("MUUSDT")
         group_results = [
-            StrategyGroupBacktest(groups[0], [WindowBacktest(1, 0, 14 * DAY_MS, BacktestResult(10_000, 9_000, [], []), 14)]),
-            StrategyGroupBacktest(groups[1], [WindowBacktest(1, 0, 14 * DAY_MS, BacktestResult(10_000, 9_500, [], []), 14)]),
+            StrategyGroupBacktest(group, [WindowBacktest(1, 0, 14 * DAY_MS, BacktestResult(10_000, 9_000, [], []), 14)])
+            for group in groups
         ]
 
         report = render_strategy_group_report(group_results, symbol="MUUSDT", data_files=[])
 
         self.assertIn("策略组对比", report)
         self.assertIn("baseline", report)
+        self.assertIn("direct_next_open", report)
+        self.assertIn("second_pullback_limit_8", report)
+        self.assertIn("direct_half_green_wide", report)
         self.assertIn("optimized_v2", report)
         self.assertIn("原策略", report)
+        self.assertIn("下一根开盘", report)
+        self.assertIn("二次回踩", report)
+        self.assertIn("半保护", report)
         self.assertIn("反向 Fibonacci", report)
 
 

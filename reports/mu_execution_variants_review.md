@@ -2,7 +2,7 @@
 
 数据：`data/MUUSDT_15m_28d.csv`、`data/MUUSDT_1h_28d.csv`  
 窗口：两段独立 14 天。  
-目的：只替换首仓执行层，不改 1h regime、Fib 信号、加仓、止损和费用逻辑。
+目的：比较正式策略组中的首仓执行层，并观察“直接买入 + 半保护 + green 宽止损”的组合效果。
 
 ## 执行层定义
 
@@ -17,28 +17,35 @@
    Fib 回踩确认后，不追突破；在接下来最多 8 根 15m K 内挂原 Fib 位附近限价，价格回踩到 Fib 附近才买入。  
    回测假设：触及 Fib 附近即按 Fib 价成交；若同根 K 继续跌破初始止损，则按保守方式视为同根止损。
 
+4. `direct_half_green_wide`
+   Fib 回踩确认后下一根开盘直接买入，同时采用半保护和 1h green 更宽止损。  
+   目的：保留 direct 执行层的收益潜力，但减少加仓后立即抬到成本/均价导致的过早止损。
+
 ## 结果
 
 | strategy | W1 return | W1 DD | W1 trades | W1 win | W1 added | W1 stage1 stops | W2 return | W2 DD | W2 trades | W2 win | W2 added | W2 stage1 stops | avg return |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | baseline_break_high | -10.47% | -18.39% | 7 | 0.00% | 3 | 3 | -5.51% | -12.40% | 12 | 16.67% | 6 | 6 | -7.99% |
 | direct_next_open | -10.44% | -18.40% | 7 | 14.29% | 3 | 3 | 15.28% | -11.42% | 11 | 18.18% | 5 | 6 | 2.42% |
-| second_pullback_limit_8 | -9.58% | -18.63% | 7 | 0.00% | 5 | 2 | 12.25% | -10.14% | 9 | 22.22% | 6 | 3 | 1.34% |
+| second_pullback_limit_8 | -9.58% | -18.63% | 7 | 0.00% | 5 | 2 | 24.13% | -10.06% | 8 | 37.50% | 6 | 2 | 7.28% |
+| direct_half_green_wide | -2.03% | -16.91% | 6 | 33.33% | 3 | 2 | 10.27% | -16.57% | 11 | 27.27% | 5 | 6 | 4.12% |
 
 ## 信号和尾部
 
-| strategy | W1 signals | W1 fills | W1 missed | W1 best | W1 worst | W2 signals | W2 fills | W2 missed | W2 best | W2 worst |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline_break_high | 7 | 7 | 0 | -0.03% | -2.15% | 12 | 12 | 0 | 6.98% | -2.10% |
-| direct_next_open | 7 | 7 | 0 | 0.00% | -2.15% | 11 | 11 | 0 | 16.51% | -2.54% |
-| second_pullback_limit_8 | 8 | 7 | 0 | -0.30% | -2.15% | 11 | 9 | 1 | 10.82% | -2.18% |
+| strategy | W1 best | W1 worst | W2 best | W2 worst |
+|---|---:|---:|---:|---:|
+| baseline_break_high | -0.03% | -2.15% | 6.98% | -2.10% |
+| direct_next_open | 0.00% | -2.15% | 16.51% | -2.54% |
+| second_pullback_limit_8 | -0.30% | -2.15% | 11.96% | -2.18% |
+| direct_half_green_wide | 7.16% | -1.78% | 15.53% | -2.54% |
 
 ## 解释
 
 - 当前 `baseline_break_high` 的主要问题仍是追高执行：Fib 回踩确认本身可以作为信号，但“下一根突破前高”经常把成交推离 Fib 区。
-- `direct_next_open` 第二段显著改善，说明不等待突破前高能保留更多趋势收益；第 1 段没有恶化，说明这个替换至少值得做成正式策略组继续观察。
-- `second_pullback_limit_8` 的风险收益更稳一点，第二段收益低于 direct，但回撤也更小；它减少了首仓止损次数，符合“等更好位置”的目标。
-- 两个替代执行层仍没有解决第 1 段亏损，说明第 1 段的问题不只是突破前高，可能还涉及 1h 状态、加仓推进和止损抬升。
+- `direct_next_open` 第二段显著改善，说明不等待突破前高能保留更多趋势收益；第 1 段没有恶化，说明这个替换值得继续作为正式策略组观察。
+- `second_pullback_limit_8` 是当前两段综合最强的执行层：第二段收益最好、回撤也比 baseline 小，且首仓止损减少。
+- `direct_half_green_wide` 明显改善第 1 段，把亏损从 `-10.44%` 收窄到 `-2.03%`，但第 2 段回撤扩大，说明 green 宽止损能放大趋势收益，也会放大回撤。
+- 两个替代执行层仍没有完全解决第 1 段亏损，说明第 1 段的问题不只是突破前高，可能还涉及 1h 状态、加仓推进和止损抬升。
 
 ## 加仓后抬止损方式思考
 
@@ -63,10 +70,10 @@
 下一轮策略组优先级：
 
 1. `baseline`
-2. `direct_next_open`
-3. `second_pullback_limit_8`
-4. `direct_next_open + 分层/延迟抬止损`
-5. `second_pullback_limit_8 + 分层/延迟抬止损`
+2. `second_pullback_limit_8`
+3. `direct_next_open`
+4. `direct_half_green_wide`
+5. `second_pullback_limit_8 + 半保护/green宽止损`
 
 不要先把抬止损改进和入场执行改进混在同一个策略里，否则很难判断收益来自哪里。
 

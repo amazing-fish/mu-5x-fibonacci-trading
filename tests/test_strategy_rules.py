@@ -10,6 +10,7 @@ from mu_strategy.strategy import (
     is_preferred_us_cash_window,
     one_hour_regime,
     optimized_strategy_group,
+    selected_strategy_groups,
     should_enter_long,
     should_execute_entry,
 )
@@ -76,10 +77,27 @@ class StrategyRuleTests(unittest.TestCase):
     def test_strategy_groups_keep_baseline_and_optimized_variant(self):
         groups = default_strategy_groups()
 
-        self.assertEqual(["baseline", "optimized_v2"], [group.name for group in groups])
+        self.assertEqual(
+            [
+                "baseline",
+                "direct_next_open",
+                "second_pullback_limit_8",
+                "direct_half_green_wide",
+                "optimized_v2",
+            ],
+            [group.name for group in groups],
+        )
         self.assertIsInstance(groups[0], StrategyGroup)
-        self.assertIsNone(groups[0].config.max_entry_above_fib_pct)
-        self.assertTrue(groups[1].config.block_reverse_fib_resistance)
+        self.assertEqual("break_high", groups[0].config.entry_execution)
+        self.assertEqual("direct_next_open", groups[1].config.entry_execution)
+        self.assertEqual("second_pullback", groups[2].config.entry_execution)
+        self.assertEqual("half_protect_green_wide", groups[3].config.stop_tightening)
+        self.assertTrue(groups[4].config.block_reverse_fib_resistance)
+
+    def test_selected_strategy_groups_loads_requested_names(self):
+        groups = selected_strategy_groups("MUUSDT", ["baseline,direct_next_open", "second_pullback_limit_8"])
+
+        self.assertEqual(["baseline", "direct_next_open", "second_pullback_limit_8"], [group.name for group in groups])
 
     def test_optimized_execution_rejects_chasing_too_far_above_fib(self):
         config = optimized_strategy_group().config
@@ -106,6 +124,19 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertIn("signal candle too wide", decision.reason)
+
+    def test_direct_next_open_execution_does_not_require_breaking_signal_high(self):
+        config = StrategyConfig(entry_execution="direct_next_open")
+        candles = [
+            Candle(0, 100, 101, 99, 100, 1000),
+            Candle(900_000, 100.4, 101.2, 100.0, 101.0, 1000),
+            Candle(1_800_000, 100.9, 101.0, 100.6, 100.8, 1000),
+        ]
+
+        decision = should_execute_entry(candles, 1, candles[2], 100, "green", config)
+
+        self.assertTrue(decision.allowed)
+        self.assertAlmostEqual(100.9, decision.entry_price)
 
     def test_execution_rejects_reverse_fibonacci_resistance(self):
         config = StrategyConfig(block_reverse_fib_resistance=True)
