@@ -1,8 +1,12 @@
+import io
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
 from mu_strategy.strategy import StrategyConfig
-from mu_strategy.visualize import render_html_visualization
+from mu_strategy.viz.backtest import render_html_visualization
 
 
 class VisualizationTests(unittest.TestCase):
@@ -61,6 +65,27 @@ class VisualizationTests(unittest.TestCase):
         self.assertIn("开仓/加仓 第1段", html)
         self.assertIn("平仓 盈利", html)
         self.assertIn("止损", html)
+
+    def test_visualize_cli_defaults_to_okx_mu_source(self):
+        from mu_strategy import visualize
+
+        cached_calls = []
+
+        def fake_cached_historical(symbol, interval, **kwargs):
+            cached_calls.append((symbol, interval, kwargs))
+            return [], Path(f"data/{symbol}_{interval}.csv")
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--days", "180", "--strategy", "baseline", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.cached_historical", side_effect=fake_cached_historical):
+                    with patch("mu_strategy.viz.backtest.run_backtest", return_value=BacktestResult(10_000, 10_000, [], [])):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            visualize.main()
+
+        self.assertEqual("MU-USDT-SWAP", cached_calls[0][0])
+        self.assertEqual("okx", cached_calls[0][2]["source"])
 
 
 if __name__ == "__main__":
