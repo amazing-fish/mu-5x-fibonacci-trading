@@ -1,0 +1,74 @@
+# MU Strategy Architecture
+
+This project is organized as a research-first trading strategy workbench. It does not implement live trading.
+
+## Data
+
+Package: `mu_strategy.market_data`
+
+- `providers/okx.py`: OKX public candle fetching for `MU-USDT-SWAP`.
+- `providers/binance.py`: Binance futures candle fetching for explicit comparison runs.
+- `cache.py`: CSV cache paths, reads/writes, incremental merge, and lookback pruning.
+
+Rules:
+
+- OKX is the default source for MU baseline work.
+- Unconfirmed OKX candles are ignored.
+- Existing OKX caches are incrementally updated and pruned to the requested `days` window.
+- If an incremental OKX refresh fails, existing cached data is still usable.
+
+## Strategies
+
+Package: `mu_strategy.strategies`
+
+- `registry.py`: named strategy groups.
+- `components.py`: entry, position, exit, and filter labels.
+- `presets/mu.py`: MU strategy preset names.
+
+Current fixed research baseline: `baseline`.
+
+## Research
+
+Package: `mu_strategy.research`
+
+Use this layer to state the current best-known strategy and supporting notes. It should read experiment outputs, not implement backtest mechanics.
+
+## Experiments
+
+Package: `mu_strategy.experiments`
+
+`experiments.walk_forward` runs strategy-group comparisons and renders the Markdown and HTML component matrix reports. Walk-forward windows are independent; aggregate dashboard drawdown uses per-window drawdown rather than concatenating reset equity curves.
+
+## Selection
+
+Package: `mu_strategy.selection`
+
+Use this layer to apply a fixed strategy across candidate rows and rank them without network access. It is the planned home for broader symbol selection.
+
+## Execution Planning
+
+Package: `mu_strategy.execution`
+
+This layer returns non-trading decisions:
+
+- `allow`: current fixed strategy permits an entry plan.
+- `wait`: signal is incomplete.
+- `block`: risk filter blocks entry.
+
+It may return margin steps and initial stop planning. It must not place orders or call broker APIs.
+
+## Visualization
+
+Package: `mu_strategy.viz`
+
+`viz.backtest` renders the interactive Plotly backtest dashboard. The top-level `mu_strategy.visualize` module remains a compatibility wrapper.
+
+## Compatibility Wrappers
+
+These old entry points remain valid during migration:
+
+- `mu_strategy.data`
+- `mu_strategy.strategy`
+- `mu_strategy.walk_forward`
+- `mu_strategy.visualize`
+- `mu_strategy.cli`
