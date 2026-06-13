@@ -1,69 +1,92 @@
-# MU 5x Fibonacci Trading Research
+# MU 5x Fibonacci 策略研究
 
-Research code for a long-only MU strategy using OKX `MU-USDT-SWAP` as the default data source.
+本仓库用于研究 MU 多头策略，当前默认数据源为 OKX `MU-USDT-SWAP`。项目目标是把主观交易想法拆成可回测、可对比、可持续扩展的规则和工具，不提供投资建议。
 
-The current baseline uses:
+当前 baseline 使用：
 
-- 1h market-structure regime filtering.
-- 15m Fibonacci retest entries.
-- RSI and MACD confirmation.
-- US cash-session timing.
-- 5x pyramiding with staged margin.
-- Strategy groups split by entry, position, exit, and filter components.
-- OKX incremental cache updates that ignore unconfirmed candles and keep the requested lookback window.
+- `1h` 市场结构过滤，判断是否允许做多。
+- `15m` Fibonacci 回踩入场。
+- RSI 和 MACD 作为确认过滤。
+- 美股现金盘时间窗口。
+- `5x` 分阶段金字塔加仓。
+- 按入场、加减仓、出场、过滤等维度拆分策略组。
+- OKX 增量缓存，只使用已确认 K 线，并按请求的 `days` 窗口裁剪缓存。
 
-This repository is a research artifact, not financial advice. Execution modules produce planning decisions only; they do not place orders.
+执行相关模块只输出规划决策，不会下单，也不会调用 broker/order API。
 
-## Architecture
+## 架构
 
-See [docs/architecture.md](docs/architecture.md) for the current package layout.
+当前包结构见 [docs/architecture.md](docs/architecture.md)。
 
-- `mu_strategy.market_data`: OKX/Binance providers and cache policy.
-- `mu_strategy.strategies`: strategy group registry and component metadata.
-- `mu_strategy.experiments`: walk-forward and ablation workflows.
-- `mu_strategy.viz`: HTML report rendering.
-- `mu_strategy.research`: current research conclusions.
-- `mu_strategy.selection`: fixed-strategy candidate ranking.
-- `mu_strategy.execution`: non-trading entry and risk planning.
+- `mu_strategy.market_data`：OKX/Binance 数据提供方与缓存策略。
+- `mu_strategy.strategies`：策略组注册表与组件元数据。
+- `mu_strategy.experiments`：walk-forward 与消融实验。
+- `mu_strategy.viz`：HTML 回测报告渲染。
+- `mu_strategy.research`：当前研究结论入口。
+- `mu_strategy.selection`：固定策略下的候选标的排序。
+- `mu_strategy.execution`：非交易的入场与风险规划。
 
-Top-level modules such as `mu_strategy.data`, `mu_strategy.walk_forward`, and `mu_strategy.visualize` remain compatibility wrappers.
+兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`。
 
-## Commands
+## 常用命令
 
-Run tests:
+运行测试：
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-Run the current OKX baseline:
+运行当前 OKX baseline 回测：
 
 ```powershell
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
 ```
 
-Run the strategy-group experiment report and HTML matrix:
+运行策略组实验，并生成组件矩阵 HTML：
 
 ```powershell
 python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report reports\mu_okx_strategy_group_review.md --html-report reports\mu_okx_strategy_components.html
 ```
 
-Generate the Plotly visualization:
+生成 Plotly 可视化回测：
 
 ```powershell
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
 
-Use Binance explicitly for comparison:
+显式使用 Binance 做对照：
 
 ```powershell
 python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy baseline --report reports\mu_binance_backtest.md
 ```
 
-## Current Artifacts
+## 当前产物
 
-- `reports/mu_okx_backtest.md`: current OKX baseline report.
-- `reports/mu_okx_strategy_group_review.md`: strategy-group experiment table.
-- `reports/mu_okx_strategy_components.html`: visual strategy component matrix.
-- `reports/mu_okx_baseline_backtest.html`: interactive 1h chart with synchronized price, volume, and equity crosshair lines.
-- `data/OKX_MU-USDT-SWAP_*_180d.csv`: cached confirmed OKX candles for reproducible local review.
+- `reports/mu_okx_backtest.md`：当前 OKX baseline Markdown 回测报告。
+- `reports/mu_okx_strategy_group_review.md`：策略组实验结果表。
+- `reports/mu_okx_strategy_components.html`：策略组件可视化矩阵。
+- `reports/mu_okx_baseline_backtest.html`：交互式 `1h` 可视化回测，包含价格、成交量和权益曲线联动。
+- `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
+
+## 数据注意事项
+
+- OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
+- 每次刷新会在已有缓存基础上增量补充后续已确认数据。
+- 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
+- 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
+
+## 策略组说明
+
+当前策略组可以通过 `--strategy` 指定，主要包括：
+
+- `legacy_break_high`：旧版突破前高确认策略，保留为备用对照。
+- `baseline`：当前固定 baseline，采用二次回踩确认买入。
+- `direct_next_open`：确认后下一根开盘直接买入。
+- `baseline_half_protect`：baseline 入场 + 半保护止损。
+- `baseline_green_wide`：baseline 入场 + `1h green` 宽止损。
+- `baseline_yellow_wide`：baseline 入场 + `1h yellow` 宽止损。
+- `baseline_yellow_green_wide`：baseline 入场 + yellow/green 均宽止损。
+- `baseline_half_green_wide`：baseline 入场 + 半保护 + green 宽止损。
+- `optimized_v2`：旧突破入场 + 首仓追价、信号 K 宽度、反向 Fibonacci 压力过滤。
+
+策略组可视化报告会按入场策略、加减仓策略、出场策略、过滤策略拆分展示，方便持续组合和消融回测。
