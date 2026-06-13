@@ -3,9 +3,10 @@ from unittest.mock import patch
 
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.strategy import default_strategy_groups, StrategyConfig
-from mu_strategy.walk_forward import (
+from mu_strategy.experiments.walk_forward import (
     StrategyGroupBacktest,
     WindowBacktest,
+    render_strategy_group_html_dashboard,
     render_strategy_group_report,
     render_walk_forward_report,
     run_walk_forward_backtests,
@@ -78,6 +79,55 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("二次回踩", report)
         self.assertIn("半保护", report)
         self.assertIn("反向 Fibonacci", report)
+        self.assertIn("## 策略组件矩阵", report)
+        self.assertIn("入场策略", report)
+        self.assertIn("加减仓策略", report)
+        self.assertIn("出场策略", report)
+        self.assertIn("过滤策略", report)
+
+    def test_strategy_group_html_dashboard_visualizes_components(self):
+        groups = default_strategy_groups("MU-USDT-SWAP")
+        group_results = [
+            StrategyGroupBacktest(group, [WindowBacktest(1, 0, 14 * DAY_MS, BacktestResult(10_000, 11_000, [], []), 14)])
+            for group in groups[:2]
+        ]
+
+        html = render_strategy_group_html_dashboard(group_results, symbol="MU-USDT-SWAP", data_files=[])
+
+        self.assertIn('<html lang="zh-CN">', html)
+        self.assertIn("策略组件矩阵", html)
+        self.assertIn("入场策略", html)
+        self.assertIn("加减仓策略", html)
+        self.assertIn("出场策略", html)
+        self.assertIn("过滤策略", html)
+        self.assertIn("baseline", html)
+
+    def test_strategy_group_html_uses_per_window_drawdown_without_reset_drop(self):
+        group = default_strategy_groups("MU-USDT-SWAP")[0]
+        group_result = StrategyGroupBacktest(
+            group,
+            [
+                WindowBacktest(
+                    1,
+                    0,
+                    DAY_MS,
+                    BacktestResult(10_000, 12_000, [], [(0, 10_000), (1, 12_000)]),
+                    2,
+                ),
+                WindowBacktest(
+                    2,
+                    DAY_MS,
+                    2 * DAY_MS,
+                    BacktestResult(10_000, 10_000, [], [(2, 10_000), (3, 9_500), (4, 10_000)]),
+                    3,
+                ),
+            ],
+        )
+
+        html = render_strategy_group_html_dashboard([group_result], symbol="MU-USDT-SWAP", data_files=[])
+
+        self.assertIn("-5.00%", html)
+        self.assertNotIn("-20.83%", html)
 
     def test_walk_forward_context_includes_hour_covering_segment_start(self):
         candles_15m = [
@@ -96,7 +146,7 @@ class WalkForwardTests(unittest.TestCase):
             captured_hourly_segments.append([bar.open_time_ms for bar in hourly_segment])
             return {bar.open_time_ms: "yellow" for bar in segment}
 
-        with patch("mu_strategy.walk_forward.build_hourly_context", side_effect=fake_context):
+        with patch("mu_strategy.experiments.walk_forward.build_hourly_context", side_effect=fake_context):
             results = run_walk_forward_backtests(
                 candles_15m,
                 candles_1h,
