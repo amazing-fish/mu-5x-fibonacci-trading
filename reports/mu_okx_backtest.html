@@ -67,6 +67,12 @@
       font-weight: 650;
       margin-top: 4px;
     }
+    .card-detail {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.3;
+    }
     .detail-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -127,6 +133,33 @@
     th:last-child, td:last-child {
       text-align: left;
     }
+    .trade-table-wrap {
+      --trade-row-height: 34px;
+      max-height: calc((var(--trade-row-height) * 15) + 40px);
+      overflow-y: auto;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .trade-table-wrap table {
+      min-width: 760px;
+    }
+    .trade-table-wrap tr {
+      height: var(--trade-row-height);
+    }
+    .trade-table-wrap thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #eef2f6;
+    }
+    .trade-positive td {
+      background: rgba(15, 139, 111, 0.08);
+    }
+    .trade-return-positive {
+      color: var(--up);
+      font-weight: 650;
+    }
     .note {
       margin-top: 14px;
       color: var(--muted);
@@ -141,12 +174,13 @@
   <div class="cards">
     <div class="card"><div class="label">总收益</div><div class="value">105.80%</div></div>
     <div class="card"><div class="label">最大回撤</div><div class="value">-26.02%</div></div>
-    <div class="card"><div class="label">交易次数</div><div class="value">31</div></div>
+    <div class="card"><div class="label">交易次数</div><div class="value">31</div><div class="card-detail">样本时长 102d</div></div>
     <div class="card"><div class="label">胜率</div><div class="value">22.58%</div></div>
     <div class="card"><div class="label">盈亏因子</div><div class="value">2.23</div></div>
     <div class="card"><div class="label">非美股风险</div><div class="value">0</div></div>
   </div>
   <p class="note">非美股风险统计：持仓期间若非美股现金时段 K 线低点跌穿按杠杆估算的爆仓线，会以“非美股时段爆仓风险”记录。</p>
+  <p class="note">出场执行说明：入场和加仓只在配置的美股现金窗口执行；止损和非美股时段爆仓风险检查会在持仓期间持续执行。</p>
   <section>
     <h2>策略组详情</h2>
     <div class="detail-grid">
@@ -193,44 +227,37 @@
   </section>
   <section>
     <h2>交易明细</h2>
-    <table>
-      <thead>
-        <tr><th>开仓 UTC</th><th>平仓 UTC</th><th>开仓均价</th><th>平仓价</th><th>最高段位</th><th>收益</th><th>原因</th></tr>
-      </thead>
-      <tbody>
-        <tr><td>2026-03-05 15:00</td><td>2026-03-05 17:15</td><td>400.03</td><td>392.03</td><td>1</td><td>-2.10%</td><td>止损</td></tr>
-<tr><td>2026-03-13 15:00</td><td>2026-03-17 16:00</td><td>445.13</td><td>453.66</td><td>4</td><td>8.89%</td><td>止损</td></tr>
-<tr><td>2026-03-18 18:45</td><td>2026-03-18 20:00</td><td>468.85</td><td>459.47</td><td>1</td><td>-2.24%</td><td>止损</td></tr>
-<tr><td>2026-03-27 14:00</td><td>2026-03-27 19:00</td><td>362.19</td><td>358.58</td><td>2</td><td>-2.29%</td><td>止损</td></tr>
-<tr><td>2026-03-31 15:30</td><td>2026-04-01 17:45</td><td>337.88</td><td>373.19</td><td>4</td><td>52.90%</td><td>止损</td></tr>
-<tr><td>2026-04-09 14:15</td><td>2026-04-10 13:30</td><td>413.75</td><td>413.75</td><td>3</td><td>-0.47%</td><td>止损</td></tr>
-<tr><td>2026-04-10 14:30</td><td>2026-04-12 16:00</td><td>419.82</td><td>411.42</td><td>1</td><td>-3.25%</td><td>止损</td></tr>
-<tr><td>2026-04-13 14:00</td><td>2026-04-14 19:00</td><td>429.30</td><td>453.71</td><td>4</td><td>42.28%</td><td>止损</td></tr>
-<tr><td>2026-04-21 19:30</td><td>2026-04-22 17:30</td><td>468.80</td><td>477.04</td><td>4</td><td>16.06%</td><td>止损</td></tr>
-<tr><td>2026-04-23 14:45</td><td>2026-04-23 17:30</td><td>484.67</td><td>479.92</td><td>2</td><td>-4.53%</td><td>止损</td></tr>
-<tr><td>2026-04-24 14:00</td><td>2026-04-25 00:00</td><td>499.32</td><td>494.43</td><td>2</td><td>-4.43%</td><td>止损</td></tr>
-<tr><td>2026-04-27 14:30</td><td>2026-04-27 18:30</td><td>522.94</td><td>517.82</td><td>2</td><td>-4.34%</td><td>止损</td></tr>
-<tr><td>2026-04-28 14:00</td><td>2026-04-28 14:15</td><td>512.67</td><td>502.42</td><td>1</td><td>-4.12%</td><td>止损</td></tr>
-<tr><td>2026-04-28 19:15</td><td>2026-04-30 14:30</td><td>515.77</td><td>507.87</td><td>2</td><td>-6.27%</td><td>止损</td></tr>
-<tr><td>2026-04-30 19:30</td><td>2026-04-30 20:15</td><td>516.28</td><td>505.95</td><td>1</td><td>-3.91%</td><td>止损</td></tr>
-<tr><td>2026-05-01 15:30</td><td>2026-05-04 15:15</td><td>565.74</td><td>580.21</td><td>4</td><td>22.37%</td><td>止损</td></tr>
-<tr><td>2026-05-06 18:45</td><td>2026-05-07 13:30</td><td>657.90</td><td>644.75</td><td>1</td><td>-4.29%</td><td>止损</td></tr>
-<tr><td>2026-05-07 15:00</td><td>2026-05-07 16:00</td><td>661.34</td><td>648.12</td><td>1</td><td>-4.20%</td><td>止损</td></tr>
-<tr><td>2026-05-11 14:15</td><td>2026-05-12 01:00</td><td>796.45</td><td>783.82</td><td>2</td><td>-6.61%</td><td>止损</td></tr>
-<tr><td>2026-05-13 15:00</td><td>2026-05-14 08:30</td><td>799.54</td><td>783.55</td><td>1</td><td>-3.98%</td><td>止损</td></tr>
-<tr><td>2026-05-14 14:00</td><td>2026-05-14 15:45</td><td>796.09</td><td>780.17</td><td>1</td><td>-3.89%</td><td>止损</td></tr>
-<tr><td>2026-05-14 19:15</td><td>2026-05-15 00:00</td><td>790.90</td><td>775.08</td><td>1</td><td>-3.81%</td><td>止损</td></tr>
-<tr><td>2026-05-19 15:15</td><td>2026-05-20 20:15</td><td>717.25</td><td>726.14</td><td>4</td><td>10.12%</td><td>止损</td></tr>
-<tr><td>2026-05-21 14:15</td><td>2026-05-22 10:30</td><td>752.58</td><td>745.20</td><td>2</td><td>-4.06%</td><td>止损</td></tr>
-<tr><td>2026-05-22 14:00</td><td>2026-05-22 19:45</td><td>761.51</td><td>754.04</td><td>2</td><td>-3.97%</td><td>止损</td></tr>
-<tr><td>2026-05-28 14:15</td><td>2026-05-28 18:45</td><td>937.71</td><td>928.52</td><td>2</td><td>-3.88%</td><td>止损</td></tr>
-<tr><td>2026-06-01 14:15</td><td>2026-06-03 13:45</td><td>1044.89</td><td>1044.89</td><td>3</td><td>-0.53%</td><td>止损</td></tr>
-<tr><td>2026-06-03 19:00</td><td>2026-06-03 21:30</td><td>1071.78</td><td>1050.34</td><td>1</td><td>-3.68%</td><td>止损</td></tr>
-<tr><td>2026-06-10 14:00</td><td>2026-06-10 14:45</td><td>934.49</td><td>934.49</td><td>3</td><td>-0.52%</td><td>止损</td></tr>
-<tr><td>2026-06-11 14:15</td><td>2026-06-12 01:15</td><td>950.88</td><td>995.26</td><td>4</td><td>39.09%</td><td>止损</td></tr>
-<tr><td>2026-06-12 14:30</td><td>2026-06-12 15:45</td><td>990.89</td><td>981.17</td><td>2</td><td>-4.54%</td><td>止损</td></tr>
-      </tbody>
-    </table>
+    <div class="trade-table-wrap"><table><thead><tr><th>开仓 UTC</th><th>平仓 UTC</th><th>开仓均价</th><th>平仓价</th><th>最高段位</th><th>收益</th></tr></thead><tbody><tr><td>2026-06-12 14:30</td><td>2026-06-12 15:45</td><td>990.89</td><td>981.17</td><td>2</td><td>-4.54%</td></tr>
+<tr class="trade-positive"><td>2026-06-11 14:15</td><td>2026-06-12 01:15</td><td>950.88</td><td>995.26</td><td>4</td><td class="trade-return-positive">39.09%</td></tr>
+<tr><td>2026-06-10 14:00</td><td>2026-06-10 14:45</td><td>934.49</td><td>934.49</td><td>3</td><td>-0.52%</td></tr>
+<tr><td>2026-06-03 19:00</td><td>2026-06-03 21:30</td><td>1071.78</td><td>1050.34</td><td>1</td><td>-3.68%</td></tr>
+<tr><td>2026-06-01 14:15</td><td>2026-06-03 13:45</td><td>1044.89</td><td>1044.89</td><td>3</td><td>-0.53%</td></tr>
+<tr><td>2026-05-28 14:15</td><td>2026-05-28 18:45</td><td>937.71</td><td>928.52</td><td>2</td><td>-3.88%</td></tr>
+<tr><td>2026-05-22 14:00</td><td>2026-05-22 19:45</td><td>761.51</td><td>754.04</td><td>2</td><td>-3.97%</td></tr>
+<tr><td>2026-05-21 14:15</td><td>2026-05-22 10:30</td><td>752.58</td><td>745.20</td><td>2</td><td>-4.06%</td></tr>
+<tr class="trade-positive"><td>2026-05-19 15:15</td><td>2026-05-20 20:15</td><td>717.25</td><td>726.14</td><td>4</td><td class="trade-return-positive">10.12%</td></tr>
+<tr><td>2026-05-14 19:15</td><td>2026-05-15 00:00</td><td>790.90</td><td>775.08</td><td>1</td><td>-3.81%</td></tr>
+<tr><td>2026-05-14 14:00</td><td>2026-05-14 15:45</td><td>796.09</td><td>780.17</td><td>1</td><td>-3.89%</td></tr>
+<tr><td>2026-05-13 15:00</td><td>2026-05-14 08:30</td><td>799.54</td><td>783.55</td><td>1</td><td>-3.98%</td></tr>
+<tr><td>2026-05-11 14:15</td><td>2026-05-12 01:00</td><td>796.45</td><td>783.82</td><td>2</td><td>-6.61%</td></tr>
+<tr><td>2026-05-07 15:00</td><td>2026-05-07 16:00</td><td>661.34</td><td>648.12</td><td>1</td><td>-4.20%</td></tr>
+<tr><td>2026-05-06 18:45</td><td>2026-05-07 13:30</td><td>657.90</td><td>644.75</td><td>1</td><td>-4.29%</td></tr>
+<tr class="trade-positive"><td>2026-05-01 15:30</td><td>2026-05-04 15:15</td><td>565.74</td><td>580.21</td><td>4</td><td class="trade-return-positive">22.37%</td></tr>
+<tr><td>2026-04-30 19:30</td><td>2026-04-30 20:15</td><td>516.28</td><td>505.95</td><td>1</td><td>-3.91%</td></tr>
+<tr><td>2026-04-28 19:15</td><td>2026-04-30 14:30</td><td>515.77</td><td>507.87</td><td>2</td><td>-6.27%</td></tr>
+<tr><td>2026-04-28 14:00</td><td>2026-04-28 14:15</td><td>512.67</td><td>502.42</td><td>1</td><td>-4.12%</td></tr>
+<tr><td>2026-04-27 14:30</td><td>2026-04-27 18:30</td><td>522.94</td><td>517.82</td><td>2</td><td>-4.34%</td></tr>
+<tr><td>2026-04-24 14:00</td><td>2026-04-25 00:00</td><td>499.32</td><td>494.43</td><td>2</td><td>-4.43%</td></tr>
+<tr><td>2026-04-23 14:45</td><td>2026-04-23 17:30</td><td>484.67</td><td>479.92</td><td>2</td><td>-4.53%</td></tr>
+<tr class="trade-positive"><td>2026-04-21 19:30</td><td>2026-04-22 17:30</td><td>468.80</td><td>477.04</td><td>4</td><td class="trade-return-positive">16.06%</td></tr>
+<tr class="trade-positive"><td>2026-04-13 14:00</td><td>2026-04-14 19:00</td><td>429.30</td><td>453.71</td><td>4</td><td class="trade-return-positive">42.28%</td></tr>
+<tr><td>2026-04-10 14:30</td><td>2026-04-12 16:00</td><td>419.82</td><td>411.42</td><td>1</td><td>-3.25%</td></tr>
+<tr><td>2026-04-09 14:15</td><td>2026-04-10 13:30</td><td>413.75</td><td>413.75</td><td>3</td><td>-0.47%</td></tr>
+<tr class="trade-positive"><td>2026-03-31 15:30</td><td>2026-04-01 17:45</td><td>337.88</td><td>373.19</td><td>4</td><td class="trade-return-positive">52.90%</td></tr>
+<tr><td>2026-03-27 14:00</td><td>2026-03-27 19:00</td><td>362.19</td><td>358.58</td><td>2</td><td>-2.29%</td></tr>
+<tr><td>2026-03-18 18:45</td><td>2026-03-18 20:00</td><td>468.85</td><td>459.47</td><td>1</td><td>-2.24%</td></tr>
+<tr class="trade-positive"><td>2026-03-13 15:00</td><td>2026-03-17 16:00</td><td>445.13</td><td>453.66</td><td>4</td><td class="trade-return-positive">8.89%</td></tr>
+<tr><td>2026-03-05 15:00</td><td>2026-03-05 17:15</td><td>400.03</td><td>392.03</td><td>1</td><td>-2.10%</td></tr></tbody></table></div>
   </section>
   <p class="note">研究用途。页面展示历史规则执行，不预测未来收益。价格图、成交量图和权益图支持同步缩放；鼠标悬停时三图会显示同一时间点的竖向虚线。</p>
 </main>
