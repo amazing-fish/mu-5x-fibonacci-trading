@@ -65,7 +65,7 @@ def main() -> None:
         "--fee-profile",
         choices=FEE_PROFILE_CHOICES,
         default="market",
-        help="Backtest cost assumption: market/taker=0.0500%, limit/maker=0.0200%.",
+        help="Backtest cost assumption: market/taker=0.0500%%, limit/maker=0.0200%%.",
     )
     parser.add_argument("--open-close-warning-pct", type=float, default=0.05)
     parser.add_argument("--high-low-warning-pct", type=float, default=0.05)

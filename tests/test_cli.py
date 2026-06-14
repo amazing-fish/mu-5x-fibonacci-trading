@@ -8,6 +8,29 @@ from mu_strategy.models import BacktestResult
 
 
 class CliTests(unittest.TestCase):
+    def test_fee_profile_help_renders_literal_percent_signs(self):
+        from mu_strategy import cli
+        from mu_strategy.commands import all_existing_data_backtests
+        from mu_strategy.experiments import walk_forward
+        from mu_strategy.viz import backtest as viz_backtest
+
+        for module, program_name in (
+            (cli, "mu_strategy.cli"),
+            (viz_backtest, "mu_strategy.visualize"),
+            (walk_forward, "mu_strategy.walk_forward"),
+            (all_existing_data_backtests, "mu_strategy.all_existing_data_backtests"),
+        ):
+            with self.subTest(program_name=program_name):
+                stdout = io.StringIO()
+                with patch("sys.argv", [program_name, "--help"]):
+                    with patch("sys.stdout", stdout):
+                        with self.assertRaises(SystemExit) as exc:
+                            module.main()
+
+                self.assertEqual(0, exc.exception.code)
+                self.assertIn("0.0500%", stdout.getvalue())
+                self.assertIn("0.0200%", stdout.getvalue())
+
     def test_cli_defaults_to_okx_mu_source_and_accepts_strategy(self):
         from mu_strategy import cli
 
