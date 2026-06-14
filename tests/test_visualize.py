@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
+from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategy import StrategyConfig
 from mu_strategy.viz.backtest import render_html_visualization
 
@@ -27,7 +28,7 @@ class VisualizationTests(unittest.TestCase):
             fees=6,
             return_pct=0.0198,
             max_stage=1,
-            exit_reason="stop",
+            exit_reason="non_session_liquidation_risk",
         )
         result = BacktestResult(10_000, 10_198, [trade], [(0, 10_000), (1_800_000, 10_198)])
 
@@ -39,6 +40,12 @@ class VisualizationTests(unittest.TestCase):
             chart_interval="1h",
             strategy_name="baseline",
             strategy_label="新baseline：二次回踩确认买入",
+            strategy_components=StrategyComponents(
+                entry="二次回踩限价",
+                position="5x 金字塔 20/20/20/40",
+                exit="baseline 抬止损",
+                filters=("1h regime", "15m RSI/MACD", "美股现金盘窗口"),
+            ),
         )
 
         self.assertIn("id=\"price-chart\"", html)
@@ -58,13 +65,30 @@ class VisualizationTests(unittest.TestCase):
         self.assertIn("新baseline：二次回踩确认买入", html)
         self.assertIn("同步缩放", html)
         self.assertIn("linkXAxis", html)
+        self.assertIn("extractXAxisUpdate", html)
+        self.assertIn('"fullXRange": [', html)
+        self.assertIn("resetLinkedCharts", html)
+        self.assertIn("plotly_doubleclick", html)
+        self.assertIn("yaxis.autorange", html)
+        self.assertIn("requestAnimationFrame", html)
+        self.assertIn("xaxis.range", html)
+        self.assertLess(
+            html.index("if (isXAxisReset(eventData))"),
+            html.index("const update = extractXAxisUpdate(eventData)"),
+        )
         self.assertIn("竖向虚线", html)
         self.assertIn("syncHoverLine", html)
         self.assertIn("plotly_hover", html)
         self.assertIn('dash: "dot"', html)
         self.assertIn("开仓/加仓 第1段", html)
         self.assertIn("平仓 盈利", html)
-        self.assertIn("止损", html)
+        self.assertIn("非美股时段爆仓风险", html)
+        self.assertIn("非美股风险统计", html)
+        self.assertIn("策略组详情", html)
+        self.assertIn("入场策略", html)
+        self.assertIn("二次回踩限价", html)
+        self.assertIn("entry_execution", html)
+        self.assertIn("trading_windows_et", html)
 
     def test_visualize_cli_defaults_to_okx_mu_source(self):
         from mu_strategy import visualize

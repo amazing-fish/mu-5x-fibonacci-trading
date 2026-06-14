@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import html
 import json
-from bisect import bisect_left
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +12,7 @@ from mu_strategy.data import cached_historical
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import selected_strategy_groups
 
 
@@ -63,6 +63,7 @@ def main() -> None:
         chart_interval=args.chart_interval,
         strategy_name=group.name,
         strategy_label=group.label,
+        strategy_components=group.components,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_text, encoding="utf-8")
@@ -78,6 +79,7 @@ def render_html_visualization(
     chart_interval: str = "15m",
     strategy_name: str | None = None,
     strategy_label: str | None = None,
+    strategy_components: StrategyComponents | None = None,
 ) -> str:
     interval_label = "1h" if chart_interval == "1h" else "15m"
     strategy_title = f" {html.escape(strategy_name)}" if strategy_name else ""
@@ -94,6 +96,8 @@ def render_html_visualization(
     rows = "\n".join(_trade_row(trade) for trade in result.trades) or (
         "<tr><td colspan=\"7\">当前规则没有产生交易。</td></tr>"
     )
+    detail_section = _strategy_detail_section(config, strategy_components)
+    risk_event_count = sum(1 for trade in result.trades if trade.exit_reason == "non_session_liquidation_risk")
     payload = json.dumps(chart_data, ensure_ascii=False)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -140,7 +144,7 @@ def render_html_visualization(
     }}
     .cards {{
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
       margin-bottom: 14px;
     }}
@@ -163,6 +167,32 @@ def render_html_visualization(
       font-size: 20px;
       font-weight: 650;
       margin-top: 4px;
+    }}
+    .detail-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .detail-cell {{
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      background: #fbfcfe;
+    }}
+    .detail-cell strong {{
+      display: block;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .config-table {{
+      width: 100%;
+      margin-top: 12px;
+    }}
+    .config-table th, .config-table td {{
+      text-align: left;
+      white-space: normal;
     }}
     section {{
       padding: 16px;
@@ -215,7 +245,10 @@ def render_html_visualization(
     {_metric_card("交易次数", str(result.trade_count))}
     {_metric_card("胜率", f"{result.win_rate:.2%}")}
     {_metric_card("盈亏因子", _format_float(result.profit_factor))}
+    {_metric_card("非美股风险", str(risk_event_count))}
   </div>
+  <p class="note">非美股风险统计：持仓期间若非美股现金时段 K 线低点跌穿按杠杆估算的爆仓线，会以“非美股时段爆仓风险”记录。</p>
+  {detail_section}
   <section>
     <h2>{interval_label} K线 + 开仓/加仓/平仓</h2>
     <div id="price-chart" class="chart"></div>
@@ -249,7 +282,13 @@ const baseLayout = {{
   plot_bgcolor: "#ffffff",
   margin: {{ l: 56, r: 24, t: 20, b: 42 }},
   font: {{ family: "Segoe UI, Arial, sans-serif", color: "#18212f" }},
-  xaxis: {{ rangeslider: {{ visible: false }}, gridcolor: "#e6ebf1", showspikes: true, spikemode: "across" }},
+  xaxis: {{
+    rangeslider: {{ visible: false }},
+    gridcolor: "#e6ebf1",
+    showspikes: true,
+    spikemode: "across",
+    ...(chartData.fullXRange.length === 2 ? {{ range: chartData.fullXRange.slice() }} : {{}})
+  }},
   yaxis: {{ gridcolor: "#e6ebf1", zeroline: false }},
   legend: {{ orientation: "h", y: 1.08, x: 0 }},
   hovermode: "x unified"
@@ -288,20 +327,62 @@ Plotly.newPlot(
 );
 
 let syncingZoom = false;
+const linkedChartIds = ["price-chart", "volume-chart", "equity-chart"];
 function linkXAxis(sourceId, targetIds) {{
   const source = document.getElementById(sourceId);
   source.on("plotly_relayout", eventData => {{
     if (syncingZoom) return;
-    const hasRange = eventData["xaxis.range[0]"] && eventData["xaxis.range[1]"];
-    const hasAutoRange = eventData["xaxis.autorange"];
-    if (!hasRange && !hasAutoRange) return;
-    syncingZoom = true;
-    const update = hasRange
-      ? {{ "xaxis.range": [eventData["xaxis.range[0]"], eventData["xaxis.range[1]"]] }}
-      : {{ "xaxis.autorange": true }};
-    Promise.all(targetIds.map(id => Plotly.relayout(id, update))).finally(() => {{
-      syncingZoom = false;
-    }});
+    if (isXAxisReset(eventData)) {{
+      requestAnimationFrame(resetLinkedCharts);
+      return;
+    }}
+    const update = extractXAxisUpdate(eventData);
+    if (update) {{
+      syncXAxisToTargets(targetIds, update);
+      return;
+    }}
+  }});
+  source.on("plotly_doubleclick", () => {{
+    requestAnimationFrame(resetLinkedCharts);
+  }});
+}}
+
+function extractXAxisUpdate(eventData) {{
+  if (Array.isArray(eventData["xaxis.range"])) {{
+    return {{ "xaxis.range": eventData["xaxis.range"] }};
+  }}
+  if (eventData["xaxis.range[0]"] !== undefined && eventData["xaxis.range[1]"] !== undefined) {{
+    return {{ "xaxis.range": [eventData["xaxis.range[0]"], eventData["xaxis.range[1]"]] }};
+  }}
+  return null;
+}}
+
+function isXAxisReset(eventData) {{
+  return (
+    eventData["xaxis.autorange"] === true ||
+    eventData["xaxis.autorange"] === "true" ||
+    eventData["yaxis.autorange"] === true ||
+    eventData["yaxis.autorange"] === "true"
+  );
+}}
+
+function resetLinkedCharts() {{
+  const update = {{ "yaxis.autorange": true, shapes: [] }};
+  if (chartData.fullXRange.length === 2) {{
+    update["xaxis.range"] = chartData.fullXRange.slice();
+  }} else {{
+    update["xaxis.autorange"] = true;
+  }}
+  syncingZoom = true;
+  Promise.all(linkedChartIds.map(id => Plotly.relayout(id, update))).finally(() => {{
+    syncingZoom = false;
+  }});
+}}
+
+function syncXAxisToTargets(targetIds, update) {{
+  syncingZoom = true;
+  Promise.all(targetIds.map(id => Plotly.relayout(id, update))).finally(() => {{
+    syncingZoom = false;
   }});
 }}
 
@@ -349,6 +430,64 @@ def _metric_card(label: str, value: str) -> str:
     return f"<div class=\"card\"><div class=\"label\">{html.escape(label)}</div><div class=\"value\">{html.escape(value)}</div></div>"
 
 
+def _strategy_detail_section(config: StrategyConfig, components: StrategyComponents | None) -> str:
+    lines = ["<section>", "    <h2>策略组详情</h2>"]
+    if components is not None:
+        filters = "<br>".join(html.escape(value) for value in components.filters)
+        lines.extend(
+            [
+                '    <div class="detail-grid">',
+                f'      <div class="detail-cell"><strong>入场策略</strong>{html.escape(components.entry)}</div>',
+                f'      <div class="detail-cell"><strong>加减仓策略</strong>{html.escape(components.position)}</div>',
+                f'      <div class="detail-cell"><strong>出场策略</strong>{html.escape(components.exit)}</div>',
+                f'      <div class="detail-cell"><strong>过滤策略</strong>{filters}</div>',
+                "    </div>",
+            ]
+        )
+
+    rows = "\n".join(
+        f"<tr><th>{html.escape(name)}</th><td>{html.escape(value)}</td></tr>"
+        for name, value in _strategy_config_rows(config)
+    )
+    lines.extend(
+        [
+            '    <table class="config-table">',
+            "      <tbody>",
+            f"        {rows}",
+            "      </tbody>",
+            "    </table>",
+            "  </section>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _strategy_config_rows(config: StrategyConfig) -> list[tuple[str, str]]:
+    return [
+        ("symbol", config.symbol),
+        ("entry_execution", config.entry_execution),
+        ("second_pullback_wait_bars", str(config.second_pullback_wait_bars)),
+        ("leverage", f"{config.leverage:.2f}x"),
+        ("margin_steps", ", ".join(f"{step:.0%}" for step in config.margin_steps)),
+        ("initial_stop_pct", f"{config.initial_stop_pct:.2%}"),
+        ("add_thresholds", ", ".join(f"{step:.2%}" for step in config.add_thresholds)),
+        ("stop_tightening", config.stop_tightening),
+        ("yellow_stop_tightening", config.yellow_stop_tightening or "-"),
+        ("green_stop_tightening", config.green_stop_tightening or "-"),
+        ("allowed_regimes", ", ".join(config.allowed_regimes)),
+        ("trading_windows_et", ", ".join(f"{start}-{end}" for start, end in config.trading_windows_et)),
+        ("max_entry_above_fib_pct", _format_optional_pct(config.max_entry_above_fib_pct)),
+        ("yellow_max_entry_above_fib_pct", _format_optional_pct(config.yellow_max_entry_above_fib_pct)),
+        ("max_signal_range_pct", _format_optional_pct(config.max_signal_range_pct)),
+        ("max_entry_above_signal_close_pct", _format_optional_pct(config.max_entry_above_signal_close_pct)),
+        ("block_reverse_fib_resistance", str(config.block_reverse_fib_resistance)),
+    ]
+
+
+def _format_optional_pct(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2%}"
+
+
 def _plotly_data(candles: list[Candle], result: BacktestResult) -> dict:
     times = [bar.open_time_iso for bar in candles]
     opens = [round(bar.open, 6) for bar in candles]
@@ -358,6 +497,7 @@ def _plotly_data(candles: list[Candle], result: BacktestResult) -> dict:
     volumes = [round(bar.volume, 6) for bar in candles]
     volume_colors = ["#0f8b6f" if bar.close >= bar.open else "#d03535" for bar in candles]
     return {
+        "fullXRange": [times[0], times[-1]] if times else [],
         "candlestick": {
             "type": "candlestick",
             "name": "K线",
@@ -454,68 +594,6 @@ def _fmt_iso(time_ms: int) -> str:
     return datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc).isoformat()
 
 
-def _render_price_chart(candles: list[Candle], trades: list[Trade]) -> str:
-    width, height, pad = 1200, 430, 48
-    if not candles:
-        return f"<svg id=\"price-chart\" viewBox=\"0 0 {width} {height}\"><text x=\"{pad}\" y=\"{pad}\">No price data.</text></svg>"
-    prices = [bar.close for bar in candles]
-    low = min(bar.low for bar in candles)
-    high = max(bar.high for bar in candles)
-    x = _x_scale(len(candles), width, pad)
-    y = _y_scale(low, high, height, pad)
-    path = _line_path([(x(index), y(value)) for index, value in enumerate(prices)])
-    markers = _price_markers(candles, trades, x, y)
-    grid = _grid(width, height, pad)
-    labels = _axis_labels(low, high, width, height, pad)
-    return f"""<svg id="price-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Price chart">
-  {grid}
-  <path class="price-line" d="{path}"/>
-  {markers}
-  {labels}
-</svg>"""
-
-
-def _render_equity_chart(candles: list[Candle], equity_curve: list[tuple[int, float]]) -> str:
-    width, height, pad = 1200, 260, 48
-    if not equity_curve:
-        return f"<svg id=\"equity-chart\" viewBox=\"0 0 {width} {height}\"><text x=\"{pad}\" y=\"{pad}\">No equity data.</text></svg>"
-    values = [equity for _, equity in equity_curve]
-    low = min(values)
-    high = max(values)
-    if low == high:
-        low *= 0.99
-        high *= 1.01
-    candle_times = [bar.open_time_ms for bar in candles]
-    x = _x_scale(max(len(candles), 1), width, pad)
-    y = _y_scale(low, high, height, pad)
-    points = [(x(_nearest_index(candle_times, time_ms)), y(equity)) for time_ms, equity in equity_curve]
-    path = _line_path(points)
-    grid = _grid(width, height, pad)
-    labels = _axis_labels(low, high, width, height, pad)
-    return f"""<svg id="equity-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Equity curve">
-  {grid}
-  <path class="equity-line" d="{path}"/>
-  {labels}
-</svg>"""
-
-
-def _price_markers(candles: list[Candle], trades: list[Trade], x_scale, y_scale) -> str:
-    times = [bar.open_time_ms for bar in candles]
-    output: list[str] = []
-    for trade in trades:
-        for stage, fill in enumerate(trade.fills, start=1):
-            x = x_scale(_nearest_index(times, fill.time_ms))
-            y = y_scale(fill.price)
-            output.append(f"<circle class=\"trade-entry\" cx=\"{x:.2f}\" cy=\"{y:.2f}\" r=\"5\"><title>Stage {stage} entry {fill.price:.2f}</title></circle>")
-        exit_x = x_scale(_nearest_index(times, trade.exit_time_ms))
-        exit_y = y_scale(trade.exit_price)
-        cls = "win" if trade.pnl >= 0 else "loss"
-        output.append(
-            f"<rect class=\"trade-exit {cls}\" x=\"{exit_x - 5:.2f}\" y=\"{exit_y - 5:.2f}\" width=\"10\" height=\"10\" transform=\"rotate(45 {exit_x:.2f} {exit_y:.2f})\"><title>Exit {trade.exit_price:.2f}, {trade.return_pct:.2%}</title></rect>"
-        )
-    return "\n  ".join(output)
-
-
 def _trade_row(trade: Trade) -> str:
     return (
         "<tr>"
@@ -530,60 +608,6 @@ def _trade_row(trade: Trade) -> str:
     )
 
 
-def _x_scale(count: int, width: int, pad: int):
-    usable = width - (pad * 2)
-    denominator = max(count - 1, 1)
-    return lambda index: pad + (usable * index / denominator)
-
-
-def _y_scale(low: float, high: float, height: int, pad: int):
-    if high == low:
-        high = low * 1.01
-        low = low * 0.99
-    span = high - low
-    usable = height - (pad * 2)
-    return lambda value: pad + (high - value) * usable / span
-
-
-def _line_path(points: list[tuple[float, float]]) -> str:
-    if not points:
-        return ""
-    first_x, first_y = points[0]
-    parts = [f"M {first_x:.2f} {first_y:.2f}"]
-    parts.extend(f"L {x:.2f} {y:.2f}" for x, y in points[1:])
-    return " ".join(parts)
-
-
-def _grid(width: int, height: int, pad: int) -> str:
-    lines = []
-    for step in range(5):
-        y = pad + ((height - pad * 2) * step / 4)
-        lines.append(f"<line class=\"grid\" x1=\"{pad}\" x2=\"{width - pad}\" y1=\"{y:.2f}\" y2=\"{y:.2f}\"/>")
-    lines.append(f"<line class=\"axis\" x1=\"{pad}\" x2=\"{width - pad}\" y1=\"{height - pad}\" y2=\"{height - pad}\"/>")
-    lines.append(f"<line class=\"axis\" x1=\"{pad}\" x2=\"{pad}\" y1=\"{pad}\" y2=\"{height - pad}\"/>")
-    return "\n  ".join(lines)
-
-
-def _axis_labels(low: float, high: float, width: int, height: int, pad: int) -> str:
-    return (
-        f"<text x=\"{width - pad + 6}\" y=\"{pad + 4}\">{high:.2f}</text>"
-        f"<text x=\"{width - pad + 6}\" y=\"{height - pad + 4}\">{low:.2f}</text>"
-    )
-
-
-def _nearest_index(times: list[int], target: int) -> int:
-    if not times:
-        return 0
-    index = bisect_left(times, target)
-    if index <= 0:
-        return 0
-    if index >= len(times):
-        return len(times) - 1
-    before = times[index - 1]
-    after = times[index]
-    return index if abs(after - target) < abs(target - before) else index - 1
-
-
 def _fmt_time(time_ms: int) -> str:
     return datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
@@ -592,6 +616,7 @@ def _translate_reason(reason: str) -> str:
     return {
         "initial_stop": "首仓止损",
         "stop": "止损",
+        "non_session_liquidation_risk": "非美股时段爆仓风险",
         "end_of_data": "数据结束",
     }.get(reason, reason)
 
