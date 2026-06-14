@@ -67,11 +67,10 @@ def execution_decision(
         action = "block" if _is_hard_block(execution.reason) else "wait"
         return ExecutionDecision(action, execution.reason, fib_level=fib_level)
 
-    price = execution.entry_price if current_price is None else current_price
     return ExecutionDecision(
         "allow",
         signal.reason,
-        initial_stop=initial_stop_price(price, config),
+        initial_stop=initial_stop_price(execution.entry_price, config),
         margin_steps=planned_margin_steps(config),
         fib_level=fib_level,
     )

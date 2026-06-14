@@ -29,6 +29,24 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertAlmostEqual(101.92, decision.initial_stop)
         self.assertEqual((0.20, 0.20, 0.20, 0.40), decision.margin_steps)
 
+    def test_execution_decision_bases_stop_on_validated_entry_price(self):
+        config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
+        candles = _candidate_signal_candles()
+
+        decision = execution_decision(
+            candles,
+            config=config,
+            regime="green",
+            rsi14=55,
+            macd_hist=0.3,
+            macd_hist_prev=0.1,
+            now_index=3,
+            current_price=110,
+        )
+
+        self.assertEqual("allow", decision.action)
+        self.assertAlmostEqual(101.92, decision.initial_stop)
+
     def test_fixed_baseline_waits_for_second_pullback_before_planning_entry(self):
         config = baseline_strategy_group("MU-USDT-SWAP").config
         candles = _candidate_signal_candles()
