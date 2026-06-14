@@ -5,6 +5,7 @@ import unittest
 from mu_strategy.commands.all_existing_data_backtests import (
     audit_candles,
     duration_label,
+    render_summary_html,
     render_summary_markdown,
     true_duration_ms,
 )
@@ -71,13 +72,34 @@ class AllExistingDataBacktestsTest(unittest.TestCase):
             "chart_path": Path("reports/example.html"),
         }
 
-        markdown = render_summary_markdown([row], generated_at="1970-01-01T00:00:00+00:00")
+        markdown = render_summary_markdown(
+            [row],
+            generated_at="1970-01-01T00:00:00+00:00",
+            strategy="optimized_v2",
+            open_close_warning_pct=0.025,
+            high_low_warning_pct=0.075,
+            prev_close_open_warning_pct=0.015,
+        )
+        html = render_summary_html(
+            [row],
+            generated_at="1970-01-01T00:00:00+00:00",
+            strategy="optimized_v2",
+            open_close_warning_pct=0.025,
+            high_low_warning_pct=0.075,
+            prev_close_open_warning_pct=0.015,
+        )
 
+        self.assertIn("strategy: optimized_v2", markdown)
+        self.assertIn("2.50%", markdown)
+        self.assertIn("7.50%", markdown)
+        self.assertIn("1.50%", markdown)
         self.assertIn("true 15m duration", markdown)
         self.assertIn("0d 0h 45m", markdown)
         self.assertIn("open-close warnings", markdown)
         self.assertIn("high-low warnings", markdown)
         self.assertIn("6.00%", markdown)
+        self.assertIn("optimized_v2", html)
+        self.assertIn("2.50%", html)
 
 
 if __name__ == "__main__":

@@ -76,8 +76,28 @@ def main() -> None:
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     md_path = args.report_dir / "mu_all_existing_data_backtests.md"
     html_path = args.report_dir / "mu_all_existing_data_backtests.html"
-    md_path.write_text(render_summary_markdown(rows, generated_at=generated_at), encoding="utf-8")
-    html_path.write_text(render_summary_html(rows, generated_at=generated_at), encoding="utf-8")
+    md_path.write_text(
+        render_summary_markdown(
+            rows,
+            generated_at=generated_at,
+            strategy=args.strategy,
+            open_close_warning_pct=args.open_close_warning_pct,
+            high_low_warning_pct=args.high_low_warning_pct,
+            prev_close_open_warning_pct=args.prev_close_open_warning_pct,
+        ),
+        encoding="utf-8",
+    )
+    html_path.write_text(
+        render_summary_html(
+            rows,
+            generated_at=generated_at,
+            strategy=args.strategy,
+            open_close_warning_pct=args.open_close_warning_pct,
+            high_low_warning_pct=args.high_low_warning_pct,
+            prev_close_open_warning_pct=args.prev_close_open_warning_pct,
+        ),
+        encoding="utf-8",
+    )
 
     print(f"datasets={len(rows)}")
     for row in rows:
@@ -332,15 +352,26 @@ def audit_price_ranges(result: BacktestResult, candles_15m: list[Candle], candle
     return audit
 
 
-def render_summary_markdown(rows: list[dict[str, Any]], *, generated_at: str) -> str:
+def render_summary_markdown(
+    rows: list[dict[str, Any]],
+    *,
+    generated_at: str,
+    strategy: str = "baseline",
+    open_close_warning_pct: float = 0.05,
+    high_low_warning_pct: float = 0.05,
+    prev_close_open_warning_pct: float = 0.01,
+) -> str:
     lines = [
         "# MU All Existing Local Data Backtests",
         "",
-        "- strategy: baseline",
+        f"- strategy: {strategy}",
         "- source policy: local CSV only; no refresh/network fetch during this aggregate run",
         f"- generated at UTC: {generated_at}",
         f"- datasets: {len(rows)}",
-        "- data quality thresholds: 15m open-close warning > 5%, 15m high-low warning > 5%, prev close -> next open warning > 1%",
+        "- data quality thresholds: "
+        f"15m open-close warning > {_format_pct(open_close_warning_pct)}, "
+        f"15m high-low warning > {_format_pct(high_low_warning_pct)}, "
+        f"prev close -> next open warning > {_format_pct(prev_close_open_warning_pct)}",
         "",
         "## Summary",
         "",
@@ -386,7 +417,15 @@ def render_summary_markdown(rows: list[dict[str, Any]], *, generated_at: str) ->
     return "\n".join(lines)
 
 
-def render_summary_html(rows: list[dict[str, Any]], *, generated_at: str) -> str:
+def render_summary_html(
+    rows: list[dict[str, Any]],
+    *,
+    generated_at: str,
+    strategy: str = "baseline",
+    open_close_warning_pct: float = 0.05,
+    high_low_warning_pct: float = 0.05,
+    prev_close_open_warning_pct: float = 0.01,
+) -> str:
     total_range_anomalies = sum(row["range_anomalies"] for row in rows)
     total_quality_issues = sum(_data_quality_issue_count(row) for row in rows)
     css = """
@@ -400,11 +439,15 @@ body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f7f8fb;color:
         '<p class="muted">Local CSV only; no refresh/network fetch during this aggregate run. Research artifact, not financial advice.</p>',
         '<div class="grid">',
         _card("Datasets", str(len(rows))),
-        _card("Strategy", "baseline"),
+        _card("Strategy", strategy),
         _card("Price range anomalies", str(total_range_anomalies)),
         _card("Data quality issues", str(total_quality_issues)),
         "</div>",
-        f'<p class="muted">Generated at UTC: {html.escape(generated_at)}. Data quality thresholds: 15m open-close > 5%, 15m high-low > 5%, prev close -> next open > 1%.</p>',
+        f'<p class="muted">Generated at UTC: {html.escape(generated_at)}. '
+        "Data quality thresholds: "
+        f"15m open-close > {_format_pct(open_close_warning_pct)}, "
+        f"15m high-low > {_format_pct(high_low_warning_pct)}, "
+        f"prev close -> next open > {_format_pct(prev_close_open_warning_pct)}.</p>",
         '<div class="scroll"><table><tr>',
     ]
     headers = [
@@ -497,6 +540,10 @@ def _summary_html_row(row: dict[str, Any]) -> str:
 
 def _card(label: str, value: str) -> str:
     return f'<div class="card"><div class="label">{html.escape(label)}</div><div class="value">{html.escape(value)}</div></div>'
+
+
+def _format_pct(value: float) -> str:
+    return f"{value:.2%}"
 
 
 def _quality_cell(value: int) -> str:

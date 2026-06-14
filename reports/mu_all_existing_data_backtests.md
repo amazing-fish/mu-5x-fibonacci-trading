@@ -2,9 +2,9 @@
 
 - strategy: baseline
 - source policy: local CSV only; no refresh/network fetch during this aggregate run
-- generated at UTC: 2026-06-14T05:37:14+00:00
+- generated at UTC: 2026-06-14T06:38:53+00:00
 - datasets: 5
-- data quality thresholds: 15m open-close warning > 5%, 15m high-low warning > 5%, prev close -> next open warning > 1%
+- data quality thresholds: 15m open-close warning > 5.00%, 15m high-low warning > 5.00%, prev close -> next open warning > 1.00%
 
 ## Summary
 

@@ -71,7 +71,7 @@ def fetch_okx_historical(
     end_time_ms = end_time_ms or int(time.time() * 1000)
     start_time_ms = end_time_ms - (days * DAY_MS)
     output: list[Candle] = []
-    after: int | None = None
+    after: int | None = end_time_ms
     while True:
         batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:

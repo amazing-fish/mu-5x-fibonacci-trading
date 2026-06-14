@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from mu_strategy.data import cached_historical, write_csv
 from mu_strategy.market_data.cache import cache_path, merge_incremental_candles, prune_candles_to_window
-from mu_strategy.market_data.providers.okx import okx_row_to_candle
+from mu_strategy.market_data.providers.okx import fetch_okx_historical, okx_row_to_candle
 from mu_strategy.models import Candle
 
 
@@ -119,6 +119,20 @@ class DataTests(unittest.TestCase):
 
         self.assertIn("Mozilla", captured["user_agent"])
         self.assertEqual("application/json", captured["accept"])
+
+    def test_okx_historical_starts_pagination_at_requested_end_time(self):
+        end_time_ms = 2 * 86_400_000
+        requested_after_values = []
+
+        def fake_fetch(symbol, interval, *, after=None):
+            requested_after_values.append(after)
+            return [_candle(86_400_000, 100)]
+
+        with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
+            candles = fetch_okx_historical("MU-USDT-SWAP", "15m", days=1, end_time_ms=end_time_ms)
+
+        self.assertEqual([end_time_ms], requested_after_values)
+        self.assertEqual([86_400_000], [candle.open_time_ms for candle in candles])
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:
