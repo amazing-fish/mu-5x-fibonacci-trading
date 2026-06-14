@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from mu_strategy.models import BacktestResult
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import StrategyConfig, fee_profile_label
 
 
 def render_markdown_report(
@@ -21,6 +21,7 @@ def render_markdown_report(
         f"- leverage: {config.leverage}x",
         f"- margin steps: {', '.join(f'{step:.0%}' for step in config.margin_steps)}",
         f"- initial stop: {config.initial_stop_pct:.2%}",
+        f"- fee profile: {fee_profile_label(config)}",
         f"- fee rate: {config.fee_rate:.4%}",
         f"- data files: {', '.join(str(path) for path in data_files)}",
         "",

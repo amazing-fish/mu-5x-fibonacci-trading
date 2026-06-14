@@ -5,6 +5,7 @@
 - leverage: 5.0x
 - margin steps: 20%, 20%, 20%, 40%
 - initial stop: 2.00%
+- fee profile: market/taker (市价/吃单)
 - fee rate: 0.0500%
 - data files: data\OKX_MU-USDT-SWAP_15m_180d.csv, data\OKX_MU-USDT-SWAP_1h_180d.csv
 

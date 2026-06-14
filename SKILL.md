@@ -20,6 +20,7 @@ This is a research workflow, not financial advice. Use it to turn discretionary 
 - Full-size account drawdown stop: `3%–4%`.
 - Daily loss stop: `4%`.
 - Main execution window: US cash session only, preferably Beijing `21:45–23:30` and `02:30–03:45` during US daylight saving time.
+- Backtest cost default: `market/taker` fee profile at `0.0500%`. Use `limit/maker` at `0.0200%` only as an explicit sensitivity scenario unless maker-fill probability is modeled.
 
 ## Decision Stack
 
@@ -81,6 +82,7 @@ Before treating this as usable, run:
 ```powershell
 python -m unittest discover -s tests
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
+python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\mu_okx_backtest_limit.md
 python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report reports\mu_okx_strategy_group_review.md --html-report reports\mu_okx_strategy_components.html
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
@@ -94,3 +96,4 @@ Review the generated Markdown and HTML reports. Do not infer future validity fro
 - Concatenating independent walk-forward equity curves before calculating drawdown.
 - Treating execution planning output as permission to place broker orders.
 - Reading one profitable backtest window as future validity.
+- Treating the baseline limit-style entry signal as guaranteed maker execution without modeling queue priority, spread, partial fills, and missed fills.

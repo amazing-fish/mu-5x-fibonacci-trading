@@ -4,12 +4,14 @@ from datetime import datetime, timezone
 from mu_strategy.models import Candle
 from mu_strategy.strategy import (
     StrategyConfig,
+    fee_profile_label,
     fibonacci_levels,
     is_preferred_us_cash_window,
     one_hour_regime,
     optimized_strategy_group,
     should_enter_long,
     should_execute_entry,
+    with_fee_profile,
 )
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import StrategyGroup, default_strategy_groups, selected_strategy_groups
@@ -94,6 +96,8 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertIsInstance(groups[1].components, StrategyComponents)
         self.assertEqual("break_high", groups[0].config.entry_execution)
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
+        self.assertEqual("market", groups[1].config.fee_profile)
+        self.assertAlmostEqual(0.0005, groups[1].config.fee_rate)
         self.assertEqual("二次回踩限价", groups[1].components.entry)
         self.assertEqual("direct_next_open", groups[2].config.entry_execution)
         self.assertEqual("second_pullback", groups[3].config.entry_execution)
@@ -112,6 +116,17 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertEqual(["legacy_break_high", "baseline", "baseline"], [group.name for group in groups])
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
+
+    def test_fee_profile_switches_between_market_and_limit_costs(self):
+        market_config = with_fee_profile(StrategyConfig(fee_rate=0), "market")
+        limit_config = with_fee_profile(market_config, "limit")
+
+        self.assertEqual("market", market_config.fee_profile)
+        self.assertEqual("market/taker (市价/吃单)", fee_profile_label(market_config))
+        self.assertAlmostEqual(0.0005, market_config.fee_rate)
+        self.assertEqual("limit", limit_config.fee_profile)
+        self.assertEqual("limit/maker (限价挂单成本假设)", fee_profile_label(limit_config))
+        self.assertAlmostEqual(0.0002, limit_config.fee_rate)
 
     def test_optimized_execution_rejects_chasing_too_far_above_fib(self):
         config = optimized_strategy_group().config

@@ -1,10 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from mu_strategy.models import Candle, EntrySignal
+
+
+FEE_PROFILE_RATES = {
+    "market": 0.0005,
+    "limit": 0.0002,
+}
+FEE_PROFILE_LABELS = {
+    "market": "market/taker (市价/吃单)",
+    "limit": "limit/maker (限价挂单成本假设)",
+}
+FEE_PROFILE_CHOICES = tuple(FEE_PROFILE_RATES)
+DEFAULT_FEE_PROFILE = "market"
 
 
 @dataclass(frozen=True)
@@ -27,7 +39,8 @@ class StrategyConfig:
     rsi_floor: float = 45.0
     rsi_add_floor: float = 50.0
     fib_tolerance_pct: float = 0.002
-    fee_rate: float = 0.0005
+    fee_profile: str = DEFAULT_FEE_PROFILE
+    fee_rate: float | None = None
     fib_lookback: int = 32
     stop_buffer_pct: float = 0.0005
     max_entry_above_fib_pct: float | None = None
@@ -48,6 +61,33 @@ class StrategyConfig:
     trading_windows_et: tuple[tuple[str, str], ...] = field(
         default_factory=lambda: (("09:45", "11:30"), ("14:30", "15:45"))
     )
+
+    def __post_init__(self) -> None:
+        profile = normalize_fee_profile(self.fee_profile)
+        object.__setattr__(self, "fee_profile", profile)
+        if self.fee_rate is None:
+            object.__setattr__(self, "fee_rate", fee_rate_for_profile(profile))
+
+
+def normalize_fee_profile(fee_profile: str) -> str:
+    profile = fee_profile.lower().strip()
+    if profile not in FEE_PROFILE_RATES:
+        raise ValueError(f"unsupported fee_profile: {fee_profile}")
+    return profile
+
+
+def fee_rate_for_profile(fee_profile: str) -> float:
+    return FEE_PROFILE_RATES[normalize_fee_profile(fee_profile)]
+
+
+def fee_profile_label(config_or_profile: StrategyConfig | str) -> str:
+    profile = config_or_profile if isinstance(config_or_profile, str) else config_or_profile.fee_profile
+    return FEE_PROFILE_LABELS[normalize_fee_profile(profile)]
+
+
+def with_fee_profile(config: StrategyConfig, fee_profile: str) -> StrategyConfig:
+    profile = normalize_fee_profile(fee_profile)
+    return replace(config, fee_profile=profile, fee_rate=fee_rate_for_profile(profile))
 
 
 from mu_strategy.strategies.registry import (

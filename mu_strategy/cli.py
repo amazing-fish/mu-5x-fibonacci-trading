@@ -8,7 +8,7 @@ from mu_strategy.data import cached_historical
 from mu_strategy.indicators import ema, macd, rsi
 from mu_strategy.models import Candle
 from mu_strategy.reporting import render_markdown_report
-from mu_strategy.strategy import one_hour_regime, selected_strategy_groups
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, one_hour_regime, selected_strategy_groups, with_fee_profile
 
 
 def main() -> None:
@@ -20,6 +20,12 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_backtest.md"))
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
+    parser.add_argument(
+        "--fee-profile",
+        choices=FEE_PROFILE_CHOICES,
+        default="market",
+        help="Backtest cost assumption: market/taker=0.0500%%, limit/maker=0.0200%%.",
+    )
     args = parser.parse_args()
 
     try:
@@ -28,7 +34,7 @@ def main() -> None:
         parser.error(str(exc))
     if len(groups) != 1:
         parser.error("--strategy must resolve to exactly one strategy group")
-    config = groups[0].config
+    config = with_fee_profile(groups[0].config, args.fee_profile)
     candles_15m, file_15m = cached_historical(
         args.symbol,
         "15m",
