@@ -11,7 +11,7 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.data import cached_historical
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import selected_strategy_groups
 
@@ -26,6 +26,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("reports/mu_okx_baseline_backtest.html"))
     parser.add_argument("--chart-interval", choices=("15m", "1h"), default="1h")
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to visualize.")
+    parser.add_argument(
+        "--fee-profile",
+        choices=FEE_PROFILE_CHOICES,
+        default="market",
+        help="Backtest cost assumption: market/taker=0.0500%, limit/maker=0.0200%.",
+    )
     args = parser.parse_args()
 
     try:
@@ -35,7 +41,7 @@ def main() -> None:
     if len(groups) != 1:
         parser.error("--strategy must resolve to exactly one strategy group")
     group = groups[0]
-    config = group.config
+    config = with_fee_profile(group.config, args.fee_profile)
     candles_15m, _ = cached_historical(
         args.symbol,
         "15m",
@@ -467,6 +473,8 @@ def _strategy_config_rows(config: StrategyConfig) -> list[tuple[str, str]]:
         ("symbol", config.symbol),
         ("entry_execution", config.entry_execution),
         ("second_pullback_wait_bars", str(config.second_pullback_wait_bars)),
+        ("fee_profile", fee_profile_label(config)),
+        ("fee_rate", f"{config.fee_rate:.4%}"),
         ("leverage", f"{config.leverage:.2f}x"),
         ("margin_steps", ", ".join(f"{step:.0%}" for step in config.margin_steps)),
         ("initial_stop_pct", f"{config.initial_stop_pct:.2%}"),

@@ -9,6 +9,7 @@
 - RSI 和 MACD 作为确认过滤。
 - 美股现金盘时间窗口。
 - `5x` 分阶段金字塔加仓。
+- 回测默认按 `market/taker` 市价吃单成本扣手续费，费率 `0.0500%`；`limit/maker` 万二只作为成本敏感性对照。
 - 按入场、加减仓、出场、过滤等维度拆分策略组。
 - OKX 增量缓存，只使用已确认 K 线，并按请求的 `days` 窗口裁剪缓存。
 
@@ -40,6 +41,12 @@ python -m unittest discover -s tests
 
 ```powershell
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
+```
+
+对照限价挂单成本假设：
+
+```powershell
+python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\mu_okx_backtest_limit.md
 ```
 
 运行策略组实验，并生成组件矩阵 HTML：
@@ -74,6 +81,7 @@ python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
+- baseline 的入场信号仍是二次回踩限价触发，但回测没有建模挂单队列、盘口价差、部分成交或错失成交；因此默认费用采用 `market/taker` 万五，避免用 `limit/maker` 万二高估结果。
 
 ## 策略组说明
 

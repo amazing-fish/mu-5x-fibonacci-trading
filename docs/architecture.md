@@ -27,6 +27,12 @@ Package: `mu_strategy.strategies`
 
 Current fixed research baseline: `baseline`.
 
+Fee realism:
+
+- Default backtests use the `market/taker` cost profile at `0.0500%`.
+- `limit/maker` at `0.0200%` is available as an explicit sensitivity run.
+- The baseline entry signal may be limit-style, but the research engine does not model order-book queue priority, spread crossing, partial fills, or missed maker fills. Use the default market/taker cost unless those execution details are modeled separately.
+
 ## Research
 
 Package: `mu_strategy.research`

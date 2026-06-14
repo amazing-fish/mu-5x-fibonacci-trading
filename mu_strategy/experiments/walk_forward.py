@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,7 +11,7 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.data import cached_historical
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.registry import StrategyGroup, selected_strategy_groups
 
 
@@ -239,7 +239,7 @@ def render_strategy_group_html_dashboard(
     }}
     table {{
       width: 100%;
-      min-width: 1120px;
+      min-width: 1220px;
       border-collapse: collapse;
       font-size: 13px;
     }}
@@ -277,6 +277,7 @@ def render_strategy_group_html_dashboard(
           <th>加减仓策略</th>
           <th>出场策略</th>
           <th>过滤策略</th>
+          <th>手续费</th>
           <th>总收益</th>
           <th>最大回撤</th>
           <th>交易数</th>
@@ -313,6 +314,8 @@ def render_walk_forward_report(
         f"- leverage: {config.leverage}x",
         f"- margin steps: {', '.join(f'{step:.0%}' for step in config.margin_steps)}",
         f"- initial stop: {config.initial_stop_pct:.2%}",
+        f"- fee profile: {fee_profile_label(config)}",
+        f"- fee rate: {config.fee_rate:.4%}",
         f"- add thresholds: {', '.join(f'{step:.2%}' for step in config.add_thresholds)}",
         f"- data files: {', '.join(str(path) for path in data_files) if data_files else '-'}",
         "",
@@ -365,6 +368,12 @@ def main() -> None:
     parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_strategy_group_review.md"))
     parser.add_argument("--html-report", type=Path, default=Path("reports/mu_okx_strategy_components.html"))
     parser.add_argument(
+        "--fee-profile",
+        choices=FEE_PROFILE_CHOICES,
+        default="market",
+        help="Backtest cost assumption: market/taker=0.0500%, limit/maker=0.0200%.",
+    )
+    parser.add_argument(
         "--strategy",
         action="append",
         help="Strategy group name to run. Repeat or pass comma-separated names. Defaults to all registered groups.",
@@ -391,7 +400,10 @@ def main() -> None:
     group_results = run_strategy_group_walk_forward_backtests(
         candles_15m,
         candles_1h,
-        groups=selected_strategy_groups(args.symbol, args.strategy),
+        groups=[
+            replace(group, config=with_fee_profile(group.config, args.fee_profile))
+            for group in selected_strategy_groups(args.symbol, args.strategy)
+        ],
         window_days=args.window_days,
         windows=args.windows,
     )
@@ -500,6 +512,7 @@ def _strategy_group_html_row(group_result: StrategyGroupBacktest) -> str:
         f"<td>{html.escape(components.position)}</td>"
         f"<td>{html.escape(components.exit)}</td>"
         f"<td>{'<br>'.join(html.escape(value) for value in components.filters)}</td>"
+        f"<td>{html.escape(fee_profile_label(group.config))}<br>{group.config.fee_rate:.4%}</td>"
         f"<td class=\"metric {total_return_class}\">{result.total_return_pct:.2%}</td>"
         f"<td class=\"metric bad\">{result.max_drawdown_pct:.2%}</td>"
         f"<td class=\"metric\">{result.trade_count}</td>"
@@ -523,6 +536,7 @@ def _combined_result(group_result: StrategyGroupBacktest) -> StrategyGroupSummar
 def _strategy_group_lines(group: StrategyGroup) -> list[str]:
     config = group.config
     output = [f"- {group.name} ({group.label})"]
+    output.append(f"  - 费用：{fee_profile_label(config)}，费率 {config.fee_rate:.4%}。")
     if config.entry_execution == "break_high":
         output.append("  - 规则：原始 Fib 回踩确认 + 下一根突破前高执行。")
     elif config.entry_execution == "direct_next_open":

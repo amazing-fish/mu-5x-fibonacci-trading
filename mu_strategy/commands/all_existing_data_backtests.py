@@ -14,6 +14,7 @@ from mu_strategy.data import read_csv
 from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import render_markdown_report
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, fee_profile_label, fee_rate_for_profile, with_fee_profile
 from mu_strategy.strategies.registry import selected_strategy_groups
 from mu_strategy.viz.backtest import render_html_visualization
 
@@ -60,6 +61,12 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report-dir", type=Path, default=Path("reports"))
     parser.add_argument("--strategy", default="baseline")
+    parser.add_argument(
+        "--fee-profile",
+        choices=FEE_PROFILE_CHOICES,
+        default="market",
+        help="Backtest cost assumption: market/taker=0.0500%, limit/maker=0.0200%.",
+    )
     parser.add_argument("--open-close-warning-pct", type=float, default=0.05)
     parser.add_argument("--high-low-warning-pct", type=float, default=0.05)
     parser.add_argument("--prev-close-open-warning-pct", type=float, default=0.01)
@@ -69,6 +76,7 @@ def main() -> None:
         data_dir=args.data_dir,
         report_dir=args.report_dir,
         strategy=args.strategy,
+        fee_profile=args.fee_profile,
         open_close_warning_pct=args.open_close_warning_pct,
         high_low_warning_pct=args.high_low_warning_pct,
         prev_close_open_warning_pct=args.prev_close_open_warning_pct,
@@ -81,6 +89,7 @@ def main() -> None:
             rows,
             generated_at=generated_at,
             strategy=args.strategy,
+            fee_profile=args.fee_profile,
             open_close_warning_pct=args.open_close_warning_pct,
             high_low_warning_pct=args.high_low_warning_pct,
             prev_close_open_warning_pct=args.prev_close_open_warning_pct,
@@ -92,6 +101,7 @@ def main() -> None:
             rows,
             generated_at=generated_at,
             strategy=args.strategy,
+            fee_profile=args.fee_profile,
             open_close_warning_pct=args.open_close_warning_pct,
             high_low_warning_pct=args.high_low_warning_pct,
             prev_close_open_warning_pct=args.prev_close_open_warning_pct,
@@ -117,6 +127,7 @@ def run_all_existing_data_backtests(
     data_dir: Path,
     report_dir: Path,
     strategy: str,
+    fee_profile: str = "market",
     open_close_warning_pct: float = 0.05,
     high_low_warning_pct: float = 0.05,
     prev_close_open_warning_pct: float = 0.01,
@@ -127,8 +138,9 @@ def run_all_existing_data_backtests(
         candles_15m = read_csv(dataset.file_15m)
         candles_1h = read_csv(dataset.file_1h)
         group = selected_strategy_groups(dataset.symbol, [strategy])[0]
+        config = with_fee_profile(group.config, fee_profile)
         context = build_hourly_context(candles_15m, candles_1h)
-        result = run_backtest(candles_15m, context, config=group.config)
+        result = run_backtest(candles_15m, context, config=config)
         range_audit = audit_price_ranges(result, candles_15m, candles_1h)
         audit_15m = audit_candles(
             candles_15m,
@@ -139,13 +151,14 @@ def run_all_existing_data_backtests(
         )
         audit_1h = audit_candles(candles_1h, "1h")
 
-        slug = f"mu_{dataset.source}_{dataset.symbol.replace('-', '_')}_{dataset.nominal_days}d_{strategy}"
+        fee_slug = "" if config.fee_profile == "market" else f"_{config.fee_profile}"
+        slug = f"mu_{dataset.source}_{dataset.symbol.replace('-', '_')}_{dataset.nominal_days}d_{strategy}{fee_slug}"
         report_path = report_dir / f"{slug}_backtest.md"
         chart_path = report_dir / f"{slug}_backtest.html"
         report_path.write_text(
             render_markdown_report(
                 result,
-                config=group.config,
+                config=config,
                 symbol=dataset.symbol,
                 data_files=[dataset.file_15m, dataset.file_1h],
             ),
@@ -155,7 +168,7 @@ def run_all_existing_data_backtests(
             render_html_visualization(
                 candles_1h,
                 result,
-                config=group.config,
+                config=config,
                 symbol=dataset.symbol,
                 chart_interval="1h",
                 strategy_name=group.name,
@@ -182,6 +195,8 @@ def run_all_existing_data_backtests(
                 "trades": result.trade_count,
                 "win_rate": result.win_rate,
                 "profit_factor": result.profit_factor,
+                "fee_profile": config.fee_profile,
+                "fee_rate": config.fee_rate,
                 "audited_events": range_audit["events"],
                 "range_anomalies": range_audit["bad_15m"] + range_audit["bad_1h"] + range_audit["missing"],
                 "invalid_ohlc": audit_15m.invalid_ohlc,
@@ -357,6 +372,7 @@ def render_summary_markdown(
     *,
     generated_at: str,
     strategy: str = "baseline",
+    fee_profile: str = "market",
     open_close_warning_pct: float = 0.05,
     high_low_warning_pct: float = 0.05,
     prev_close_open_warning_pct: float = 0.01,
@@ -365,6 +381,8 @@ def render_summary_markdown(
         "# MU All Existing Local Data Backtests",
         "",
         f"- strategy: {strategy}",
+        f"- fee profile: {fee_profile_label(fee_profile)}",
+        f"- fee rate: {fee_rate_for_profile(fee_profile):.4%}",
         "- source policy: local CSV only; no refresh/network fetch during this aggregate run",
         f"- generated at UTC: {generated_at}",
         f"- datasets: {len(rows)}",
@@ -422,6 +440,7 @@ def render_summary_html(
     *,
     generated_at: str,
     strategy: str = "baseline",
+    fee_profile: str = "market",
     open_close_warning_pct: float = 0.05,
     high_low_warning_pct: float = 0.05,
     prev_close_open_warning_pct: float = 0.01,
@@ -440,6 +459,8 @@ body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f7f8fb;color:
         '<div class="grid">',
         _card("Datasets", str(len(rows))),
         _card("Strategy", strategy),
+        _card("Fee Profile", fee_profile_label(fee_profile)),
+        _card("Fee Rate", f"{fee_rate_for_profile(fee_profile):.4%}"),
         _card("Price range anomalies", str(total_range_anomalies)),
         _card("Data quality issues", str(total_quality_issues)),
         "</div>",
