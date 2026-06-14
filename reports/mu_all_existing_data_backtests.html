@@ -1,0 +1,49 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>MU All Existing Local Data Backtests</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f7f8fb;color:#17202a}h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:16px 0}.card{background:#fff;border:1px solid #dde3eb;border-radius:8px;padding:12px}.label{font-size:12px;color:#667085}.value{font-size:20px;font-weight:700;margin-top:4px}table{border-collapse:collapse;width:100%;background:white;font-size:13px}th,td{border:1px solid #d9dee7;padding:7px 8px;text-align:left;vertical-align:top}th{background:#eef2f6}.ok{color:#0f766e;font-weight:700}.bad{color:#b42318;font-weight:700}.scroll{overflow-x:auto}.muted{color:#667085}a{color:#175cd3;text-decoration:none}
+</style></head><body>
+<h1>MU All Existing Local Data Backtests</h1>
+<p class="muted">Local CSV only; no refresh/network fetch during this aggregate run. Research artifact, not financial advice.</p>
+<div class="grid">
+<div class="card"><div class="label">Datasets</div><div class="value">5</div></div>
+<div class="card"><div class="label">Strategy</div><div class="value">baseline</div></div>
+<div class="card"><div class="label">Price range anomalies</div><div class="value">0</div></div>
+<div class="card"><div class="label">Data quality issues</div><div class="value">10</div></div>
+</div>
+<p class="muted">Generated at UTC: 2026-06-14T06:38:53+00:00. Data quality thresholds: 15m open-close > 5.00%, 15m high-low > 5.00%, prev close -> next open > 1.00%.</p>
+<div class="scroll"><table><tr>
+<th>Source</th>
+<th>Symbol</th>
+<th>Nominal Days</th>
+<th>True 15m Duration</th>
+<th>True 1h Duration</th>
+<th>15m Bars</th>
+<th>1h Bars</th>
+<th>15m Coverage UTC</th>
+<th>Ending Equity</th>
+<th>Return</th>
+<th>Max DD</th>
+<th>Trades</th>
+<th>Win Rate</th>
+<th>Profit Factor</th>
+<th>Audited Events</th>
+<th>Price Range Anomalies</th>
+<th>OHLC Invalid</th>
+<th>Dup TS</th>
+<th>15m Gaps</th>
+<th>Open-Close Warnings</th>
+<th>High-Low Warnings</th>
+<th>Max O-C</th>
+<th>Max H-L</th>
+<th>Max PrevC-Open</th>
+<th>Report</th>
+<th>Chart</th>
+</tr>
+<tr><td>binance</td><td>MUUSDT</td><td>14</td><td>14d 0h 0m</td><td>14d 0h 0m</td><td>1344</td><td>336</td><td>2026-05-28T18:15:00+00:00 to 2026-06-11T18:00:00+00:00</td><td>11683.11</td><td>16.83%</td><td>-8.42%</td><td>4</td><td>50.00%</td><td>25.65</td><td>15</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td>3.26%</td><td>4.79%</td><td>0.04%</td><td><a href="mu_binance_MUUSDT_14d_baseline_backtest.md">md</a></td><td><a href="mu_binance_MUUSDT_14d_baseline_backtest.html">html</a></td></tr>
+<tr><td>binance</td><td>MUUSDT</td><td>28</td><td>28d 0h 0m</td><td>28d 0h 0m</td><td>2688</td><td>672</td><td>2026-05-14T19:00:00+00:00 to 2026-06-11T18:45:00+00:00</td><td>12365.07</td><td>23.65%</td><td>-11.30%</td><td>8</td><td>37.50%</td><td>4.10</td><td>30</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="bad">1</td><td>3.93%</td><td>5.45%</td><td>0.08%</td><td><a href="mu_binance_MUUSDT_28d_baseline_backtest.md">md</a></td><td><a href="mu_binance_MUUSDT_28d_baseline_backtest.html">html</a></td></tr>
+<tr><td>binance</td><td>MUUSDT</td><td>180</td><td>65d 14h 15m</td><td>65d 15h 0m</td><td>6297</td><td>1575</td><td>2026-04-07T13:15:00+00:00 to 2026-06-12T03:15:00+00:00</td><td>16519.32</td><td>65.19%</td><td>-23.91%</td><td>24</td><td>25.00%</td><td>2.37</td><td>76</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="bad">2</td><td>4.02%</td><td>5.45%</td><td>0.79%</td><td><a href="mu_binance_MUUSDT_180d_baseline_backtest.md">md</a></td><td><a href="mu_binance_MUUSDT_180d_baseline_backtest.html">html</a></td></tr>
+<tr><td>okx</td><td>MU-USDT-SWAP</td><td>5</td><td>4d 23h 45m</td><td>4d 23h 0m</td><td>479</td><td>119</td><td>2026-06-09T05:15:00+00:00 to 2026-06-14T04:45:00+00:00</td><td>11757.88</td><td>17.58%</td><td>-10.20%</td><td>3</td><td>33.33%</td><td>4.70</td><td>11</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td>3.07%</td><td>4.82%</td><td>0.06%</td><td><a href="mu_okx_MU_USDT_SWAP_5d_baseline_backtest.md">md</a></td><td><a href="mu_okx_MU_USDT_SWAP_5d_baseline_backtest.html">html</a></td></tr>
+<tr><td>okx</td><td>MU-USDT-SWAP</td><td>180</td><td>101d 21h 45m</td><td>101d 22h 0m</td><td>9783</td><td>2446</td><td>2026-03-04T07:15:00+00:00 to 2026-06-14T04:45:00+00:00</td><td>20580.12</td><td>105.80%</td><td>-26.02%</td><td>31</td><td>22.58%</td><td>2.23</td><td>99</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="ok">0</td><td class="bad">1</td><td class="bad">6</td><td>7.01%</td><td>7.92%</td><td>0.63%</td><td><a href="mu_okx_MU_USDT_SWAP_180d_baseline_backtest.md">md</a></td><td><a href="mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html">html</a></td></tr>
+</table></div>
+</body></html>

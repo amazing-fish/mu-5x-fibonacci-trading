@@ -3,17 +3,16 @@ from datetime import datetime, timezone
 
 from mu_strategy.models import Candle
 from mu_strategy.strategy import (
-    StrategyGroup,
     StrategyConfig,
-    default_strategy_groups,
     fibonacci_levels,
     is_preferred_us_cash_window,
     one_hour_regime,
     optimized_strategy_group,
-    selected_strategy_groups,
     should_enter_long,
     should_execute_entry,
 )
+from mu_strategy.strategies.components import StrategyComponents
+from mu_strategy.strategies.registry import StrategyGroup, default_strategy_groups, selected_strategy_groups
 
 
 class StrategyRuleTests(unittest.TestCase):
@@ -92,8 +91,10 @@ class StrategyRuleTests(unittest.TestCase):
             [group.name for group in groups],
         )
         self.assertIsInstance(groups[0], StrategyGroup)
+        self.assertIsInstance(groups[1].components, StrategyComponents)
         self.assertEqual("break_high", groups[0].config.entry_execution)
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
+        self.assertEqual("二次回踩限价", groups[1].components.entry)
         self.assertEqual("direct_next_open", groups[2].config.entry_execution)
         self.assertEqual("second_pullback", groups[3].config.entry_execution)
         self.assertEqual("half_protect", groups[3].config.stop_tightening)

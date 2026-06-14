@@ -74,16 +74,37 @@ def run_backtest(
                 if index > pending_entry.expires_index:
                     pending_entry = None
                 elif candle.low <= pending_entry.fib_level * (1 + config.fib_tolerance_pct):
-                    entry_price = pending_entry.fib_level
+                    if not is_preferred_us_cash_window(candle.open_time_ms, config):
+                        index += 1
+                        continue
+                    entry_price = _buy_limit_fill_price(candle, pending_entry.fib_level)
+                    if entry_price is None:
+                        index += 1
+                        continue
                     fill = _make_fill(candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
                     stop_price = entry_price * (1 - config.initial_stop_pct)
                     position = OpenPosition([fill], stop_price, entry_price, stop_price)
                     pending_entry = None
-                    if candle.low <= position.stop_price:
+                    if _has_non_session_liquidation_risk(candle, position, config):
+                        exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
                         equity, trade = _close_position(
                             position,
                             candle,
-                            position.stop_price,
+                            exit_price if exit_price is not None else _liquidation_risk_price(position, config),
+                            equity,
+                            starting_equity,
+                            "non_session_liquidation_risk",
+                            config,
+                        )
+                        trades.append(trade)
+                        position = None
+                        equity_curve.append((candle.open_time_ms, equity))
+                    elif candle.low <= position.stop_price:
+                        exit_price = _sell_stop_fill_price(candle, position.stop_price)
+                        equity, trade = _close_position(
+                            position,
+                            candle,
+                            exit_price if exit_price is not None else position.stop_price,
                             equity,
                             starting_equity,
                             "initial_stop",
@@ -132,16 +153,34 @@ def run_backtest(
             if not execution.allowed or execution.entry_price is None:
                 index += 1
                 continue
+            if not is_preferred_us_cash_window(next_candle.open_time_ms, config):
+                index += 1
+                continue
 
             entry_price = execution.entry_price
             fill = _make_fill(next_candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
             stop_price = entry_price * (1 - config.initial_stop_pct)
             position = OpenPosition([fill], stop_price, entry_price, stop_price)
-            if next_candle.low <= position.stop_price:
+            if _has_non_session_liquidation_risk(next_candle, position, config):
+                exit_price = _sell_stop_fill_price(next_candle, _liquidation_risk_price(position, config))
                 equity, trade = _close_position(
                     position,
                     next_candle,
-                    position.stop_price,
+                    exit_price if exit_price is not None else _liquidation_risk_price(position, config),
+                    equity,
+                    starting_equity,
+                    "non_session_liquidation_risk",
+                    config,
+                )
+                trades.append(trade)
+                position = None
+                equity_curve.append((next_candle.open_time_ms, equity))
+            elif next_candle.low <= position.stop_price:
+                exit_price = _sell_stop_fill_price(next_candle, position.stop_price)
+                equity, trade = _close_position(
+                    position,
+                    next_candle,
+                    exit_price if exit_price is not None else position.stop_price,
                     equity,
                     starting_equity,
                     "initial_stop",
@@ -153,11 +192,29 @@ def run_backtest(
             index += 1
             continue
 
-        if candle.low <= position.stop_price:
+        if _has_non_session_liquidation_risk(candle, position, config):
+            exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
             equity, trade = _close_position(
                 position,
                 candle,
-                position.stop_price,
+                exit_price if exit_price is not None else _liquidation_risk_price(position, config),
+                equity,
+                starting_equity,
+                "non_session_liquidation_risk",
+                config,
+            )
+            trades.append(trade)
+            position = None
+            equity_curve.append((candle.open_time_ms, equity))
+            index += 1
+            continue
+
+        if candle.low <= position.stop_price:
+            exit_price = _sell_stop_fill_price(candle, position.stop_price)
+            equity, trade = _close_position(
+                position,
+                candle,
+                exit_price if exit_price is not None else position.stop_price,
                 equity,
                 starting_equity,
                 "stop",
@@ -198,6 +255,42 @@ def _make_fill(time_ms: int, price: float, margin_fraction: float, equity: float
     return Fill(time_ms, price, margin_fraction, notional, units, fee)
 
 
+def _buy_limit_fill_price(candle: Candle, limit_price: float) -> float | None:
+    if candle.low > limit_price:
+        return None
+    if candle.open < limit_price:
+        return candle.open
+    return limit_price
+
+
+def _buy_stop_fill_price(candle: Candle, trigger_price: float) -> float | None:
+    if candle.high < trigger_price:
+        return None
+    if candle.open > trigger_price:
+        return candle.open
+    return trigger_price
+
+
+def _sell_stop_fill_price(candle: Candle, stop_price: float) -> float | None:
+    if candle.low > stop_price:
+        return None
+    if candle.open < stop_price:
+        return candle.open
+    return stop_price
+
+
+def _has_non_session_liquidation_risk(candle: Candle, position: OpenPosition, config: StrategyConfig) -> bool:
+    if is_preferred_us_cash_window(candle.open_time_ms, config):
+        return False
+    return candle.low <= _liquidation_risk_price(position, config)
+
+
+def _liquidation_risk_price(position: OpenPosition, config: StrategyConfig) -> float:
+    if config.leverage <= 0:
+        raise ValueError("leverage must be positive")
+    return position.entry_price * max(0.0, 1 - (1 / config.leverage))
+
+
 def _maybe_add(
     position: OpenPosition,
     candle: Candle,
@@ -212,8 +305,12 @@ def _maybe_add(
     next_stage = position.max_stage + 1
     if next_stage > len(config.margin_steps):
         return
+    if not is_preferred_us_cash_window(candle.open_time_ms, config):
+        return
     threshold = config.add_thresholds[next_stage - 2]
-    if candle.high < position.entry_anchor * (1 + threshold):
+    trigger_price = position.entry_anchor * (1 + threshold)
+    fill_price = _buy_stop_fill_price(candle, trigger_price)
+    if fill_price is None:
         return
     if rsi_values[index] < config.rsi_add_floor or hist_values[index] < hist_values[index - 1]:
         return
@@ -221,7 +318,6 @@ def _maybe_add(
     if next_stage >= 3 and regime != config.full_size_regime:
         return
 
-    fill_price = position.entry_anchor * (1 + threshold)
     fill = _make_fill(candle.open_time_ms, fill_price, config.margin_steps[next_stage - 1], equity, config)
     position.fills.append(fill)
     position.max_stage = next_stage

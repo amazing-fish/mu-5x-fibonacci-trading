@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MU-USDT-SWAP 策略组件矩阵</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #687386;
+      --border: #d9dfe8;
+      --good: #0f766e;
+      --bad: #b42318;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 26px;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin-bottom: 18px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    table {
+      width: 100%;
+      min-width: 1120px;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      background: #eef2f6;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    td.metric {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>MU-USDT-SWAP 策略组件矩阵</h1>
+  <div class="subtitle">数据文件：data\OKX_MU-USDT-SWAP_15m_180d.csv, data\OKX_MU-USDT-SWAP_1h_180d.csv。按入场策略、加减仓策略、出场策略、过滤策略拆分，方便持续组合回测。</div>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>策略组</th>
+          <th>入场策略</th>
+          <th>加减仓策略</th>
+          <th>出场策略</th>
+          <th>过滤策略</th>
+          <th>总收益</th>
+          <th>最大回撤</th>
+          <th>交易数</th>
+          <th>胜率</th>
+          <th>加仓后胜率</th>
+          <th>首仓止损</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>legacy_break_high</strong><br><span class="muted">旧突破前高baseline备用</span></td><td>突破前高确认</td><td>5x 金字塔 20/20/20/40</td><td>baseline 抬止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">82.34%</td><td class="metric bad">-39.34%</td><td class="metric">56</td><td class="metric">16.07%</td><td class="metric">30.00%</td><td class="metric">25</td></tr>
+<tr><td><strong>baseline</strong><br><span class="muted">新baseline：二次回踩确认买入</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>baseline 抬止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">65.64%</td><td class="metric bad">-23.92%</td><td class="metric">46</td><td class="metric">21.74%</td><td class="metric">33.33%</td><td class="metric">16</td></tr>
+<tr><td><strong>direct_next_open</strong><br><span class="muted">回踩确认后下一根开盘买入</span></td><td>下一根开盘直接买入</td><td>5x 金字塔 20/20/20/40</td><td>baseline 抬止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">103.81%</td><td class="metric bad">-32.25%</td><td class="metric">64</td><td class="metric">15.62%</td><td class="metric">27.78%</td><td class="metric">27</td></tr>
+<tr><td><strong>baseline_half_protect</strong><br><span class="muted">新baseline + 半保护止损</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>半保护止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">37.58%</td><td class="metric bad">-23.88%</td><td class="metric">42</td><td class="metric">28.57%</td><td class="metric">44.44%</td><td class="metric">15</td></tr>
+<tr><td><strong>baseline_green_wide</strong><br><span class="muted">新baseline + green宽止损（yellow窄）</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>yellow baseline / green 宽止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">71.73%</td><td class="metric bad">-23.89%</td><td class="metric">46</td><td class="metric">21.74%</td><td class="metric">33.33%</td><td class="metric">16</td></tr>
+<tr><td><strong>baseline_yellow_wide</strong><br><span class="muted">新baseline + yellow宽止损（green窄）</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>yellow 宽止损 / green baseline</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">60.90%</td><td class="metric bad">-23.92%</td><td class="metric">46</td><td class="metric">21.74%</td><td class="metric">33.33%</td><td class="metric">16</td></tr>
+<tr><td><strong>baseline_yellow_green_wide</strong><br><span class="muted">新baseline + yellow/green均宽止损</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>yellow/green 均宽止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">53.68%</td><td class="metric bad">-24.06%</td><td class="metric">45</td><td class="metric">24.44%</td><td class="metric">36.67%</td><td class="metric">15</td></tr>
+<tr><td><strong>baseline_half_green_wide</strong><br><span class="muted">新baseline + 半保护 + green宽止损</span></td><td>二次回踩限价</td><td>5x 金字塔 20/20/20/40</td><td>半保护 + green 宽止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口</td><td class="metric good">52.18%</td><td class="metric bad">-23.02%</td><td class="metric">42</td><td class="metric">28.57%</td><td class="metric">44.44%</td><td class="metric">15</td></tr>
+<tr><td><strong>optimized_v2</strong><br><span class="muted">优化策略 v2</span></td><td>突破前高确认</td><td>5x 金字塔 20/20/20/40</td><td>baseline 抬止损</td><td>1h regime<br>15m RSI/MACD<br>美股现金盘窗口<br>首仓追价限制<br>信号K宽度限制<br>反向 Fibonacci 压力过滤</td><td class="metric good">43.06%</td><td class="metric bad">-26.86%</td><td class="metric">29</td><td class="metric">17.24%</td><td class="metric">33.33%</td><td class="metric">14</td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+</body>
+</html>
