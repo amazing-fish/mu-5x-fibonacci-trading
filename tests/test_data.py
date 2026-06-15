@@ -1,4 +1,5 @@
 import unittest
+import urllib.error
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -119,6 +120,34 @@ class DataTests(unittest.TestCase):
 
         self.assertIn("Mozilla", captured["user_agent"])
         self.assertEqual("application/json", captured["accept"])
+
+    def test_okx_fetch_retries_transient_urlopen_errors(self):
+        from mu_strategy.market_data.providers.okx import fetch_okx_candles
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"code":"0","msg":"","data":[]}'
+
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise urllib.error.URLError("transient eof")
+            return FakeResponse()
+
+        with patch("mu_strategy.market_data.providers.okx.urllib.request.urlopen", side_effect=fake_urlopen):
+            with patch("mu_strategy.market_data.providers.okx.time.sleep"):
+                candles = fetch_okx_candles("MU-USDT-SWAP", "15m")
+
+        self.assertEqual([], candles)
+        self.assertEqual(2, len(calls))
 
     def test_okx_historical_starts_pagination_at_requested_end_time(self):
         end_time_ms = 2 * 86_400_000

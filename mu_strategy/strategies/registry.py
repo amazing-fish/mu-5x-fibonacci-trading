@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from mu_strategy.strategies.components import StrategyComponents
+from mu_strategy.strategies.presets.fibonacci import preferred_fib_lookback
 
 if TYPE_CHECKING:
     from mu_strategy.strategy import StrategyConfig
@@ -23,11 +24,21 @@ def _config(**kwargs) -> "StrategyConfig":
     return StrategyConfig(**kwargs)
 
 
+def _baseline_config(symbol: str = "MUUSDT", **kwargs) -> "StrategyConfig":
+    return _config(
+        symbol=symbol,
+        entry_execution="second_pullback",
+        second_pullback_wait_bars=8,
+        fib_lookback=preferred_fib_lookback(symbol),
+        **kwargs,
+    )
+
+
 def baseline_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
         "baseline",
         "新baseline：二次回踩确认买入",
-        _config(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+        _baseline_config(symbol),
         StrategyComponents(entry="二次回踩限价"),
     )
 
@@ -49,7 +60,7 @@ def second_pullback_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
         "second_pullback_limit_8",
         "回踩确认后等待二次回踩买入",
-        _config(symbol=symbol, entry_execution="second_pullback", second_pullback_wait_bars=8),
+        _baseline_config(symbol),
         StrategyComponents(entry="二次回踩限价"),
     )
 
@@ -58,10 +69,8 @@ def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGrou
     return StrategyGroup(
         "baseline_half_protect",
         "新baseline + 半保护止损",
-        _config(
-            symbol=symbol,
-            entry_execution="second_pullback",
-            second_pullback_wait_bars=8,
+        _baseline_config(
+            symbol,
             stop_tightening="half_protect",
         ),
         StrategyComponents(entry="二次回踩限价", exit="半保护止损"),
@@ -72,10 +81,8 @@ def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
         "baseline_green_wide",
         "新baseline + green宽止损（yellow窄）",
-        _config(
-            symbol=symbol,
-            entry_execution="second_pullback",
-            second_pullback_wait_bars=8,
+        _baseline_config(
+            symbol,
             yellow_stop_tightening="baseline",
             green_stop_tightening="wide",
         ),
@@ -87,10 +94,8 @@ def baseline_yellow_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup
     return StrategyGroup(
         "baseline_yellow_wide",
         "新baseline + yellow宽止损（green窄）",
-        _config(
-            symbol=symbol,
-            entry_execution="second_pullback",
-            second_pullback_wait_bars=8,
+        _baseline_config(
+            symbol,
             yellow_stop_tightening="wide",
             green_stop_tightening="baseline",
         ),
@@ -102,10 +107,8 @@ def baseline_yellow_green_wide_strategy_group(symbol: str = "MUUSDT") -> Strateg
     return StrategyGroup(
         "baseline_yellow_green_wide",
         "新baseline + yellow/green均宽止损",
-        _config(
-            symbol=symbol,
-            entry_execution="second_pullback",
-            second_pullback_wait_bars=8,
+        _baseline_config(
+            symbol,
             yellow_stop_tightening="wide",
             green_stop_tightening="wide",
         ),
@@ -117,10 +120,8 @@ def baseline_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyG
     return StrategyGroup(
         "baseline_half_green_wide",
         "新baseline + 半保护 + green宽止损",
-        _config(
-            symbol=symbol,
-            entry_execution="second_pullback",
-            second_pullback_wait_bars=8,
+        _baseline_config(
+            symbol,
             stop_tightening="half_protect_green_wide",
         ),
         StrategyComponents(entry="二次回踩限价", exit="半保护 + green 宽止损"),

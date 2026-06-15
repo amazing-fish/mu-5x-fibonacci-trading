@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 from mu_strategy.market_data.utils import DAY_MS, dedupe_candles
@@ -37,6 +38,7 @@ def fetch_okx_candles(
     *,
     after: int | None = None,
     limit: int = 100,
+    retries: int = 3,
 ) -> list[Candle]:
     params: dict[str, str | int] = {
         "instId": symbol,
@@ -53,8 +55,19 @@ def fetch_okx_candles(
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+            time.sleep(0.5 * attempt)
+    else:
+        raise RuntimeError(f"OKX request failed after {retries} retries: {last_error}")
     if payload.get("code") != "0":
         raise RuntimeError(f"OKX request failed: {payload.get('msg') or payload.get('code')}")
     candles = [okx_row_to_candle(row) for row in payload.get("data", [])]

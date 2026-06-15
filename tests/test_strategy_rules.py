@@ -14,6 +14,7 @@ from mu_strategy.strategy import (
     with_fee_profile,
 )
 from mu_strategy.strategies.components import StrategyComponents
+from mu_strategy.strategies.presets.fibonacci import preferred_fibonacci_parameter, preferred_fib_lookback
 from mu_strategy.strategies.registry import StrategyGroup, default_strategy_groups, selected_strategy_groups
 
 
@@ -96,6 +97,7 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertIsInstance(groups[1].components, StrategyComponents)
         self.assertEqual("break_high", groups[0].config.entry_execution)
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
+        self.assertEqual(8, groups[1].config.fib_lookback)
         self.assertEqual("market", groups[1].config.fee_profile)
         self.assertAlmostEqual(0.0005, groups[1].config.fee_rate)
         self.assertEqual("二次回踩限价", groups[1].components.entry)
@@ -116,6 +118,25 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertEqual(["legacy_break_high", "baseline", "baseline"], [group.name for group in groups])
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
+        self.assertEqual(8, groups[1].config.fib_lookback)
+
+    def test_known_assets_record_preferred_fibonacci_lookbacks(self):
+        self.assertEqual(8, preferred_fib_lookback("MU-USDT-SWAP"))
+        self.assertEqual(8, preferred_fib_lookback("SPCX-USDT-SWAP"))
+        self.assertEqual(36, preferred_fib_lookback("META-USDT-SWAP"))
+        self.assertEqual(12, preferred_fib_lookback("BTC-USDT-SWAP"))
+        self.assertEqual(32, preferred_fib_lookback("UNKNOWN-USDT-SWAP"))
+
+        meta = preferred_fibonacci_parameter("META-USDT-SWAP")
+
+        self.assertIsNotNone(meta)
+        self.assertEqual(9, meta.horizon_hours)
+        self.assertIn("fibonacci_pullback_multi_asset", meta.evidence_report)
+
+    def test_baseline_uses_preferred_fibonacci_lookback_for_known_assets(self):
+        groups = selected_strategy_groups("BTC-USDT-SWAP", ["baseline"])
+
+        self.assertEqual(12, groups[0].config.fib_lookback)
 
     def test_fee_profile_switches_between_market_and_limit_costs(self):
         market_config = with_fee_profile(StrategyConfig(fee_rate=0), "market")

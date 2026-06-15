@@ -24,8 +24,9 @@ Package: `mu_strategy.strategies`
 - `registry.py`: named strategy groups.
 - `components.py`: entry, position, exit, and filter labels.
 - `presets/mu.py`: MU strategy preset names.
+- `presets/fibonacci.py`: preferred Fibonacci lookback records by symbol.
 
-Current fixed research baseline: `baseline`.
+Current fixed research baseline: `baseline`. MU uses the 2h Fibonacci lookback record (`fib_lookback=8`); unknown symbols fall back to the legacy 8h default (`fib_lookback=32`).
 
 Fee realism:
 
@@ -44,6 +45,8 @@ Use this layer to state the current best-known strategy and supporting notes. It
 Package: `mu_strategy.experiments`
 
 `experiments.walk_forward` runs strategy-group comparisons and renders the Markdown and HTML component matrix reports. Walk-forward windows are independent; aggregate dashboard drawdown uses per-window drawdown rather than concatenating reset equity curves.
+
+`experiments.fibonacci_pullback` runs 1h-12h Fibonacci lookback sweeps for one or more assets and renders the ranking reports used by `docs/fibonacci-preferred-parameters.md`.
 
 ## Selection
 

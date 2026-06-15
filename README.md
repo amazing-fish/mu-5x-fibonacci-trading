@@ -5,7 +5,7 @@
 当前 baseline 使用：
 
 - `1h` 市场结构过滤，判断是否允许做多。
-- `15m` Fibonacci 回踩入场。
+- `15m` Fibonacci 回踩入场；MU 当前 baseline 使用 2h 回看窗口，即 `fib_lookback=8`。
 - RSI 和 MACD 作为确认过滤。
 - 美股现金盘时间窗口。
 - `5x` 分阶段金字塔加仓。
@@ -43,6 +43,18 @@ python -m unittest discover -s tests
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
 ```
 
+运行 MU 最新一周 Fibonacci 窗口敏感性回测：
+
+```powershell
+python -m mu_strategy.experiments.fibonacci_pullback --asset MU --days 7 --min-hour 1 --max-hour 12 --strategy baseline --fee-profile market --refresh --multi-report reports\mu_fibonacci_pullback_1h_12h_7d.md
+```
+
+运行多标的 Fibonacci 优选参数对照：
+
+```powershell
+python -m mu_strategy.experiments.fibonacci_pullback --asset MU,SPACEX,META,BTC --days 180 --min-hour 1 --max-hour 12 --strategy baseline --fee-profile market --refresh --multi-report reports\fibonacci_pullback_multi_asset_1h_12h_180d.md
+```
+
 对照限价挂单成本假设：
 
 ```powershell
@@ -73,7 +85,10 @@ python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy
 - `reports/mu_okx_strategy_group_review.md`：策略组实验结果表。
 - `reports/mu_okx_strategy_components.html`：策略组件可视化矩阵。
 - `reports/mu_okx_baseline_backtest.html`：交互式 `1h` 可视化回测，包含价格、成交量和权益曲线联动。
+- `reports/mu_fibonacci_pullback_1h_12h_7d.md`：MU 最新一周 `1h-12h` Fibonacci 窗口回测，用于确认 2h baseline。
+- `reports/fibonacci_pullback_multi_asset_1h_12h_180d.md`：MU/SPACEX/META/BTC 的优选窗口对照。
 - `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
+- `docs/fibonacci-preferred-parameters.md`：当前标的优选 Fibonacci 参数记录。
 
 ## 数据注意事项
 
@@ -88,7 +103,7 @@ python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy
 当前策略组可以通过 `--strategy` 指定，主要包括：
 
 - `legacy_break_high`：旧版突破前高确认策略，保留为备用对照。
-- `baseline`：当前固定 baseline，采用二次回踩确认买入。
+- `baseline`：当前固定 baseline，采用二次回踩确认买入；MU 使用 2h Fibonacci 回看窗口。
 - `direct_next_open`：确认后下一根开盘直接买入。
 - `baseline_half_protect`：baseline 入场 + 半保护止损。
 - `baseline_green_wide`：baseline 入场 + `1h green` 宽止损。
