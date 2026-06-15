@@ -150,6 +150,26 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
         self.assertIn("月度 2h/4h 判定", report)
         self.assertIn("| SPACEX | 2026-01 | 2h", report)
 
+    def test_multi_asset_report_prints_selected_strategy(self):
+        asset_result = AssetFibonacciBacktest(
+            asset=resolve_asset("mu"),
+            horizon_results=[_horizon(2, 0.05)],
+            data_files=[],
+        )
+
+        report = render_multi_asset_report(
+            [asset_result],
+            days=180,
+            strategy_name="baseline_half_protect",
+            min_hour=1,
+            max_hour=12,
+            target_hours=(2, 4),
+        )
+
+        self.assertIn("同一套 baseline_half_protect 规则", report)
+        self.assertIn("- strategy: baseline_half_protect", report)
+        self.assertNotIn("同一套 baseline 规则", report)
+
 
 def _candle(open_time_ms: int) -> Candle:
     return Candle(open_time_ms, 100, 101, 99, 100.5, 1000)

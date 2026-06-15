@@ -347,10 +347,11 @@ def render_multi_asset_report(
     lines = [
         f"# 多标的 Fibonacci 回调 {min_hour}h-{max_hour}h 请求 {days}d 回测",
         "",
-        "目的：对同一套 baseline 规则做多标的窗口敏感性检查，确认 2h/4h 是否在各自样本内属于最优或较优。",
+        f"目的：对同一套 {strategy_name} 规则做多标的窗口敏感性检查，确认 2h/4h 是否在各自样本内属于最优或较优。",
         "",
         "## 判定口径",
         "",
+        f"- strategy: {strategy_name}",
         "- 排名依据：完整实际样本总收益。",
         "- 最优：排名第 1。",
         "- 较优：排名第 2 或第 3。",
