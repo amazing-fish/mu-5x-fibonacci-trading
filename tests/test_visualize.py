@@ -96,6 +96,44 @@ class VisualizationTests(unittest.TestCase):
         self.assertIn("0.0500%", html)
         self.assertIn("trading_windows_et", html)
 
+    def test_strategy_detail_exposes_selected_group_and_module_composition(self):
+        candles = [
+            Candle(0, 100, 101, 99, 100, 1000),
+            Candle(900_000, 100, 103, 100, 102, 1000),
+        ]
+        result = BacktestResult(10_000, 10_000, [], [(0, 10_000), (900_000, 10_000)])
+
+        html = render_html_visualization(
+            candles,
+            result,
+            config=StrategyConfig(
+                symbol="MU-USDT-SWAP",
+                entry_execution="second_pullback",
+                second_pullback_wait_bars=8,
+                fib_lookback=8,
+            ),
+            symbol="MU-USDT-SWAP",
+            chart_interval="1h",
+            strategy_name="baseline",
+            strategy_label="新baseline：二次回踩确认买入",
+            strategy_components=StrategyComponents(entry="二次回踩限价"),
+        )
+
+        self.assertIn("已选策略组", html)
+        self.assertIn("<th>strategy_group</th><td>baseline</td>", html)
+        self.assertIn("<th>strategy_label</th><td>新baseline：二次回踩确认买入</td>", html)
+        self.assertIn("策略模块组合", html)
+        self.assertIn("<td>入场信号</td>", html)
+        self.assertIn("<td>二次回踩限价</td>", html)
+        self.assertIn("<td>入场执行</td>", html)
+        self.assertIn("second_pullback", html)
+        self.assertIn("等待 8 根 15m K", html)
+        self.assertIn("<td>Fibonacci 窗口</td>", html)
+        self.assertIn("2h / 8 根 15m K", html)
+        self.assertIn("<td>成本模型</td>", html)
+        self.assertIn("market/taker (市价/吃单)", html)
+        self.assertIn("fib_lookback", html)
+
     def test_trade_table_reverses_scrolls_and_hides_stop_only_reason(self):
         candles = [
             Candle(0, 100, 101, 99, 100, 1000),
