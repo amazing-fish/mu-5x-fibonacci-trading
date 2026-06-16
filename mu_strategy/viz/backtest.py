@@ -100,7 +100,12 @@ def render_html_visualization(
         strategy_note += "。"
     chart_data = _plotly_data(candles, result)
     trade_table = _trade_table(result.trades)
-    detail_section = _strategy_detail_section(config, strategy_components)
+    detail_section = _strategy_detail_section(
+        config,
+        strategy_components,
+        strategy_name=strategy_name,
+        strategy_label=strategy_label,
+    )
     duration_label = _coverage_duration_label(candles)
     risk_event_count = sum(1 for trade in result.trades if trade.exit_reason == "non_session_liquidation_risk")
     payload = json.dumps(chart_data, ensure_ascii=False)
@@ -201,9 +206,23 @@ def render_html_visualization(
       width: 100%;
       margin-top: 12px;
     }}
-    .config-table th, .config-table td {{
+    .identity-table, .module-table {{
+      width: 100%;
+      margin-top: 12px;
+    }}
+    .config-table th, .config-table td,
+    .identity-table th, .identity-table td,
+    .module-table th, .module-table td {{
       text-align: left;
       white-space: normal;
+      vertical-align: top;
+    }}
+    .section-subhead {{
+      margin: 16px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }}
     section {{
       padding: 16px;
@@ -466,8 +485,29 @@ def _metric_card(label: str, value: str, detail: str | None = None) -> str:
     )
 
 
-def _strategy_detail_section(config: StrategyConfig, components: StrategyComponents | None) -> str:
+def _strategy_detail_section(
+    config: StrategyConfig,
+    components: StrategyComponents | None,
+    *,
+    strategy_name: str | None = None,
+    strategy_label: str | None = None,
+) -> str:
     lines = ["<section>", "    <h2>策略组详情</h2>"]
+    if strategy_name or strategy_label:
+        identity_rows = "\n".join(
+            f"<tr><th>{html.escape(name)}</th><td>{html.escape(value)}</td></tr>"
+            for name, value in _strategy_identity_rows(strategy_name, strategy_label)
+        )
+        lines.extend(
+            [
+                '    <h3 class="section-subhead">已选策略组</h3>',
+                '    <table class="identity-table">',
+                "      <tbody>",
+                f"        {identity_rows}",
+                "      </tbody>",
+                "    </table>",
+            ]
+        )
     if components is not None:
         filters = "<br>".join(html.escape(value) for value in components.filters)
         lines.extend(
@@ -478,6 +518,16 @@ def _strategy_detail_section(config: StrategyConfig, components: StrategyCompone
                 f'      <div class="detail-cell"><strong>出场策略</strong>{html.escape(components.exit)}</div>',
                 f'      <div class="detail-cell"><strong>过滤策略</strong>{filters}</div>',
                 "    </div>",
+            ]
+        )
+        module_rows = "\n".join(_strategy_module_row(module) for module in _strategy_module_rows(config, components))
+        lines.extend(
+            [
+                '    <h3 class="section-subhead">策略模块组合</h3>',
+                '    <table class="module-table">',
+                "      <thead><tr><th>模块</th><th>使用策略</th><th>关键参数</th><th>状态</th><th>说明</th></tr></thead>",
+                f"      <tbody>{module_rows}</tbody>",
+                "    </table>",
             ]
         )
 
@@ -498,11 +548,112 @@ def _strategy_detail_section(config: StrategyConfig, components: StrategyCompone
     return "\n".join(lines)
 
 
+def _strategy_identity_rows(strategy_name: str | None, strategy_label: str | None) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    if strategy_name:
+        rows.append(("strategy_group", strategy_name))
+    if strategy_label:
+        rows.append(("strategy_label", strategy_label))
+    return rows
+
+
+def _strategy_module_row(values: tuple[str, str, str, str, str]) -> str:
+    return "<tr>" + "".join(f"<td>{html.escape(value)}</td>" for value in values) + "</tr>"
+
+
+def _strategy_module_rows(config: StrategyConfig, components: StrategyComponents) -> list[tuple[str, str, str, str, str]]:
+    return [
+        (
+            "入场信号",
+            components.entry,
+            f"RSI floor {config.rsi_floor:.0f}; Fibonacci tolerance {config.fib_tolerance_pct:.2%}; MACD 不继续走弱",
+            "启用",
+            "15m 信号先确认回踩，成交由入场执行模块决定。",
+        ),
+        (
+            "入场执行",
+            config.entry_execution,
+            _entry_execution_detail(config),
+            "启用",
+            "明确 signal 与 fill 是否分离。",
+        ),
+        (
+            "Fibonacci 窗口",
+            "近端 0.382 / 0.5 / 0.618 回踩位",
+            _fib_lookback_label(config),
+            "启用",
+            "用于寻找本次入场可接受的回踩区。",
+        ),
+        (
+            "过滤策略",
+            ", ".join(components.filters),
+            f"allowed_regimes={', '.join(config.allowed_regimes)}",
+            "启用",
+            "1h 结构和 15m 动能过滤不是独立买入按钮。",
+        ),
+        (
+            "仓位策略",
+            components.position,
+            f"leverage={config.leverage:.2f}x; margin_steps={', '.join(f'{step:.0%}' for step in config.margin_steps)}",
+            "启用",
+            f"adds={', '.join(f'{step:.2%}' for step in config.add_thresholds)}",
+        ),
+        (
+            "出场/止损",
+            components.exit,
+            _stop_detail(config),
+            "启用",
+            "止损在持仓期间持续检查。",
+        ),
+        (
+            "交易窗口",
+            "美股现金盘窗口",
+            ", ".join(f"{start}-{end} ET" for start, end in config.trading_windows_et),
+            "启用",
+            "入场和加仓只在配置窗口执行。",
+        ),
+        (
+            "成本模型",
+            fee_profile_label(config),
+            f"fee_rate={config.fee_rate:.4%}",
+            "启用",
+            "回测默认按实际更保守的吃单成本估算。",
+        ),
+    ]
+
+
+def _entry_execution_detail(config: StrategyConfig) -> str:
+    if config.entry_execution == "second_pullback":
+        return f"等待 {config.second_pullback_wait_bars} 根 15m K"
+    if config.entry_execution == "direct_next_open":
+        return "下一根 K 开盘执行"
+    if config.entry_execution == "break_high":
+        return "下一根 K 突破信号高点后执行"
+    return "-"
+
+
+def _fib_lookback_label(config: StrategyConfig) -> str:
+    total_minutes = config.fib_lookback * 15
+    horizon = f"{total_minutes // 60}h" if total_minutes % 60 == 0 else f"{total_minutes}m"
+    return f"{horizon} / {config.fib_lookback} 根 15m K"
+
+
+def _stop_detail(config: StrategyConfig) -> str:
+    regime_overrides = []
+    if config.yellow_stop_tightening:
+        regime_overrides.append(f"yellow={config.yellow_stop_tightening}")
+    if config.green_stop_tightening:
+        regime_overrides.append(f"green={config.green_stop_tightening}")
+    override_text = f"; {'; '.join(regime_overrides)}" if regime_overrides else ""
+    return f"initial_stop={config.initial_stop_pct:.2%}; stop_tightening={config.stop_tightening}{override_text}"
+
+
 def _strategy_config_rows(config: StrategyConfig) -> list[tuple[str, str]]:
     return [
         ("symbol", config.symbol),
         ("entry_execution", config.entry_execution),
         ("second_pullback_wait_bars", str(config.second_pullback_wait_bars)),
+        ("fib_lookback", str(config.fib_lookback)),
         ("fee_profile", fee_profile_label(config)),
         ("fee_rate", f"{config.fee_rate:.4%}"),
         ("leverage", f"{config.leverage:.2f}x"),
