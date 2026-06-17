@@ -102,13 +102,13 @@ python -m mu_strategy.live.okx_cli shadow-record --event-id evt-001 --symbol MU-
 生成 OKX demo trading 订单 dry-run，不发订单：
 
 ```powershell
-python -m mu_strategy.live.okx_cli demo-order --inst-id MU-USDT-SWAP --side buy --size 1 --order-type limit --price 100 --client-order-id demo-001
+python -m mu_strategy.live.okx_cli demo-order --inst-id MU-USDT-SWAP --side buy --size 1 --order-type limit --price 100 --client-order-id DEMO001
 ```
 
-显式发送 OKX demo trading 订单：
+`--client-order-id` 应使用 1-32 位 ASCII 字母数字。OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；如果 `MU-USDT-SWAP` 返回 `51001`，应把它视为 demo 品种支持问题，而不是凭据失败。显式验证 OKX demo trading 连通性可使用已验证的小尺寸 IOC 示例：
 
 ```powershell
-python -m mu_strategy.live.okx_cli demo-order --inst-id MU-USDT-SWAP --side buy --size 1 --order-type limit --price 100 --client-order-id demo-001 --confirm-demo-order
+python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
 ```
 
 ## 当前产物

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ from typing import Any, Callable
 
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
+OKX_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{1,32}$")
 
 
 @dataclass(frozen=True)
@@ -81,11 +83,13 @@ class DemoOrderRequest:
         if self.price is not None:
             body["px"] = self.price
         if self.client_order_id is not None:
+            if not OKX_CLIENT_ORDER_ID_PATTERN.fullmatch(self.client_order_id):
+                raise ValueError("client_order_id must be 1-32 ASCII alphanumeric characters")
             body["clOrdId"] = self.client_order_id
         if self.pos_side is not None:
             body["posSide"] = self.pos_side
         if self.reduce_only is not None:
-            body["reduceOnly"] = str(self.reduce_only).lower()
+            body["reduceOnly"] = self.reduce_only
         return body
 
 

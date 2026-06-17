@@ -175,7 +175,7 @@ class OKXExecutionCLITests(unittest.TestCase):
                     "--price",
                     "100",
                     "--client-order-id",
-                    "demo-1",
+                    "DEMO1",
                 ],
                 stdout=stdout,
             )

@@ -220,7 +220,7 @@ class DemoOrderGuardTests(unittest.TestCase):
             size="1",
             order_type="limit",
             price="100",
-            client_order_id="shadow-1",
+            client_order_id="SHADOW1",
         )
 
         prepared = client.prepare_demo_order(request)
@@ -243,7 +243,7 @@ class DemoOrderGuardTests(unittest.TestCase):
             side="buy",
             size="1",
             order_type="market",
-            client_order_id="shadow-2",
+            client_order_id="SHADOW2",
         )
 
         with self.assertRaisesRegex(PermissionError, "confirm_demo_order"):
@@ -254,7 +254,47 @@ class DemoOrderGuardTests(unittest.TestCase):
         self.assertEqual({"code": "0", "data": [{"ok": True}], "msg": ""}, response)
         self.assertEqual(1, len(transport.calls))
         self.assertEqual("POST", transport.calls[0]["method"])
-        self.assertEqual('{"instId":"MU-USDT-SWAP","tdMode":"isolated","side":"buy","ordType":"market","sz":"1","clOrdId":"shadow-2"}', transport.calls[0]["body"])
+        self.assertEqual('{"instId":"MU-USDT-SWAP","tdMode":"isolated","side":"buy","ordType":"market","sz":"1","clOrdId":"SHADOW2"}', transport.calls[0]["body"])
+
+    def test_demo_order_reduce_only_serializes_as_json_boolean(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+        request = DemoOrderRequest(
+            inst_id="MU-USDT-SWAP",
+            side="sell",
+            size="1",
+            order_type="market",
+            reduce_only=True,
+        )
+
+        client.place_demo_order(request, confirm_demo_order=True)
+
+        self.assertEqual(
+            '{"instId":"MU-USDT-SWAP","tdMode":"isolated","side":"sell","ordType":"market","sz":"1","reduceOnly":true}',
+            transport.calls[0]["body"],
+        )
+
+    def test_demo_order_rejects_client_order_id_with_non_alphanumeric_characters(self):
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=RecordingTransport(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "client_order_id"):
+            client.prepare_demo_order(
+                DemoOrderRequest(
+                    inst_id="MU-USDT-SWAP",
+                    side="buy",
+                    size="1",
+                    client_order_id="demo-001",
+                )
+            )
 
     def test_demo_order_cannot_be_sent_with_production_client(self):
         client = OKXRestClient(
