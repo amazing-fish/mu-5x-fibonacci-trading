@@ -66,6 +66,26 @@ This layer returns non-trading decisions:
 
 It may return margin steps and initial stop planning. It must not place orders or call broker APIs.
 
+## OKX API Execution Preparation
+
+Package: `mu_strategy.live`
+
+This layer is isolated from the backtest engine and the execution-planning package. It exists to prepare and measure future API-driven execution without changing research results.
+
+- `okx.OKXRestClient`: minimal OKX REST client with official HMAC signing, demo header support, read-only account endpoints, and guarded demo-order methods.
+- `okx.ShadowExecutionLedger`: append-only JSONL ledger for paper/shadow execution observations.
+- `okx_cli`: command-line entry point for read-only checks, shadow event recording, and OKX demo trading dry-runs.
+
+Safety boundaries:
+
+- Production live order placement is not implemented.
+- The strategy engine does not call this package to place orders automatically.
+- Demo orders require `--confirm-demo-order`; without it, the CLI returns a sanitized dry-run request.
+- Confirmed demo orders preflight the demo instrument endpoint first and block unsupported instruments before sending an order request.
+- Secrets are read from environment variables and redacted from dry-run output.
+- Shadow execution writes local audit rows only and never calls OKX.
+- v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, risk kill-switches, or execution idempotency.
+
 ## Visualization
 
 Package: `mu_strategy.viz`

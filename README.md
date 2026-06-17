@@ -13,7 +13,8 @@
 - 按入场、加减仓、出场、过滤等维度拆分策略组。
 - OKX 增量缓存，只使用已确认 K 线，并按请求的 `days` 窗口裁剪缓存。
 
-执行相关模块只输出规划决策，不会下单，也不会调用 broker/order API。
+执行规划模块只输出规划决策，不会下单，也不会调用 broker/order API。
+OKX API 相关工具独立放在 `mu_strategy.live` 下，当前只覆盖只读检查、shadow execution 本地审计、以及需要显式确认的 OKX demo trading 订单。
 
 ## 架构
 
@@ -26,6 +27,7 @@
 - `mu_strategy.research`：当前研究结论入口。
 - `mu_strategy.selection`：固定策略下的候选标的排序。
 - `mu_strategy.execution`：非交易的入场与风险规划。
+- `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
 
 兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`。
 
@@ -79,6 +81,37 @@ python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 
 python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy baseline --report reports\mu_binance_backtest.md
 ```
 
+OKX API 只读检查：
+
+```powershell
+$env:OKX_API_KEY="..."
+$env:OKX_SECRET_KEY="..."
+$env:OKX_PASSPHRASE="..."
+python -m mu_strategy.live.okx_cli read-only --demo --inst-type SWAP --inst-id MU-USDT-SWAP --ccy USDT
+```
+
+Windows 上默认会优先读取持久化的 User/Machine 环境变量，避免 Codex 等长驻进程沿用旧的进程环境；如需强制使用当前 shell 的临时变量，设置 `$env:OKX_ENV_SOURCE="process"`。
+也可以在需要凭据的 CLI 命令上显式传入 `--credential-source auto|process|user|machine`。未传 `--credential-source` 时，CLI 会先尊重 `OKX_ENV_SOURCE`，再回到自动选择。`read-only` 输出会保留 OKX 原始响应，并额外给出 `status` 与 `warnings`；例如 demo positions 对单合约返回业务错误时会进入 warning，而不会被误判为认证失败。
+
+记录 shadow execution 事件，不发订单：
+
+```powershell
+python -m mu_strategy.live.okx_cli shadow-record --event-id evt-001 --symbol MU-USDT-SWAP --action buy --plan-price 100 --observed-price 100.2 --quantity 1 --status filled --reason "manual observation" --timestamp-ms 1780000000000
+```
+
+生成 OKX demo trading 订单 dry-run，不发订单：
+
+```powershell
+python -m mu_strategy.live.okx_cli demo-order --inst-id MU-USDT-SWAP --side buy --size 1 --order-type limit --price 100 --client-order-id DEMO001
+```
+
+`--client-order-id` 应使用 1-32 位 ASCII 字母数字。`--price` 只用于 `limit`、`post_only`、`fok`、`ioc`，`market` 订单会拒绝传入价格。
+OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；demo 模式下 public instruments 也会带 `x-simulated-trading: 1` 做一致性检查。如果 `MU-USDT-SWAP` 返回 `51001`，应把它视为 demo 品种支持问题，而不是凭据失败。确认发送前会先做 demo instrument 预检；预检失败时返回 `blocked_demo_order`，不会继续发送订单。显式验证 OKX demo trading 连通性可使用已验证的小尺寸 IOC 示例：
+
+```powershell
+python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
+```
+
 ## 当前产物
 
 - `reports/mu_okx_backtest.md`：当前 OKX baseline Markdown 回测报告。
@@ -97,6 +130,9 @@ python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
 - baseline 的入场信号仍是二次回踩限价触发，但回测没有建模挂单队列、盘口价差、部分成交或错失成交；因此默认费用采用 `market/taker` 万五，避免用 `limit/maker` 万二高估结果。
+- OKX API 工具默认使用环境变量读取密钥，不应把 API key、secret、passphrase 写入代码、报告或命令输出。
+- 生产实盘下单入口尚未实现；当前只允许 read-only、shadow、本地 dry-run，以及显式确认后的 OKX demo trading 下单。
+- v1 不接入策略自动下单，不处理生产订单生命周期、撤单/重试、成交回报、仓位同步、风控熔断或幂等执行。
 
 ## 策略组说明
 
