@@ -192,8 +192,56 @@ class OKXExecutionCLITests(unittest.TestCase):
 
         with patch("mu_strategy.live.okx_cli.OKXCredentials.from_env") as from_env:
             from_env.return_value = OKXCredentials("key", "secret", "passphrase")
-            with patch("mu_strategy.live.okx_cli.OKXRestClient.place_demo_order") as place_demo_order:
-                place_demo_order.return_value = {"code": "0", "data": [{"ordId": "1"}], "msg": ""}
+            with patch("mu_strategy.live.okx_cli.OKXRestClient.get_instruments") as get_instruments:
+                get_instruments.return_value = {"code": "0", "data": [{"instId": "MU-USDT-SWAP"}], "msg": ""}
+                with patch("mu_strategy.live.okx_cli.OKXRestClient.place_demo_order") as place_demo_order:
+                    place_demo_order.return_value = {"code": "0", "data": [{"ordId": "1"}], "msg": ""}
+                    exit_code = main(
+                        [
+                            "demo-order",
+                            "--inst-id",
+                            "MU-USDT-SWAP",
+                            "--side",
+                            "buy",
+                            "--size",
+                            "1",
+                            "--confirm-demo-order",
+                        ],
+                        stdout=stdout,
+                    )
+
+        self.assertEqual(0, exit_code)
+        get_instruments.assert_called_once_with(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+        place_demo_order.assert_called_once()
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("sent_demo_order", output["mode"])
+        self.assertEqual("0", output["response"]["code"])
+
+    def test_demo_order_command_blocks_confirm_when_demo_instrument_is_unavailable(self):
+        class StubClient:
+            def __init__(self, *, credentials, demo):
+                self.credentials = credentials
+                self.demo = demo
+                self.place_calls = 0
+
+            def get_instruments(self, *, inst_type, inst_id):
+                self.requested_inst_type = inst_type
+                self.requested_inst_id = inst_id
+                return {
+                    "code": "51001",
+                    "data": [],
+                    "msg": "Instrument ID, Instrument ID code, or Spread ID doesn't exist.",
+                }
+
+            def place_demo_order(self, request, *, confirm_demo_order):
+                self.place_calls += 1
+                raise AssertionError("place_demo_order should not be called for unavailable demo instruments")
+
+        stdout = io.StringIO()
+
+        with patch("mu_strategy.live.okx_cli.OKXCredentials.from_env") as from_env:
+            from_env.return_value = OKXCredentials("key", "secret", "passphrase")
+            with patch("mu_strategy.live.okx_cli.OKXRestClient", StubClient):
                 exit_code = main(
                     [
                         "demo-order",
@@ -202,17 +250,28 @@ class OKXExecutionCLITests(unittest.TestCase):
                         "--side",
                         "buy",
                         "--size",
-                        "1",
+                        "0.01",
                         "--confirm-demo-order",
                     ],
                     stdout=stdout,
                 )
 
         self.assertEqual(0, exit_code)
-        place_demo_order.assert_called_once()
         output = json.loads(stdout.getvalue())
-        self.assertEqual("sent_demo_order", output["mode"])
-        self.assertEqual("0", output["response"]["code"])
+        self.assertEqual("blocked_demo_order", output["mode"])
+        self.assertEqual("blocked", output["status"])
+        self.assertEqual("demo_instrument_unavailable", output["reason"])
+        self.assertEqual("51001", output["instrument"]["code"])
+        self.assertEqual(
+            [
+                {
+                    "component": "instrument",
+                    "code": "51001",
+                    "msg": "Instrument ID, Instrument ID code, or Spread ID doesn't exist.",
+                }
+            ],
+            output["warnings"],
+        )
 
     def test_demo_order_command_passes_explicit_credential_source(self):
         stdout = io.StringIO()

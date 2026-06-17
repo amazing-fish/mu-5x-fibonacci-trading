@@ -145,9 +145,17 @@ class OKXRestClientTests(unittest.TestCase):
         self.assertEqual("GET", call["method"])
         self.assertTrue(call["url"].endswith("/api/v5/public/instruments?instType=SWAP&instId=MU-USDT-SWAP"))
         self.assertNotIn("OK-ACCESS-KEY", call["headers"])
-        self.assertNotIn("x-simulated-trading", call["headers"])
+        self.assertEqual("1", call["headers"]["x-simulated-trading"])
         self.assertEqual("Mozilla/5.0", call["headers"]["User-Agent"])
         self.assertEqual("application/json", call["headers"]["Accept"])
+
+    def test_demo_public_instrument_request_uses_simulated_trading_header(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(credentials=None, demo=True, transport=transport)
+
+        client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+
+        self.assertEqual("1", transport.calls[0]["headers"]["x-simulated-trading"])
 
 
 class ShadowExecutionLedgerTests(unittest.TestCase):
@@ -293,6 +301,24 @@ class DemoOrderGuardTests(unittest.TestCase):
                     side="buy",
                     size="1",
                     client_order_id="demo-001",
+                )
+            )
+
+    def test_demo_order_rejects_price_on_market_order(self):
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=RecordingTransport(),
+        )
+
+        with self.assertRaisesRegex(ValueError, "price"):
+            client.prepare_demo_order(
+                DemoOrderRequest(
+                    inst_id="MU-USDT-SWAP",
+                    side="buy",
+                    size="1",
+                    order_type="market",
+                    price="100",
                 )
             )
 

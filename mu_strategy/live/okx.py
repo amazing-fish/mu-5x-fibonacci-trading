@@ -71,6 +71,8 @@ class DemoOrderRequest:
             raise ValueError("side must be buy or sell")
         if self.order_type not in {"market", "limit", "post_only", "fok", "ioc"}:
             raise ValueError("unsupported order_type")
+        if self.order_type == "market" and self.price is not None:
+            raise ValueError("price is not allowed for market orders")
         if self.order_type in {"limit", "post_only", "fok", "ioc"} and self.price is None:
             raise ValueError("price is required for non-market orders")
         body: dict[str, Any] = {
@@ -177,7 +179,7 @@ class OKXRestClient:
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json",
         }
-        if self.demo and private:
+        if self.demo:
             headers["x-simulated-trading"] = "1"
         if private:
             if self.credentials is None:

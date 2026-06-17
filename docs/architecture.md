@@ -81,6 +81,7 @@ Safety boundaries:
 - Production live order placement is not implemented.
 - The strategy engine does not call this package to place orders automatically.
 - Demo orders require `--confirm-demo-order`; without it, the CLI returns a sanitized dry-run request.
+- Confirmed demo orders preflight the demo instrument endpoint first and block unsupported instruments before sending an order request.
 - Secrets are read from environment variables and redacted from dry-run output.
 - Shadow execution writes local audit rows only and never calls OKX.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, risk kill-switches, or execution idempotency.

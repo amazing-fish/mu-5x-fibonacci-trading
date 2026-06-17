@@ -64,6 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     demo_order = subparsers.add_parser("demo-order", help="Prepare or explicitly send an OKX demo trading order.")
     demo_order.add_argument("--inst-id", required=True)
+    demo_order.add_argument("--inst-type", default="SWAP")
     demo_order.add_argument("--side", choices=("buy", "sell"), required=True)
     demo_order.add_argument("--size", required=True)
     demo_order.add_argument("--order-type", default="market", choices=("market", "limit", "post_only", "fok", "ioc"))
@@ -127,6 +128,16 @@ def _run_demo_order(args: argparse.Namespace) -> dict:
     if not args.confirm_demo_order:
         prepared = client.prepare_demo_order(request)
         return {"mode": "dry_run", "request": prepared.sanitized()}
+    instrument = client.get_instruments(inst_type=args.inst_type, inst_id=args.inst_id)
+    instrument_warnings = _instrument_unavailable_warnings(instrument)
+    if instrument_warnings:
+        return {
+            "mode": "blocked_demo_order",
+            "status": "blocked",
+            "reason": "demo_instrument_unavailable",
+            "instrument": instrument,
+            "warnings": instrument_warnings,
+        }
     response = client.place_demo_order(request, confirm_demo_order=True)
     return {"mode": "sent_demo_order", "response": response}
 
@@ -148,6 +159,22 @@ def _response_warnings(output: dict, components: tuple[str, ...]) -> list[dict[s
             }
         )
     return warnings
+
+
+def _instrument_unavailable_warnings(instrument: dict) -> list[dict[str, str]]:
+    warnings = _response_warnings({"instrument": instrument}, ("instrument",))
+    if warnings:
+        return warnings
+    data = instrument.get("data")
+    if isinstance(data, list) and data:
+        return []
+    return [
+        {
+            "component": "instrument",
+            "code": str(instrument.get("code", "")),
+            "msg": "No instrument rows returned from OKX demo instruments endpoint.",
+        }
+    ]
 
 
 if __name__ == "__main__":
