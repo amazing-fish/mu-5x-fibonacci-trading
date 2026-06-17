@@ -48,7 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
     read_only.add_argument("--ccy", default="USDT")
     read_only.add_argument("--demo", action="store_true")
     read_only.add_argument("--public-only", action="store_true")
-    read_only.add_argument("--credential-source", default="auto", choices=CREDENTIAL_SOURCE_CHOICES)
+    read_only.add_argument("--credential-source", choices=CREDENTIAL_SOURCE_CHOICES)
 
     shadow = subparsers.add_parser("shadow-record", help="Append a local shadow execution event.")
     shadow.add_argument("--ledger", type=Path, default=Path("reports/live/shadow_execution.jsonl"))
@@ -73,7 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     demo_order.add_argument("--pos-side")
     demo_order.add_argument("--reduce-only", action="store_true")
     demo_order.add_argument("--confirm-demo-order", action="store_true")
-    demo_order.add_argument("--credential-source", default="auto", choices=CREDENTIAL_SOURCE_CHOICES)
+    demo_order.add_argument("--credential-source", choices=CREDENTIAL_SOURCE_CHOICES)
     return parser
 
 

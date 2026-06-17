@@ -91,7 +91,7 @@ python -m mu_strategy.live.okx_cli read-only --demo --inst-type SWAP --inst-id M
 ```
 
 Windows 上默认会优先读取持久化的 User/Machine 环境变量，避免 Codex 等长驻进程沿用旧的进程环境；如需强制使用当前 shell 的临时变量，设置 `$env:OKX_ENV_SOURCE="process"`。
-也可以在需要凭据的 CLI 命令上显式传入 `--credential-source auto|process|user|machine`。`read-only` 输出会保留 OKX 原始响应，并额外给出 `status` 与 `warnings`；例如 demo positions 对单合约返回业务错误时会进入 warning，而不会被误判为认证失败。
+也可以在需要凭据的 CLI 命令上显式传入 `--credential-source auto|process|user|machine`。未传 `--credential-source` 时，CLI 会先尊重 `OKX_ENV_SOURCE`，再回到自动选择。`read-only` 输出会保留 OKX 原始响应，并额外给出 `status` 与 `warnings`；例如 demo positions 对单合约返回业务错误时会进入 warning，而不会被误判为认证失败。
 
 记录 shadow execution 事件，不发订单：
 
