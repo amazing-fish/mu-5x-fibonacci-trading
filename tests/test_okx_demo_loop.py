@@ -37,7 +37,7 @@ class StubBroker:
 
     def place_limit_buy(self, *, inst_id, size, price, client_order_id, confirm_demo_order, td_mode="isolated", pos_side=None):
         self.calls.append(("place_limit_buy", inst_id, size, price, client_order_id, confirm_demo_order, td_mode, pos_side))
-        return {"code": "0", "data": [{"ordId": "1", "clOrdId": client_order_id}], "msg": ""}
+        return {"code": "0", "data": [{"ordId": "1", "clOrdId": client_order_id, "sCode": "0", "sMsg": ""}], "msg": ""}
 
 
 class OKXDemoLoopTests(unittest.TestCase):
@@ -156,6 +156,31 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("51008", result["orders"][0]["response"]["code"])
         self.assertEqual("blocked", result["orders"][1]["status"])
         self.assertEqual("order_placement_failed", result["orders"][1]["reason"])
+
+    def test_run_once_blocks_failed_okx_order_data_scode(self):
+        class FailedOrderDataBroker(StubBroker):
+            def place_limit_buy(self, *, inst_id, size, price, client_order_id, confirm_demo_order, td_mode="isolated", pos_side=None):
+                self.calls.append(("place_limit_buy", inst_id, size, price, client_order_id, confirm_demo_order, td_mode, pos_side))
+                return {
+                    "code": "0",
+                    "data": [{"ordId": "", "clOrdId": client_order_id, "sCode": "51008", "sMsg": "Insufficient margin"}],
+                    "msg": "",
+                }
+
+        broker = FailedOrderDataBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, notional_usdt=10.0),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual("blocked", result["orders"][0]["status"])
+        self.assertEqual("order_placement_failed", result["orders"][0]["reason"])
+        self.assertEqual("51008", result["orders"][0]["response"]["data"][0]["sCode"])
 
     def test_run_once_blocks_failed_leverage_setup_response(self):
         class FailedLeverageBroker(StubBroker):

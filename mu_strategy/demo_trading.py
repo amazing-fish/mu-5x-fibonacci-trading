@@ -114,7 +114,7 @@ def run_once(
             continue
 
         leverage_response = broker.set_leverage(inst_id=result.symbol, lever=config.leverage, margin_mode="isolated")
-        if str(leverage_response.get("code", "")) not in {"", "0"}:
+        if _okx_response_failed(leverage_response):
             plan["status"] = "blocked"
             plan["reason"] = "leverage_setup_failed"
             plan["response"] = leverage_response
@@ -128,7 +128,7 @@ def run_once(
             client_order_id=plan["client_order_id"],
             confirm_demo_order=True,
         )
-        if str(response.get("code", "")) not in {"", "0"}:
+        if _okx_response_failed(response):
             plan["status"] = "blocked"
             plan["reason"] = "order_placement_failed"
             plan["response"] = response
@@ -221,6 +221,19 @@ def _account_context_error(account_context: dict[str, Any]) -> dict[str, str] | 
                 "msg": str(response.get("msg", "")) if isinstance(response, dict) else "",
             }
     return None
+
+
+def _okx_response_failed(response: dict[str, Any]) -> bool:
+    if str(response.get("code", "")) not in {"", "0"}:
+        return True
+
+    data = response.get("data")
+    if not isinstance(data, list):
+        return False
+    for row in data:
+        if isinstance(row, dict) and "sCode" in row and str(row.get("sCode", "")) not in {"", "0"}:
+            return True
+    return False
 
 
 def _decimal(value: Any) -> Decimal:
