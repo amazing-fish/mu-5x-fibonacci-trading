@@ -113,7 +113,14 @@ def run_once(
             orders.append(plan)
             continue
 
-        broker.set_leverage(inst_id=result.symbol, lever=config.leverage, margin_mode="isolated")
+        leverage_response = broker.set_leverage(inst_id=result.symbol, lever=config.leverage, margin_mode="isolated")
+        if str(leverage_response.get("code", "")) not in {"", "0"}:
+            plan["status"] = "blocked"
+            plan["reason"] = "leverage_setup_failed"
+            plan["response"] = leverage_response
+            orders.append(plan)
+            continue
+
         response = broker.place_limit_buy(
             inst_id=result.symbol,
             size=plan["size"],

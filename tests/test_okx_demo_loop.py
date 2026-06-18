@@ -157,6 +157,28 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("blocked", result["orders"][1]["status"])
         self.assertEqual("order_placement_failed", result["orders"][1]["reason"])
 
+    def test_run_once_blocks_failed_leverage_setup_response(self):
+        class FailedLeverageBroker(StubBroker):
+            def set_leverage(self, *, inst_id, lever, margin_mode="isolated"):
+                self.calls.append(("set_leverage", inst_id, lever, margin_mode))
+                return {"code": "51000", "data": [], "msg": "Leverage setting failed"}
+
+        broker = FailedLeverageBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, notional_usdt=10.0),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual("blocked", result["orders"][0]["status"])
+        self.assertEqual("leverage_setup_failed", result["orders"][0]["reason"])
+        self.assertEqual("51000", result["orders"][0]["response"]["code"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_does_not_order_on_watch_action(self):
         broker = StubBroker()
 
