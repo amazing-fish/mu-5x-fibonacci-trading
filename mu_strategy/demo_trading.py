@@ -121,6 +121,12 @@ def run_once(
             client_order_id=plan["client_order_id"],
             confirm_demo_order=True,
         )
+        if str(response.get("code", "")) not in {"", "0"}:
+            plan["status"] = "blocked"
+            plan["reason"] = "order_placement_failed"
+            plan["response"] = response
+            orders.append(plan)
+            continue
         plan["status"] = "submitted"
         plan["response"] = response
         orders.append(plan)

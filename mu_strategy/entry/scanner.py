@@ -6,7 +6,7 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.execution.plan import initial_stop_price
 from mu_strategy.indicators import macd, rsi
 from mu_strategy.models import Candle, closes
-from mu_strategy.strategy import StrategyConfig, nearest_fib_retest_level, should_enter_long
+from mu_strategy.strategy import StrategyConfig, is_preferred_us_cash_window, nearest_fib_retest_level, should_enter_long
 
 
 @dataclass(frozen=True)
@@ -71,13 +71,25 @@ def scan_entry(
     if blocked is not None:
         return blocked
 
+    if not is_preferred_us_cash_window(last_candle.open_time_ms, config):
+        return EntryScanResult(
+            symbol=symbol,
+            action="wait",
+            reason="current bar is outside configured trading window",
+            last_close=last_candle.close,
+            regime_1h=last_regime,
+            rsi14=last_rsi,
+            macd_hist=last_hist,
+            macd_hist_prev=previous_hist,
+        )
+
     signal = _latest_recent_signal(
         candles_15m,
         hourly_context,
         rsi_values,
         hist_values,
         config=config,
-        lookback_bars=lookback_bars,
+        lookback_bars=_effective_lookback_bars(config, lookback_bars),
     )
     if signal is None:
         return EntryScanResult(
@@ -168,6 +180,8 @@ def _latest_recent_signal(
     start = max(1, len(candles) - max(1, lookback_bars))
     latest: tuple[Candle, float] | None = None
     for index in range(start, len(candles)):
+        if not is_preferred_us_cash_window(candles[index].open_time_ms, config):
+            continue
         fib_level = nearest_fib_retest_level(candles, index, config)
         if fib_level is None:
             continue
@@ -184,6 +198,12 @@ def _latest_recent_signal(
         if entry_signal.allowed:
             latest = (candles[index], fib_level)
     return latest
+
+
+def _effective_lookback_bars(config: StrategyConfig, requested_lookback_bars: int) -> int:
+    if config.entry_execution != "second_pullback":
+        return requested_lookback_bars
+    return min(requested_lookback_bars, config.second_pullback_wait_bars + 1)
 
 
 def _series_value(values: list[float], index: int) -> float:

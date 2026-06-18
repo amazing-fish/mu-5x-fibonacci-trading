@@ -130,6 +130,33 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("100.1", place_call[3])
         self.assertTrue(place_call[5])
 
+    def test_run_once_blocks_failed_okx_order_response(self):
+        class FailedOrderBroker(StubBroker):
+            def place_limit_buy(self, *, inst_id, size, price, client_order_id, confirm_demo_order, td_mode="isolated", pos_side=None):
+                self.calls.append(("place_limit_buy", inst_id, size, price, client_order_id, confirm_demo_order, td_mode, pos_side))
+                return {"code": "51008", "data": [], "msg": "Insufficient balance"}
+
+        broker = FailedOrderBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=2, dry_run=False, notional_usdt=10.0, max_open_positions=1),
+            broker=broker,
+            universe_provider=lambda limit: [
+                OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0),
+                OKXSwapTicker("ETH-USDT-SWAP", 101.0, 900.0),
+            ],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual(2, len(result["orders"]))
+        self.assertEqual("blocked", result["orders"][0]["status"])
+        self.assertEqual("order_placement_failed", result["orders"][0]["reason"])
+        self.assertEqual("51008", result["orders"][0]["response"]["code"])
+        self.assertEqual("blocked", result["orders"][1]["status"])
+        self.assertEqual("order_placement_failed", result["orders"][1]["reason"])
+
     def test_run_once_does_not_order_on_watch_action(self):
         broker = StubBroker()
 
