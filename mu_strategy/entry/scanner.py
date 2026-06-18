@@ -96,7 +96,7 @@ def scan_entry(
     if distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct:
         return EntryScanResult(
             symbol=symbol,
-            action="watch",
+            action="enter",
             reason="recent retest confirmed and price is near fib zone",
             last_close=last_candle.close,
             regime_1h=last_regime,

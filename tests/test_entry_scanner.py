@@ -6,7 +6,7 @@ from mu_strategy.strategies.registry import baseline_strategy_group
 
 
 class EntryScannerTests(unittest.TestCase):
-    def test_scan_entry_returns_watch_when_recent_retest_is_near_fib(self):
+    def test_scan_entry_returns_enter_when_recent_retest_is_near_fib(self):
         from mu_strategy.entry.scanner import scan_entry
 
         candles = [_candle(i * 900_000, 100 + i * 0.1) for i in range(40)]
@@ -29,7 +29,7 @@ class EntryScannerTests(unittest.TestCase):
                             lookback_bars=4,
                         )
 
-        self.assertEqual("watch", result.action)
+        self.assertEqual("enter", result.action)
         self.assertEqual("recent retest confirmed and price is near fib zone", result.reason)
         self.assertEqual("green", result.regime_1h)
         self.assertAlmostEqual(100.0, result.fib_level)

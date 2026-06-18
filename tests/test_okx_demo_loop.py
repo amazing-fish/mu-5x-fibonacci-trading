@@ -54,7 +54,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             broker=None,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
-            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _watch(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol),
         )
 
         self.assertEqual("dry_run", result["mode"])
@@ -84,7 +84,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
-            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _watch(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol),
         )
 
         self.assertEqual("blocked", result["orders"][0]["status"])
@@ -103,7 +103,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
-            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _watch(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol),
         )
 
         self.assertEqual("blocked", result["mode"])
@@ -119,7 +119,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
-            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _watch(symbol, trigger_price=100.19),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
         )
 
         self.assertEqual("live_demo", result["mode"])
@@ -129,6 +129,21 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("9.99", place_call[2])
         self.assertEqual("100.1", place_call[3])
         self.assertTrue(place_call[5])
+
+    def test_run_once_does_not_order_on_watch_action(self):
+        broker = StubBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, notional_usdt=10.0),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _scan_result(symbol, action="watch", trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_cli_once_dry_run_uses_runner_without_credentials(self):
         from mu_strategy.commands.okx_demo_loop import main
@@ -177,10 +192,14 @@ def _bundle(symbol: str) -> CandleBundle:
     )
 
 
-def _watch(symbol: str, trigger_price: float = 100.0) -> EntryScanResult:
+def _entry(symbol: str, trigger_price: float = 100.0) -> EntryScanResult:
+    return _scan_result(symbol, action="enter", trigger_price=trigger_price)
+
+
+def _scan_result(symbol: str, *, action: str, trigger_price: float = 100.0) -> EntryScanResult:
     return EntryScanResult(
         symbol=symbol,
-        action="watch",
+        action=action,
         reason="recent retest confirmed and price is near fib zone",
         last_close=100.5,
         regime_1h="green",

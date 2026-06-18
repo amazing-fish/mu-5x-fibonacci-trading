@@ -86,7 +86,7 @@ def run_once(
         )
         scans.append(_scan_payload(result, bundle))
 
-        if result.action != "watch" or result.trigger_price is None:
+        if result.action != "enter" or result.trigger_price is None:
             continue
 
         plan = _build_order_plan(result, config)
