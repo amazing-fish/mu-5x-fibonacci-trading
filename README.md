@@ -14,13 +14,14 @@
 - OKX 增量缓存，只使用已确认 K 线，并按请求的 `days` 窗口裁剪缓存。
 
 执行规划模块只输出规划决策，不会下单，也不会调用 broker/order API。
-OKX API 相关工具独立放在 `mu_strategy.live` 下，当前只覆盖只读检查、shadow execution 本地审计、以及需要显式确认的 OKX demo trading 订单。
+OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 OKX API 适配，`mu_strategy.demo_trading` 负责 5 分钟扫描、风控、幂等和 demo 限价单编排；它们只消费固定策略结果，不反向修改研究/回测逻辑。
 
 ## 架构
 
 当前包结构见 [docs/architecture.md](docs/architecture.md)。
 
-- `mu_strategy.market_data`：OKX/Binance 数据提供方与缓存策略。
+- `mu_strategy.market_data`：OKX/Binance 数据提供方、缓存策略、Top USDT-SWAP 标的池与 `15m/1h` K 线包。
+- `mu_strategy.entry`：统一入场扫描服务，输出固定结构的 `EntryScanResult`。
 - `mu_strategy.strategies`：策略组注册表与组件元数据。
 - `mu_strategy.experiments`：walk-forward 与消融实验。
 - `mu_strategy.viz`：HTML 回测报告渲染。
@@ -28,6 +29,7 @@ OKX API 相关工具独立放在 `mu_strategy.live` 下，当前只覆盖只读�
 - `mu_strategy.selection`：固定策略下的候选标的排序。
 - `mu_strategy.execution`：非交易的入场与风险规划。
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
+- `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、风险上限、`clOrdId` 幂等和小额限价单。
 
 兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`。
 
@@ -112,6 +114,20 @@ OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；demo 模式�
 python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
 ```
 
+运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单：
+
+```powershell
+python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 28
+```
+
+持续每 5 分钟扫描并允许 OKX Demo 限价买入，需要显式确认并提供 `OKX_API_KEY`、`OKX_SECRET_KEY`、`OKX_PASSPHRASE`：
+
+```powershell
+python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-seconds 300 --limit 10 --notional-usdt 10 --max-open-positions 3
+```
+
+默认每单 `10 USDT`，最多 `3` 个 open order/position，使用 isolated `5x` 和 Fib 附近限价买入；不会市价追价。缺少凭证时 dry-run 仍可用，确认下单模式会在发送任何订单前失败。
+
 ## 当前产物
 
 - `reports/mu_okx_backtest.md`：当前 OKX baseline Markdown 回测报告。
@@ -128,11 +144,12 @@ python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
+- 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
 - baseline 的入场信号仍是二次回踩限价触发，但回测没有建模挂单队列、盘口价差、部分成交或错失成交；因此默认费用采用 `market/taker` 万五，避免用 `limit/maker` 万二高估结果。
 - OKX API 工具默认使用环境变量读取密钥，不应把 API key、secret、passphrase 写入代码、报告或命令输出。
 - 生产实盘下单入口尚未实现；当前只允许 read-only、shadow、本地 dry-run，以及显式确认后的 OKX demo trading 下单。
-- v1 不接入策略自动下单，不处理生产订单生命周期、撤单/重试、成交回报、仓位同步、风控熔断或幂等执行。
+- OKX Demo loop 已实现 `clOrdId` 幂等、open exposure 上限、isolated `5x` 和限价买入；仍不处理生产订单生命周期、撤单/重试、成交回报、仓位同步或风控熔断。
 
 ## 策略组说明
 

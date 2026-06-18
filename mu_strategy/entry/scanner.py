@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from mu_strategy.cli import build_hourly_context
+from mu_strategy.execution.plan import initial_stop_price
+from mu_strategy.indicators import macd, rsi
+from mu_strategy.models import Candle, closes
+from mu_strategy.strategy import StrategyConfig, nearest_fib_retest_level, should_enter_long
+
+
+@dataclass(frozen=True)
+class EntryScanResult:
+    symbol: str
+    action: str
+    reason: str
+    last_close: float | None
+    regime_1h: str
+    rsi14: float | None
+    macd_hist: float | None
+    macd_hist_prev: float | None
+    fib_level: float | None = None
+    fib_distance_pct: float | None = None
+    trigger_price: float | None = None
+    initial_stop: float | None = None
+    signal_time_ms: int | None = None
+
+
+def scan_entry(
+    symbol: str,
+    candles_15m: list[Candle],
+    candles_1h: list[Candle],
+    *,
+    config: StrategyConfig,
+    lookback_bars: int = 16,
+    max_fib_distance_pct: float = 0.01,
+) -> EntryScanResult:
+    if not candles_15m:
+        return EntryScanResult(
+            symbol=symbol,
+            action="wait",
+            reason="no 15m candles",
+            last_close=None,
+            regime_1h="yellow",
+            rsi14=None,
+            macd_hist=None,
+            macd_hist_prev=None,
+        )
+
+    close_values = closes(candles_15m)
+    rsi_values = rsi(close_values, 14)
+    _, _, hist_values = macd(close_values)
+    hourly_context = build_hourly_context(candles_15m, candles_1h)
+
+    last_index = len(candles_15m) - 1
+    last_candle = candles_15m[last_index]
+    last_regime = hourly_context.get(last_candle.open_time_ms, "yellow")
+    last_rsi = _series_value(rsi_values, last_index)
+    last_hist = _series_value(hist_values, last_index)
+    previous_hist = _series_value(hist_values, max(0, last_index - 1))
+
+    blocked = _blocked_result(
+        symbol=symbol,
+        last_candle=last_candle,
+        regime=last_regime,
+        rsi14=last_rsi,
+        macd_hist=last_hist,
+        macd_hist_prev=previous_hist,
+        config=config,
+    )
+    if blocked is not None:
+        return blocked
+
+    signal = _latest_recent_signal(
+        candles_15m,
+        hourly_context,
+        rsi_values,
+        hist_values,
+        config=config,
+        lookback_bars=lookback_bars,
+    )
+    if signal is None:
+        return EntryScanResult(
+            symbol=symbol,
+            action="wait",
+            reason="filters are not fully blocked, but no recent confirmed fib retest",
+            last_close=last_candle.close,
+            regime_1h=last_regime,
+            rsi14=last_rsi,
+            macd_hist=last_hist,
+            macd_hist_prev=previous_hist,
+        )
+
+    signal_candle, fib_level = signal
+    distance_pct = (last_candle.close / fib_level) - 1 if fib_level else None
+    if distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct:
+        return EntryScanResult(
+            symbol=symbol,
+            action="watch",
+            reason="recent retest confirmed and price is near fib zone",
+            last_close=last_candle.close,
+            regime_1h=last_regime,
+            rsi14=last_rsi,
+            macd_hist=last_hist,
+            macd_hist_prev=previous_hist,
+            fib_level=fib_level,
+            fib_distance_pct=distance_pct,
+            trigger_price=fib_level,
+            initial_stop=initial_stop_price(fib_level, config),
+            signal_time_ms=signal_candle.open_time_ms,
+        )
+
+    return EntryScanResult(
+        symbol=symbol,
+        action="wait",
+        reason="recent retest confirmed but price has moved away from fib zone",
+        last_close=last_candle.close,
+        regime_1h=last_regime,
+        rsi14=last_rsi,
+        macd_hist=last_hist,
+        macd_hist_prev=previous_hist,
+        fib_level=fib_level,
+        fib_distance_pct=distance_pct,
+        signal_time_ms=signal_candle.open_time_ms,
+    )
+
+
+def _blocked_result(
+    *,
+    symbol: str,
+    last_candle: Candle,
+    regime: str,
+    rsi14: float,
+    macd_hist: float,
+    macd_hist_prev: float,
+    config: StrategyConfig,
+) -> EntryScanResult | None:
+    if regime == "red":
+        reason = "1h regime is red"
+    elif rsi14 < config.rsi_floor:
+        reason = "15m RSI is below floor"
+    elif macd_hist < macd_hist_prev and macd_hist < 0:
+        reason = "15m MACD histogram still weakening"
+    else:
+        return None
+
+    return EntryScanResult(
+        symbol=symbol,
+        action="skip",
+        reason=reason,
+        last_close=last_candle.close,
+        regime_1h=regime,
+        rsi14=rsi14,
+        macd_hist=macd_hist,
+        macd_hist_prev=macd_hist_prev,
+    )
+
+
+def _latest_recent_signal(
+    candles: list[Candle],
+    hourly_context: dict[int, str],
+    rsi_values: list[float],
+    hist_values: list[float],
+    *,
+    config: StrategyConfig,
+    lookback_bars: int,
+) -> tuple[Candle, float] | None:
+    start = max(1, len(candles) - max(1, lookback_bars))
+    latest: tuple[Candle, float] | None = None
+    for index in range(start, len(candles)):
+        fib_level = nearest_fib_retest_level(candles, index, config)
+        if fib_level is None:
+            continue
+        previous_hist = _series_value(hist_values, max(0, index - 1))
+        entry_signal = should_enter_long(
+            candles[index],
+            fib_level,
+            hourly_context.get(candles[index].open_time_ms, "yellow"),
+            _series_value(rsi_values, index),
+            _series_value(hist_values, index),
+            previous_hist,
+            config,
+        )
+        if entry_signal.allowed:
+            latest = (candles[index], fib_level)
+    return latest
+
+
+def _series_value(values: list[float], index: int) -> float:
+    if not values:
+        return 0.0
+    return values[min(index, len(values) - 1)]

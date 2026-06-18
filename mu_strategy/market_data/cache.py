@@ -10,6 +10,11 @@ from mu_strategy.models import Candle
 
 
 CSV_FIELDS = ["open_time_ms", "open_time_iso", "open", "high", "low", "close", "volume"]
+DEFAULT_MAX_CLOSE_TO_NEXT_OPEN_GAP_PCT = 0.02
+
+
+class DataQualityError(ValueError):
+    pass
 
 
 def cache_path(symbol: str, interval: str, *, days: int, data_dir: Path = Path("data"), source: str = "binance") -> Path:
@@ -50,6 +55,29 @@ def prune_candles_to_window(candles: list[Candle], *, days: int, end_time_ms: in
     return [bar for bar in dedupe_candles(candles) if start_time_ms <= bar.open_time_ms <= end_time_ms]
 
 
+def validate_close_to_next_open_gaps(
+    candles: list[Candle],
+    *,
+    max_gap_pct: float = DEFAULT_MAX_CLOSE_TO_NEXT_OPEN_GAP_PCT,
+) -> None:
+    if max_gap_pct < 0:
+        raise ValueError("max_gap_pct must be non-negative")
+    for previous, current in zip(candles, candles[1:]):
+        if previous.close == 0:
+            continue
+        gap_pct = abs((current.open / previous.close) - 1)
+        if gap_pct > max_gap_pct:
+            raise DataQualityError(
+                "close_to_next_open_gap "
+                f"previous_time={previous.open_time_iso} "
+                f"current_time={current.open_time_iso} "
+                f"previous_close={previous.close:.8f} "
+                f"current_open={current.open:.8f} "
+                f"gap_pct={gap_pct:.6f} "
+                f"max_gap_pct={max_gap_pct:.6f}"
+            )
+
+
 def cached_historical(
     symbol: str,
     interval: str,
@@ -68,16 +96,19 @@ def cached_historical(
     path = cache_path(symbol, interval, days=days, data_dir=data_dir, source=source)
     if path.exists() and not refresh:
         candles = read_csv(path)
+        validate_close_to_next_open_gaps(candles)
         if source == "okx" and incremental and candles:
             since_time_ms = candles[-2].open_time_ms if len(candles) >= 2 else candles[0].open_time_ms
             try:
                 fetched = fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
             except Exception:
                 candles = prune_candles_to_window(candles, days=days)
+                validate_close_to_next_open_gaps(candles)
                 write_csv(candles, path)
                 return candles, path
             candles = merge_incremental_candles(candles, fetched)
             candles = prune_candles_to_window(candles, days=days)
+            validate_close_to_next_open_gaps(candles)
             write_csv(candles, path)
         return candles, path
 
@@ -85,5 +116,6 @@ def cached_historical(
         candles = fetch_okx_historical(symbol, interval, days=days)
     else:
         candles = fetch_historical(symbol, interval, days=days)
+    validate_close_to_next_open_gaps(candles)
     write_csv(candles, path)
     return candles, path
