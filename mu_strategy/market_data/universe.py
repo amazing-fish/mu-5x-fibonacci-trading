@@ -43,7 +43,7 @@ def select_top_okx_usdt_swaps(rows: list[dict], *, limit: int) -> list[OKXSwapTi
         if volume <= 0 or last <= 0:
             continue
         candidates.append(OKXSwapTicker(inst_id=inst_id, last=last, volume_ccy_24h=volume))
-    return sorted(candidates, key=lambda item: item.volume_ccy_24h, reverse=True)[:limit]
+    return sorted(candidates, key=_usdt_turnover_24h, reverse=True)[:limit]
 
 
 def top_okx_usdt_swaps(*, limit: int = 10) -> list[OKXSwapTicker]:
@@ -55,3 +55,7 @@ def _float(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _usdt_turnover_24h(ticker: OKXSwapTicker) -> float:
+    return ticker.last * ticker.volume_ccy_24h

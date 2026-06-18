@@ -17,7 +17,7 @@ class MarketDataSymbolTests(unittest.TestCase):
 
 
 class MarketDataUniverseTests(unittest.TestCase):
-    def test_select_top_okx_usdt_swaps_filters_and_sorts_by_base_volume(self):
+    def test_select_top_okx_usdt_swaps_filters_and_sorts_by_usdt_turnover(self):
         from mu_strategy.market_data.universe import select_top_okx_usdt_swaps
 
         rows = [
@@ -26,12 +26,13 @@ class MarketDataUniverseTests(unittest.TestCase):
             {"instId": "BTC-USD-SWAP", "instType": "SWAP", "volCcy24h": "999", "last": "65000"},
             {"instId": "DOGE-USDT-SWAP", "instType": "SWAP", "volCcy24h": "0", "last": "0.1"},
             {"instId": "SOL-USDT-SWAP", "instType": "SWAP", "volCcy24h": "30", "last": "75"},
+            {"instId": "PEPE-USDT-SWAP", "instType": "SWAP", "volCcy24h": "1000000", "last": "0.000001"},
         ]
 
         selected = select_top_okx_usdt_swaps(rows, limit=2)
 
-        self.assertEqual(["BTC-USDT-SWAP", "SOL-USDT-SWAP"], [item.inst_id for item in selected])
-        self.assertEqual([50.0, 30.0], [item.volume_ccy_24h for item in selected])
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"], [item.inst_id for item in selected])
+        self.assertEqual([50.0, 20.0], [item.volume_ccy_24h for item in selected])
 
 
 class CandleBundleServiceTests(unittest.TestCase):

@@ -59,6 +59,39 @@ def scan_entry(
     last_hist = _series_value(hist_values, last_index)
     previous_hist = _series_value(hist_values, max(0, last_index - 1))
 
+    if config.entry_execution == "second_pullback":
+        pending_signal = _latest_recent_signal(
+            candles_15m,
+            hourly_context,
+            rsi_values,
+            hist_values,
+            config=config,
+            lookback_bars=_effective_lookback_bars(config, lookback_bars),
+        )
+        if pending_signal is not None:
+            if not is_preferred_us_cash_window(last_candle.open_time_ms, config):
+                return EntryScanResult(
+                    symbol=symbol,
+                    action="wait",
+                    reason="current bar is outside configured trading window",
+                    last_close=last_candle.close,
+                    regime_1h=last_regime,
+                    rsi14=last_rsi,
+                    macd_hist=last_hist,
+                    macd_hist_prev=previous_hist,
+                )
+            return _result_for_recent_signal(
+                symbol=symbol,
+                last_candle=last_candle,
+                regime=last_regime,
+                rsi14=last_rsi,
+                macd_hist=last_hist,
+                macd_hist_prev=previous_hist,
+                signal=pending_signal,
+                max_fib_distance_pct=max_fib_distance_pct,
+                config=config,
+            )
+
     blocked = _blocked_result(
         symbol=symbol,
         last_candle=last_candle,
@@ -103,6 +136,31 @@ def scan_entry(
             macd_hist_prev=previous_hist,
         )
 
+    return _result_for_recent_signal(
+        symbol=symbol,
+        last_candle=last_candle,
+        regime=last_regime,
+        rsi14=last_rsi,
+        macd_hist=last_hist,
+        macd_hist_prev=previous_hist,
+        signal=signal,
+        max_fib_distance_pct=max_fib_distance_pct,
+        config=config,
+    )
+
+
+def _result_for_recent_signal(
+    *,
+    symbol: str,
+    last_candle: Candle,
+    regime: str,
+    rsi14: float,
+    macd_hist: float,
+    macd_hist_prev: float,
+    signal: tuple[Candle, float],
+    max_fib_distance_pct: float,
+    config: StrategyConfig,
+) -> EntryScanResult:
     signal_candle, fib_level = signal
     distance_pct = (last_candle.close / fib_level) - 1 if fib_level else None
     if distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct:
@@ -111,10 +169,10 @@ def scan_entry(
             action="enter",
             reason="recent retest confirmed and price is near fib zone",
             last_close=last_candle.close,
-            regime_1h=last_regime,
-            rsi14=last_rsi,
-            macd_hist=last_hist,
-            macd_hist_prev=previous_hist,
+            regime_1h=regime,
+            rsi14=rsi14,
+            macd_hist=macd_hist,
+            macd_hist_prev=macd_hist_prev,
             fib_level=fib_level,
             fib_distance_pct=distance_pct,
             trigger_price=fib_level,
@@ -127,10 +185,10 @@ def scan_entry(
         action="wait",
         reason="recent retest confirmed but price has moved away from fib zone",
         last_close=last_candle.close,
-        regime_1h=last_regime,
-        rsi14=last_rsi,
-        macd_hist=last_hist,
-        macd_hist_prev=previous_hist,
+        regime_1h=regime,
+        rsi14=rsi14,
+        macd_hist=macd_hist,
+        macd_hist_prev=macd_hist_prev,
         fib_level=fib_level,
         fib_distance_pct=distance_pct,
         signal_time_ms=signal_candle.open_time_ms,
