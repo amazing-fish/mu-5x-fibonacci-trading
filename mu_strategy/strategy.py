@@ -43,6 +43,8 @@ class StrategyConfig:
     fee_rate: float | None = None
     fib_lookback: int = 32
     stop_buffer_pct: float = 0.0005
+    stop_transition_bars: int = 8
+    stop_transition_curve: str = "linear"
     max_entry_above_fib_pct: float | None = None
     yellow_max_entry_above_fib_pct: float | None = None
     max_signal_range_pct: float | None = None

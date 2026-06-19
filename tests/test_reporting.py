@@ -19,6 +19,24 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("- fee profile: market/taker (市价/吃单)", report)
         self.assertIn("- fee rate: 0.0500%", report)
 
+    def test_markdown_report_discloses_stop_transition_config(self):
+        config = StrategyConfig(
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="slow_start",
+        )
+
+        report = render_markdown_report(
+            BacktestResult(10_000, 10_000, [], []),
+            config=config,
+            symbol="MU-USDT-SWAP",
+            data_files=[],
+        )
+
+        self.assertIn("- stop tightening: delayed_baseline", report)
+        self.assertIn("- stop transition bars: 8", report)
+        self.assertIn("- stop transition curve: slow_start", report)
+
 
 if __name__ == "__main__":
     unittest.main()
