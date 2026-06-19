@@ -645,7 +645,12 @@ def _stop_detail(config: StrategyConfig) -> str:
     if config.green_stop_tightening:
         regime_overrides.append(f"green={config.green_stop_tightening}")
     override_text = f"; {'; '.join(regime_overrides)}" if regime_overrides else ""
-    return f"initial_stop={config.initial_stop_pct:.2%}; stop_tightening={config.stop_tightening}{override_text}"
+    return (
+        f"initial_stop={config.initial_stop_pct:.2%}; "
+        f"stop_tightening={config.stop_tightening}; "
+        f"stop_transition_bars={config.stop_transition_bars}; "
+        f"stop_transition_curve={config.stop_transition_curve}{override_text}"
+    )
 
 
 def _strategy_config_rows(config: StrategyConfig) -> list[tuple[str, str]]:
@@ -661,6 +666,8 @@ def _strategy_config_rows(config: StrategyConfig) -> list[tuple[str, str]]:
         ("initial_stop_pct", f"{config.initial_stop_pct:.2%}"),
         ("add_thresholds", ", ".join(f"{step:.2%}" for step in config.add_thresholds)),
         ("stop_tightening", config.stop_tightening),
+        ("stop_transition_bars", str(config.stop_transition_bars)),
+        ("stop_transition_curve", config.stop_transition_curve),
         ("yellow_stop_tightening", config.yellow_stop_tightening or "-"),
         ("green_stop_tightening", config.green_stop_tightening or "-"),
         ("allowed_regimes", ", ".join(config.allowed_regimes)),

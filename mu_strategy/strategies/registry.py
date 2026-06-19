@@ -128,6 +128,62 @@ def baseline_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyG
     )
 
 
+def baseline_delayed_tighten_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_delayed_tighten",
+        "新baseline + 加仓后线性渐进抬止损",
+        _baseline_config(
+            symbol,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="linear",
+        ),
+        StrategyComponents(entry="二次回踩限价", exit="加仓后8根15m K线性渐进抬止损"),
+    )
+
+
+def baseline_delayed_tighten_slow_start_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_delayed_tighten_slow_start",
+        "新baseline + 加仓后慢启动抬止损",
+        _baseline_config(
+            symbol,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="slow_start",
+        ),
+        StrategyComponents(entry="二次回踩限价", exit="加仓后8根15m K慢启动抬止损"),
+    )
+
+
+def baseline_delayed_tighten_fast_start_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_delayed_tighten_fast_start",
+        "新baseline + 加仓后快启动抬止损",
+        _baseline_config(
+            symbol,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="fast_start",
+        ),
+        StrategyComponents(entry="二次回踩限价", exit="加仓后8根15m K快启动抬止损"),
+    )
+
+
+def baseline_delayed_tighten_smooth_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return StrategyGroup(
+        "baseline_delayed_tighten_smooth",
+        "新baseline + 加仓后S曲线抬止损",
+        _baseline_config(
+            symbol,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="smooth",
+        ),
+        StrategyComponents(entry="二次回踩限价", exit="加仓后8根15m K S曲线抬止损"),
+    )
+
+
 def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return StrategyGroup(
         "optimized_v2",
@@ -163,6 +219,7 @@ def default_strategy_groups(symbol: str = "MUUSDT") -> list[StrategyGroup]:
         baseline_yellow_wide_strategy_group(symbol),
         baseline_yellow_green_wide_strategy_group(symbol),
         baseline_half_green_wide_strategy_group(symbol),
+        baseline_delayed_tighten_fast_start_strategy_group(symbol),
         optimized_strategy_group(symbol),
     ]
 

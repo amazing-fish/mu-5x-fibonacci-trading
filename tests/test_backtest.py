@@ -197,6 +197,98 @@ class BacktestTests(unittest.TestCase):
         self.assertAlmostEqual(99, yellow_position.stop_price)
         self.assertAlmostEqual(100, green_position.stop_price)
 
+    def test_delayed_baseline_stop_tightening_raises_stop_over_transition_bars(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=4,
+            stop_transition_curve="linear",
+        )
+        first = _make_fill(0, 100, 0.2, 10_000, config)
+        second = _make_fill(900_000, 102, 0.2, 10_000, config)
+        candles = [candle(index, 100 + index, 101 + index, 99 + index, 100 + index) for index in range(6)]
+        position = OpenPosition([first, second], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=2)
+
+        _tighten_stop(position, candles[1], 1, candles, "green", config)
+        self.assertAlmostEqual(98, position.stop_price)
+
+        _tighten_stop(position, candles[3], 3, candles, "green", config)
+        self.assertAlmostEqual(99, position.stop_price)
+
+        _tighten_stop(position, candles[5], 5, candles, "green", config)
+        self.assertAlmostEqual(100, position.stop_price)
+
+    def test_delayed_baseline_non_linear_curves_change_transition_speed(self):
+        first_candle = candle(0, 100, 101, 99, 100)
+        second_candle = candle(1, 101, 102, 100, 101)
+        midpoint_candle = candle(3, 103, 104, 102, 103)
+        candles = [first_candle, second_candle, candle(2, 102, 103, 101, 102), midpoint_candle]
+        expected_stops = {
+            "slow_start": 98.5,
+            "fast_start": 99.5,
+            "smooth": 99.0,
+        }
+
+        for curve, expected_stop in expected_stops.items():
+            with self.subTest(curve=curve):
+                config = StrategyConfig(
+                    fee_rate=0,
+                    stop_tightening="delayed_baseline",
+                    stop_transition_bars=4,
+                    stop_transition_curve=curve,
+                )
+                first = _make_fill(0, 100, 0.2, 10_000, config)
+                second = _make_fill(900_000, 102, 0.2, 10_000, config)
+                position = OpenPosition(
+                    [first, second],
+                    stop_price=98,
+                    entry_anchor=100,
+                    initial_stop_price=98,
+                    max_stage=2,
+                )
+
+                _tighten_stop(position, midpoint_candle, 3, candles, "green", config)
+
+                self.assertAlmostEqual(expected_stop, position.stop_price)
+
+    def test_delayed_baseline_new_add_continues_from_current_stop(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="fast_start",
+        )
+        first = _make_fill(0, 100, 0.2, 10_000, config)
+        second = _make_fill(900_000, 102, 0.2, 10_000, config)
+        third = _make_fill(1_800_000, 104, 0.2, 10_000, config)
+        candles = [candle(index, 100 + index, 101 + index, 99 + index, 100 + index) for index in range(6)]
+        position = OpenPosition([first, second], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=2)
+
+        _tighten_stop(position, candles[2], 2, candles, "green", config)
+        self.assertAlmostEqual(98.46875, position.stop_price)
+
+        position.fills.append(third)
+        position.max_stage = 3
+        _tighten_stop(position, candles[2], 2, candles, "green", config)
+
+        self.assertAlmostEqual(98.46875, position.stop_price)
+
+    def test_smooth_delay_curve_starts_slower_than_linear(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=4,
+            stop_transition_curve="smooth",
+        )
+        first = _make_fill(0, 100, 0.2, 10_000, config)
+        second = _make_fill(900_000, 102, 0.2, 10_000, config)
+        candles = [candle(index, 100 + index, 101 + index, 99 + index, 100 + index) for index in range(6)]
+        position = OpenPosition([first, second], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=2)
+
+        _tighten_stop(position, candles[2], 2, candles, "green", config)
+
+        self.assertAlmostEqual(98.3125, position.stop_price)
+
     def test_non_session_liquidation_risk_is_not_hidden_by_cash_session_entry_filter(self):
         config = StrategyConfig(
             fee_rate=0,
