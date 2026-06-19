@@ -235,6 +235,8 @@ class OKXRestClient:
         client_order_id: str | None = None,
         confirm_demo_order: bool,
     ) -> dict[str, Any]:
+        if not self.demo:
+            raise PermissionError("demo order cancellation requires a demo client")
         if not confirm_demo_order:
             raise PermissionError("confirm_demo_order=True is required before canceling a demo order")
         if order_id is None and client_order_id is None:

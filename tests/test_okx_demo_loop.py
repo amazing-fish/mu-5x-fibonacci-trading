@@ -9,6 +9,7 @@ from mu_strategy.market_data.service import CandleBundle
 from mu_strategy.market_data.symbols import ResolvedSymbol
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import Candle
+from mu_strategy.strategies.registry import baseline_strategy_group
 
 
 class StubBroker:
@@ -65,6 +66,26 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("planned", result["orders"][0]["status"])
         self.assertEqual("BTC-USDT-SWAP", result["orders"][0]["symbol"])
         self.assertEqual(10.0, result["orders"][0]["notional_usdt"])
+
+    def test_run_once_scans_with_current_baseline_strategy_config(self):
+        captured = {}
+
+        def scanner(symbol, candles_15m, candles_1h, **kwargs):
+            captured["symbol"] = symbol
+            captured["config"] = kwargs["config"]
+            return _scan_result(symbol, action="wait", trigger_price=None)
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=True),
+            broker=None,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=scanner,
+        )
+
+        self.assertEqual([], result["orders"])
+        self.assertEqual("BTC-USDT-SWAP", captured["symbol"])
+        self.assertEqual(baseline_strategy_group("BTC-USDT-SWAP").config, captured["config"])
 
     def test_run_once_blocks_when_open_exposure_limit_is_reached(self):
         class FullBroker(StubBroker):
@@ -176,6 +197,48 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
+    def test_run_once_expires_stale_orders_before_enforcing_capacity(self):
+        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
+
+        class StaleLaterOrderBroker(StubBroker):
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "SOL-USDT-SWAP",
+                            "ordId": "OLD-SOL",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        def scanner(symbol, candles_15m, candles_1h, **kwargs):
+            if symbol == "BTC-USDT-SWAP":
+                return _entry(symbol, trigger_price=100.19)
+            return _scan_result(symbol, action="wait", trigger_price=None)
+
+        broker = StaleLaterOrderBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=1, notional_usdt=10.0),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=scanner,
+        )
+
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual("SOL-USDT-SWAP", result["expired_orders"][0]["symbol"])
+        self.assertEqual("submitted", result["orders"][0]["status"])
+        self.assertEqual("BTC-USDT-SWAP", result["orders"][0]["symbol"])
+        self.assertIn(("cancel_order", "SOL-USDT-SWAP", "OLD-SOL", stale_client_order_id, True), broker.calls)
+        self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):

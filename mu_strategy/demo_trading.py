@@ -77,6 +77,7 @@ def run_once(
         existing_client_order_ids = _client_order_ids(open_orders)
 
     scans: list[dict[str, Any]] = []
+    scan_results: list[EntryScanResult] = []
     orders: list[dict[str, Any]] = []
     expired_orders: list[dict[str, Any]] = []
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
@@ -95,6 +96,7 @@ def run_once(
             bundle.candles_by_interval.get("1h", []),
             config=baseline_strategy_group(ticker.inst_id).config,
         )
+        scan_results.append(result)
         scans.append(_scan_payload(result, bundle))
 
         if not config.dry_run:
@@ -127,6 +129,7 @@ def run_once(
                     open_exposure = max(0, open_exposure - len(successful_expirations))
                     remaining_capacity += len(successful_expirations)
 
+    for result in scan_results:
         if result.action != "enter" or result.trigger_price is None:
             continue
 

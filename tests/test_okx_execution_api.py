@@ -257,6 +257,23 @@ class OKXRestClientTests(unittest.TestCase):
             call["body"],
         )
 
+    def test_cancel_order_cannot_be_sent_with_production_client(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=False,
+            transport=transport,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "demo"):
+            client.cancel_order(
+                inst_id="BTC-USDT-SWAP",
+                client_order_id="DEMO3",
+                confirm_demo_order=True,
+            )
+
+        self.assertEqual([], transport.calls)
+
 
 class ShadowExecutionLedgerTests(unittest.TestCase):
     def test_shadow_event_is_append_only_and_metrics_are_computed(self):
