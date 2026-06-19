@@ -205,6 +205,31 @@
     </table>
   </div>
 
+  <h2>数据有效性</h2>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>Dataset</th>
+          <th>Bars</th>
+          <th>True duration</th>
+          <th>Structural anomalies</th>
+          <th>Large-move warnings</th>
+          <th>Valid</th>
+          <th>Useful</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>OKX_MU-USDT-SWAP_15m_28d.csv</code></td><td class="metric">2689</td><td>28d 0h 15m</td><td class="good">0 dup / 0 gaps / 0 invalid OHLC</td><td>0 open-close / 0 high-low / 0 prev-gap</td><td class="good">yes</td><td class="good">yes</td><td>keep latest data in PR</td></tr>
+        <tr><td><code>OKX_MU-USDT-SWAP_1h_28d.csv</code></td><td class="metric">673</td><td>28d 1h 0m</td><td class="good">0 dup / 0 gaps / 0 invalid OHLC</td><td>1 open-close / 12 high-low / 0 prev-gap</td><td class="good">yes</td><td class="good">yes</td><td>keep latest data in PR</td></tr>
+        <tr><td><code>OKX_MU-USDT-SWAP_15m_180d.csv</code></td><td class="metric">10263</td><td>106d 21h 45m</td><td class="good">0 dup / 0 gaps / 0 invalid OHLC</td><td>1 open-close / 6 high-low / 0 prev-gap</td><td class="good">yes</td><td class="good">yes</td><td>keep latest data in PR</td></tr>
+        <tr><td><code>OKX_MU-USDT-SWAP_1h_180d.csv</code></td><td class="metric">2566</td><td>106d 22h 0m</td><td class="good">0 dup / 0 gaps / 0 invalid OHLC</td><td>6 open-close / 30 high-low / 0 prev-gap</td><td class="good">yes</td><td class="good">yes</td><td>keep latest data in PR</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">Large-move warnings are threshold flags for volatile bars, not structural data failures. The 180d OKX MU files currently cover about 106d of continuous available data; they remain valid for this comparison and should stay current when anomaly checks pass.</p>
+
   <h2>曲线定义</h2>
   <div class="panel">
     <table>
@@ -287,6 +312,28 @@
     <li><code>smooth</code> 与 linear 接近，没有足够增量价值。</li>
     <li><code>fast_start</code> 的逻辑最符合目标：先尽快提高保护，再给趋势留空间。</li>
   </ul>
+
+  <h2>旧报告处置</h2>
+  <div class="panel">
+    <table>
+      <thead>
+        <tr>
+          <th>Artifact group</th>
+          <th>Valid</th>
+          <th>Useful</th>
+          <th>Action</th>
+          <th>Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>mu_delay_curve_strategy_review.html</code></td><td class="good">yes</td><td class="good">yes</td><td>include in PR</td><td>Canonical HTML report for this decision.</td></tr>
+        <tr><td><code>mu_delay_curve_*.md</code></td><td>yes</td><td>local audit only</td><td>do not include in PR</td><td>Intermediate per-strategy markdown outputs; metrics are summarized here.</td></tr>
+        <tr><td><code>mu_okx_*_baseline_relax_to_half_protect.md</code></td><td class="bad">no longer decision-valid</td><td class="bad">no</td><td>clean local artifact</td><td>Relax candidate was abandoned and should not appear in current recommendations.</td></tr>
+        <tr><td><code>mu_stop_transition_strategy_review.md</code></td><td class="bad">stale</td><td class="bad">no</td><td>clean local artifact</td><td>Superseded by this HTML report and still references abandoned relax comparison.</td></tr>
+        <tr><td>Older committed markdown reports</td><td>historical</td><td>case-by-case</td><td>leave out of this PR</td><td>Future report updates should carry explicit Valid / Useful / Action fields before being merged.</td></tr>
+      </tbody>
+    </table>
+  </div>
 
   <h2>Artifacts</h2>
   <div class="panel">
