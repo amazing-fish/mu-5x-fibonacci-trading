@@ -251,6 +251,28 @@ class BacktestTests(unittest.TestCase):
 
                 self.assertAlmostEqual(expected_stop, position.stop_price)
 
+    def test_delayed_baseline_new_add_continues_from_current_stop(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=8,
+            stop_transition_curve="fast_start",
+        )
+        first = _make_fill(0, 100, 0.2, 10_000, config)
+        second = _make_fill(900_000, 102, 0.2, 10_000, config)
+        third = _make_fill(1_800_000, 104, 0.2, 10_000, config)
+        candles = [candle(index, 100 + index, 101 + index, 99 + index, 100 + index) for index in range(6)]
+        position = OpenPosition([first, second], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=2)
+
+        _tighten_stop(position, candles[2], 2, candles, "green", config)
+        self.assertAlmostEqual(98.46875, position.stop_price)
+
+        position.fills.append(third)
+        position.max_stage = 3
+        _tighten_stop(position, candles[2], 2, candles, "green", config)
+
+        self.assertAlmostEqual(98.46875, position.stop_price)
+
     def test_smooth_delay_curve_starts_slower_than_linear(self):
         config = StrategyConfig(
             fee_rate=0,

@@ -21,6 +21,8 @@ class OpenPosition:
     entry_anchor: float
     initial_stop_price: float = 0.0
     max_stage: int = 1
+    stop_transition_fill_count: int = 0
+    stop_transition_start: float = 0.0
 
     @property
     def units(self) -> float:
@@ -425,11 +427,14 @@ def _tighten_stop_delayed_baseline(
     candles: list[Candle],
     config: StrategyConfig,
 ) -> None:
+    if position.stop_transition_fill_count != len(position.fills):
+        position.stop_transition_fill_count = len(position.fills)
+        position.stop_transition_start = position.stop_price
     progress = _apply_stop_transition_curve(
         _stop_transition_progress(position, index, candles, config),
         config.stop_transition_curve,
     )
-    start = _previous_baseline_stop_target(position)
+    start = position.stop_transition_start or _previous_baseline_stop_target(position)
     target = _baseline_stop_target(position, index, candles, config)
     transitioned = _interpolate(start, target, progress)
     position.stop_price = max(position.stop_price, transitioned)
