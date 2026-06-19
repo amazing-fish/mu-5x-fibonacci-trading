@@ -268,7 +268,7 @@ def _latest_recent_signal(
 def _effective_lookback_bars(config: StrategyConfig, requested_lookback_bars: int) -> int:
     if config.entry_execution != "second_pullback":
         return requested_lookback_bars
-    return min(requested_lookback_bars, config.second_pullback_wait_bars + 1)
+    return min(requested_lookback_bars, config.second_pullback_wait_bars)
 
 
 def _series_value(values: list[float], index: int) -> float:
