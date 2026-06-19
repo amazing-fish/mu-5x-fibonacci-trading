@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -281,6 +282,34 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn(("cancel_order", "SOL-USDT-SWAP", "OLD-SOL", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_blocks_live_demo_orders_when_market_data_is_stale(self):
+        broker = StubBroker()
+        stale_bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={
+                "15m": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+                "1h": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            },
+            files_by_interval={},
+            days=28,
+        )
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: stale_bundle,
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("BTC-USDT-SWAP", result["data_errors"][0]["symbol"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+        self.assertEqual("market_data_stale", result["scans"][0]["reason"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
@@ -504,8 +533,10 @@ class OKXDemoLoopTests(unittest.TestCase):
 
 
 def _bundle(symbol: str) -> CandleBundle:
+    last_open_time_ms = int(time.time() * 1000) - 900_000
+    first_open_time_ms = last_open_time_ms - (39 * 900_000)
     candles = [
-        Candle(index * 900_000, 100.0, 101.0, 99.0, 100.0 + index * 0.01, 1000.0)
+        Candle(first_open_time_ms + index * 900_000, 100.0, 101.0, 99.0, 100.0 + index * 0.01, 1000.0)
         for index in range(40)
     ]
     return CandleBundle(

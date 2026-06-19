@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -11,6 +12,7 @@ from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, refresh_candle_bundle
 from mu_strategy.market_data.universe import OKXSwapTicker, top_okx_usdt_swaps
+from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -31,6 +33,7 @@ class DemoTradingConfig:
     max_open_positions: int = 3
     leverage: int = 5
     dry_run: bool = True
+    max_candle_staleness_bars: int = 3
 
 
 def run_once(
@@ -81,6 +84,7 @@ def run_once(
     scan_results: list[EntryScanResult] = []
     orders: list[dict[str, Any]] = []
     expired_orders: list[dict[str, Any]] = []
+    data_errors: list[dict[str, Any]] = []
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
 
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
@@ -91,6 +95,17 @@ def run_once(
             data_dir=config.data_dir,
             refresh=config.refresh,
         )
+        if not config.dry_run:
+            data_error = _market_data_freshness_error(
+                symbol=ticker.inst_id,
+                bundle=bundle,
+                config=config,
+                now_ms=int(time.time() * 1000),
+            )
+            if data_error is not None:
+                data_errors.append(data_error)
+                scans.append(_stale_scan_payload(ticker.inst_id, bundle, data_error))
+                continue
         result = scanner(
             ticker.inst_id,
             bundle.candles_by_interval.get("15m", []),
@@ -206,6 +221,7 @@ def run_once(
         "scans": scans,
         "orders": orders,
         "expired_orders": expired_orders,
+        "data_errors": data_errors,
     }
 
 
@@ -254,6 +270,64 @@ def _scan_payload(result: EntryScanResult, bundle: CandleBundle) -> dict[str, An
     payload = asdict(result)
     payload["data_files"] = {interval: str(path) for interval, path in bundle.files_by_interval.items()}
     return payload
+
+
+def _stale_scan_payload(symbol: str, bundle: CandleBundle, data_error: dict[str, Any]) -> dict[str, Any]:
+    payload = _scan_payload(
+        EntryScanResult(
+            symbol=symbol,
+            action="skip",
+            reason=data_error["reason"],
+            last_close=_latest_close(bundle.candles_by_interval.get("15m", [])),
+            regime_1h="yellow",
+            rsi14=None,
+            macd_hist=None,
+            macd_hist_prev=None,
+        ),
+        bundle,
+    )
+    payload["data_error"] = data_error
+    return payload
+
+
+def _market_data_freshness_error(
+    *,
+    symbol: str,
+    bundle: CandleBundle,
+    config: DemoTradingConfig,
+    now_ms: int,
+) -> dict[str, Any] | None:
+    max_staleness_bars = max(1, config.max_candle_staleness_bars)
+    for interval, candles in bundle.candles_by_interval.items():
+        if not candles:
+            return {
+                "symbol": symbol,
+                "reason": "market_data_missing",
+                "interval": interval,
+                "latest_open_time_ms": None,
+                "age_ms": None,
+                "max_age_ms": interval_to_ms(interval) * max_staleness_bars,
+            }
+        latest_open_time_ms = max(candle.open_time_ms for candle in candles)
+        max_age_ms = interval_to_ms(interval) * max_staleness_bars
+        age_ms = now_ms - latest_open_time_ms
+        if age_ms > max_age_ms:
+            return {
+                "symbol": symbol,
+                "reason": "market_data_stale",
+                "interval": interval,
+                "latest_open_time_ms": latest_open_time_ms,
+                "age_ms": age_ms,
+                "max_age_ms": max_age_ms,
+            }
+    return None
+
+
+def _latest_close(candles: list) -> float | None:
+    if not candles:
+        return None
+    latest = max(candles, key=lambda candle: candle.open_time_ms)
+    return latest.close
 
 
 def _count_open_exposure(positions: dict[str, Any], open_orders: dict[str, Any]) -> int:
