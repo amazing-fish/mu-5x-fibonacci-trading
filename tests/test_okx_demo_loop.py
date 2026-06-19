@@ -240,6 +240,47 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn(("cancel_order", "SOL-USDT-SWAP", "OLD-SOL", stale_client_order_id, True), broker.calls)
         self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_does_not_reenter_off_universe_stale_order_symbol(self):
+        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
+
+        class OffUniverseStaleOrderBroker(StubBroker):
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "SOL-USDT-SWAP",
+                            "ordId": "OLD-SOL",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        def scanner(symbol, candles_15m, candles_1h, **kwargs):
+            if symbol == "SOL-USDT-SWAP":
+                return _entry(symbol, trigger_price=100.19)
+            return _scan_result(symbol, action="wait", trigger_price=None)
+
+        broker = OffUniverseStaleOrderBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, notional_usdt=10.0),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=scanner,
+        )
+
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual("SOL-USDT-SWAP", result["expired_orders"][0]["symbol"])
+        self.assertEqual([], result["orders"])
+        self.assertIn(("cancel_order", "SOL-USDT-SWAP", "OLD-SOL", stale_client_order_id, True), broker.calls)
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
@@ -400,6 +441,66 @@ class OKXDemoLoopTests(unittest.TestCase):
                 )
 
         self.assertEqual("", stdout.getvalue())
+
+    def test_run_forever_schedules_next_cycle_from_fixed_rate_tick(self):
+        from mu_strategy.commands.okx_demo_loop import _run_forever
+
+        class StopLoop(Exception):
+            pass
+
+        stdout = io.StringIO()
+        sleep_calls = []
+        clock_values = iter([100.0, 100.0, 112.0, 112.0])
+
+        def clock():
+            return next(clock_values)
+
+        def sleeper(seconds):
+            sleep_calls.append(seconds)
+            raise StopLoop()
+
+        with self.assertRaises(StopLoop):
+            _run_forever(
+                DemoTradingConfig(dry_run=True),
+                broker=None,
+                interval_seconds=300,
+                runner=lambda config, broker: {"mode": "dry_run"},
+                stdout=stdout,
+                clock=clock,
+                sleeper=sleeper,
+            )
+
+        self.assertEqual([288.0], sleep_calls)
+
+    def test_run_forever_skips_missed_ticks_after_overrun(self):
+        from mu_strategy.commands.okx_demo_loop import _run_forever
+
+        class StopLoop(Exception):
+            pass
+
+        stdout = io.StringIO()
+        sleep_calls = []
+        clock_values = iter([100.0, 100.0, 760.0, 760.0])
+
+        def clock():
+            return next(clock_values)
+
+        def sleeper(seconds):
+            sleep_calls.append(seconds)
+            raise StopLoop()
+
+        with self.assertRaises(StopLoop):
+            _run_forever(
+                DemoTradingConfig(dry_run=True),
+                broker=None,
+                interval_seconds=300,
+                runner=lambda config, broker: {"mode": "dry_run"},
+                stdout=stdout,
+                clock=clock,
+                sleeper=sleeper,
+            )
+
+        self.assertEqual([240.0], sleep_calls)
 
 
 def _bundle(symbol: str) -> CandleBundle:

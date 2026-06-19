@@ -43,6 +43,7 @@ def run_once(
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
     tickers = universe_provider(limit=config.universe_limit)
+    entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
     open_exposure = 0
     open_position_inst_ids: set[str] = set()
     open_order_inst_ids: set[str] = set()
@@ -130,6 +131,8 @@ def run_once(
                     remaining_capacity += len(successful_expirations)
 
     for result in scan_results:
+        if result.symbol not in entry_eligible_inst_ids:
+            continue
         if result.action != "enter" or result.trigger_price is None:
             continue
 

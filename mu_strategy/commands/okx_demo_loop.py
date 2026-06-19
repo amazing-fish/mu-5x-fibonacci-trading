@@ -75,13 +75,24 @@ def _run_forever(
     interval_seconds: int,
     runner: Runner,
     stdout: TextIO,
+    clock: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> None:
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
+    next_run_at = clock()
     while True:
+        sleep_seconds = next_run_at - clock()
+        if sleep_seconds > 0:
+            sleeper(sleep_seconds)
         payload = runner(config, broker=broker)
         stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
         stdout.write("\n")
         stdout.flush()
-        time.sleep(interval_seconds)
+        next_run_at += interval_seconds
+        now = clock()
+        while next_run_at <= now:
+            next_run_at += interval_seconds
 
 
 if __name__ == "__main__":
