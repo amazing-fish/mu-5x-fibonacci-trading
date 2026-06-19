@@ -95,6 +95,7 @@ def run_once(
             data_dir=config.data_dir,
             refresh=config.refresh,
         )
+        data_error = None
         if not config.dry_run:
             data_error = _market_data_freshness_error(
                 symbol=ticker.inst_id,
@@ -104,16 +105,18 @@ def run_once(
             )
             if data_error is not None:
                 data_errors.append(data_error)
-                scans.append(_stale_scan_payload(ticker.inst_id, bundle, data_error))
-                continue
-        result = scanner(
-            ticker.inst_id,
-            bundle.candles_by_interval.get("15m", []),
-            bundle.candles_by_interval.get("1h", []),
-            config=baseline_strategy_group(ticker.inst_id).config,
-        )
-        scan_results.append(result)
-        scans.append(_scan_payload(result, bundle))
+                result = _stale_scan_result(ticker.inst_id, bundle, data_error)
+                scans.append(_stale_scan_payload(result, bundle, data_error))
+
+        if data_error is None:
+            result = scanner(
+                ticker.inst_id,
+                bundle.candles_by_interval.get("15m", []),
+                bundle.candles_by_interval.get("1h", []),
+                config=baseline_strategy_group(ticker.inst_id).config,
+            )
+            scan_results.append(result)
+            scans.append(_scan_payload(result, bundle))
 
         if not config.dry_run:
             stale_orders = _expire_stale_limit_orders(
@@ -144,6 +147,8 @@ def run_once(
                         open_order_inst_ids.discard(ticker.inst_id)
                     open_exposure = max(0, open_exposure - len(successful_expirations))
                     remaining_capacity += len(successful_expirations)
+            if data_error is not None:
+                continue
 
     for result in scan_results:
         if result.symbol not in entry_eligible_inst_ids:
@@ -272,20 +277,21 @@ def _scan_payload(result: EntryScanResult, bundle: CandleBundle) -> dict[str, An
     return payload
 
 
-def _stale_scan_payload(symbol: str, bundle: CandleBundle, data_error: dict[str, Any]) -> dict[str, Any]:
-    payload = _scan_payload(
-        EntryScanResult(
-            symbol=symbol,
-            action="skip",
-            reason=data_error["reason"],
-            last_close=_latest_close(bundle.candles_by_interval.get("15m", [])),
-            regime_1h="yellow",
-            rsi14=None,
-            macd_hist=None,
-            macd_hist_prev=None,
-        ),
-        bundle,
+def _stale_scan_result(symbol: str, bundle: CandleBundle, data_error: dict[str, Any]) -> EntryScanResult:
+    return EntryScanResult(
+        symbol=symbol,
+        action="skip",
+        reason=data_error["reason"],
+        last_close=_latest_close(bundle.candles_by_interval.get("15m", [])),
+        regime_1h="yellow",
+        rsi14=None,
+        macd_hist=None,
+        macd_hist_prev=None,
     )
+
+
+def _stale_scan_payload(result: EntryScanResult, bundle: CandleBundle, data_error: dict[str, Any]) -> dict[str, Any]:
+    payload = _scan_payload(result, bundle)
     payload["data_error"] = data_error
     return payload
 

@@ -284,15 +284,7 @@ class OKXDemoLoopTests(unittest.TestCase):
 
     def test_run_once_blocks_live_demo_orders_when_market_data_is_stale(self):
         broker = StubBroker()
-        stale_bundle = CandleBundle(
-            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
-            candles_by_interval={
-                "15m": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
-                "1h": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
-            },
-            files_by_interval={},
-            days=28,
-        )
+        stale_bundle = _stale_bundle("BTC-USDT-SWAP")
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -308,6 +300,45 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("BTC-USDT-SWAP", result["data_errors"][0]["symbol"])
         self.assertEqual("skip", result["scans"][0]["action"])
         self.assertEqual("market_data_stale", result["scans"][0]["reason"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
+    def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
+        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
+
+        class StaleOrderBroker(StubBroker):
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "ordId": "OLD1",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        broker = StaleOrderBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _stale_bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail("stale data must not be scanned"),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual("market_data_stale", result["expired_orders"][0]["reason"])
+        self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
+        self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
@@ -542,6 +573,18 @@ def _bundle(symbol: str) -> CandleBundle:
     return CandleBundle(
         symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
         candles_by_interval={"15m": candles, "1h": candles},
+        files_by_interval={},
+        days=28,
+    )
+
+
+def _stale_bundle(symbol: str) -> CandleBundle:
+    return CandleBundle(
+        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
+        candles_by_interval={
+            "15m": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(0, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        },
         files_by_interval={},
         days=28,
     )
