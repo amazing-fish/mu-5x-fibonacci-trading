@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
+OKX_CANCEL_ORDER_PATH = "/api/v5/trade/cancel-order"
 OKX_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{1,32}$")
 
 
@@ -225,6 +226,27 @@ class OKXRestClient:
             ),
             confirm_demo_order=confirm_demo_order,
         )
+
+    def cancel_order(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        confirm_demo_order: bool,
+    ) -> dict[str, Any]:
+        if not confirm_demo_order:
+            raise PermissionError("confirm_demo_order=True is required before canceling a demo order")
+        if order_id is None and client_order_id is None:
+            raise ValueError("order_id or client_order_id is required")
+        body = {"instId": inst_id}
+        if order_id is not None:
+            body["ordId"] = order_id
+        if client_order_id is not None:
+            if not OKX_CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
+                raise ValueError("client_order_id must be 1-32 ASCII alphanumeric characters")
+            body["clOrdId"] = client_order_id
+        return self._request("POST", OKX_CANCEL_ORDER_PATH, body=body, private=True)
 
     def _request(
         self,

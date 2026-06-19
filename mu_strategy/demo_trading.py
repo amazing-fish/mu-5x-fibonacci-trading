@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +17,8 @@ from mu_strategy.strategies.registry import baseline_strategy_group
 UniverseProvider = Callable[..., list[OKXSwapTicker]]
 CandleLoader = Callable[..., CandleBundle]
 Scanner = Callable[..., EntryScanResult]
+BOT_CLIENT_ORDER_ID_PATTERN = re.compile(r"^OD[A-F0-9]{20}$")
+PENDING_ORDER_STATES = {"", "live", "partially_filled"}
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ def run_once(
     open_exposure = 0
     open_position_inst_ids: set[str] = set()
     open_order_inst_ids: set[str] = set()
+    open_order_rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
 
@@ -64,17 +68,20 @@ def run_once(
                 "open_exposure": 0,
                 "scans": [],
                 "orders": [],
+                "expired_orders": [],
             }
         open_exposure = _count_open_exposure(positions, open_orders)
         open_position_inst_ids = _open_position_inst_ids(positions)
         open_order_inst_ids = _open_order_inst_ids(open_orders)
+        open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
         existing_client_order_ids = _client_order_ids(open_orders)
 
     scans: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
+    expired_orders: list[dict[str, Any]] = []
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
 
-    for ticker in tickers:
+    for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
         bundle = candle_loader(
             ticker.inst_id,
             intervals=("15m", "1h"),
@@ -89,6 +96,36 @@ def run_once(
             config=baseline_strategy_group(ticker.inst_id).config,
         )
         scans.append(_scan_payload(result, bundle))
+
+        if not config.dry_run:
+            stale_orders = _expire_stale_limit_orders(
+                broker=broker,
+                symbol=ticker.inst_id,
+                open_order_rows=open_order_rows_by_inst_id.get(ticker.inst_id, []),
+                result=result,
+            )
+            if stale_orders:
+                expired_orders.extend(stale_orders)
+                successful_expirations = [item for item in stale_orders if item["status"] == "expired"]
+                if successful_expirations:
+                    expired_client_order_ids = {
+                        item["client_order_id"] for item in successful_expirations if item.get("client_order_id")
+                    }
+                    expired_order_ids = {item["order_id"] for item in successful_expirations if item.get("order_id")}
+                    existing_client_order_ids.difference_update(expired_client_order_ids)
+                    remaining_rows = [
+                        row
+                        for row in open_order_rows_by_inst_id.get(ticker.inst_id, [])
+                        if str(row.get("clOrdId") or "") not in expired_client_order_ids
+                        and str(row.get("ordId") or "") not in expired_order_ids
+                    ]
+                    if remaining_rows:
+                        open_order_rows_by_inst_id[ticker.inst_id] = remaining_rows
+                    else:
+                        open_order_rows_by_inst_id.pop(ticker.inst_id, None)
+                        open_order_inst_ids.discard(ticker.inst_id)
+                    open_exposure = max(0, open_exposure - len(successful_expirations))
+                    remaining_capacity += len(successful_expirations)
 
         if result.action != "enter" or result.trigger_price is None:
             continue
@@ -162,6 +199,7 @@ def run_once(
         "account_context": account_context,
         "scans": scans,
         "orders": orders,
+        "expired_orders": expired_orders,
     }
 
 
@@ -233,8 +271,96 @@ def _open_order_inst_ids(open_orders: dict[str, Any]) -> set[str]:
     return {str(row.get("instId")) for row in open_orders.get("data") or [] if row.get("instId")}
 
 
+def _open_order_rows_by_inst_id(open_orders: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
+    for row in open_orders.get("data") or []:
+        if not isinstance(row, dict) or not row.get("instId"):
+            continue
+        rows_by_inst_id.setdefault(str(row["instId"]), []).append(row)
+    return rows_by_inst_id
+
+
 def _client_order_ids(open_orders: dict[str, Any]) -> set[str]:
     return {str(row.get("clOrdId")) for row in open_orders.get("data") or [] if row.get("clOrdId")}
+
+
+def _tickers_to_scan(
+    tickers: list[OKXSwapTicker],
+    open_order_rows_by_inst_id: dict[str, list[dict[str, Any]]],
+) -> list[OKXSwapTicker]:
+    scan_tickers = list(tickers)
+    seen = {ticker.inst_id for ticker in scan_tickers}
+    for inst_id, rows in open_order_rows_by_inst_id.items():
+        if inst_id in seen or not any(_is_bot_fib_limit_order(row) for row in rows):
+            continue
+        scan_tickers.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0))
+        seen.add(inst_id)
+    return scan_tickers
+
+
+def _expire_stale_limit_orders(
+    *,
+    broker: Any,
+    symbol: str,
+    open_order_rows: list[dict[str, Any]],
+    result: EntryScanResult,
+) -> list[dict[str, Any]]:
+    expired_orders = []
+    for row in open_order_rows:
+        if not _is_bot_fib_limit_order(row):
+            continue
+        client_order_id = str(row.get("clOrdId") or "")
+        if _matches_active_signal_order(client_order_id, result):
+            continue
+        order_id = _text_or_none(row.get("ordId"))
+        response = broker.cancel_order(
+            inst_id=symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            confirm_demo_order=True,
+        )
+        expired_orders.append(
+            {
+                "symbol": symbol,
+                "status": "expire_failed" if _okx_response_failed(response) else "expired",
+                "reason": _stale_order_reason(result),
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "response": response,
+            }
+        )
+    return expired_orders
+
+
+def _is_bot_fib_limit_order(row: dict[str, Any]) -> bool:
+    client_order_id = str(row.get("clOrdId") or "")
+    if not BOT_CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
+        return False
+    state = str(row.get("state") or "").lower()
+    if state not in PENDING_ORDER_STATES:
+        return False
+    order_type = str(row.get("ordType") or "limit").lower()
+    side = str(row.get("side") or "buy").lower()
+    return order_type == "limit" and side == "buy"
+
+
+def _matches_active_signal_order(client_order_id: str, result: EntryScanResult) -> bool:
+    if result.action != "enter" or result.trigger_price is None:
+        return False
+    return client_order_id == generate_client_order_id(result.symbol, result.signal_time_ms, result.trigger_price)
+
+
+def _stale_order_reason(result: EntryScanResult) -> str:
+    if result.action == "enter":
+        return "superseded_by_current_signal"
+    return result.reason
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
 
 
 def _account_context_error(account_context: dict[str, Any]) -> dict[str, str] | None:

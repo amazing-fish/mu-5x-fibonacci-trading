@@ -230,6 +230,33 @@ class OKXRestClientTests(unittest.TestCase):
             transport.calls[0]["body"],
         )
 
+    def test_cancel_order_uses_client_order_id_endpoint(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        self.assertTrue(hasattr(client, "cancel_order"), "OKXRestClient needs a cancel_order wrapper")
+
+        response = client.cancel_order(
+            inst_id="BTC-USDT-SWAP",
+            client_order_id="DEMO3",
+            confirm_demo_order=True,
+        )
+
+        self.assertEqual({"code": "0", "data": [{"ok": True}], "msg": ""}, response)
+        call = transport.calls[0]
+        self.assertEqual("POST", call["method"])
+        self.assertTrue(call["url"].endswith("/api/v5/trade/cancel-order"))
+        self.assertEqual("1", call["headers"]["x-simulated-trading"])
+        self.assertEqual(
+            '{"instId":"BTC-USDT-SWAP","clOrdId":"DEMO3"}',
+            call["body"],
+        )
+
 
 class ShadowExecutionLedgerTests(unittest.TestCase):
     def test_shadow_event_is_append_only_and_metrics_are_computed(self):
