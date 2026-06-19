@@ -163,11 +163,16 @@ def _result_for_recent_signal(
 ) -> EntryScanResult:
     signal_candle, fib_level = signal
     distance_pct = (last_candle.close / fib_level) - 1 if fib_level else None
-    if distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct:
+    close_is_near_fib = distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct
+    if distance_pct is not None and (close_is_near_fib or config.entry_execution == "second_pullback"):
         return EntryScanResult(
             symbol=symbol,
             action="enter",
-            reason="recent retest confirmed and price is near fib zone",
+            reason=(
+                "recent retest confirmed and price is near fib zone"
+                if close_is_near_fib
+                else "recent retest confirmed; resting second-pullback fib limit"
+            ),
             last_close=last_candle.close,
             regime_1h=regime,
             rsi14=rsi14,

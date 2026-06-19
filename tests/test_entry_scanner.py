@@ -121,6 +121,39 @@ class EntryScannerTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, result.trigger_price)
         self.assertAlmostEqual(0.005, result.fib_distance_pct)
 
+    def test_scan_entry_second_pullback_places_limit_when_current_close_moved_away_from_fib(self):
+        from mu_strategy.entry.scanner import scan_entry
+
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 15))
+        signal_index = len(candles) - 2
+        candles[signal_index] = Candle(candles[signal_index].open_time_ms, 100, 103, 99.8, 102.5, 1000)
+        candles[-1] = Candle(candles[-1].open_time_ms, 102.5, 103, 102.0, 102.2, 1000)
+        config = replace(
+            baseline_strategy_group("BTC-USDT-SWAP").config,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+        )
+
+        with patch("mu_strategy.entry.scanner.build_hourly_context") as build_context:
+            build_context.return_value = {bar.open_time_ms: "green" for bar in candles}
+            with patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)):
+                with patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))):
+                    with patch("mu_strategy.entry.scanner.nearest_fib_retest_level") as nearest_fib:
+                        nearest_fib.side_effect = lambda _candles, index, _config: 100.0 if index == signal_index else None
+
+                        result = scan_entry(
+                            "BTC-USDT-SWAP",
+                            candles,
+                            candles,
+                            config=config,
+                            lookback_bars=4,
+                        )
+
+        self.assertEqual("enter", result.action)
+        self.assertEqual(candles[signal_index].open_time_ms, result.signal_time_ms)
+        self.assertAlmostEqual(100.0, result.trigger_price)
+        self.assertAlmostEqual(0.022, result.fib_distance_pct)
+
     def test_scan_entry_waits_when_current_bar_is_outside_trading_window(self):
         from mu_strategy.entry.scanner import scan_entry
 

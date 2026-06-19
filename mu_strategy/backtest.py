@@ -21,6 +21,8 @@ class OpenPosition:
     entry_anchor: float
     initial_stop_price: float = 0.0
     max_stage: int = 1
+    stop_transition_fill_count: int = 0
+    stop_transition_start: float = 0.0
 
     @property
     def units(self) -> float:
@@ -347,6 +349,10 @@ def _tighten_stop(
         _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
         return
 
+    if mode == "delayed_baseline":
+        _tighten_stop_delayed_baseline(position, index, candles, config)
+        return
+
     raise ValueError(f"unsupported stop_tightening: {mode}")
 
 
@@ -413,6 +419,95 @@ def _tighten_stop_green_wide(
         higher_low = recent_higher_low(candles, index)
         if higher_low:
             position.stop_price = max(position.stop_price, first_entry, higher_low * (1 - config.green_wide_stop_buffer_pct))
+
+
+def _tighten_stop_delayed_baseline(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
+    config: StrategyConfig,
+) -> None:
+    if position.stop_transition_fill_count != len(position.fills):
+        position.stop_transition_fill_count = len(position.fills)
+        position.stop_transition_start = position.stop_price
+    progress = _apply_stop_transition_curve(
+        _stop_transition_progress(position, index, candles, config),
+        config.stop_transition_curve,
+    )
+    start = position.stop_transition_start or _previous_baseline_stop_target(position)
+    target = _baseline_stop_target(position, index, candles, config)
+    transitioned = _interpolate(start, target, progress)
+    position.stop_price = max(position.stop_price, transitioned)
+
+
+def _stop_transition_progress(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
+    config: StrategyConfig,
+) -> float:
+    if config.stop_transition_bars <= 0:
+        return 1.0
+    fill_index = _fill_index(candles, position.fills[-1].time_ms)
+    elapsed = max(0, index - fill_index)
+    return min(1.0, elapsed / config.stop_transition_bars)
+
+
+def _apply_stop_transition_curve(progress: float, curve: str) -> float:
+    if curve == "linear":
+        return progress
+    if curve == "slow_start":
+        return progress * progress
+    if curve == "fast_start":
+        return 1 - ((1 - progress) * (1 - progress))
+    if curve == "smooth":
+        return (3 * progress * progress) - (2 * progress * progress * progress)
+    raise ValueError(f"unsupported stop_transition_curve: {curve}")
+
+
+def _fill_index(candles: list[Candle], fill_time_ms: int) -> int:
+    for index, candle in enumerate(candles):
+        if candle.open_time_ms == fill_time_ms:
+            return index
+    return 0
+
+
+def _baseline_stop_target(
+    position: OpenPosition,
+    index: int,
+    candles: list[Candle],
+    config: StrategyConfig,
+) -> float:
+    target = position.initial_stop_price or position.stop_price
+    if position.max_stage >= 2:
+        target = max(target, position.fills[0].price)
+    if position.max_stage >= 3:
+        target = max(target, position.entry_price)
+    if position.max_stage >= 4:
+        higher_low = recent_higher_low(candles, index)
+        if higher_low:
+            target = max(target, higher_low * (1 - config.stop_buffer_pct))
+    return target
+
+
+def _previous_baseline_stop_target(position: OpenPosition) -> float:
+    initial_stop = position.initial_stop_price or position.stop_price
+    if position.max_stage <= 2:
+        return initial_stop
+    if position.max_stage == 3:
+        return position.fills[0].price
+    return _fills_entry_price(position.fills[:-1])
+
+
+def _fills_entry_price(fills: list[Fill]) -> float:
+    units = sum(fill.units for fill in fills)
+    if not units:
+        return 0.0
+    return sum(fill.price * fill.units for fill in fills) / units
+
+
+def _interpolate(start: float, target: float, progress: float) -> float:
+    return start + ((target - start) * progress)
 
 
 def _marked_equity(equity: float, position: OpenPosition | None, mark_price: float) -> float:

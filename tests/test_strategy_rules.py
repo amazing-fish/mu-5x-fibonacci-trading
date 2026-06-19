@@ -89,6 +89,7 @@ class StrategyRuleTests(unittest.TestCase):
                 "baseline_yellow_wide",
                 "baseline_yellow_green_wide",
                 "baseline_half_green_wide",
+                "baseline_delayed_tighten_fast_start",
                 "optimized_v2",
             ],
             [group.name for group in groups],
@@ -111,14 +112,24 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertEqual("wide", groups[6].config.yellow_stop_tightening)
         self.assertEqual("wide", groups[6].config.green_stop_tightening)
         self.assertEqual("half_protect_green_wide", groups[7].config.stop_tightening)
-        self.assertTrue(groups[8].config.block_reverse_fib_resistance)
+        self.assertEqual("delayed_baseline", groups[8].config.stop_tightening)
+        self.assertEqual(8, groups[8].config.stop_transition_bars)
+        self.assertEqual("fast_start", groups[8].config.stop_transition_curve)
+        self.assertTrue(groups[9].config.block_reverse_fib_resistance)
 
     def test_selected_strategy_groups_loads_requested_names(self):
-        groups = selected_strategy_groups("MUUSDT", ["legacy_break_high,baseline", "second_pullback_limit_8"])
+        groups = selected_strategy_groups(
+            "MUUSDT",
+            ["legacy_break_high,baseline", "second_pullback_limit_8,baseline_delayed_tighten_fast_start"],
+        )
 
-        self.assertEqual(["legacy_break_high", "baseline", "baseline"], [group.name for group in groups])
+        self.assertEqual(
+            ["legacy_break_high", "baseline", "baseline", "baseline_delayed_tighten_fast_start"],
+            [group.name for group in groups],
+        )
         self.assertEqual("second_pullback", groups[1].config.entry_execution)
         self.assertEqual(8, groups[1].config.fib_lookback)
+        self.assertEqual("fast_start", groups[3].config.stop_transition_curve)
 
     def test_known_assets_record_preferred_fibonacci_lookbacks(self):
         self.assertEqual(8, preferred_fib_lookback("MU-USDT-SWAP"))
