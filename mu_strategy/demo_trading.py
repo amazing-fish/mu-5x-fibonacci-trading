@@ -41,6 +41,7 @@ def run_once(
     config = config or DemoTradingConfig()
     tickers = universe_provider(limit=config.universe_limit)
     open_exposure = 0
+    open_position_inst_ids: set[str] = set()
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
 
@@ -64,6 +65,7 @@ def run_once(
                 "orders": [],
             }
         open_exposure = _count_open_exposure(positions, open_orders)
+        open_position_inst_ids = _open_position_inst_ids(positions)
         existing_client_order_ids = _client_order_ids(open_orders)
 
     scans: list[dict[str, Any]] = []
@@ -103,6 +105,11 @@ def run_once(
         if plan["client_order_id"] in existing_client_order_ids:
             plan["status"] = "blocked"
             plan["reason"] = "duplicate_client_order_id"
+            orders.append(plan)
+            continue
+        if result.symbol in open_position_inst_ids:
+            plan["status"] = "blocked"
+            plan["reason"] = "symbol_position_already_open"
             orders.append(plan)
             continue
 
@@ -205,6 +212,14 @@ def _count_open_exposure(positions: dict[str, Any], open_orders: dict[str, Any])
             count += 1
     count += len(open_orders.get("data") or [])
     return count
+
+
+def _open_position_inst_ids(positions: dict[str, Any]) -> set[str]:
+    return {
+        str(row.get("instId"))
+        for row in positions.get("data") or []
+        if row.get("instId") and _decimal(row.get("pos")) != 0
+    }
 
 
 def _client_order_ids(open_orders: dict[str, Any]) -> set[str]:

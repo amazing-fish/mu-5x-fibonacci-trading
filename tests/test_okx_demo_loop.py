@@ -91,6 +91,26 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("max_open_exposure_reached", result["orders"][0]["reason"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_blocks_initial_entry_when_symbol_position_is_open(self):
+        class PositionedBroker(StubBroker):
+            def get_positions(self, *, inst_type=None, inst_id=None):
+                return {"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "pos": "0.01"}], "msg": ""}
+
+        broker = PositionedBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual("blocked", result["orders"][0]["status"])
+        self.assertEqual("symbol_position_already_open", result["orders"][0]["reason"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
