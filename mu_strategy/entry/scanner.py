@@ -254,6 +254,8 @@ def _latest_recent_signal(
             config,
         )
         if entry_signal.allowed:
+            if config.entry_execution == "second_pullback":
+                return (candles[index], fib_level)
             latest = (candles[index], fib_level)
     return latest
 
