@@ -274,12 +274,11 @@ def _second_pullback_signal_already_filled(
     config: StrategyConfig,
 ) -> bool:
     expires_index = min(len(candles) - 1, signal_index + config.second_pullback_wait_bars)
-    fill_threshold = fib_level * (1 + config.fib_tolerance_pct)
     for index in range(signal_index + 1, expires_index + 1):
         candle = candles[index]
         if not is_preferred_us_cash_window(candle.open_time_ms, config):
             continue
-        if candle.low <= fill_threshold:
+        if candle.low <= fib_level:
             return True
     return False
 

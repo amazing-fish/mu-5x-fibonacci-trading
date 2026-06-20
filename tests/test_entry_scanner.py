@@ -112,7 +112,7 @@ class EntryScannerTests(unittest.TestCase):
         self.assertEqual("filters are not fully blocked, but no recent confirmed fib retest", result.reason)
         self.assertIsNone(result.trigger_price)
 
-    def test_scan_entry_second_pullback_ignores_signal_filled_inside_fib_tolerance(self):
+    def test_scan_entry_second_pullback_keeps_tolerance_only_pullback_pending(self):
         from mu_strategy.entry.scanner import scan_entry
 
         candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
@@ -141,9 +141,10 @@ class EntryScannerTests(unittest.TestCase):
                             lookback_bars=4,
                         )
 
-        self.assertEqual("wait", result.action)
-        self.assertEqual("filters are not fully blocked, but no recent confirmed fib retest", result.reason)
-        self.assertIsNone(result.trigger_price)
+        self.assertEqual("enter", result.action)
+        self.assertEqual("recent retest confirmed; resting second-pullback fib limit", result.reason)
+        self.assertEqual(candles[signal_index].open_time_ms, result.signal_time_ms)
+        self.assertAlmostEqual(100.0, result.trigger_price)
 
     def test_scan_entry_second_pullback_preserves_older_active_pending_signal(self):
         from mu_strategy.entry.scanner import scan_entry
