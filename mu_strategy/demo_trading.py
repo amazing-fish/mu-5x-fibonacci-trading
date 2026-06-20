@@ -45,8 +45,8 @@ def run_once(
     scanner: Scanner = scan_entry,
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
-    tickers = universe_provider(limit=config.universe_limit)
-    entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
+    tickers: list[OKXSwapTicker] = []
+    universe_error: dict[str, Any] | None = None
     open_exposure = 0
     open_position_inst_ids: set[str] = set()
     open_order_inst_ids: set[str] = set()
@@ -54,7 +54,9 @@ def run_once(
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
 
-    if not config.dry_run:
+    if config.dry_run:
+        tickers = universe_provider(limit=config.universe_limit)
+    else:
         if broker is None:
             raise RuntimeError("broker is required when dry_run is false")
         positions = broker.get_positions(inst_type="SWAP")
@@ -79,6 +81,12 @@ def run_once(
         open_order_inst_ids = _open_order_inst_ids(open_orders)
         open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
         existing_client_order_ids = _client_order_ids(open_orders)
+        try:
+            tickers = universe_provider(limit=config.universe_limit)
+        except Exception as exc:
+            universe_error = _universe_load_error(exc)
+
+    entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
 
     scans: list[dict[str, Any]] = []
     scan_results: list[EntryScanResult] = []
@@ -234,6 +242,7 @@ def run_once(
         "scans": scans,
         "orders": orders,
         "expired_orders": expired_orders,
+        "universe_error": universe_error,
         "data_errors": data_errors,
     }
 
@@ -328,6 +337,14 @@ def _market_data_load_error(symbol: str, exc: Exception) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "reason": "market_data_load_failed",
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
+
+
+def _universe_load_error(exc: Exception) -> dict[str, Any]:
+    return {
+        "reason": "universe_load_failed",
         "error_type": type(exc).__name__,
         "message": str(exc),
     }

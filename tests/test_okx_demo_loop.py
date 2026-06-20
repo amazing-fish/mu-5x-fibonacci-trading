@@ -386,6 +386,54 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_expires_stale_bot_limit_order_when_universe_provider_fails(self):
+        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
+
+        class StaleOrderBroker(StubBroker):
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "ordId": "OLD1",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        broker = StaleOrderBroker()
+
+        def failing_universe_provider(*, limit):
+            raise RuntimeError("ticker timeout")
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=failing_universe_provider,
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _scan_result(
+                symbol,
+                action="wait",
+                trigger_price=None,
+            ),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["universe"])
+        self.assertEqual("universe_load_failed", result["universe_error"]["reason"])
+        self.assertEqual("RuntimeError", result["universe_error"]["error_type"])
+        self.assertEqual("ticker timeout", result["universe_error"]["message"])
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
+        self.assertEqual([], result["orders"])
+        self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
