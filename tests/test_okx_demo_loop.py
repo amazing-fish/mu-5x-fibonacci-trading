@@ -341,6 +341,51 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_expires_stale_bot_limit_order_when_candle_loader_fails(self):
+        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
+
+        class StaleOrderBroker(StubBroker):
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "ordId": "OLD1",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        broker = StaleOrderBroker()
+
+        def failing_loader(symbol, **kwargs):
+            raise RuntimeError("fetch timeout")
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=failing_loader,
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail("failed data load must not be scanned"),
+        )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_load_failed", result["data_errors"][0]["reason"])
+        self.assertEqual("RuntimeError", result["data_errors"][0]["error_type"])
+        self.assertEqual("fetch timeout", result["data_errors"][0]["message"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+        self.assertEqual("market_data_load_failed", result["scans"][0]["reason"])
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual("market_data_load_failed", result["expired_orders"][0]["reason"])
+        self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_blocks_live_demo_when_account_context_has_business_error(self):
         class ErrorBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):

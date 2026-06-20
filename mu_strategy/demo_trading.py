@@ -88,15 +88,23 @@ def run_once(
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
 
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
-        bundle = candle_loader(
-            ticker.inst_id,
-            intervals=("15m", "1h"),
-            days=config.days,
-            data_dir=config.data_dir,
-            refresh=config.refresh,
-        )
         data_error = None
-        if not config.dry_run:
+        bundle = None
+        try:
+            bundle = candle_loader(
+                ticker.inst_id,
+                intervals=("15m", "1h"),
+                days=config.days,
+                data_dir=config.data_dir,
+                refresh=config.refresh,
+            )
+        except Exception as exc:
+            data_error = _market_data_load_error(ticker.inst_id, exc)
+            data_errors.append(data_error)
+            result = _data_error_scan_result(ticker.inst_id, data_error)
+            scans.append(_data_error_scan_payload(result, data_error))
+
+        if bundle is not None and not config.dry_run:
             data_error = _market_data_freshness_error(
                 symbol=ticker.inst_id,
                 bundle=bundle,
@@ -108,7 +116,7 @@ def run_once(
                 result = _stale_scan_result(ticker.inst_id, bundle, data_error)
                 scans.append(_stale_scan_payload(result, bundle, data_error))
 
-        if data_error is None:
+        if bundle is not None and data_error is None:
             result = scanner(
                 ticker.inst_id,
                 bundle.candles_by_interval.get("15m", []),
@@ -278,11 +286,24 @@ def _scan_payload(result: EntryScanResult, bundle: CandleBundle) -> dict[str, An
 
 
 def _stale_scan_result(symbol: str, bundle: CandleBundle, data_error: dict[str, Any]) -> EntryScanResult:
+    return _data_error_scan_result(
+        symbol,
+        data_error,
+        last_close=_latest_close(bundle.candles_by_interval.get("15m", [])),
+    )
+
+
+def _data_error_scan_result(
+    symbol: str,
+    data_error: dict[str, Any],
+    *,
+    last_close: float | None = None,
+) -> EntryScanResult:
     return EntryScanResult(
         symbol=symbol,
         action="skip",
         reason=data_error["reason"],
-        last_close=_latest_close(bundle.candles_by_interval.get("15m", [])),
+        last_close=last_close,
         regime_1h="yellow",
         rsi14=None,
         macd_hist=None,
@@ -294,6 +315,22 @@ def _stale_scan_payload(result: EntryScanResult, bundle: CandleBundle, data_erro
     payload = _scan_payload(result, bundle)
     payload["data_error"] = data_error
     return payload
+
+
+def _data_error_scan_payload(result: EntryScanResult, data_error: dict[str, Any]) -> dict[str, Any]:
+    payload = asdict(result)
+    payload["data_files"] = {}
+    payload["data_error"] = data_error
+    return payload
+
+
+def _market_data_load_error(symbol: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "reason": "market_data_load_failed",
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
 
 
 def _market_data_freshness_error(

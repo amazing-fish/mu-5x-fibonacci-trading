@@ -260,9 +260,27 @@ def _latest_recent_signal(
         )
         if entry_signal.allowed:
             if config.entry_execution == "second_pullback":
+                if _second_pullback_signal_already_filled(candles, index, fib_level, config):
+                    continue
                 return (candles[index], fib_level)
             latest = (candles[index], fib_level)
     return latest
+
+
+def _second_pullback_signal_already_filled(
+    candles: list[Candle],
+    signal_index: int,
+    fib_level: float,
+    config: StrategyConfig,
+) -> bool:
+    expires_index = min(len(candles) - 2, signal_index + config.second_pullback_wait_bars)
+    for index in range(signal_index + 1, expires_index + 1):
+        candle = candles[index]
+        if not is_preferred_us_cash_window(candle.open_time_ms, config):
+            continue
+        if candle.low <= fib_level:
+            return True
+    return False
 
 
 def _effective_lookback_bars(config: StrategyConfig, requested_lookback_bars: int) -> int:
