@@ -5,7 +5,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.data import cached_historical, write_csv
-from mu_strategy.market_data.cache import cache_path, merge_incremental_candles, prune_candles_to_window
+from mu_strategy.market_data.cache import (
+    DataQualityError,
+    cache_path,
+    merge_incremental_candles,
+    prune_candles_to_window,
+    validate_close_to_next_open_gaps,
+)
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, okx_row_to_candle
 from mu_strategy.models import Candle
 
@@ -54,6 +60,23 @@ class DataTests(unittest.TestCase):
 
         self.assertEqual([86_400_000, 2 * 86_400_000], [bar.open_time_ms for bar in pruned])
 
+    def test_validate_close_to_next_open_gaps_blocks_large_data_jump(self):
+        candles = [
+            Candle(0, 99, 101, 98, 100, 1000),
+            Candle(900_000, 108, 109, 107, 108.5, 1000),
+        ]
+
+        with self.assertRaisesRegex(DataQualityError, "close_to_next_open_gap"):
+            validate_close_to_next_open_gaps(candles, max_gap_pct=0.02)
+
+    def test_validate_close_to_next_open_gaps_allows_small_continuity_noise(self):
+        candles = [
+            Candle(0, 99, 101, 98, 100, 1000),
+            Candle(900_000, 100.5, 101, 99, 100.7, 1000),
+        ]
+
+        validate_close_to_next_open_gaps(candles, max_gap_pct=0.02)
+
     def test_okx_cached_historical_updates_existing_cache_incrementally_and_prunes_window(self):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -94,6 +117,28 @@ class DataTests(unittest.TestCase):
 
         self.assertEqual(path, returned_path)
         self.assertEqual(existing, candles)
+
+    def test_okx_cached_historical_blocks_existing_cache_with_large_close_to_open_gap(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            path = cache_path("MU-USDT-SWAP", "15m", days=180, data_dir=data_dir, source="okx")
+            write_csv(
+                [
+                    Candle(0, 99, 101, 98, 100, 1000),
+                    Candle(900_000, 108, 109, 107, 108.5, 1000),
+                ],
+                path,
+            )
+
+            with self.assertRaisesRegex(DataQualityError, "close_to_next_open_gap"):
+                cached_historical(
+                    "MU-USDT-SWAP",
+                    "15m",
+                    days=180,
+                    data_dir=data_dir,
+                    source="okx",
+                    incremental=False,
+                )
 
     def test_okx_fetch_uses_browser_user_agent(self):
         from mu_strategy.market_data.providers.okx import fetch_okx_candles

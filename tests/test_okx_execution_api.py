@@ -7,6 +7,7 @@ from unittest.mock import patch
 from mu_strategy.live.okx import (
     DemoOrderRequest,
     OKXCredentials,
+    OKXInstrumentSpec,
     OKXRestClient,
     ShadowExecutionEvent,
     ShadowExecutionLedger,
@@ -156,6 +157,135 @@ class OKXRestClientTests(unittest.TestCase):
         client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
 
         self.assertEqual("1", transport.calls[0]["headers"]["x-simulated-trading"])
+
+    def test_set_leverage_sends_isolated_five_x_demo_private_request(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        client.set_leverage(inst_id="BTC-USDT-SWAP", lever=5, margin_mode="isolated")
+
+        call = transport.calls[0]
+        self.assertEqual("POST", call["method"])
+        self.assertTrue(call["url"].endswith("/api/v5/account/set-leverage"))
+        self.assertEqual("1", call["headers"]["x-simulated-trading"])
+        self.assertEqual(
+            '{"instId":"BTC-USDT-SWAP","lever":"5","mgnMode":"isolated"}',
+            call["body"],
+        )
+
+    def test_set_leverage_cannot_be_sent_with_production_client(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=False,
+            transport=transport,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "demo"):
+            client.set_leverage(inst_id="BTC-USDT-SWAP", lever=5, margin_mode="isolated")
+
+        self.assertEqual([], transport.calls)
+
+    def test_get_open_orders_adds_swap_and_symbol_filters(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        client.get_open_orders(inst_type="SWAP", inst_id="BTC-USDT-SWAP")
+
+        call = transport.calls[0]
+        self.assertEqual("GET", call["method"])
+        self.assertTrue(call["url"].endswith("/api/v5/trade/orders-pending?instType=SWAP&instId=BTC-USDT-SWAP"))
+        self.assertEqual("1", call["headers"]["x-simulated-trading"])
+
+    def test_instrument_spec_rounds_limit_price_and_size_for_notional(self):
+        spec = OKXInstrumentSpec.from_row(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "tickSz": "0.1",
+                "lotSz": "0.01",
+                "ctVal": "0.01",
+            }
+        )
+
+        self.assertEqual("100.1", spec.price_to_string(100.19))
+        self.assertEqual("9.99", spec.size_for_notional(10.0, price=100.1))
+
+    def test_place_limit_buy_uses_isolated_limit_order(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        response = client.place_limit_buy(
+            inst_id="BTC-USDT-SWAP",
+            size="0.01",
+            price="65000.1",
+            client_order_id="DEMO3",
+            confirm_demo_order=True,
+        )
+
+        self.assertEqual({"code": "0", "data": [{"ok": True}], "msg": ""}, response)
+        self.assertEqual(
+            '{"instId":"BTC-USDT-SWAP","tdMode":"isolated","side":"buy","ordType":"limit","sz":"0.01","px":"65000.1","clOrdId":"DEMO3"}',
+            transport.calls[0]["body"],
+        )
+
+    def test_cancel_order_uses_client_order_id_endpoint(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        self.assertTrue(hasattr(client, "cancel_order"), "OKXRestClient needs a cancel_order wrapper")
+
+        response = client.cancel_order(
+            inst_id="BTC-USDT-SWAP",
+            client_order_id="DEMO3",
+            confirm_demo_order=True,
+        )
+
+        self.assertEqual({"code": "0", "data": [{"ok": True}], "msg": ""}, response)
+        call = transport.calls[0]
+        self.assertEqual("POST", call["method"])
+        self.assertTrue(call["url"].endswith("/api/v5/trade/cancel-order"))
+        self.assertEqual("1", call["headers"]["x-simulated-trading"])
+        self.assertEqual(
+            '{"instId":"BTC-USDT-SWAP","clOrdId":"DEMO3"}',
+            call["body"],
+        )
+
+    def test_cancel_order_cannot_be_sent_with_production_client(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=False,
+            transport=transport,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "demo"):
+            client.cancel_order(
+                inst_id="BTC-USDT-SWAP",
+                client_order_id="DEMO3",
+                confirm_demo_order=True,
+            )
+
+        self.assertEqual([], transport.calls)
 
 
 class ShadowExecutionLedgerTests(unittest.TestCase):

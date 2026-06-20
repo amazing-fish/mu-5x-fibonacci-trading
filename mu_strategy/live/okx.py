@@ -11,12 +11,14 @@ import urllib.request
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Callable
 
 
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
+OKX_CANCEL_ORDER_PATH = "/api/v5/trade/cancel-order"
 OKX_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{1,32}$")
 
 
@@ -95,6 +97,38 @@ class DemoOrderRequest:
         return body
 
 
+@dataclass(frozen=True)
+class OKXInstrumentSpec:
+    inst_id: str
+    tick_size: Decimal
+    lot_size: Decimal
+    contract_value: Decimal
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> "OKXInstrumentSpec":
+        return cls(
+            inst_id=str(row["instId"]),
+            tick_size=Decimal(str(row["tickSz"])),
+            lot_size=Decimal(str(row["lotSz"])),
+            contract_value=Decimal(str(row.get("ctVal", "1"))),
+        )
+
+    def price_to_string(self, price: float | str | Decimal) -> str:
+        return _decimal_to_string(_floor_to_step(Decimal(str(price)), self.tick_size))
+
+    def size_to_string(self, size: float | str | Decimal) -> str:
+        return _decimal_to_string(_floor_to_step(Decimal(str(size)), self.lot_size))
+
+    def size_for_notional(self, notional_usdt: float | str | Decimal, *, price: float | str | Decimal) -> str:
+        price_value = Decimal(str(price))
+        if price_value <= 0:
+            raise ValueError("price must be positive")
+        if self.contract_value <= 0:
+            raise ValueError("contract_value must be positive")
+        raw_size = Decimal(str(notional_usdt)) / (price_value * self.contract_value)
+        return self.size_to_string(raw_size)
+
+
 Transport = Callable[[str, str], dict[str, Any]]
 
 
@@ -128,11 +162,29 @@ class OKXRestClient:
             query["instId"] = inst_id
         return self._request("GET", "/api/v5/account/positions", query=query or None, private=True)
 
+    def get_open_orders(self, *, inst_type: str | None = None, inst_id: str | None = None) -> dict[str, Any]:
+        query = {}
+        if inst_type:
+            query["instType"] = inst_type
+        if inst_id:
+            query["instId"] = inst_id
+        return self._request("GET", "/api/v5/trade/orders-pending", query=query or None, private=True)
+
     def get_instruments(self, *, inst_type: str, inst_id: str | None = None) -> dict[str, Any]:
         query = {"instType": inst_type}
         if inst_id:
             query["instId"] = inst_id
         return self._request("GET", "/api/v5/public/instruments", query=query, private=False)
+
+    def set_leverage(self, *, inst_id: str, lever: float | int | str, margin_mode: str = "isolated") -> dict[str, Any]:
+        if not self.demo:
+            raise PermissionError("demo leverage setup requires a demo client")
+        body = {
+            "instId": inst_id,
+            "lever": _decimal_to_string(Decimal(str(lever))),
+            "mgnMode": margin_mode,
+        }
+        return self._request("POST", "/api/v5/account/set-leverage", body=body, private=True)
 
     def prepare_demo_order(self, request: DemoOrderRequest) -> PreparedRequest:
         if not self.demo:
@@ -151,6 +203,54 @@ class OKXRestClient:
             body=prepared.body,
             timeout=self.timeout,
         )
+
+    def place_limit_buy(
+        self,
+        *,
+        inst_id: str,
+        size: str,
+        price: str,
+        client_order_id: str,
+        confirm_demo_order: bool,
+        td_mode: str = "isolated",
+        pos_side: str | None = None,
+    ) -> dict[str, Any]:
+        return self.place_demo_order(
+            DemoOrderRequest(
+                inst_id=inst_id,
+                side="buy",
+                size=size,
+                order_type="limit",
+                price=price,
+                td_mode=td_mode,
+                client_order_id=client_order_id,
+                pos_side=pos_side,
+            ),
+            confirm_demo_order=confirm_demo_order,
+        )
+
+    def cancel_order(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        confirm_demo_order: bool,
+    ) -> dict[str, Any]:
+        if not self.demo:
+            raise PermissionError("demo order cancellation requires a demo client")
+        if not confirm_demo_order:
+            raise PermissionError("confirm_demo_order=True is required before canceling a demo order")
+        if order_id is None and client_order_id is None:
+            raise ValueError("order_id or client_order_id is required")
+        body = {"instId": inst_id}
+        if order_id is not None:
+            body["ordId"] = order_id
+        if client_order_id is not None:
+            if not OKX_CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
+                raise ValueError("client_order_id must be 1-32 ASCII alphanumeric characters")
+            body["clOrdId"] = client_order_id
+        return self._request("POST", OKX_CANCEL_ORDER_PATH, body=body, private=True)
 
     def _request(
         self,
@@ -374,6 +474,19 @@ def _credential_values_are_complete(prefix: str, values: Mapping[str, str]) -> b
 
 def _compact_json(value: dict[str, Any]) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+
+
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        raise ValueError("step must be positive")
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _decimal_to_string(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        return str(normalized.quantize(Decimal("1")))
+    return format(normalized, "f")
 
 
 def _sign(*, timestamp: str, method: str, request_path: str, body: str, secret_key: str) -> str:
