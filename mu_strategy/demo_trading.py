@@ -53,6 +53,7 @@ def run_once(
     open_order_rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
+    account_error: dict[str, str] | None = None
 
     if config.dry_run:
         tickers = universe_provider(limit=config.universe_limit)
@@ -63,28 +64,17 @@ def run_once(
         open_orders = broker.get_open_orders(inst_type="SWAP")
         account_context = {"positions": positions, "open_orders": open_orders}
         account_error = _account_context_error(account_context)
-        if account_error is not None:
-            return {
-                "mode": "blocked",
-                "dry_run": config.dry_run,
-                "reason": "account_context_error",
-                "account_context": account_context,
-                "account_error": account_error,
-                "universe": [asdict(ticker) for ticker in tickers],
-                "open_exposure": 0,
-                "scans": [],
-                "orders": [],
-                "expired_orders": [],
-            }
-        open_exposure = _count_open_exposure(positions, open_orders)
-        open_position_inst_ids = _open_position_inst_ids(positions)
-        open_order_inst_ids = _open_order_inst_ids(open_orders)
-        open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
-        existing_client_order_ids = _client_order_ids(open_orders)
-        try:
-            tickers = universe_provider(limit=config.universe_limit)
-        except Exception as exc:
-            universe_error = _universe_load_error(exc)
+        if not _okx_response_failed(open_orders):
+            open_order_inst_ids = _open_order_inst_ids(open_orders)
+            open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
+            existing_client_order_ids = _client_order_ids(open_orders)
+        if account_error is None:
+            open_exposure = _count_open_exposure(positions, open_orders)
+            open_position_inst_ids = _open_position_inst_ids(positions)
+            try:
+                tickers = universe_provider(limit=config.universe_limit)
+            except Exception as exc:
+                universe_error = _universe_load_error(exc)
 
     entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
 
@@ -233,8 +223,11 @@ def run_once(
         existing_client_order_ids.add(plan["client_order_id"])
         remaining_capacity -= 1
 
-    return {
-        "mode": "dry_run" if config.dry_run else "live_demo",
+    mode = "dry_run" if config.dry_run else "live_demo"
+    if account_error is not None:
+        mode = "blocked"
+    payload = {
+        "mode": mode,
         "dry_run": config.dry_run,
         "universe": [asdict(ticker) for ticker in tickers],
         "open_exposure": open_exposure,
@@ -245,6 +238,10 @@ def run_once(
         "universe_error": universe_error,
         "data_errors": data_errors,
     }
+    if account_error is not None:
+        payload["reason"] = "account_context_error"
+        payload["account_error"] = account_error
+    return payload
 
 
 def generate_client_order_id(symbol: str, signal_time_ms: int | None, trigger_price: float) -> str:

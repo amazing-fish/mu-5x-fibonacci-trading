@@ -454,6 +454,53 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual([], result["orders"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_expires_stale_bot_limit_order_when_positions_context_has_business_error(self):
+        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
+
+        class StaleOrderPositionErrorBroker(StubBroker):
+            def get_positions(self, *, inst_type=None, inst_id=None):
+                return {"code": "50011", "data": [], "msg": "request failed"}
+
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "ordId": "OLD1",
+                            "clOrdId": stale_client_order_id,
+                            "ordType": "limit",
+                            "side": "buy",
+                            "state": "live",
+                        }
+                    ],
+                    "msg": "",
+                }
+
+        broker = StaleOrderPositionErrorBroker()
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            broker=broker,
+            universe_provider=lambda limit: self.fail("account error must block fresh universe entries"),
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _scan_result(
+                symbol,
+                action="wait",
+                trigger_price=None,
+            ),
+        )
+
+        self.assertEqual("blocked", result["mode"])
+        self.assertEqual("account_context_error", result["reason"])
+        self.assertEqual("positions", result["account_error"]["component"])
+        self.assertEqual([], result["universe"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("expired", result["expired_orders"][0]["status"])
+        self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
+        self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_sends_isolated_limit_order_when_confirmed(self):
         broker = StubBroker()
 
