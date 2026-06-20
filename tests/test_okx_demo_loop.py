@@ -655,6 +655,51 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual([240.0], sleep_calls)
 
+    def test_run_forever_logs_runner_failure_and_continues_next_cycle(self):
+        from mu_strategy.commands.okx_demo_loop import _run_forever
+
+        class StopLoop(Exception):
+            pass
+
+        stdout = io.StringIO()
+        sleep_calls = []
+        runner_calls = []
+        clock_values = iter([100.0, 100.0, 100.0, 100.0, 400.0, 400.0])
+
+        def clock():
+            return next(clock_values)
+
+        def runner(config, broker):
+            runner_calls.append(config.dry_run)
+            if len(runner_calls) == 1:
+                raise RuntimeError("temporary OKX timeout")
+            return {"mode": "dry_run", "cycle": len(runner_calls)}
+
+        def sleeper(seconds):
+            sleep_calls.append(seconds)
+            if len(sleep_calls) == 2:
+                raise StopLoop()
+
+        with self.assertRaises(StopLoop):
+            _run_forever(
+                DemoTradingConfig(dry_run=True),
+                broker=None,
+                interval_seconds=300,
+                runner=runner,
+                stdout=stdout,
+                clock=clock,
+                sleeper=sleeper,
+            )
+
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual("cycle_failed", lines[0]["mode"])
+        self.assertEqual("runner_failed", lines[0]["reason"])
+        self.assertEqual("RuntimeError", lines[0]["error_type"])
+        self.assertEqual("temporary OKX timeout", lines[0]["message"])
+        self.assertEqual({"cycle": 2, "mode": "dry_run"}, lines[1])
+        self.assertEqual([300.0, 300.0], sleep_calls)
+        self.assertEqual([True, True], runner_calls)
+
 
 def _bundle(symbol: str) -> CandleBundle:
     last_open_time_ms = int(time.time() * 1000) - 900_000

@@ -85,7 +85,10 @@ def _run_forever(
         sleep_seconds = next_run_at - clock()
         if sleep_seconds > 0:
             sleeper(sleep_seconds)
-        payload = runner(config, broker=broker)
+        try:
+            payload = runner(config, broker=broker)
+        except Exception as exc:
+            payload = _runner_failure_payload(exc)
         stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
         stdout.write("\n")
         stdout.flush()
@@ -93,6 +96,15 @@ def _run_forever(
         now = clock()
         while next_run_at <= now:
             next_run_at += interval_seconds
+
+
+def _runner_failure_payload(exc: Exception) -> dict[str, str]:
+    return {
+        "mode": "cycle_failed",
+        "reason": "runner_failed",
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+    }
 
 
 if __name__ == "__main__":
