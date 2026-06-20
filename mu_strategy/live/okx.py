@@ -177,6 +177,8 @@ class OKXRestClient:
         return self._request("GET", "/api/v5/public/instruments", query=query, private=False)
 
     def set_leverage(self, *, inst_id: str, lever: float | int | str, margin_mode: str = "isolated") -> dict[str, Any]:
+        if not self.demo:
+            raise PermissionError("demo leverage setup requires a demo client")
         body = {
             "instId": inst_id,
             "lever": _decimal_to_string(Decimal(str(lever))),

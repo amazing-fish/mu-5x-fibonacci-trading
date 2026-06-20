@@ -178,6 +178,19 @@ class OKXRestClientTests(unittest.TestCase):
             call["body"],
         )
 
+    def test_set_leverage_cannot_be_sent_with_production_client(self):
+        transport = RecordingTransport()
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=False,
+            transport=transport,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "demo"):
+            client.set_leverage(inst_id="BTC-USDT-SWAP", lever=5, margin_mode="isolated")
+
+        self.assertEqual([], transport.calls)
+
     def test_get_open_orders_adds_swap_and_symbol_filters(self):
         transport = RecordingTransport()
         client = OKXRestClient(
