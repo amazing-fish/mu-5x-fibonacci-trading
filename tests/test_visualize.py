@@ -2,8 +2,10 @@ import io
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from mu_strategy.market_data.trusted import DataStatus
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategy import StrategyConfig
@@ -219,6 +221,114 @@ class VisualizationTests(unittest.TestCase):
         self.assertEqual("okx", cached_calls[0][2]["source"])
         self.assertEqual("market", configs[0].fee_profile)
         self.assertAlmostEqual(0.0005, configs[0].fee_rate)
+
+    def test_visualize_cli_can_use_trusted_data_layer(self):
+        from mu_strategy import visualize
+
+        trusted_calls = []
+        candles_15m = [_candle(0, 100), _candle(900_000, 101)]
+        candles_1h = [_candle(0, 100)]
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            trusted_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": candles_15m, "1h": candles_1h},
+                statuses_by_interval={
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=len(candles_15m), path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=len(candles_1h), path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+            )
+
+        def fake_run_backtest(candles, context, *, config):
+            return BacktestResult(10_000, 10_000, [], [(0, 10_000)])
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = [
+                "mu_strategy.visualize",
+                "--trusted-data",
+                "--days",
+                "7",
+                "--data-dir",
+                str(Path(tmp) / "live"),
+                "--output",
+                str(output_path),
+            ]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle, create=True):
+                    with patch("mu_strategy.viz.backtest.cached_historical", side_effect=AssertionError("legacy cache must not be used")):
+                        with patch("mu_strategy.viz.backtest.run_backtest", side_effect=fake_run_backtest):
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                try:
+                                    visualize.main()
+                                except SystemExit as exc:
+                                    self.fail(f"--trusted-data should run without parser exit: {exc}")
+
+            html = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
+        self.assertEqual(("5m", "15m", "1h"), trusted_calls[0][1]["intervals"])
+        self.assertEqual(7, trusted_calls[0][1]["days"])
+        self.assertIn("trusted OKX data layer", html)
+
+    def test_visualize_cli_rejects_invalid_trusted_status(self):
+        from mu_strategy import visualize
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "15m": _status(
+                        "MU-USDT-SWAP",
+                        "15m",
+                        rows=1,
+                        path=Path("data/live/okx/MU-USDT-SWAP/15m.csv"),
+                        is_valid=False,
+                        reason="missing_in_built",
+                    )
+                },
+            )
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle, create=True):
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        with self.assertRaises(SystemExit) as raised:
+                            visualize.main()
+
+            self.assertFalse(output_path.exists())
+
+        self.assertNotEqual(0, raised.exception.code)
+
+
+def _candle(open_time_ms: int, close: float) -> Candle:
+    return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
+
+
+def _status(
+    symbol: str,
+    interval: str,
+    *,
+    rows: int,
+    path: Path,
+    is_valid: bool = True,
+    is_stale: bool = False,
+    reason: str = "ok",
+) -> DataStatus:
+    return DataStatus(
+        symbol=symbol,
+        interval=interval,
+        rows=rows,
+        first_timestamp_ms=0 if rows else None,
+        last_timestamp_ms=0 if rows else None,
+        updated_at_ms=0,
+        source_file=path,
+        is_valid=is_valid,
+        is_stale=is_stale,
+        reason=reason,
+    )
 
 
 if __name__ == "__main__":

@@ -152,6 +152,30 @@ def refresh_trusted_interval(
         )
 
 
+def refresh_trusted_symbol_statuses(
+    symbol: str,
+    *,
+    intervals: tuple[str, ...] = DEFAULT_INTERVALS,
+    days: int,
+    data_dir: Path = DEFAULT_LIVE_DATA_DIR,
+    now_ms: int | None = None,
+    fetcher: Callable[..., list[Candle]] | None = None,
+) -> dict[str, DataStatus]:
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    interval_statuses = {}
+    for interval in intervals:
+        interval_statuses[interval] = refresh_trusted_interval(
+            symbol,
+            interval,
+            days=days,
+            data_dir=data_dir,
+            now_ms=now_ms,
+            fetcher=fetcher,
+        )
+    _attach_built_native_validation(interval_statuses, data_dir=data_dir)
+    return interval_statuses
+
+
 def refresh_market_data_once(
     *,
     data_dir: Path = DEFAULT_LIVE_DATA_DIR,
@@ -187,18 +211,14 @@ def refresh_market_data_once(
         manifest["warnings"].append(f"stock_token_top_count_below_limit:{len(stock_top)}/{limit}")
 
     for ticker in symbols:
-        interval_statuses = {}
-        for interval in intervals:
-            status = refresh_trusted_interval(
-                ticker.inst_id,
-                interval,
-                days=days,
-                data_dir=data_dir,
-                now_ms=now_ms,
-                fetcher=fetcher,
-            )
-            interval_statuses[interval] = status
-        _attach_built_native_validation(interval_statuses, data_dir=data_dir)
+        interval_statuses = refresh_trusted_symbol_statuses(
+            ticker.inst_id,
+            intervals=intervals,
+            days=days,
+            data_dir=data_dir,
+            now_ms=now_ms,
+            fetcher=fetcher,
+        )
         manifest["symbols"][ticker.inst_id] = {
             "source": ticker.source,
             "last": ticker.last,
@@ -206,6 +226,7 @@ def refresh_market_data_once(
             "intervals": {interval: status.to_dict() for interval, status in interval_statuses.items()},
         }
 
+    manifest["status"] = _manifest_status(manifest)
     _write_manifest(manifest, data_dir=data_dir)
     _append_run_log(manifest, data_dir=data_dir)
     return manifest
@@ -389,6 +410,17 @@ def _run_log_payload(manifest: dict) -> dict:
         "invalid_count": invalid_count,
         "warnings": manifest.get("warnings") or [],
     }
+
+
+def _manifest_status(manifest: dict) -> str:
+    has_stale = False
+    for symbol in (manifest.get("symbols") or {}).values():
+        for status in (symbol.get("intervals") or {}).values():
+            if not status.get("is_valid"):
+                return "invalid"
+            if status.get("is_stale"):
+                has_stale = True
+    return "stale" if has_stale else "ok"
 
 
 def _dedupe_tickers(tickers: Iterable[OKXSwapTicker]) -> list[OKXSwapTicker]:

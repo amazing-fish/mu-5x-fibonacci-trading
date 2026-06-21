@@ -140,6 +140,61 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("TimeoutError", status.error_type)
         self.assertEqual("blocked", status.message)
 
+    def test_refresh_once_marks_manifest_invalid_when_any_interval_fails(self):
+        from mu_strategy.market_data.trusted import refresh_market_data_once
+
+        rows = [
+            {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "10"},
+            {"instId": "MU-USDT-SWAP", "last": "5", "volCcy24h": "100"},
+        ]
+
+        def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
+            if interval == "15m":
+                raise TimeoutError("blocked")
+            return _fake_fetcher(symbol, interval, days=days)
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            manifest = refresh_market_data_once(
+                data_dir=data_dir,
+                ticker_rows=rows,
+                stock_token_inst_ids={"MU-USDT-SWAP"},
+                limit=1,
+                days=1,
+                intervals=("5m", "15m"),
+                fetcher=fetcher,
+                now_ms=3_600_000,
+            )
+
+            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("invalid", persisted["status"])
+        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual(2, run_log["invalid_count"])
+        self.assertFalse(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
+        self.assertEqual("refresh_failed", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["reason"])
+
+
+class TrustedCandleBundleTests(unittest.TestCase):
+    def test_refresh_trusted_candle_bundle_attaches_built_native_validation(self):
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+
+        with TemporaryDirectory() as tmp:
+            bundle = refresh_trusted_candle_bundle(
+                "MU-USDT-SWAP",
+                intervals=("15m", "1h"),
+                days=1,
+                data_dir=Path(tmp),
+                fetcher=_fake_fetcher,
+            )
+
+        self.assertEqual(["15m", "1h"], list(bundle.candles_by_interval))
+        self.assertIn("5m", bundle.statuses_by_interval)
+        self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
+        self.assertTrue(bundle.statuses_by_interval["1h"].validation.ok)
+
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)

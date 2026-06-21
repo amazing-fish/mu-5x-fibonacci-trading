@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from mu_strategy.market_data.cache import cached_historical
+from mu_strategy.market_data.cache import cached_historical, read_csv
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted import DataStatus, refresh_trusted_interval
+from mu_strategy.market_data.trusted import DataStatus, refresh_trusted_symbol_statuses
 from mu_strategy.models import Candle
 
 
@@ -55,23 +56,25 @@ def refresh_trusted_candle_bundle(
     days: int = 28,
     data_dir: Path = Path("data/live"),
     refresh: bool = False,
+    fetcher: Callable[..., list[Candle]] | None = None,
 ) -> CandleBundle:
     resolved = resolve_okx_swap_symbol(symbol)
     candles_by_interval: dict[str, list[Candle]] = {}
     files_by_interval: dict[str, Path] = {}
-    statuses_by_interval: dict[str, DataStatus] = {}
-    for interval in intervals:
-        status = refresh_trusted_interval(
-            resolved.inst_id,
-            interval,
-            days=days,
-            data_dir=data_dir,
-        )
-        statuses_by_interval[interval] = status
+    requested_intervals = tuple(dict.fromkeys(intervals))
+    validation_intervals = _validation_intervals(requested_intervals)
+    statuses_by_interval = refresh_trusted_symbol_statuses(
+        resolved.inst_id,
+        intervals=validation_intervals,
+        days=days,
+        data_dir=data_dir,
+        fetcher=fetcher,
+    )
+
+    for interval in requested_intervals:
+        status = statuses_by_interval[interval]
         files_by_interval[interval] = status.source_file
         if status.source_file.exists():
-            from mu_strategy.market_data.cache import read_csv
-
             candles_by_interval[interval] = read_csv(status.source_file)
         else:
             candles_by_interval[interval] = []
@@ -82,3 +85,9 @@ def refresh_trusted_candle_bundle(
         days=days,
         statuses_by_interval=statuses_by_interval,
     )
+
+
+def _validation_intervals(intervals: tuple[str, ...]) -> tuple[str, ...]:
+    if any(interval in {"15m", "1h"} for interval in intervals):
+        return tuple(dict.fromkeys(("5m", *intervals)))
+    return intervals
