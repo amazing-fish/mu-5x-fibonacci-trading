@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from mu_strategy.market_data.cache import cached_historical, read_csv
+from mu_strategy.market_data.cache import cached_historical, read_csv, validate_close_to_next_open_gaps
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted import DataStatus, refresh_trusted_symbol_statuses
+from mu_strategy.market_data.trusted import (
+    DataStatus,
+    aggregate_candles,
+    refresh_trusted_symbol_statuses,
+    trusted_cache_path,
+    validate_built_native_candles,
+)
 from mu_strategy.models import Candle
 
 
@@ -26,18 +32,27 @@ def refresh_candle_bundle(
     days: int = 28,
     data_dir: Path = Path("data"),
     refresh: bool = False,
+    source: str = "okx",
 ) -> CandleBundle:
-    resolved = resolve_okx_swap_symbol(symbol)
+    if source == "okx":
+        resolved = resolve_okx_swap_symbol(symbol)
+        fetch_symbol = resolved.inst_id
+    elif source == "binance":
+        resolved = ResolvedSymbol(requested=symbol, inst_id=symbol, source=source)
+        fetch_symbol = symbol
+    else:
+        raise ValueError(f"unsupported data source: {source}")
     candles_by_interval: dict[str, list[Candle]] = {}
     files_by_interval: dict[str, Path] = {}
     for interval in intervals:
         candles, path = cached_historical(
-            resolved.inst_id,
+            fetch_symbol,
             interval,
             days=days,
             data_dir=data_dir,
             refresh=refresh,
-            source=resolved.source,
+            source=source,
+            incremental=refresh,
         )
         candles_by_interval[interval] = candles
         files_by_interval[interval] = path
@@ -63,21 +78,30 @@ def refresh_trusted_candle_bundle(
     files_by_interval: dict[str, Path] = {}
     requested_intervals = tuple(dict.fromkeys(intervals))
     validation_intervals = _validation_intervals(requested_intervals)
-    statuses_by_interval = refresh_trusted_symbol_statuses(
-        resolved.inst_id,
-        intervals=validation_intervals,
-        days=days,
-        data_dir=data_dir,
-        fetcher=fetcher,
-    )
+    if refresh:
+        statuses_by_interval = refresh_trusted_symbol_statuses(
+            resolved.inst_id,
+            intervals=validation_intervals,
+            days=days,
+            data_dir=data_dir,
+            fetcher=fetcher,
+        )
+    else:
+        statuses_by_interval, cached_candles = _load_trusted_cache_statuses(
+            resolved.inst_id,
+            intervals=validation_intervals,
+            data_dir=data_dir,
+        )
 
     for interval in requested_intervals:
         status = statuses_by_interval[interval]
         files_by_interval[interval] = status.source_file
-        if status.source_file.exists():
+        if not status.is_valid:
+            candles_by_interval[interval] = []
+        elif refresh:
             candles_by_interval[interval] = read_csv(status.source_file)
         else:
-            candles_by_interval[interval] = []
+            candles_by_interval[interval] = cached_candles[interval]
     return CandleBundle(
         symbol=resolved,
         candles_by_interval=candles_by_interval,
@@ -91,3 +115,82 @@ def _validation_intervals(intervals: tuple[str, ...]) -> tuple[str, ...]:
     if any(interval in {"15m", "1h"} for interval in intervals):
         return tuple(dict.fromkeys(("5m", *intervals)))
     return intervals
+
+
+def _load_trusted_cache_statuses(
+    symbol: str,
+    *,
+    intervals: tuple[str, ...],
+    data_dir: Path,
+) -> tuple[dict[str, DataStatus], dict[str, list[Candle]]]:
+    statuses: dict[str, DataStatus] = {}
+    candles_by_interval: dict[str, list[Candle]] = {}
+    for interval in intervals:
+        path = trusted_cache_path(symbol, interval, data_dir=data_dir)
+        try:
+            candles = read_csv(path) if path.exists() else []
+            validate_close_to_next_open_gaps(candles)
+            candles_by_interval[interval] = candles
+            statuses[interval] = _cache_status(symbol, interval, candles, path)
+        except Exception as exc:
+            candles_by_interval[interval] = []
+            statuses[interval] = DataStatus(
+                symbol=symbol,
+                interval=interval,
+                rows=0,
+                first_timestamp_ms=None,
+                last_timestamp_ms=None,
+                updated_at_ms=0,
+                source_file=path,
+                is_valid=False,
+                reason="cache_read_failed",
+                error_type=type(exc).__name__,
+                message=str(exc),
+            )
+    _attach_cached_built_native_validation(statuses, candles_by_interval)
+    return statuses, candles_by_interval
+
+
+def _cache_status(symbol: str, interval: str, candles: list[Candle], path: Path) -> DataStatus:
+    rows = len(candles)
+    reason = "ok"
+    if not path.exists():
+        reason = "cache_missing"
+    elif not candles:
+        reason = "empty"
+    return DataStatus(
+        symbol=symbol,
+        interval=interval,
+        rows=rows,
+        first_timestamp_ms=candles[0].open_time_ms if candles else None,
+        last_timestamp_ms=candles[-1].open_time_ms if candles else None,
+        updated_at_ms=0,
+        source_file=path,
+        is_valid=rows > 0,
+        reason=reason,
+    )
+
+
+def _attach_cached_built_native_validation(
+    statuses: dict[str, DataStatus],
+    candles_by_interval: dict[str, list[Candle]],
+) -> None:
+    five_minute_status = statuses.get("5m")
+    if five_minute_status is None or not five_minute_status.is_valid:
+        return
+    five_minute = candles_by_interval.get("5m") or []
+    for interval in ("15m", "1h"):
+        native_status = statuses.get(interval)
+        if native_status is None or not native_status.is_valid:
+            continue
+        validation = validate_built_native_candles(
+            aggregate_candles(five_minute, interval=interval),
+            candles_by_interval.get(interval) or [],
+            interval=interval,
+        )
+        statuses[interval] = replace(
+            native_status,
+            is_valid=native_status.is_valid and validation.ok,
+            reason=native_status.reason if validation.ok else validation.reason,
+            validation=validation,
+        )

@@ -219,6 +219,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 intervals=("15m", "1h"),
                 days=1,
                 data_dir=Path(tmp),
+                refresh=True,
                 fetcher=_fake_fetcher,
             )
 
@@ -226,6 +227,65 @@ class TrustedCandleBundleTests(unittest.TestCase):
         self.assertIn("5m", bundle.statuses_by_interval)
         self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
         self.assertTrue(bundle.statuses_by_interval["1h"].validation.ok)
+
+    def test_refresh_trusted_candle_bundle_honors_refresh_false(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for interval in ("5m", "15m", "1h"):
+                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                write_csv(_fake_fetcher("MU-USDT-SWAP", interval, days=1), path)
+
+            with patch(
+                "mu_strategy.market_data.service.refresh_trusted_symbol_statuses",
+                side_effect=AssertionError("refresh=False must not refresh trusted data"),
+            ):
+                bundle = refresh_trusted_candle_bundle(
+                    "MU-USDT-SWAP",
+                    intervals=("15m", "1h"),
+                    days=1,
+                    data_dir=data_dir,
+                    refresh=False,
+                )
+
+        self.assertEqual(4, len(bundle.candles_by_interval["15m"]))
+        self.assertEqual(1, len(bundle.candles_by_interval["1h"]))
+        self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
+
+    def test_refresh_trusted_candle_bundle_does_not_reread_invalid_status_file(self):
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+        from mu_strategy.market_data.trusted import DataStatus
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            corrupt_cache = data_dir / "okx" / "MU-USDT-SWAP" / "15m.csv"
+            corrupt_cache.parent.mkdir(parents=True)
+            corrupt_cache.write_text("not,a,valid,candle\n1,2,3,4\n", encoding="utf-8")
+            status = DataStatus(
+                symbol="MU-USDT-SWAP",
+                interval="15m",
+                rows=0,
+                first_timestamp_ms=None,
+                last_timestamp_ms=None,
+                updated_at_ms=0,
+                source_file=corrupt_cache,
+                is_valid=False,
+                reason="cache_read_failed",
+            )
+
+            with patch("mu_strategy.market_data.service.refresh_trusted_symbol_statuses", return_value={"15m": status}):
+                bundle = refresh_trusted_candle_bundle(
+                    "MU-USDT-SWAP",
+                    intervals=("15m",),
+                    days=1,
+                    data_dir=data_dir,
+                    refresh=True,
+                )
+
+        self.assertEqual([], bundle.candles_by_interval["15m"])
+        self.assertEqual("cache_read_failed", bundle.statuses_by_interval["15m"].reason)
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:

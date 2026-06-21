@@ -197,12 +197,15 @@ class VisualizationTests(unittest.TestCase):
     def test_visualize_cli_defaults_to_okx_mu_source(self):
         from mu_strategy import visualize
 
-        cached_calls = []
+        bundle_calls = []
         configs = []
 
-        def fake_cached_historical(symbol, interval, **kwargs):
-            cached_calls.append((symbol, interval, kwargs))
-            return [], Path(f"data/{symbol}_{interval}.csv")
+        def fake_refresh_candle_bundle(symbol, **kwargs):
+            bundle_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": [], "1h": []},
+                files_by_interval={"15m": Path("data/15m.csv"), "1h": Path("data/1h.csv")},
+            )
 
         def fake_run_backtest(candles_15m, context, *, config):
             configs.append(config)
@@ -212,15 +215,74 @@ class VisualizationTests(unittest.TestCase):
             output_path = Path(tmp) / "chart.html"
             argv = ["mu_strategy.visualize", "--days", "180", "--strategy", "baseline", "--output", str(output_path)]
             with patch("sys.argv", argv):
-                with patch("mu_strategy.viz.backtest.cached_historical", side_effect=fake_cached_historical):
+                with patch("mu_strategy.viz.backtest.refresh_candle_bundle", side_effect=fake_refresh_candle_bundle):
+                    with patch("mu_strategy.viz.backtest.cached_historical", side_effect=AssertionError("visualize must use market_data.service"), create=True):
+                        with patch("mu_strategy.viz.backtest.run_backtest", side_effect=fake_run_backtest):
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                visualize.main()
+
+        self.assertEqual("MU-USDT-SWAP", bundle_calls[0][0])
+        self.assertEqual(("15m", "1h"), bundle_calls[0][1]["intervals"])
+        self.assertEqual("okx", bundle_calls[0][1]["source"])
+        self.assertEqual(180, bundle_calls[0][1]["days"])
+        self.assertFalse(bundle_calls[0][1]["refresh"])
+        self.assertEqual("market", configs[0].fee_profile)
+        self.assertAlmostEqual(0.0005, configs[0].fee_rate)
+
+    def test_visualize_trusted_data_consumes_cache_without_refresh_by_default(self):
+        from mu_strategy import visualize
+
+        trusted_calls = []
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            trusted_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+            )
+
+        def fake_run_backtest(candles, context, *, config):
+            return BacktestResult(10_000, 10_000, [], [(0, 10_000)])
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
                     with patch("mu_strategy.viz.backtest.run_backtest", side_effect=fake_run_backtest):
                         with patch("sys.stdout", new_callable=io.StringIO):
                             visualize.main()
 
-        self.assertEqual("MU-USDT-SWAP", cached_calls[0][0])
-        self.assertEqual("okx", cached_calls[0][2]["source"])
-        self.assertEqual("market", configs[0].fee_profile)
-        self.assertAlmostEqual(0.0005, configs[0].fee_rate)
+        self.assertFalse(trusted_calls[0][1]["refresh"])
+
+    def test_visualize_trusted_data_refresh_flag_requests_refresh(self):
+        from mu_strategy import visualize
+
+        trusted_calls = []
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            trusted_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+            )
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--refresh", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("mu_strategy.viz.backtest.run_backtest", return_value=BacktestResult(10_000, 10_000, [], [(0, 10_000)])):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            visualize.main()
+
+        self.assertTrue(trusted_calls[0][1]["refresh"])
 
     def test_visualize_cli_can_use_trusted_data_layer(self):
         from mu_strategy import visualize
@@ -256,7 +318,7 @@ class VisualizationTests(unittest.TestCase):
             ]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle, create=True):
-                    with patch("mu_strategy.viz.backtest.cached_historical", side_effect=AssertionError("legacy cache must not be used")):
+                    with patch("mu_strategy.viz.backtest.cached_historical", side_effect=AssertionError("legacy cache must not be used"), create=True):
                         with patch("mu_strategy.viz.backtest.run_backtest", side_effect=fake_run_backtest):
                             with patch("sys.stdout", new_callable=io.StringIO):
                                 try:

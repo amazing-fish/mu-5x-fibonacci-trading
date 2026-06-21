@@ -4,8 +4,9 @@ import argparse
 from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
-from mu_strategy.data import cached_historical
 from mu_strategy.indicators import ema, macd, rsi
+from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted import DataStatus
 from mu_strategy.models import Candle
 from mu_strategy.reporting import render_markdown_report
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, one_hour_regime, selected_strategy_groups, with_fee_profile
@@ -17,7 +18,8 @@ def main() -> None:
     parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--trusted-data", action="store_true", help="Use the trusted OKX data layer instead of legacy cached_historical.")
     parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_backtest.md"))
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
     parser.add_argument(
@@ -35,28 +37,51 @@ def main() -> None:
     if len(groups) != 1:
         parser.error("--strategy must resolve to exactly one strategy group")
     config = with_fee_profile(groups[0].config, args.fee_profile)
-    candles_15m, file_15m = cached_historical(
-        args.symbol,
-        "15m",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
-    candles_1h, file_1h = cached_historical(
-        args.symbol,
-        "1h",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = Path("data/live") if args.trusted_data else Path("data")
+    if args.trusted_data:
+        bundle = refresh_trusted_candle_bundle(
+            args.symbol,
+            intervals=("5m", "15m", "1h"),
+            days=args.days,
+            data_dir=data_dir,
+            refresh=args.refresh,
+        )
+        status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("15m", "1h"))
+        if status_error:
+            parser.error(status_error)
+    else:
+        bundle = refresh_candle_bundle(
+            args.symbol,
+            intervals=("15m", "1h"),
+            days=args.days,
+            data_dir=data_dir,
+            refresh=args.refresh,
+            source=args.source,
+        )
+    candles_15m = bundle.candles_by_interval["15m"]
+    candles_1h = bundle.candles_by_interval["1h"]
+    file_15m = bundle.files_by_interval["15m"]
+    file_1h = bundle.files_by_interval["1h"]
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)
     report = render_markdown_report(result, config=config, symbol=args.symbol, data_files=[file_15m, file_1h])
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")
     print(report)
+
+
+def _trusted_status_error(statuses: dict[str, DataStatus], *, required_intervals: tuple[str, ...]) -> str | None:
+    for interval in required_intervals:
+        status = statuses.get(interval)
+        if status is None:
+            return f"trusted data status missing for {interval}"
+        if not status.is_valid:
+            return f"trusted data invalid for {interval}: {status.reason}"
+        if status.is_stale:
+            return f"trusted data stale for {interval}: {status.reason}"
+    return None
 
 
 def build_hourly_context(candles_15m: list[Candle], candles_1h: list[Candle]) -> dict[int, str]:
