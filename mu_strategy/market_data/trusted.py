@@ -117,9 +117,12 @@ def refresh_trusted_interval(
 ) -> DataStatus:
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     path = trusted_cache_path(symbol, interval, data_dir=data_dir)
-    existing = read_csv(path) if path.exists() else []
+    existing: list[Candle] = []
+    cache_loaded = False
     fetcher = fetcher or fetch_okx_historical
     try:
+        existing = read_csv(path) if path.exists() else []
+        cache_loaded = True
         if existing:
             since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
             fetched = fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -138,6 +141,10 @@ def refresh_trusted_interval(
         )
     except Exception as exc:
         candles = _merge_trusted_candles([], existing, days=days)
+        reason = "incremental_refresh_failed" if existing else "refresh_failed"
+        if path.exists() and not cache_loaded:
+            reason = "cache_read_failed"
+            candles = []
         return _status_from_candles(
             symbol=symbol,
             interval=interval,
@@ -145,8 +152,8 @@ def refresh_trusted_interval(
             path=path,
             updated_at_ms=now_ms,
             is_valid=False,
-            is_stale=True,
-            reason="incremental_refresh_failed" if existing else "refresh_failed",
+            is_stale=bool(candles),
+            reason=reason,
             error_type=type(exc).__name__,
             message=str(exc),
         )
@@ -295,7 +302,7 @@ def validate_built_native_candles(
 
 def _attach_built_native_validation(interval_statuses: dict[str, DataStatus], *, data_dir: Path) -> None:
     five_minute = interval_statuses.get("5m")
-    if five_minute is None or not five_minute.source_file.exists():
+    if five_minute is None or not five_minute.is_valid or not five_minute.source_file.exists():
         return
     five_minute_candles = read_csv(five_minute.source_file)
     for interval in ("15m", "1h"):

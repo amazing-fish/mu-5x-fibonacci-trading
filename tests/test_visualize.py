@@ -271,6 +271,32 @@ class VisualizationTests(unittest.TestCase):
         self.assertEqual(7, trusted_calls[0][1]["days"])
         self.assertIn("trusted OKX data layer", html)
 
+    def test_visualize_cli_defaults_trusted_data_dir_to_live_store(self):
+        from mu_strategy import visualize
+
+        trusted_calls = []
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            trusted_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+            )
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("mu_strategy.viz.backtest.run_backtest", return_value=BacktestResult(10_000, 10_000, [], [(0, 10_000)])):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            visualize.main()
+
+        self.assertEqual(Path("data/live"), trusted_calls[0][1]["data_dir"])
+
     def test_visualize_cli_rejects_invalid_trusted_status(self):
         from mu_strategy import visualize
 

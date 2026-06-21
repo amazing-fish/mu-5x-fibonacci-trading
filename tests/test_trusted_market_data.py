@@ -176,6 +176,38 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertFalse(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
         self.assertEqual("refresh_failed", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["reason"])
 
+    def test_refresh_once_marks_bad_cache_invalid_without_aborting_other_symbols(self):
+        from mu_strategy.market_data.trusted import refresh_market_data_once
+
+        rows = [
+            {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "20"},
+            {"instId": "ETH-USDT-SWAP", "last": "3000", "volCcy24h": "10"},
+        ]
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            corrupt_cache = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
+            corrupt_cache.parent.mkdir(parents=True)
+            corrupt_cache.write_text("not,a,valid,candle\n1,2,3,4\n", encoding="utf-8")
+
+            manifest = refresh_market_data_once(
+                data_dir=data_dir,
+                ticker_rows=rows,
+                stock_token_inst_ids=set(),
+                limit=2,
+                days=1,
+                intervals=("5m",),
+                fetcher=_fake_fetcher,
+                now_ms=3_600_000,
+            )
+
+        btc_status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
+        eth_status = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]
+        self.assertEqual("invalid", manifest["status"])
+        self.assertFalse(btc_status["is_valid"])
+        self.assertEqual("cache_read_failed", btc_status["reason"])
+        self.assertTrue(eth_status["is_valid"])
+
 
 class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_attaches_built_native_validation(self):

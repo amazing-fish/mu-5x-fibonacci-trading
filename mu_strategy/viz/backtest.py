@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--trusted-data", action="store_true", help="Use the trusted OKX data layer instead of legacy cached_historical.")
     parser.add_argument("--output", type=Path, default=Path("reports/mu_okx_baseline_backtest.html"))
     parser.add_argument("--chart-interval", choices=("15m", "1h"), default="1h")
@@ -45,13 +45,16 @@ def main() -> None:
         parser.error("--strategy must resolve to exactly one strategy group")
     group = groups[0]
     config = with_fee_profile(group.config, args.fee_profile)
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = Path("data/live") if args.trusted_data else Path("data")
     data_source_note = None
     if args.trusted_data:
         bundle = refresh_trusted_candle_bundle(
             args.symbol,
             intervals=("5m", "15m", "1h"),
             days=args.days,
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             refresh=args.refresh,
         )
         status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("15m", "1h"))
@@ -65,7 +68,7 @@ def main() -> None:
             args.symbol,
             "15m",
             days=args.days,
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             refresh=args.refresh,
             source=args.source,
         )
@@ -73,7 +76,7 @@ def main() -> None:
             args.symbol,
             "1h",
             days=args.days,
-            data_dir=args.data_dir,
+            data_dir=data_dir,
             refresh=args.refresh,
             source=args.source,
         )
