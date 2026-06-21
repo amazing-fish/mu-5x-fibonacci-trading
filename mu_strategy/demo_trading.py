@@ -407,6 +407,9 @@ def _market_data_freshness_error(
     config: DemoTradingConfig,
     now_ms: int,
 ) -> dict[str, Any] | None:
+    status_error = _market_data_status_error(symbol=symbol, bundle=bundle)
+    if status_error is not None:
+        return status_error
     max_staleness_bars = max(1, config.max_candle_staleness_bars)
     for interval, candles in bundle.candles_by_interval.items():
         if not candles:
@@ -430,6 +433,26 @@ def _market_data_freshness_error(
                 "age_ms": age_ms,
                 "max_age_ms": max_age_ms,
             }
+    return None
+
+
+def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str, Any] | None:
+    statuses = getattr(bundle, "statuses_by_interval", None) or {}
+    for interval, status in statuses.items():
+        is_valid = bool(getattr(status, "is_valid", True))
+        is_stale = bool(getattr(status, "is_stale", False))
+        if is_valid and not is_stale:
+            continue
+        return {
+            "symbol": symbol,
+            "reason": "market_data_invalid" if not is_valid else "market_data_cache_stale",
+            "interval": interval,
+            "status_reason": getattr(status, "reason", None),
+            "error_type": getattr(status, "error_type", None),
+            "message": getattr(status, "message", None),
+            "latest_open_time_ms": getattr(status, "last_timestamp_ms", None),
+            "source_file": str(getattr(status, "source_file", "")),
+        }
     return None
 
 

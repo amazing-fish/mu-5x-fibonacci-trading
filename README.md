@@ -20,7 +20,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 
 当前包结构见 [docs/architecture.md](docs/architecture.md)。
 
-- `mu_strategy.market_data`：OKX/Binance 数据提供方、缓存策略、Top USDT-SWAP 标的池与 `15m/1h` K 线包。
+- `mu_strategy.market_data`：OKX/Binance 数据提供方、缓存策略、Top USDT-SWAP 标的池、可信数据刷新状态与 `5m/15m/1h` K 线包。
 - `mu_strategy.entry`：统一入场扫描服务，输出固定结构的 `EntryScanResult`。
 - `mu_strategy.strategies`：策略组注册表与组件元数据。
 - `mu_strategy.experiments`：walk-forward 与消融实验。
@@ -120,6 +120,18 @@ python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --refresh --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
+刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`：
+
+```powershell
+python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
+```
+
+持续刷新模式：
+
+```powershell
+python -m mu_strategy.commands.refresh_market_data --loop --interval-seconds 300 --data-dir data\live --html-output reports\live\data_health.html
+```
+
 持续每 5 分钟扫描并允许 OKX Demo 限价买入，需要显式确认并提供 `OKX_API_KEY`、`OKX_SECRET_KEY`、`OKX_PASSPHRASE`：
 
 ```powershell
@@ -135,6 +147,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `reports/mu_okx_strategy_components.html`：策略组件可视化矩阵。
 - `reports/mu_okx_baseline_backtest.html`：交互式 `1h` 可视化回测，包含价格、成交量和权益曲线联动。
 - `reports/live/okx_entry_dashboard.html`：OKX 入场扫描自动刷新看板，用于人工下单前复核。
+- `reports/live/data_health.html`：OKX 数据健康静态看板，展示 Top universe、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
 - `reports/mu_fibonacci_pullback_1h_12h_7d.md`：MU 最新一周 `1h-12h` Fibonacci 窗口回测，用于确认 2h baseline。
 - `reports/fibonacci_pullback_multi_asset_1h_12h_180d.md`：MU/SPACEX/META/BTC 的优选窗口对照。
 - `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
@@ -144,6 +157,8 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
+- 可信数据层 v1 只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
+- 可信数据层 v1 固定使用 CSV + `data/live/manifest.json` + `data/live/refresh_runs.jsonl`；`data/live/**` 和 `reports/live/*.html` 是运行时产物，默认不提交。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
