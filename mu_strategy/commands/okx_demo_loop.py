@@ -7,12 +7,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from mu_strategy.demo_trading import DemoTradingConfig, run_once
+from mu_strategy.demo_trading import DEFAULT_WATCHLIST_SYMBOLS, DemoTradingConfig, run_once
 from mu_strategy.live.okx import OKXCredentials, OKXRestClient
 from mu_strategy.live.okx_cli import CREDENTIAL_SOURCE_CHOICES
+from mu_strategy.viz.entry_dashboard import DEFAULT_REFRESH_SECONDS, write_entry_dashboard
 
 
 Runner = Callable[[DemoTradingConfig, Any], dict[str, Any]]
+DashboardWriter = Callable[..., Path]
 
 
 def main(
@@ -20,6 +22,7 @@ def main(
     *,
     stdout: TextIO | None = None,
     runner: Runner = run_once,
+    dashboard_writer: DashboardWriter = write_entry_dashboard,
 ) -> int:
     stdout = stdout or sys.stdout
     args = _build_parser().parse_args(argv)
@@ -33,6 +36,7 @@ def main(
         max_open_positions=args.max_open_positions,
         leverage=args.leverage,
         dry_run=dry_run,
+        watchlist_symbols=_watchlist_symbols(args),
     )
     broker = _build_broker(dry_run=dry_run, credential_source=args.credential_source)
 
@@ -40,9 +44,26 @@ def main(
         payload = runner(config, broker=broker)
         stdout.write(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
         stdout.write("\n")
+        _write_dashboard_safely(
+            payload,
+            dashboard_output=args.dashboard_output,
+            dashboard_refresh_seconds=args.dashboard_refresh_seconds,
+            dashboard_writer=dashboard_writer,
+            stderr=sys.stderr,
+        )
         return 0
 
-    _run_forever(config, broker=broker, interval_seconds=args.interval_seconds, runner=runner, stdout=stdout)
+    _run_forever(
+        config,
+        broker=broker,
+        interval_seconds=args.interval_seconds,
+        runner=runner,
+        stdout=stdout,
+        stderr=sys.stderr,
+        dashboard_output=args.dashboard_output,
+        dashboard_refresh_seconds=args.dashboard_refresh_seconds,
+        dashboard_writer=dashboard_writer,
+    )
     return 0
 
 
@@ -60,7 +81,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-open-positions", type=int, default=3)
     parser.add_argument("--leverage", type=int, default=5)
     parser.add_argument("--credential-source", choices=CREDENTIAL_SOURCE_CHOICES)
+    parser.add_argument(
+        "--watchlist-symbol",
+        action="append",
+        default=[],
+        help="Always scan this OKX swap symbol in addition to the Top universe. Can be repeated.",
+    )
+    parser.add_argument(
+        "--no-default-watchlist",
+        action="store_true",
+        help="Disable the default fixed watchlist, including MU-USDT-SWAP.",
+    )
+    parser.add_argument("--dashboard-output", type=Path, help="Write an auto-refreshing HTML dashboard after each scan cycle.")
+    parser.add_argument("--dashboard-refresh-seconds", type=int, default=DEFAULT_REFRESH_SECONDS)
     return parser
+
+
+def _watchlist_symbols(args: argparse.Namespace) -> tuple[str, ...]:
+    symbols: list[str] = []
+    if not args.no_default_watchlist:
+        symbols.extend(DEFAULT_WATCHLIST_SYMBOLS)
+    symbols.extend(args.watchlist_symbol or [])
+    return tuple(symbols)
 
 
 def _build_broker(*, dry_run: bool, credential_source: str | None) -> OKXRestClient:
@@ -75,9 +117,14 @@ def _run_forever(
     interval_seconds: int,
     runner: Runner,
     stdout: TextIO,
+    stderr: TextIO | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
+    dashboard_output: Path | None = None,
+    dashboard_refresh_seconds: int = DEFAULT_REFRESH_SECONDS,
+    dashboard_writer: DashboardWriter = write_entry_dashboard,
 ) -> None:
+    stderr = stderr or sys.stderr
     if interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
     next_run_at = clock()
@@ -92,6 +139,13 @@ def _run_forever(
         stdout.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
         stdout.write("\n")
         stdout.flush()
+        _write_dashboard_safely(
+            payload,
+            dashboard_output=dashboard_output,
+            dashboard_refresh_seconds=dashboard_refresh_seconds,
+            dashboard_writer=dashboard_writer,
+            stderr=stderr,
+        )
         next_run_at += interval_seconds
         now = clock()
         while next_run_at <= now:
@@ -105,6 +159,36 @@ def _runner_failure_payload(exc: Exception) -> dict[str, str]:
         "error_type": type(exc).__name__,
         "message": str(exc),
     }
+
+
+def _write_dashboard_safely(
+    payload: dict[str, Any],
+    *,
+    dashboard_output: Path | None,
+    dashboard_refresh_seconds: int,
+    dashboard_writer: DashboardWriter,
+    stderr: TextIO,
+) -> None:
+    if dashboard_output is None:
+        return
+    try:
+        dashboard_writer(payload, dashboard_output, refresh_seconds=dashboard_refresh_seconds)
+    except Exception as exc:
+        stderr.write(
+            json.dumps(
+                {
+                    "mode": "dashboard_render_failed",
+                    "reason": "dashboard_render_failed",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "dashboard_output": str(dashboard_output),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+        stderr.write("\n")
+        stderr.flush()
 
 
 if __name__ == "__main__":

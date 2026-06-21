@@ -14,6 +14,7 @@ class OKXSwapTicker:
     inst_id: str
     last: float
     volume_ccy_24h: float
+    source: str = "top"
 
 
 def fetch_okx_swap_tickers() -> list[dict]:

@@ -114,10 +114,10 @@ OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；demo 模式�
 python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
 ```
 
-运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单：
+运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认扫描 OKX Top 10 USDT-SWAP，并固定加入 `MU-USDT-SWAP` 作为 watchlist：
 
 ```powershell
-python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 28
+python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --refresh --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
 持续每 5 分钟扫描并允许 OKX Demo 限价买入，需要显式确认并提供 `OKX_API_KEY`、`OKX_SECRET_KEY`、`OKX_PASSPHRASE`：
@@ -126,7 +126,7 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-seconds 300 --limit 10 --notional-usdt 10 --max-open-positions 3
 ```
 
-默认每单 `10 USDT`，最多 `3` 个 open order/position，使用 isolated `5x` 和 Fib 附近限价买入；不会市价追价。缺少凭证时 dry-run 仍可用，确认下单模式会在发送任何订单前失败。
+默认每单 `10 USDT`，最多 `3` 个 open order/position，使用 isolated `5x` 和 Fib 附近限价买入；不会市价追价。缺少凭证时 dry-run 仍可用，确认下单模式会在发送任何订单前失败。`--dashboard-output` 会覆盖生成本地自动刷新 HTML 看板；页面只展示人工复核信息，不提供真实下单/撤单按钮。`orders[]` 为空表示当前无挂单建议、无撤单目标；出现 `status=planned` 时才展示具体挂单价、挂单量、初始止损和绑定该建议单的撤单触发点。
 
 ## 当前产物
 
@@ -134,6 +134,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `reports/mu_okx_strategy_group_review.md`：策略组实验结果表。
 - `reports/mu_okx_strategy_components.html`：策略组件可视化矩阵。
 - `reports/mu_okx_baseline_backtest.html`：交互式 `1h` 可视化回测，包含价格、成交量和权益曲线联动。
+- `reports/live/okx_entry_dashboard.html`：OKX 入场扫描自动刷新看板，用于人工下单前复核。
 - `reports/mu_fibonacci_pullback_1h_12h_7d.md`：MU 最新一周 `1h-12h` Fibonacci 窗口回测，用于确认 2h baseline。
 - `reports/fibonacci_pullback_multi_asset_1h_12h_180d.md`：MU/SPACEX/META/BTC 的优选窗口对照。
 - `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
@@ -166,3 +167,4 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `optimized_v2`：旧突破入场 + 首仓追价、信号 K 宽度、反向 Fibonacci 压力过滤。
 
 策略组可视化报告会按入场策略、加减仓策略、出场策略、过滤策略拆分展示，方便持续组合和消融回测。
+
