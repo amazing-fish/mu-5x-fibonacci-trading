@@ -19,16 +19,27 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
     intervals = tuple(args.interval or DEFAULT_INTERVALS)
 
     while True:
-        manifest = refresh_market_data_once(
-            data_dir=args.data_dir,
-            stock_token_config=args.stock_token_config,
-            limit=args.limit,
-            days=args.days,
-            intervals=intervals,
-        )
-        if args.html_output is not None:
-            write_data_health_dashboard(manifest, args.html_output)
-        stdout.write(json.dumps({"status": manifest["status"], "symbols": len(manifest["symbols"])}, sort_keys=True))
+        try:
+            manifest = refresh_market_data_once(
+                data_dir=args.data_dir,
+                stock_token_config=args.stock_token_config,
+                limit=args.limit,
+                days=args.days,
+                intervals=intervals,
+            )
+            if args.html_output is not None:
+                write_data_health_dashboard(manifest, args.html_output)
+            output = {"status": manifest["status"], "symbols": len(manifest["symbols"])}
+        except Exception as exc:
+            if not args.loop:
+                raise
+            output = {
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "symbols": 0,
+            }
+        stdout.write(json.dumps(output, sort_keys=True))
         stdout.write("\n")
         stdout.flush()
         if not args.loop:
