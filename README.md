@@ -77,19 +77,6 @@ python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report report
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
 
-刷新最新 MU 短周期数据，并用 `5m` 构建 `15m/1h`，再用原生 `1h` 做基础校验。默认建议使用 4 小时窗口，降低调度频率时仍保留足够的跨小时校验样本：
-
-```powershell
-python -m mu_strategy.data_refresh --once --source okx --symbol MU-USDT-SWAP --window-minutes 360 --data-dir data\live
-```
-
-如果需要由当前进程长驻执行每 4 小时刷新：
-
-```powershell
-python -m mu_strategy.data_refresh --loop --interval-minutes 240 --source okx --symbol MU-USDT-SWAP --window-minutes 360 --data-dir data\live
-```
-
-更推荐把 `--once` 命令交给 Windows Task Scheduler、cron 或 Codex automation 每 4 小时触发一次；这样单次失败会返回非零退出码，调度层更容易发现数据校验异常。
 显式使用 Binance 做对照：
 
 ```powershell
@@ -158,9 +145,6 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
-- `data_refresh` 默认每次拉取最近 `360` 分钟原生 `5m` 和 `1h`，以 `5m` 为基准构建完整 `15m` 和 `1h`；不完整的聚合周期会被丢弃。
-- 最新短窗口刷新使用 OKX recent candles 接口；历史回补仍使用 OKX history candles 接口。
-- `data_refresh` 写入 `data/live`，不会覆盖历史回测缓存；如果构建出的 `1h` 与原生 `1h` 不一致，命令会返回失败。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。
 - baseline 的入场信号仍是二次回踩限价触发，但回测没有建模挂单队列、盘口价差、部分成交或错失成交；因此默认费用采用 `market/taker` 万五，避免用 `limit/maker` 万二高估结果。

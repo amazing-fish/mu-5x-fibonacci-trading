@@ -202,7 +202,7 @@ class DataTests(unittest.TestCase):
             requested_after_values.append(after)
             return [_candle(86_400_000, 100)]
 
-        with patch("mu_strategy.market_data.providers.okx.fetch_okx_history_candles", side_effect=fake_fetch):
+        with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
             candles = fetch_okx_historical("MU-USDT-SWAP", "15m", days=1, end_time_ms=end_time_ms)
 
         self.assertEqual([end_time_ms], requested_after_values)

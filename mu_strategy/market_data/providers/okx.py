@@ -10,10 +10,7 @@ from mu_strategy.market_data.utils import DAY_MS, dedupe_candles
 from mu_strategy.models import Candle
 
 
-OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
-OKX_HISTORY_CANDLES_URL = "https://www.okx.com/api/v5/market/history-candles"
-OKX_BASE_URL = OKX_CANDLES_URL
-OKX_MAX_CANDLE_LIMIT = 300
+OKX_BASE_URL = "https://www.okx.com/api/v5/market/history-candles"
 
 
 def okx_interval(interval: str) -> str:
@@ -40,61 +37,17 @@ def fetch_okx_candles(
     interval: str,
     *,
     after: int | None = None,
-    before: int | None = None,
-    limit: int = 100,
-    retries: int = 3,
-) -> list[Candle]:
-    return _fetch_okx_candles(
-        OKX_CANDLES_URL,
-        symbol,
-        interval,
-        after=after,
-        before=before,
-        limit=limit,
-        retries=retries,
-    )
-
-
-def fetch_okx_history_candles(
-    symbol: str,
-    interval: str,
-    *,
-    after: int | None = None,
-    before: int | None = None,
-    limit: int = 100,
-    retries: int = 3,
-) -> list[Candle]:
-    return _fetch_okx_candles(
-        OKX_HISTORY_CANDLES_URL,
-        symbol,
-        interval,
-        after=after,
-        before=before,
-        limit=limit,
-        retries=retries,
-    )
-
-
-def _fetch_okx_candles(
-    base_url: str,
-    symbol: str,
-    interval: str,
-    *,
-    after: int | None = None,
-    before: int | None = None,
     limit: int = 100,
     retries: int = 3,
 ) -> list[Candle]:
     params: dict[str, str | int] = {
         "instId": symbol,
         "bar": okx_interval(interval),
-        "limit": min(limit, OKX_MAX_CANDLE_LIMIT),
+        "limit": min(limit, 100),
     }
     if after is not None:
         params["after"] = after
-    if before is not None:
-        params["before"] = before
-    url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    url = f"{OKX_BASE_URL}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
         url,
         headers={
@@ -133,7 +86,7 @@ def fetch_okx_historical(
     output: list[Candle] = []
     after: int | None = end_time_ms
     while True:
-        batch = fetch_okx_history_candles(symbol, interval, after=after)
+        batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:
             break
         output.extend(batch)
@@ -155,7 +108,7 @@ def fetch_okx_incremental(
     output: list[Candle] = []
     after: int | None = None
     while True:
-        batch = fetch_okx_history_candles(symbol, interval, after=after)
+        batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:
             break
         output.extend(bar for bar in batch if bar.open_time_ms >= since_time_ms)
