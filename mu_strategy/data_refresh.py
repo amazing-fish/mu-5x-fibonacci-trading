@@ -91,6 +91,8 @@ def run_once(
     data_dir: Path,
     end_time_ms: int | None = None,
 ) -> DataRefreshResult:
+    if end_time_ms is None:
+        end_time_ms = _latest_closed_interval_end_time_ms(interval_to_ms("1h"))
     candles_5m = fetch_latest_window(
         symbol,
         "5m",

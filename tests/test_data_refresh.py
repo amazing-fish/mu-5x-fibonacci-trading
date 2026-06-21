@@ -209,6 +209,37 @@ class DataRefreshTests(unittest.TestCase):
         self.assertEqual(4 * hour_ms, fetch_calls[0][2]["start_time_ms"])
         self.assertEqual(6 * hour_ms, fetch_calls[0][2]["end_time_ms"])
 
+    def test_run_once_anchors_5m_and_native_1h_to_same_cutoff(self):
+        from mu_strategy import data_refresh
+
+        hour_ms = 3_600_000
+        cutoff_ms = 6 * hour_ms
+        five_minute = [
+            _candle((4 * hour_ms) + (index * FIVE_MIN_MS), 100 + index, 101 + index, 99 + index, 100.25 + index, 10 + index)
+            for index in range(24)
+        ]
+        native_1h = [
+            _candle(4 * hour_ms, 100, 112, 99, 111.25, sum(10 + index for index in range(12))),
+            _candle(5 * hour_ms, 112, 124, 111, 123.25, sum(22 + index for index in range(12))),
+        ]
+        calls = []
+
+        def fake_fetch(symbol, interval, **kwargs):
+            calls.append((symbol, interval, kwargs))
+            return five_minute if interval == "5m" else native_1h
+
+        with TemporaryDirectory() as tmp:
+            with patch("mu_strategy.data_refresh.time.time", return_value=((cutoff_ms + 59 * 60_000) / 1000)):
+                with patch("mu_strategy.data_refresh.fetch_latest_window", side_effect=fake_fetch):
+                    data_refresh.run_once(
+                        source="okx",
+                        symbol="MU-USDT-SWAP",
+                        window_minutes=120,
+                        data_dir=Path(tmp),
+                    )
+
+        self.assertEqual([cutoff_ms, cutoff_ms], [call[2]["end_time_ms"] for call in calls])
+
     def test_once_refresh_defaults_to_four_hour_validation_window(self):
         from mu_strategy import data_refresh
 
