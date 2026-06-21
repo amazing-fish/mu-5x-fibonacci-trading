@@ -23,7 +23,11 @@ def render_entry_dashboard(
     universe = _list(payload.get("universe"))
     scans = _list(payload.get("scans"))
     orders = _list(payload.get("orders"))
-    planned_orders = [order for order in orders if str(order.get("status") or "") == "planned"]
+    order_groups = _order_groups(orders)
+    planned_orders = order_groups["planned"]
+    submitted_orders = order_groups["submitted"]
+    blocked_orders = order_groups["blocked"]
+    execution_orders = submitted_orders + blocked_orders
     data_errors = _list(payload.get("data_errors"))
     expired_orders = _list(payload.get("expired_orders"))
     mode = str(payload.get("mode") or "-")
@@ -35,14 +39,27 @@ def render_entry_dashboard(
         headline = "扫描失败"
         headline_detail = "不可下单"
         state_class = "state-bad"
+        headline_badge_class = "failed"
     elif planned_orders:
         headline = f"发现 {len(planned_orders)} 个可人工复核机会"
         headline_detail = "只用于人工复核，不代表已经下单"
         state_class = "state-good"
+        headline_badge_class = "planned"
+    elif submitted_orders:
+        headline = f"本轮已提交 {len(submitted_orders)} 个 demo 订单"
+        headline_detail = "核对订单状态，必要时按撤单目标处理"
+        state_class = "state-good"
+        headline_badge_class = "planned"
+    elif blocked_orders:
+        headline = "本轮无可挂单建议，存在阻塞订单结果"
+        headline_detail = "未下单，查看阻塞原因"
+        state_class = "state-wait"
+        headline_badge_class = "wait"
     else:
         headline = "当前无进场机会"
         headline_detail = "等待下一轮扫描"
         state_class = "state-wait"
+        headline_badge_class = "wait"
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -220,7 +237,7 @@ def render_entry_dashboard(
     <div class="status {state_class}">
       <div class="headline">
         <h1>{_e(headline)}</h1>
-        <span class="badge {('failed' if failed else 'planned' if planned_orders else 'wait')}">{_e(headline_detail)}</span>
+        <span class="badge {headline_badge_class}">{_e(headline_detail)}</span>
       </div>
       <div class="subtle">生成时间：{_e(generated_at)} · 扫描范围：{_e(scope_label)} · 页面刷新倒计时 <strong id="refresh-countdown">{refresh_seconds}</strong>s</div>
     </div>
@@ -232,7 +249,8 @@ def render_entry_dashboard(
   </header>
 
   {_failure_section(payload) if failed else ""}
-  {_orders_section(planned_orders, scans, mode)}
+  {_orders_section(planned_orders, scans, mode, show_empty_notice=not orders)}
+  {_order_results_section(execution_orders, scans, mode)}
   {_reason_summary_section(scans)}
   {_scan_table_section(scans)}
   {_account_open_orders_section(payload)}
@@ -293,8 +311,16 @@ def latest_payload_from_jsonl(log_path: Path) -> dict[str, Any]:
     return latest
 
 
-def _orders_section(planned_orders: list[dict[str, Any]], scans: list[dict[str, Any]], mode: str) -> str:
+def _orders_section(
+    planned_orders: list[dict[str, Any]],
+    scans: list[dict[str, Any]],
+    mode: str,
+    *,
+    show_empty_notice: bool = True,
+) -> str:
     if not planned_orders:
+        if not show_empty_notice:
+            return ""
         return """
   <section>
     <h2>挂单建议单</h2>
@@ -377,6 +403,79 @@ def _cancel_instruction(order: dict[str, Any], scan: dict[str, Any] | None, mode
         mode_note,
     ]
     return '<div class="instruction">' + "".join(f"<div>{_e(line)}</div>" for line in lines) + "</div>"
+
+
+def _order_results_section(orders: list[dict[str, Any]], scans: list[dict[str, Any]], mode: str) -> str:
+    if not orders:
+        return ""
+    scans_by_symbol = {str(scan.get("symbol")): scan for scan in scans if scan.get("symbol")}
+    rows = "\n".join(_execution_order_rows(order, scans_by_symbol.get(str(order.get("symbol"))), mode) for order in orders)
+    return f"""
+  <section>
+    <h2>订单执行结果</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>状态</th>
+          <th>symbol</th>
+          <th>order_id</th>
+          <th>client_order_id</th>
+          <th>挂单价</th>
+          <th>挂单量</th>
+          <th>初始止损点</th>
+          <th>reason</th>
+          <th>response</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </section>"""
+
+
+def _execution_order_rows(order: dict[str, Any], scan: dict[str, Any] | None, mode: str) -> str:
+    status = _order_status(order)
+    order_id = _order_id(order)
+    client_order_id = _client_order_id(order)
+    if status == "submitted":
+        status_text = "已提交 demo 订单"
+        status_class = "planned"
+        instruction = _submitted_cancel_instruction(order, order_id, client_order_id)
+    else:
+        status_text = "已阻塞，未下单"
+        status_class = "bad"
+        instruction = _blocked_order_instruction(order)
+    return f"""
+        <tr>
+          <td><span class="badge {status_class}">{_e(status_text)}</span></td>
+          <td>{_e(order.get("symbol"))}</td>
+          <td class="mono">{_e(order_id)}</td>
+          <td class="mono">{_e(client_order_id)}</td>
+          <td class="num">{_e(order.get("limit_price"))}</td>
+          <td class="num">{_e(order.get("size"))}</td>
+          <td class="num">{_fmt_number(order.get("initial_stop"))}</td>
+          <td>{_e(order.get("reason"))}</td>
+          <td class="mono">{_e(_response_summary(order))}</td>
+        </tr>
+        <tr>
+          <td colspan="9">{instruction}</td>
+        </tr>"""
+
+
+def _submitted_cancel_instruction(order: dict[str, Any], order_id: str, client_order_id: str) -> str:
+    symbol = _fmt(order.get("symbol"))
+    limit_price = _fmt(order.get("limit_price"))
+    size = _fmt(order.get("size")) if order.get("size") not in {None, ""} else "未换算"
+    lines = [
+        f"撤单目标：{symbol} / {order_id} / {client_order_id} / {limit_price} / {size}",
+        "已提交 demo 订单；如需撤单，应使用上面的 order_id/client_order_id 核对 OKX demo 挂单。",
+    ]
+    return '<div class="instruction">' + "".join(f"<div>{_e(line)}</div>" for line in lines) + "</div>"
+
+
+def _blocked_order_instruction(order: dict[str, Any]) -> str:
+    reason = _fmt(order.get("reason"))
+    line = f"未下单，无撤单目标。reason={reason}"
+    return f'<div class="instruction"><div>{_e(line)}</div></div>'
 
 
 def _reason_summary_section(scans: list[dict[str, Any]]) -> str:
@@ -588,6 +687,62 @@ def _expiry_instruction(signal_time_ms: Any, wait_bars: int) -> str:
         f"时间失效点：{_format_time_ms(signal_time_ms)} + {wait_bars} 根 15m K = "
         f"{_format_time_ms(expiry_ms)}"
     )
+
+
+def _order_groups(orders: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups = {"planned": [], "submitted": [], "blocked": [], "other": []}
+    for order in orders:
+        status = _order_status(order)
+        if status in groups:
+            groups[status].append(order)
+        else:
+            groups["other"].append(order)
+    return groups
+
+
+def _order_status(order: dict[str, Any]) -> str:
+    return str(order.get("status") or "").lower()
+
+
+def _order_id(order: dict[str, Any]) -> str:
+    if order.get("order_id"):
+        return _fmt(order.get("order_id"))
+    response = order.get("response")
+    if isinstance(response, dict):
+        for row in response.get("data") or []:
+            if isinstance(row, dict) and row.get("ordId"):
+                return _fmt(row.get("ordId"))
+    return "-"
+
+
+def _client_order_id(order: dict[str, Any]) -> str:
+    if order.get("client_order_id"):
+        return _fmt(order.get("client_order_id"))
+    response = order.get("response")
+    if isinstance(response, dict):
+        for row in response.get("data") or []:
+            if isinstance(row, dict) and row.get("clOrdId"):
+                return _fmt(row.get("clOrdId"))
+    return "-"
+
+
+def _response_summary(order: dict[str, Any]) -> str:
+    response = order.get("response")
+    if not isinstance(response, dict):
+        return "-"
+    code = response.get("code")
+    msg = response.get("msg")
+    data = response.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        row = data[0]
+        parts = [
+            f"code={_fmt(code)}",
+            f"sCode={_fmt(row.get('sCode'))}",
+            f"sMsg={_fmt(row.get('sMsg'))}",
+        ]
+    else:
+        parts = [f"code={_fmt(code)}", f"msg={_fmt(msg)}"]
+    return " ".join(part for part in parts if not part.endswith("=-"))
 
 
 def _metric(label: str, value: Any) -> str:
