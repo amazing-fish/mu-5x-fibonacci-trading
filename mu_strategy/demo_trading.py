@@ -11,6 +11,7 @@ from typing import Any, Callable
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, refresh_candle_bundle
+from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker, top_okx_usdt_swaps
 from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.strategies.registry import baseline_strategy_group
@@ -21,6 +22,7 @@ CandleLoader = Callable[..., CandleBundle]
 Scanner = Callable[..., EntryScanResult]
 BOT_CLIENT_ORDER_ID_PATTERN = re.compile(r"^OD[A-F0-9]{20}$")
 PENDING_ORDER_STATES = {"", "live", "partially_filled"}
+DEFAULT_WATCHLIST_SYMBOLS = ("MU-USDT-SWAP",)
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class DemoTradingConfig:
     leverage: int = 5
     dry_run: bool = True
     max_candle_staleness_bars: int = 3
+    watchlist_symbols: tuple[str, ...] = DEFAULT_WATCHLIST_SYMBOLS
 
 
 def run_once(
@@ -56,7 +59,10 @@ def run_once(
     account_error: dict[str, str] | None = None
 
     if config.dry_run:
-        tickers = universe_provider(limit=config.universe_limit)
+        tickers = _merge_watchlist_tickers(
+            universe_provider(limit=config.universe_limit),
+            config.watchlist_symbols,
+        )
     else:
         if broker is None:
             raise RuntimeError("broker is required when dry_run is false")
@@ -72,10 +78,12 @@ def run_once(
             open_exposure = _count_open_exposure(positions, open_orders)
             open_position_inst_ids = _open_position_inst_ids(positions)
             try:
-                tickers = universe_provider(limit=config.universe_limit)
+                tickers = _merge_watchlist_tickers(
+                    universe_provider(limit=config.universe_limit),
+                    config.watchlist_symbols,
+                )
             except Exception as exc:
                 universe_error = _universe_load_error(exc)
-
     entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
 
     scans: list[dict[str, Any]] = []
@@ -100,7 +108,7 @@ def run_once(
             data_error = _market_data_load_error(ticker.inst_id, exc)
             data_errors.append(data_error)
             result = _data_error_scan_result(ticker.inst_id, data_error)
-            scans.append(_data_error_scan_payload(result, data_error))
+            scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
 
         if bundle is not None and not config.dry_run:
             data_error = _market_data_freshness_error(
@@ -112,17 +120,25 @@ def run_once(
             if data_error is not None:
                 data_errors.append(data_error)
                 result = _stale_scan_result(ticker.inst_id, bundle, data_error)
-                scans.append(_stale_scan_payload(result, bundle, data_error))
+                scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
 
         if bundle is not None and data_error is None:
+            strategy_config = baseline_strategy_group(ticker.inst_id).config
             result = scanner(
                 ticker.inst_id,
                 bundle.candles_by_interval.get("15m", []),
                 bundle.candles_by_interval.get("1h", []),
-                config=baseline_strategy_group(ticker.inst_id).config,
+                config=strategy_config,
             )
             scan_results.append(result)
-            scans.append(_scan_payload(result, bundle))
+            scans.append(
+                _scan_payload(
+                    result,
+                    bundle,
+                    source=ticker.source,
+                    second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
+                )
+            )
 
         if not config.dry_run:
             stale_orders = _expire_stale_limit_orders(
@@ -263,6 +279,7 @@ def _build_order_plan(result: EntryScanResult, config: DemoTradingConfig) -> dic
         "size": None,
         "initial_stop": result.initial_stop,
         "signal_time_ms": result.signal_time_ms,
+        "leverage": config.leverage,
     }
 
 
@@ -285,8 +302,32 @@ def _instrument_spec(response: dict[str, Any]) -> OKXInstrumentSpec | None:
     return OKXInstrumentSpec.from_row(data[0])
 
 
-def _scan_payload(result: EntryScanResult, bundle: CandleBundle) -> dict[str, Any]:
+def _merge_watchlist_tickers(
+    tickers: list[OKXSwapTicker],
+    watchlist_symbols: tuple[str, ...],
+) -> list[OKXSwapTicker]:
+    merged = list(tickers)
+    seen = {ticker.inst_id for ticker in merged}
+    for symbol in watchlist_symbols:
+        inst_id = resolve_okx_swap_symbol(symbol).inst_id
+        if inst_id in seen:
+            continue
+        merged.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0, source="watchlist"))
+        seen.add(inst_id)
+    return merged
+
+
+def _scan_payload(
+    result: EntryScanResult,
+    bundle: CandleBundle,
+    *,
+    source: str = "top",
+    second_pullback_wait_bars: int | None = None,
+) -> dict[str, Any]:
     payload = asdict(result)
+    payload["source"] = source
+    if second_pullback_wait_bars is not None:
+        payload["second_pullback_wait_bars"] = second_pullback_wait_bars
     payload["data_files"] = {interval: str(path) for interval, path in bundle.files_by_interval.items()}
     return payload
 
@@ -317,14 +358,26 @@ def _data_error_scan_result(
     )
 
 
-def _stale_scan_payload(result: EntryScanResult, bundle: CandleBundle, data_error: dict[str, Any]) -> dict[str, Any]:
-    payload = _scan_payload(result, bundle)
+def _stale_scan_payload(
+    result: EntryScanResult,
+    bundle: CandleBundle,
+    data_error: dict[str, Any],
+    *,
+    source: str = "top",
+) -> dict[str, Any]:
+    payload = _scan_payload(result, bundle, source=source)
     payload["data_error"] = data_error
     return payload
 
 
-def _data_error_scan_payload(result: EntryScanResult, data_error: dict[str, Any]) -> dict[str, Any]:
+def _data_error_scan_payload(
+    result: EntryScanResult,
+    data_error: dict[str, Any],
+    *,
+    source: str = "top",
+) -> dict[str, Any]:
     payload = asdict(result)
+    payload["source"] = source
     payload["data_files"] = {}
     payload["data_error"] = data_error
     return payload
@@ -430,7 +483,7 @@ def _tickers_to_scan(
     for inst_id, rows in open_order_rows_by_inst_id.items():
         if inst_id in seen or not any(_is_bot_fib_limit_order(row) for row in rows):
             continue
-        scan_tickers.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0))
+        scan_tickers.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0, source="open_order"))
         seen.add(inst_id)
     return scan_tickers
 
@@ -534,3 +587,4 @@ def _decimal(value: Any) -> Decimal:
 
 def _float_to_price_text(value: float) -> str:
     return format(Decimal(str(value)).normalize(), "f")
+

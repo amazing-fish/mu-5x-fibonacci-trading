@@ -2,6 +2,8 @@ import io
 import json
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.demo_trading import DemoTradingConfig, generate_client_order_id, run_once
@@ -56,7 +58,7 @@ class OKXDemoLoopTests(unittest.TestCase):
 
     def test_run_once_dry_run_scans_without_credentials_or_private_broker(self):
         result = run_once(
-            DemoTradingConfig(universe_limit=1, dry_run=True),
+            DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
             broker=None,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
@@ -77,7 +79,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             return _scan_result(symbol, action="wait", trigger_price=None)
 
         result = run_once(
-            DemoTradingConfig(universe_limit=1, dry_run=True),
+            DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
             broker=None,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
@@ -87,6 +89,66 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual([], result["orders"])
         self.assertEqual("BTC-USDT-SWAP", captured["symbol"])
         self.assertEqual(baseline_strategy_group("BTC-USDT-SWAP").config, captured["config"])
+
+    def test_run_once_default_watchlist_adds_mu_after_top_universe(self):
+        scanned = []
+
+        def scanner(symbol, candles_15m, candles_1h, **kwargs):
+            scanned.append(symbol)
+            return _scan_result(symbol, action="wait", trigger_price=None)
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=2, dry_run=True),
+            broker=None,
+            universe_provider=lambda limit: [
+                OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0),
+                OKXSwapTicker("ETH-USDT-SWAP", 100.0, 900.0),
+            ],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=scanner,
+        )
+
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP", "MU-USDT-SWAP"], scanned)
+        self.assertEqual(["top", "top", "watchlist"], [row["source"] for row in result["universe"]])
+        self.assertEqual(["top", "top", "watchlist"], [row["source"] for row in result["scans"]])
+
+    def test_run_once_deduplicates_watchlist_symbol_already_in_top_universe(self):
+        scanned = []
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=2, dry_run=True, watchlist_symbols=("MU-USDT-SWAP",)),
+            broker=None,
+            universe_provider=lambda limit: [
+                OKXSwapTicker("MU-USDT-SWAP", 3.0, 1000.0),
+                OKXSwapTicker("BTC-USDT-SWAP", 101.0, 900.0),
+            ],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol)
+            or _scan_result(symbol, action="wait", trigger_price=None),
+        )
+
+        self.assertEqual(["MU-USDT-SWAP", "BTC-USDT-SWAP"], scanned)
+        self.assertEqual(["top", "top"], [row["source"] for row in result["universe"]])
+
+    def test_cli_can_disable_default_watchlist(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        stdout = io.StringIO()
+
+        exit_code = main(
+            ["--once", "--dry-run", "--no-default-watchlist", "--limit", "1"],
+            stdout=stdout,
+            runner=lambda config, broker: {
+                "mode": "dry_run",
+                "watchlist_symbols": list(config.watchlist_symbols),
+                "limit": config.universe_limit,
+            },
+        )
+
+        self.assertEqual(0, exit_code)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual([], output["watchlist_symbols"])
+        self.assertEqual(1, output["limit"])
 
     def test_run_once_blocks_when_open_exposure_limit_is_reached(self):
         class FullBroker(StubBroker):
@@ -106,7 +168,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         broker = FullBroker()
 
         result = run_once(
-            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, watchlist_symbols=()),
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
@@ -125,7 +187,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         broker = PositionedBroker()
 
         result = run_once(
-            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, watchlist_symbols=()),
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
@@ -145,7 +207,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         broker = PendingOrderBroker()
 
         result = run_once(
-            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
+            DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, watchlist_symbols=()),
             broker=broker,
             universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
             candle_loader=lambda symbol, **kwargs: _bundle(symbol),
@@ -500,7 +562,6 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
-
     def test_run_once_sends_isolated_limit_order_when_confirmed(self):
         broker = StubBroker()
 
@@ -529,7 +590,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         broker = FailedOrderBroker()
 
         result = run_once(
-            DemoTradingConfig(universe_limit=2, dry_run=False, notional_usdt=10.0, max_open_positions=1),
+            DemoTradingConfig(universe_limit=2, dry_run=False, notional_usdt=10.0, max_open_positions=1, watchlist_symbols=()),
             broker=broker,
             universe_provider=lambda limit: [
                 OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0),
@@ -642,6 +703,24 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("", stdout.getvalue())
 
+    def test_cli_once_writes_dashboard_output(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "dashboard.html"
+            stdout = io.StringIO()
+
+            exit_code = main(
+                ["--once", "--dry-run", "--dashboard-output", str(output_path)],
+                stdout=stdout,
+                runner=lambda config, broker: {"mode": "dry_run", "orders": [], "scans": [], "expired_orders": []},
+            )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual("dry_run", json.loads(stdout.getvalue())["mode"])
+            self.assertTrue(output_path.exists())
+            self.assertIn("当前无进场机会", output_path.read_text(encoding="utf-8"))
+
     def test_run_forever_schedules_next_cycle_from_fixed_rate_tick(self):
         from mu_strategy.commands.okx_demo_loop import _run_forever
 
@@ -747,6 +826,47 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual([300.0, 300.0], sleep_calls)
         self.assertEqual([True, True], runner_calls)
 
+    def test_run_forever_dashboard_failure_does_not_block_jsonl_output(self):
+        from mu_strategy.commands.okx_demo_loop import _run_forever
+
+        class StopLoop(Exception):
+            pass
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        sleep_calls = []
+        clock_values = iter([100.0, 100.0, 100.0, 100.0])
+
+        def clock():
+            return next(clock_values)
+
+        def sleeper(seconds):
+            sleep_calls.append(seconds)
+            raise StopLoop()
+
+        def failing_dashboard_writer(*args, **kwargs):
+            raise RuntimeError("disk full")
+
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(StopLoop):
+                _run_forever(
+                    DemoTradingConfig(dry_run=True),
+                    broker=None,
+                    interval_seconds=300,
+                    runner=lambda config, broker: {"mode": "dry_run", "orders": [], "scans": []},
+                    stdout=stdout,
+                    stderr=stderr,
+                    clock=clock,
+                    sleeper=sleeper,
+                    dashboard_output=Path(tmp) / "dashboard.html",
+                    dashboard_refresh_seconds=30,
+                    dashboard_writer=failing_dashboard_writer,
+                )
+
+        self.assertEqual({"mode": "dry_run", "orders": [], "scans": []}, json.loads(stdout.getvalue().splitlines()[0]))
+        self.assertIn("dashboard_render_failed", stderr.getvalue())
+        self.assertIn("disk full", stderr.getvalue())
+
 
 def _bundle(symbol: str) -> CandleBundle:
     last_open_time_ms = int(time.time() * 1000) - 900_000
@@ -799,3 +919,4 @@ def _scan_result(symbol: str, *, action: str, trigger_price: float = 100.0) -> E
 
 if __name__ == "__main__":
     unittest.main()
+

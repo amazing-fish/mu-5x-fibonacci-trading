@@ -107,7 +107,7 @@ Package: `mu_strategy.demo_trading`
 
 This is the five-minute demo automation layer. It consumes the fixed research baseline and application services:
 
-1. Dynamic OKX Top USDT-SWAP universe.
+1. Dynamic OKX Top USDT-SWAP universe plus fixed watchlist symbols; `MU-USDT-SWAP` is included by default.
 2. `15m/1h` candle bundle refresh.
 3. `entry.scan_entry` result.
 4. Open exposure risk cap.
@@ -120,6 +120,7 @@ Defaults:
 - Maximum `3` open orders/positions.
 - Dry-run unless `--confirm-demo-orders` is supplied.
 - `300` second loop interval in `python -m mu_strategy.commands.okx_demo_loop`.
+- Optional `--dashboard-output` writes an auto-refreshing local HTML dashboard after each scan cycle.
 
 Boundaries:
 
@@ -127,12 +128,15 @@ Boundaries:
 - The broker adapter only executes the fixed plan; it does not own signal logic.
 - Missing credentials are acceptable in dry-run and fail before order submission in confirmed mode.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, or risk kill-switches.
+- If no `planned` order exists, the dashboard explicitly reports no order suggestion and no cancel target.
 
 ## Visualization
 
 Package: `mu_strategy.viz`
 
 `viz.backtest` renders the interactive Plotly backtest dashboard. The top-level `mu_strategy.visualize` module remains a compatibility wrapper.
+
+`viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload.
 
 ## Compatibility Wrappers
 
@@ -143,3 +147,4 @@ These old entry points remain valid during migration:
 - `mu_strategy.walk_forward`
 - `mu_strategy.visualize`
 - `mu_strategy.cli`
+
