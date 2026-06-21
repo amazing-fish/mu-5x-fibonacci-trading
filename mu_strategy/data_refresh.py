@@ -45,7 +45,7 @@ def fetch_latest_window(
 ) -> list[Candle]:
     interval_ms = interval_to_ms(interval)
     if source == "okx":
-        limit = math.ceil((window_minutes * 60_000) / interval_ms) + 5
+        limit = _fetch_limit_for_aligned_window(window_minutes, interval_ms, align_start_interval)
         candles = fetch_okx_candles(symbol, interval, limit=limit)
     elif source == "binance":
         if end_time_ms is None:
@@ -171,6 +171,12 @@ def _aligned_window_start(end_time_ms: int, window_minutes: int, align_interval:
         return start_time_ms
     align_ms = interval_to_ms(align_interval)
     return (start_time_ms // align_ms) * align_ms
+
+
+def _fetch_limit_for_aligned_window(window_minutes: int, interval_ms: int, align_interval: str | None) -> int:
+    window_ms = window_minutes * 60_000
+    align_padding_ms = interval_to_ms(align_interval) if align_interval is not None else 0
+    return math.ceil((window_ms + align_padding_ms) / interval_ms)
 
 
 if __name__ == "__main__":

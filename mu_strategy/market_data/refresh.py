@@ -68,8 +68,12 @@ def validate_built_candles(
     *,
     tolerance: float = 0.000001,
 ) -> None:
+    built_by_time = {bar.open_time_ms: bar for bar in built}
     native_by_time = {bar.open_time_ms: bar for bar in native}
     mismatches: list[CandleValidationMismatch] = []
+    for native_bar in native:
+        if native_bar.open_time_ms not in built_by_time:
+            mismatches.append(CandleValidationMismatch(native_bar.open_time_ms, "missing_built", None, None))
     for built_bar in built:
         native_bar = native_by_time.get(built_bar.open_time_ms)
         if native_bar is None:

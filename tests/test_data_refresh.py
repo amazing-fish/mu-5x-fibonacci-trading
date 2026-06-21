@@ -72,6 +72,19 @@ class DataRefreshTests(unittest.TestCase):
         self.assertIn("high", str(exc.exception))
         self.assertEqual(1, len(exc.exception.mismatches))
 
+    def test_validation_raises_when_native_1h_is_missing_from_built_series(self):
+        built = [_candle(0, 100, 110, 90, 105, 1000)]
+        native = [
+            _candle(0, 100, 110, 90, 105, 1000),
+            _candle(3_600_000, 105, 112, 104, 111, 1200),
+        ]
+
+        with self.assertRaises(CandleValidationError) as exc:
+            validate_built_candles(built, native, tolerance=0.000001)
+
+        self.assertIn("missing_built", str(exc.exception))
+        self.assertEqual(1, len(exc.exception.mismatches))
+
     def test_once_refresh_fetches_5m_and_1h_writes_live_outputs(self):
         from mu_strategy import data_refresh
 
@@ -140,6 +153,32 @@ class DataRefreshTests(unittest.TestCase):
             self.assertEqual(20, len(selected))
         self.assertEqual(0, selected[0].open_time_ms)
         self.assertEqual(19 * FIVE_MIN_MS, selected[-1].open_time_ms)
+
+    def test_okx_latest_5m_window_fetches_enough_bars_for_hour_alignment(self):
+        from mu_strategy import data_refresh
+
+        candles = [
+            _candle(index * FIVE_MIN_MS, 100 + index, 101 + index, 99 + index, 100.25 + index, 10 + index)
+            for index in range(83)
+        ]
+        requested_limits = []
+
+        def fake_fetch_okx_candles(symbol, interval, *, limit):
+            requested_limits.append(limit)
+            return candles[-limit:]
+
+        with patch("mu_strategy.data_refresh.fetch_okx_candles", side_effect=fake_fetch_okx_candles):
+            selected = data_refresh.fetch_latest_window(
+                "MU-USDT-SWAP",
+                "5m",
+                source="okx",
+                window_minutes=360,
+            )
+
+        self.assertEqual([84], requested_limits)
+        self.assertEqual(83, len(selected))
+        self.assertEqual(0, selected[0].open_time_ms)
+        self.assertEqual(82 * FIVE_MIN_MS, selected[-1].open_time_ms)
 
     def test_once_refresh_defaults_to_four_hour_validation_window(self):
         from mu_strategy import data_refresh
