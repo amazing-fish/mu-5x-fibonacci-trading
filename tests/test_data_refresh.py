@@ -180,6 +180,35 @@ class DataRefreshTests(unittest.TestCase):
         self.assertEqual(0, selected[0].open_time_ms)
         self.assertEqual(82 * FIVE_MIN_MS, selected[-1].open_time_ms)
 
+    def test_binance_latest_window_excludes_current_incomplete_candle(self):
+        from mu_strategy import data_refresh
+
+        hour_ms = 3_600_000
+        current_hour_open = 6 * hour_ms
+        candles = [
+            _candle(4 * hour_ms, 100, 101, 99, 100.25, 10),
+            _candle(5 * hour_ms, 101, 102, 100, 101.25, 11),
+            _candle(current_hour_open, 102, 103, 101, 102.25, 12),
+        ]
+        fetch_calls = []
+
+        def fake_fetch_klines(symbol, interval, **kwargs):
+            fetch_calls.append((symbol, interval, kwargs))
+            return candles
+
+        with patch("mu_strategy.data_refresh.time.time", return_value=((current_hour_open + 30 * 60_000) / 1000)):
+            with patch("mu_strategy.data_refresh.fetch_klines", side_effect=fake_fetch_klines):
+                selected = data_refresh.fetch_latest_window(
+                    "MUUSDT",
+                    "1h",
+                    source="binance",
+                    window_minutes=120,
+                )
+
+        self.assertEqual([4 * hour_ms, 5 * hour_ms], [bar.open_time_ms for bar in selected])
+        self.assertEqual(4 * hour_ms, fetch_calls[0][2]["start_time_ms"])
+        self.assertEqual(6 * hour_ms, fetch_calls[0][2]["end_time_ms"])
+
     def test_once_refresh_defaults_to_four_hour_validation_window(self):
         from mu_strategy import data_refresh
 

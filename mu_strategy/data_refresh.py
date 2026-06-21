@@ -44,12 +44,23 @@ def fetch_latest_window(
     align_start_interval: str | None = "1h",
 ) -> list[Candle]:
     interval_ms = interval_to_ms(interval)
+    end_is_exclusive = False
     if source == "okx":
         limit = _fetch_limit_for_aligned_window(window_minutes, interval_ms, align_start_interval)
         candles = fetch_okx_candles(symbol, interval, limit=limit)
     elif source == "binance":
         if end_time_ms is None:
-            candles = fetch_klines(symbol, interval, limit=100)
+            end_time_ms = _latest_closed_interval_end_time_ms(interval_ms)
+            start_time_ms = _aligned_window_start(end_time_ms, window_minutes, align_start_interval)
+            limit = math.ceil((end_time_ms - start_time_ms) / interval_ms) + 5
+            candles = fetch_klines(
+                symbol,
+                interval,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                limit=limit,
+            )
+            end_is_exclusive = True
         else:
             start_time_ms = _aligned_window_start(end_time_ms, window_minutes, align_start_interval)
             limit = math.ceil((end_time_ms - start_time_ms) / interval_ms) + 5
@@ -67,6 +78,8 @@ def fetch_latest_window(
             return []
         end_time_ms = max(bar.open_time_ms for bar in candles) + interval_ms
     start_time_ms = _aligned_window_start(end_time_ms, window_minutes, align_start_interval)
+    if end_is_exclusive:
+        return [bar for bar in dedupe_candles(candles) if start_time_ms <= bar.open_time_ms < end_time_ms]
     return [bar for bar in dedupe_candles(candles) if start_time_ms <= bar.open_time_ms <= end_time_ms]
 
 
@@ -177,6 +190,10 @@ def _fetch_limit_for_aligned_window(window_minutes: int, interval_ms: int, align
     window_ms = window_minutes * 60_000
     align_padding_ms = interval_to_ms(align_interval) if align_interval is not None else 0
     return math.ceil((window_ms + align_padding_ms) / interval_ms)
+
+
+def _latest_closed_interval_end_time_ms(interval_ms: int) -> int:
+    return (int(time.time() * 1000) // interval_ms) * interval_ms
 
 
 if __name__ == "__main__":
