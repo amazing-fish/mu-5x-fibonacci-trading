@@ -307,7 +307,7 @@ def _attach_built_native_validation(interval_statuses: dict[str, DataStatus], *,
     five_minute_candles = read_csv(five_minute.source_file)
     for interval in ("15m", "1h"):
         native_status = interval_statuses.get(interval)
-        if native_status is None or not native_status.source_file.exists():
+        if native_status is None or not native_status.is_valid or not native_status.source_file.exists():
             continue
         built = aggregate_candles(five_minute_candles, interval=interval)
         native = read_csv(native_status.source_file)

@@ -63,6 +63,29 @@ class CandleBundleServiceTests(unittest.TestCase):
         self.assertTrue(all(call[2]["source"] == "okx" for call in calls))
         self.assertTrue(all(call[2]["data_dir"] == data_dir for call in calls))
 
+    def test_refresh_candle_bundle_preserves_okx_incremental_default(self):
+        from mu_strategy.market_data.service import refresh_candle_bundle
+
+        calls = []
+
+        def fake_cached_historical(symbol, interval, **kwargs):
+            calls.append((symbol, interval, kwargs))
+            return [_candle(0, 100)], Path(f"data/OKX_{symbol}_{interval}_28d.csv")
+
+        with TemporaryDirectory() as tmp:
+            with patch("mu_strategy.market_data.service.cached_historical", side_effect=fake_cached_historical):
+                refresh_candle_bundle(
+                    "MU-USDT-SWAP",
+                    intervals=("15m", "1h"),
+                    days=28,
+                    data_dir=Path(tmp),
+                    refresh=False,
+                    source="okx",
+                )
+
+        self.assertTrue(calls)
+        self.assertTrue(all(call[2].get("incremental") is None for call in calls))
+
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)

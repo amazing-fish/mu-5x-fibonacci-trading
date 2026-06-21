@@ -52,7 +52,6 @@ def refresh_candle_bundle(
             data_dir=data_dir,
             refresh=refresh,
             source=source,
-            incremental=refresh,
         )
         candles_by_interval[interval] = candles
         files_by_interval[interval] = path
