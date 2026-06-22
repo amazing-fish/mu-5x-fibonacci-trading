@@ -12,14 +12,15 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         captured = {}
 
-        def fake_refresh(**kwargs):
-            captured.update(kwargs)
+        def fake_refresh(args, *, intervals):
+            captured["args"] = args
+            captured["intervals"] = intervals
             return {"status": "ok", "symbols": {}}
 
         with TemporaryDirectory() as tmp:
             stdout = io.StringIO()
             html_path = Path(tmp) / "health.html"
-            with patch("mu_strategy.commands.refresh_market_data.refresh_market_data_once", side_effect=fake_refresh):
+            with patch("mu_strategy.commands.refresh_market_data._refresh_once", side_effect=fake_refresh):
                 with patch("mu_strategy.commands.refresh_market_data.write_data_health_dashboard") as write_dashboard:
                     exit_code = main(["--interval", "5m", "--html-output", str(html_path)], stdout=stdout)
 
@@ -33,8 +34,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         calls = []
 
-        def fake_refresh(**kwargs):
-            calls.append(kwargs)
+        def fake_refresh(args, *, intervals):
+            calls.append((args, intervals))
             if len(calls) == 1:
                 raise TimeoutError("ticker timeout")
             return {"status": "ok", "symbols": {"BTC-USDT-SWAP": {}}}
@@ -49,7 +50,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         stdout = io.StringIO()
         with TemporaryDirectory() as tmp:
             html_path = Path(tmp) / "health.html"
-            with patch("mu_strategy.commands.refresh_market_data.refresh_market_data_once", side_effect=fake_refresh):
+            with patch("mu_strategy.commands.refresh_market_data._refresh_once", side_effect=fake_refresh):
                 with patch("mu_strategy.commands.refresh_market_data.write_data_health_dashboard") as write_dashboard:
                     with patch("mu_strategy.commands.refresh_market_data.time.sleep", side_effect=fake_sleep):
                         with self.assertRaises(KeyboardInterrupt):

@@ -68,14 +68,14 @@ def main(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scan OKX Top USDT-SWAP symbols and place guarded demo limit orders.")
+    parser = argparse.ArgumentParser(description="Scan trusted manifest universe symbols and place guarded demo limit orders.")
     parser.add_argument("--once", action="store_true", help="Run one scan cycle and exit.")
     parser.add_argument("--dry-run", action="store_true", help="Plan orders without private account calls or placement.")
     parser.add_argument("--confirm-demo-orders", action="store_true", help="Allow real OKX demo trading order placement.")
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--days", type=int, default=28)
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--notional-usdt", type=float, default=10.0)
     parser.add_argument("--max-open-positions", type=int, default=3)

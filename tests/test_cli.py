@@ -137,6 +137,33 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(0, raised.exception.code)
 
+    def test_cli_trusted_data_uses_trust_decision_gate(self):
+        from mu_strategy import cli
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                files_by_interval={"15m": Path("data/live/15m.csv"), "1h": Path("data/live/1h.csv")},
+                statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", Path("data/live/5m.csv")),
+                    "15m": _status("MU-USDT-SWAP", "15m", Path("data/live/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", Path("data/live/1h.csv")),
+                },
+                trust_decision=TrustDecision(False, HealthReason.MALFORMED_MANIFEST),
+            )
+
+        with TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "report.md"
+            argv = ["mu_strategy.cli", "--trusted-data", "--report", str(report_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        with self.assertRaises(SystemExit) as raised:
+                            cli.main()
+
+        self.assertNotEqual(0, raised.exception.code)
+
     def test_cli_accepts_limit_fee_profile_for_cost_sensitivity(self):
         from mu_strategy import cli
 

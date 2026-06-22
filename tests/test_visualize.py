@@ -428,6 +428,34 @@ class VisualizationTests(unittest.TestCase):
 
         self.assertNotEqual(0, raised.exception.code)
 
+    def test_visualize_cli_uses_trust_decision_gate(self):
+        from mu_strategy import visualize
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+                trust_decision=TrustDecision(False, HealthReason.MALFORMED_MANIFEST),
+            )
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        with self.assertRaises(SystemExit) as raised:
+                            visualize.main()
+
+            self.assertFalse(output_path.exists())
+
+        self.assertNotEqual(0, raised.exception.code)
+
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)

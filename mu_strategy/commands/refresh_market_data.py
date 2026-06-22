@@ -7,7 +7,12 @@ import time
 from pathlib import Path
 from typing import TextIO
 
-from mu_strategy.market_data.trusted import DEFAULT_INTERVALS, refresh_market_data_once
+from mu_strategy.market_data.trusted_data.refresh import (
+    DEFAULT_INTERVALS,
+    RefreshTrustedMarketData,
+    RefreshTrustedMarketDataRequest,
+)
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.viz.data_health import write_data_health_dashboard
 
 
@@ -20,13 +25,7 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
 
     while True:
         try:
-            manifest = refresh_market_data_once(
-                data_dir=args.data_dir,
-                stock_token_config=args.stock_token_config,
-                limit=args.limit,
-                days=args.days,
-                intervals=intervals,
-            )
+            manifest = _refresh_once(args, intervals=intervals)
             if args.html_output is not None:
                 write_data_health_dashboard(manifest, args.html_output)
             output = {"status": manifest["status"], "symbols": len(manifest["symbols"])}
@@ -58,6 +57,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=300)
     return parser
+
+
+def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> dict:
+    run = RefreshTrustedMarketData(TrustedDataStore(data_dir=args.data_dir)).execute(
+        RefreshTrustedMarketDataRequest(
+            requested_intervals=intervals,
+            days=args.days,
+            limit=args.limit,
+            stock_token_config=args.stock_token_config,
+        )
+    )
+    return run.to_manifest()
 
 
 if __name__ == "__main__":

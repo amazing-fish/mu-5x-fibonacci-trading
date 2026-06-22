@@ -12,7 +12,7 @@ from mu_strategy.market_data.service import (
     TRUSTED_REQUIRED_INTERVALS,
     refresh_candle_bundle,
     refresh_trusted_candle_bundle,
-    trusted_status_error,
+    trusted_bundle_error,
 )
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
@@ -60,7 +60,7 @@ def main() -> None:
             data_dir=data_dir,
             refresh=args.refresh,
         )
-        status_error = trusted_status_error(bundle.statuses_by_interval)
+        status_error = trusted_bundle_error(bundle)
         if status_error:
             parser.error(status_error)
         candles_15m = bundle.candles_by_interval["15m"]

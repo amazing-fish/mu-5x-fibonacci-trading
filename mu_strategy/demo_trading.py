@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -10,9 +11,10 @@ from typing import Any, Callable
 
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
-from mu_strategy.market_data.service import CandleBundle, refresh_candle_bundle
+from mu_strategy.market_data.service import CandleBundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
-from mu_strategy.market_data.universe import OKXSwapTicker, top_okx_usdt_swaps
+from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -29,7 +31,7 @@ DEFAULT_WATCHLIST_SYMBOLS = ("MU-USDT-SWAP",)
 class DemoTradingConfig:
     universe_limit: int = 10
     days: int = 28
-    data_dir: Path = Path("data")
+    data_dir: Path = Path("data/live")
     refresh: bool = False
     notional_usdt: float = 10.0
     max_open_positions: int = 3
@@ -43,11 +45,13 @@ def run_once(
     config: DemoTradingConfig | None = None,
     *,
     broker: Any | None,
-    universe_provider: UniverseProvider = top_okx_usdt_swaps,
-    candle_loader: CandleLoader = refresh_candle_bundle,
+    universe_provider: UniverseProvider | None = None,
+    candle_loader: CandleLoader | None = None,
     scanner: Scanner = scan_entry,
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
+    default_trusted_loader = candle_loader is None
+    candle_loader = candle_loader or refresh_trusted_candle_bundle
     tickers: list[OKXSwapTicker] = []
     universe_error: dict[str, Any] | None = None
     open_exposure = 0
@@ -59,10 +63,13 @@ def run_once(
     account_error: dict[str, str] | None = None
 
     if config.dry_run:
-        tickers = _merge_watchlist_tickers(
-            universe_provider(limit=config.universe_limit),
-            config.watchlist_symbols,
-        )
+        try:
+            tickers = _merge_watchlist_tickers(
+                _load_universe(config, universe_provider),
+                config.watchlist_symbols,
+            )
+        except Exception as exc:
+            universe_error = _universe_load_error(exc)
     else:
         if broker is None:
             raise RuntimeError("broker is required when dry_run is false")
@@ -79,7 +86,7 @@ def run_once(
             open_position_inst_ids = _open_position_inst_ids(positions)
             try:
                 tickers = _merge_watchlist_tickers(
-                    universe_provider(limit=config.universe_limit),
+                    _load_universe(config, universe_provider),
                     config.watchlist_symbols,
                 )
             except Exception as exc:
@@ -92,25 +99,29 @@ def run_once(
     expired_orders: list[dict[str, Any]] = []
     data_errors: list[dict[str, Any]] = []
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
+    cycle_run_id: str | None = None
 
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
         data_error = None
         bundle = None
         try:
-            bundle = candle_loader(
-                ticker.inst_id,
-                intervals=("15m", "1h"),
-                days=config.days,
-                data_dir=config.data_dir,
-                refresh=config.refresh,
-            )
+            loader_kwargs = {
+                "intervals": ("15m", "1h"),
+                "days": config.days,
+                "data_dir": config.data_dir,
+                "refresh": config.refresh,
+            }
+            if default_trusted_loader:
+                loader_kwargs["policy"] = trading_strict_policy()
+            bundle = candle_loader(ticker.inst_id, **loader_kwargs)
         except Exception as exc:
             data_error = _market_data_load_error(ticker.inst_id, exc)
             data_errors.append(data_error)
             result = _data_error_scan_result(ticker.inst_id, data_error)
             scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
 
-        if bundle is not None and not config.dry_run:
+        if bundle is not None:
+            cycle_run_id = cycle_run_id or getattr(bundle, "run_id", None)
             data_error = _market_data_freshness_error(
                 symbol=ticker.inst_id,
                 bundle=bundle,
@@ -254,6 +265,8 @@ def run_once(
         "universe_error": universe_error,
         "data_errors": data_errors,
     }
+    if cycle_run_id is not None:
+        payload["run_id"] = cycle_run_id
     if account_error is not None:
         payload["reason"] = "account_context_error"
         payload["account_error"] = account_error
@@ -264,6 +277,37 @@ def generate_client_order_id(symbol: str, signal_time_ms: int | None, trigger_pr
     source = f"{symbol}:{signal_time_ms or 0}:{trigger_price:.8f}"
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:20].upper()
     return f"OD{digest}"
+
+
+def trusted_manifest_universe_provider(*, limit: int, data_dir: Path = Path("data/live")) -> list[OKXSwapTicker]:
+    manifest_path = Path(data_dir) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    universe = manifest.get("universes") or {}
+    rows = [*(universe.get("crypto_top") or []), *(universe.get("stock_token_top") or [])]
+    tickers: list[OKXSwapTicker] = []
+    seen: set[str] = set()
+    for row in rows:
+        inst_id = str(row.get("inst_id") or row.get("instId") or "")
+        if not inst_id or inst_id in seen:
+            continue
+        tickers.append(
+            OKXSwapTicker(
+                inst_id=inst_id,
+                last=_float(row.get("last")),
+                volume_ccy_24h=_float(row.get("volume_ccy_24h") or row.get("volCcy24h")),
+                source=str(row.get("source") or "trusted_manifest"),
+            )
+        )
+        seen.add(inst_id)
+        if len(tickers) >= limit:
+            break
+    return tickers
+
+
+def _load_universe(config: DemoTradingConfig, universe_provider: UniverseProvider | None) -> list[OKXSwapTicker]:
+    if universe_provider is None:
+        return trusted_manifest_universe_provider(limit=config.universe_limit, data_dir=config.data_dir)
+    return universe_provider(limit=config.universe_limit)
 
 
 def _build_order_plan(result: EntryScanResult, config: DemoTradingConfig) -> dict[str, Any]:
@@ -326,6 +370,8 @@ def _scan_payload(
 ) -> dict[str, Any]:
     payload = asdict(result)
     payload["source"] = source
+    if getattr(bundle, "run_id", None):
+        payload["run_id"] = bundle.run_id
     if second_pullback_wait_bars is not None:
         payload["second_pullback_wait_bars"] = second_pullback_wait_bars
     payload["data_files"] = {interval: str(path) for interval, path in bundle.files_by_interval.items()}
@@ -437,6 +483,19 @@ def _market_data_freshness_error(
 
 
 def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str, Any] | None:
+    decision = getattr(bundle, "trust_decision", None)
+    if decision is not None and not getattr(decision, "allowed", True):
+        reason = getattr(getattr(decision, "reason", None), "value", getattr(decision, "reason", None))
+        return {
+            "symbol": symbol,
+            "reason": "market_data_invalid",
+            "interval": None,
+            "status_reason": reason,
+            "error_type": None,
+            "message": getattr(decision, "message", None),
+            "latest_open_time_ms": None,
+            "source_file": "",
+        }
     statuses = getattr(bundle, "statuses_by_interval", None) or {}
     for interval, status in statuses.items():
         is_valid = bool(getattr(status, "is_valid", True))
@@ -610,4 +669,11 @@ def _decimal(value: Any) -> Decimal:
 
 def _float_to_price_text(value: float) -> str:
     return format(Decimal(str(value)).normalize(), "f")
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 

@@ -13,7 +13,7 @@ from mu_strategy.market_data.trusted import (
 )
 from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, TrustDecision, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
-from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+from mu_strategy.market_data.trusted_data.policy import TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_LIVE_DATA_DIR,
     DEFAULT_INTERVALS,
@@ -86,6 +86,7 @@ def refresh_trusted_candle_bundle(
     refresh: bool = False,
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
+    policy: TrustPolicy | None = None,
 ) -> CandleBundle:
     resolved = resolve_okx_swap_symbol(symbol)
     store = TrustedDataStore(data_dir=Path(data_dir))
@@ -107,9 +108,20 @@ def refresh_trusted_candle_bundle(
             intervals=requested_intervals,
             days=days,
         ),
-        observe_only_policy(),
+        policy or research_strict_policy(),
     )
     return _compat_bundle(resolved, bundle)
+
+
+def trusted_bundle_error(
+    bundle: CandleBundle,
+    *,
+    required_intervals: tuple[str, ...] = TRUSTED_REQUIRED_INTERVALS,
+) -> str | None:
+    decision = getattr(bundle, "trust_decision", None)
+    if decision is not None and not decision.allowed:
+        return f"trusted data blocked: {decision.reason.value}"
+    return trusted_status_error(bundle.statuses_by_interval, required_intervals=required_intervals)
 
 
 def trusted_status_error(
