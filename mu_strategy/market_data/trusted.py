@@ -2,18 +2,18 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
-from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
 from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, ValidationReport
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_INTERVALS,
     DEFAULT_LIVE_DATA_DIR,
     DEFAULT_STOCK_TOKEN_CONFIG,
-    OKXMarketDataProvider,
-    RefreshTrustedMarketData,
+    OKXHistoryFetcher,
+    OKXIncrementalFetcher,
     RefreshTrustedMarketDataRequest,
     load_stock_token_inst_ids,
+    refresh_with_okx_provider,
     select_top_okx_crypto_swaps,
     select_top_okx_stock_tokens,
 )
@@ -26,8 +26,6 @@ from mu_strategy.models import Candle
 
 
 TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
-OKXHistoryFetcher = Callable[..., list[Candle]]
-OKXIncrementalFetcher = Callable[..., list[Candle]]
 
 
 @dataclass(frozen=True)
@@ -104,8 +102,8 @@ def refresh_trusted_symbol_statuses(
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> dict[str, DataStatus]:
-    provider = _CompatProvider(days=days, fetcher=fetcher, incremental_fetcher=incremental_fetcher)
-    run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(data_dir)), provider).execute(
+    run = refresh_with_okx_provider(
+        TrustedDataStore(data_dir=Path(data_dir)),
         RefreshTrustedMarketDataRequest(
             requested_intervals=intervals,
             days=days,
@@ -113,7 +111,10 @@ def refresh_trusted_symbol_statuses(
             explicit_symbols=(symbol,),
             stock_token_inst_ids=set(),
             now_ms=now_ms,
-        )
+        ),
+        history_fetcher=fetcher,
+        incremental_fetcher=incremental_fetcher,
+        history_days_fallback=days,
     )
     return {
         interval: _data_status_from_health(health)
@@ -135,13 +136,8 @@ def refresh_market_data_once(
     incremental_fetcher: OKXIncrementalFetcher | None = None,
     now_ms: int | None = None,
 ) -> dict:
-    provider = _CompatProvider(
-        days=days,
-        ticker_rows=ticker_rows,
-        fetcher=fetcher,
-        incremental_fetcher=incremental_fetcher,
-    )
-    run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(data_dir)), provider).execute(
+    run = refresh_with_okx_provider(
+        TrustedDataStore(data_dir=Path(data_dir)),
         RefreshTrustedMarketDataRequest(
             requested_intervals=intervals,
             days=days,
@@ -149,7 +145,11 @@ def refresh_market_data_once(
             stock_token_config=stock_token_config,
             stock_token_inst_ids=stock_token_inst_ids,
             now_ms=now_ms,
-        )
+        ),
+        ticker_rows=ticker_rows,
+        history_fetcher=fetcher,
+        incremental_fetcher=incremental_fetcher,
+        history_days_fallback=days,
     )
     return run.to_manifest()
 
@@ -174,38 +174,6 @@ def validate_built_native_candles(
         max_value_mismatches=max_value_mismatches,
     )
     return _validation_result_from_report(report)
-
-
-class _CompatProvider(OKXMarketDataProvider):
-    def __init__(
-        self,
-        *,
-        days: int,
-        ticker_rows: list[dict] | None = None,
-        fetcher: OKXHistoryFetcher | None = None,
-        incremental_fetcher: OKXIncrementalFetcher | None = None,
-    ):
-        self.days = days
-        self.ticker_rows = ticker_rows
-        self.fetcher = fetcher
-        self.incremental_fetcher = incremental_fetcher
-
-    def fetch_tickers(self) -> list[dict]:
-        if self.ticker_rows is not None:
-            return list(self.ticker_rows)
-        return super().fetch_tickers()
-
-    def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
-        if self.fetcher is not None:
-            return self.fetcher(symbol, interval, days=days)
-        return fetch_okx_historical(symbol, interval, days=days)
-
-    def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
-        if self.incremental_fetcher is not None:
-            return self.incremental_fetcher(symbol, interval, since_time_ms=since_time_ms)
-        if self.fetcher is not None:
-            return self.fetcher(symbol, interval, days=self.days)
-        return fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
 
 
 def _data_status_from_health(health: DatasetHealth) -> DataStatus:

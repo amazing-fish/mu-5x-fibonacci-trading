@@ -7,8 +7,6 @@ from mu_strategy.market_data.cache import cached_historical
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted import (
     DataStatus,
-    OKXHistoryFetcher,
-    OKXIncrementalFetcher,
     refresh_trusted_symbol_statuses,
 )
 from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, TrustDecision, UniverseSnapshot
@@ -17,8 +15,10 @@ from mu_strategy.market_data.trusted_data.policy import TrustPolicy, research_st
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_LIVE_DATA_DIR,
     DEFAULT_INTERVALS,
-    RefreshTrustedMarketData,
+    OKXHistoryFetcher,
+    OKXIncrementalFetcher,
     RefreshTrustedMarketDataRequest,
+    refresh_with_okx_provider,
 )
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import Candle
@@ -92,15 +92,18 @@ def refresh_trusted_candle_bundle(
     store = TrustedDataStore(data_dir=Path(data_dir))
     requested_intervals = tuple(dict.fromkeys(intervals))
     if refresh:
-        provider = _ServiceProvider(days=days, fetcher=fetcher, incremental_fetcher=incremental_fetcher)
-        RefreshTrustedMarketData(store, provider).execute(
+        refresh_with_okx_provider(
+            store,
             RefreshTrustedMarketDataRequest(
                 requested_intervals=requested_intervals,
                 days=days,
                 limit=0,
                 explicit_symbols=(resolved.inst_id,),
                 stock_token_inst_ids=set(),
-            )
+            ),
+            history_fetcher=fetcher,
+            incremental_fetcher=incremental_fetcher,
+            history_days_fallback=days,
         )
     bundle = LoadTrustedBundle(store).execute(
         LoadTrustedBundleQuery(
@@ -138,28 +141,6 @@ def trusted_status_error(
         if status.is_stale:
             return f"trusted data stale for {interval}: {status.reason}"
     return None
-
-
-class _ServiceProvider:
-    def __init__(
-        self,
-        *,
-        days: int,
-        fetcher: OKXHistoryFetcher | None = None,
-        incremental_fetcher: OKXIncrementalFetcher | None = None,
-    ):
-        from mu_strategy.market_data.trusted import _CompatProvider
-
-        self._provider = _CompatProvider(days=days, fetcher=fetcher, incremental_fetcher=incremental_fetcher)
-
-    def fetch_tickers(self):
-        return self._provider.fetch_tickers()
-
-    def fetch_history(self, symbol, interval, *, days):
-        return self._provider.fetch_history(symbol, interval, days=days)
-
-    def fetch_incremental(self, symbol, interval, *, since_time_ms):
-        return self._provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
 
 
 def _compat_bundle(resolved: ResolvedSymbol, bundle) -> CandleBundle:

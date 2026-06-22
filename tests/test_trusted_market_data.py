@@ -160,7 +160,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
             write_csv([_candle(0, 100), _candle(300_000, 101)], path)
 
-            with patch("mu_strategy.market_data.trusted.fetch_okx_incremental", side_effect=TimeoutError("blocked")):
+            with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental", side_effect=TimeoutError("blocked")):
                 status = refresh_trusted_interval("BTC-USDT-SWAP", "5m", days=1, data_dir=data_dir, now_ms=900_000)
 
         self.assertTrue(status.is_stale)
@@ -184,7 +184,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
             write_csv([_candle(0, 100), _candle(300_000, 101)], path)
 
-            with patch("mu_strategy.market_data.trusted.fetch_okx_incremental", side_effect=AssertionError("must not hit live OKX")):
+            with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental", side_effect=AssertionError("must not hit live OKX")):
                 status = refresh_trusted_interval(
                     "BTC-USDT-SWAP",
                     "5m",

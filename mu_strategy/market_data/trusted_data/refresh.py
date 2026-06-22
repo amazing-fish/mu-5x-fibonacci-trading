@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from mu_strategy.market_data.cache import prune_candles_to_window
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
@@ -37,6 +37,8 @@ from mu_strategy.models import Candle
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
+OKXHistoryFetcher = Callable[..., list[Candle]]
+OKXIncrementalFetcher = Callable[..., list[Candle]]
 
 
 class MarketDataProvider(Protocol):
@@ -51,14 +53,53 @@ class MarketDataProvider(Protocol):
 
 
 class OKXMarketDataProvider:
+    def __init__(
+        self,
+        *,
+        ticker_rows: list[dict] | None = None,
+        history_fetcher: OKXHistoryFetcher | None = None,
+        incremental_fetcher: OKXIncrementalFetcher | None = None,
+        history_days_fallback: int | None = None,
+    ):
+        self.ticker_rows = ticker_rows
+        self.history_fetcher = history_fetcher
+        self.incremental_fetcher = incremental_fetcher
+        self.history_days_fallback = history_days_fallback
+
     def fetch_tickers(self) -> list[dict]:
+        if self.ticker_rows is not None:
+            return list(self.ticker_rows)
         return fetch_okx_swap_tickers()
 
     def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
+        if self.history_fetcher is not None:
+            return self.history_fetcher(symbol, interval, days=days)
         return fetch_okx_historical(symbol, interval, days=days)
 
     def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+        if self.incremental_fetcher is not None:
+            return self.incremental_fetcher(symbol, interval, since_time_ms=since_time_ms)
+        if self.history_fetcher is not None and self.history_days_fallback is not None:
+            return self.history_fetcher(symbol, interval, days=self.history_days_fallback)
         return fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
+
+
+def refresh_with_okx_provider(
+    store: TrustedDataStore,
+    request: RefreshTrustedMarketDataRequest,
+    *,
+    ticker_rows: list[dict] | None = None,
+    history_fetcher: OKXHistoryFetcher | None = None,
+    incremental_fetcher: OKXIncrementalFetcher | None = None,
+    history_days_fallback: int | None = None,
+) -> RefreshRun:
+    provider = OKXMarketDataProvider(
+        ticker_rows=ticker_rows,
+        history_fetcher=history_fetcher,
+        incremental_fetcher=incremental_fetcher,
+        history_days_fallback=history_days_fallback,
+    )
+    return RefreshTrustedMarketData(store, provider).execute(request)
 
 
 @dataclass(frozen=True)

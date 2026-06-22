@@ -91,6 +91,15 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertTrue(bundle.trust_decision.allowed)
         self.assertLess(len(bundle.candles_by_interval["15m"]), 192)
 
+    def test_compatibility_facades_do_not_import_okx_fetchers(self):
+        import mu_strategy.market_data.service as service
+        import mu_strategy.market_data.trusted as trusted
+
+        self.assertFalse(hasattr(trusted, "fetch_okx_historical"))
+        self.assertFalse(hasattr(trusted, "fetch_okx_incremental"))
+        self.assertFalse(hasattr(service, "fetch_okx_historical"))
+        self.assertFalse(hasattr(service, "fetch_okx_incremental"))
+
     def test_atomic_write_failure_does_not_leave_partial_target(self):
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
