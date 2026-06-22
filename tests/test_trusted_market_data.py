@@ -288,6 +288,56 @@ class TrustedCandleBundleTests(unittest.TestCase):
         self.assertEqual(1, len(bundle.candles_by_interval["1h"]))
         self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
 
+    def test_refresh_trusted_candle_bundle_preserves_manifest_failure_status(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for interval in ("5m", "15m"):
+                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                write_csv(_fake_fetcher("MU-USDT-SWAP", interval, days=1), path)
+            manifest = {
+                "symbols": {
+                    "MU-USDT-SWAP": {
+                        "intervals": {
+                            "15m": {
+                                "symbol": "MU-USDT-SWAP",
+                                "interval": "15m",
+                                "rows": 4,
+                                "first_timestamp_ms": 0,
+                                "last_timestamp_ms": 2_700_000,
+                                "updated_at_ms": 3_600_000,
+                                "source_file": str(data_dir / "okx" / "MU-USDT-SWAP" / "15m.csv"),
+                                "is_valid": False,
+                                "is_stale": True,
+                                "reason": "incremental_refresh_failed",
+                                "error_type": "TimeoutError",
+                                "message": "blocked",
+                                "warnings": [],
+                            }
+                        }
+                    }
+                }
+            }
+            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            bundle = refresh_trusted_candle_bundle(
+                "MU-USDT-SWAP",
+                intervals=("15m",),
+                days=1,
+                data_dir=data_dir,
+                refresh=False,
+            )
+
+        status = bundle.statuses_by_interval["15m"]
+        self.assertFalse(status.is_valid)
+        self.assertTrue(status.is_stale)
+        self.assertEqual("incremental_refresh_failed", status.reason)
+        self.assertEqual("TimeoutError", status.error_type)
+        self.assertEqual("blocked", status.message)
+        self.assertEqual([], bundle.candles_by_interval["15m"])
+
     def test_refresh_trusted_candle_bundle_does_not_reread_invalid_status_file(self):
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
         from mu_strategy.market_data.trusted import DataStatus

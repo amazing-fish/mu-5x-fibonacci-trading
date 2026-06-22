@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -124,13 +125,15 @@ def _load_trusted_cache_statuses(
 ) -> tuple[dict[str, DataStatus], dict[str, list[Candle]]]:
     statuses: dict[str, DataStatus] = {}
     candles_by_interval: dict[str, list[Candle]] = {}
+    manifest_statuses = _load_manifest_interval_statuses(symbol, intervals=intervals, data_dir=data_dir)
     for interval in intervals:
         path = trusted_cache_path(symbol, interval, data_dir=data_dir)
         try:
             candles = read_csv(path) if path.exists() else []
             validate_close_to_next_open_gaps(candles)
             candles_by_interval[interval] = candles
-            statuses[interval] = _cache_status(symbol, interval, candles, path)
+            cache_status = _cache_status(symbol, interval, candles, path)
+            statuses[interval] = (manifest_statuses.get(interval) or cache_status) if cache_status.is_valid else cache_status
         except Exception as exc:
             candles_by_interval[interval] = []
             statuses[interval] = DataStatus(
@@ -148,6 +151,47 @@ def _load_trusted_cache_statuses(
             )
     _attach_cached_built_native_validation(statuses, candles_by_interval)
     return statuses, candles_by_interval
+
+
+def _load_manifest_interval_statuses(
+    symbol: str,
+    *,
+    intervals: tuple[str, ...],
+    data_dir: Path,
+) -> dict[str, DataStatus]:
+    path = Path(data_dir) / "manifest.json"
+    if not path.exists():
+        return {}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    interval_payloads = (
+        (manifest.get("symbols") or {})
+        .get(symbol, {})
+        .get("intervals", {})
+    )
+    statuses: dict[str, DataStatus] = {}
+    for interval in intervals:
+        payload = interval_payloads.get(interval)
+        if not isinstance(payload, dict):
+            continue
+        statuses[interval] = DataStatus(
+            symbol=str(payload.get("symbol") or symbol),
+            interval=str(payload.get("interval") or interval),
+            rows=int(payload.get("rows") or 0),
+            first_timestamp_ms=payload.get("first_timestamp_ms"),
+            last_timestamp_ms=payload.get("last_timestamp_ms"),
+            updated_at_ms=int(payload.get("updated_at_ms") or 0),
+            source_file=Path(payload.get("source_file") or trusted_cache_path(symbol, interval, data_dir=data_dir)),
+            is_valid=bool(payload.get("is_valid", True)),
+            is_stale=bool(payload.get("is_stale")),
+            reason=str(payload.get("reason") or "ok"),
+            error_type=payload.get("error_type"),
+            message=payload.get("message"),
+            warnings=tuple(payload.get("warnings") or ()),
+        )
+    return statuses
 
 
 def _cache_status(symbol: str, interval: str, candles: list[Candle], path: Path) -> DataStatus:
