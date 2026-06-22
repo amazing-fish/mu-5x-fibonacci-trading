@@ -92,6 +92,23 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual("ohlcv_mismatch", result.reason)
         self.assertEqual([{"timestamp_ms": 0, "field": "high", "built": 110, "native": 111}], result.value_mismatches)
 
+    def test_validate_built_native_accepts_price_and_volume_within_tolerance(self):
+        from mu_strategy.market_data.trusted import validate_built_native_candles
+
+        built = [Candle(0, 100.0, 110.0, 90.0, 105.0, 123.0)]
+        native = [Candle(0, 100.0001, 110.0001, 90.0001, 105.0001, 123.0001)]
+
+        result = validate_built_native_candles(
+            built,
+            native,
+            interval="15m",
+            value_rel_tol=1e-5,
+            value_abs_tol=1e-5,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual("ok", result.reason)
+
 
 class TrustedRefreshStoreTests(unittest.TestCase):
     def test_refresh_once_writes_manifest_run_log_and_health_dashboard(self):
@@ -414,9 +431,28 @@ class TrustedCandleBundleTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
+            manifest_intervals = {}
             for interval in ("5m", "15m", "1h"):
                 path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
-                write_csv(_fake_fetcher("MU-USDT-SWAP", interval, days=1), path)
+                candles = _fake_fetcher("MU-USDT-SWAP", interval, days=1)
+                write_csv(candles, path)
+                manifest_intervals[interval] = {
+                    "symbol": "MU-USDT-SWAP",
+                    "interval": interval,
+                    "rows": len(candles),
+                    "first_timestamp_ms": candles[0].open_time_ms,
+                    "last_timestamp_ms": candles[-1].open_time_ms,
+                    "updated_at_ms": 3_600_000,
+                    "source_file": str(path),
+                    "is_valid": True,
+                    "is_stale": False,
+                    "reason": "ok",
+                    "warnings": [],
+                }
+            (data_dir / "manifest.json").write_text(
+                json.dumps({"symbols": {"MU-USDT-SWAP": {"intervals": manifest_intervals}}}),
+                encoding="utf-8",
+            )
 
             with patch(
                 "mu_strategy.market_data.service.refresh_trusted_symbol_statuses",
@@ -570,6 +606,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     days=1,
                     data_dir=data_dir,
                     refresh=True,
+                    fetcher=_fake_fetcher,
                 )
 
         self.assertEqual([], bundle.candles_by_interval["15m"])
