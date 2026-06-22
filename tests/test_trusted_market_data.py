@@ -176,6 +176,34 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertFalse(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
         self.assertEqual("refresh_failed", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["reason"])
 
+    def test_refresh_once_marks_empty_universe_invalid(self):
+        from mu_strategy.market_data.trusted import refresh_market_data_once
+
+        def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
+            raise AssertionError("empty universe must not fetch symbol candles")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            manifest = refresh_market_data_once(
+                data_dir=data_dir,
+                ticker_rows=[],
+                stock_token_inst_ids=set(),
+                limit=1,
+                days=1,
+                intervals=("5m",),
+                fetcher=fetcher,
+                now_ms=3_600_000,
+            )
+
+            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("invalid", persisted["status"])
+        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual({}, manifest["symbols"])
+        self.assertIn("empty_universe", manifest["warnings"])
+
     def test_refresh_once_marks_bad_cache_invalid_without_aborting_other_symbols(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
 

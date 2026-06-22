@@ -239,6 +239,7 @@ class VisualizationTests(unittest.TestCase):
             return SimpleNamespace(
                 candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
                 statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
                     "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
                     "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
                 },
@@ -268,6 +269,7 @@ class VisualizationTests(unittest.TestCase):
             return SimpleNamespace(
                 candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
                 statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
                     "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
                     "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
                 },
@@ -296,6 +298,7 @@ class VisualizationTests(unittest.TestCase):
             return SimpleNamespace(
                 candles_by_interval={"15m": candles_15m, "1h": candles_1h},
                 statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
                     "15m": _status("MU-USDT-SWAP", "15m", rows=len(candles_15m), path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
                     "1h": _status("MU-USDT-SWAP", "1h", rows=len(candles_1h), path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
                 },
@@ -343,6 +346,7 @@ class VisualizationTests(unittest.TestCase):
             return SimpleNamespace(
                 candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
                 statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
                     "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
                     "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
                 },
@@ -366,6 +370,7 @@ class VisualizationTests(unittest.TestCase):
             return SimpleNamespace(
                 candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
                 statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
                     "15m": _status(
                         "MU-USDT-SWAP",
                         "15m",
@@ -382,6 +387,39 @@ class VisualizationTests(unittest.TestCase):
             argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle, create=True):
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        with self.assertRaises(SystemExit) as raised:
+                            visualize.main()
+
+            self.assertFalse(output_path.exists())
+
+        self.assertNotEqual(0, raised.exception.code)
+
+    def test_visualize_cli_rejects_invalid_base_5m_status(self):
+        from mu_strategy import visualize
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                statuses_by_interval={
+                    "5m": _status(
+                        "MU-USDT-SWAP",
+                        "5m",
+                        rows=0,
+                        path=Path("data/live/okx/MU-USDT-SWAP/5m.csv"),
+                        is_valid=False,
+                        reason="cache_read_failed",
+                    ),
+                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
+                },
+            )
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "chart.html"
+            argv = ["mu_strategy.visualize", "--trusted-data", "--output", str(output_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
                     with patch("sys.stderr", new_callable=io.StringIO):
                         with self.assertRaises(SystemExit) as raised:
                             visualize.main()

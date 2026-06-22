@@ -48,7 +48,7 @@ def main() -> None:
             data_dir=data_dir,
             refresh=args.refresh,
         )
-        status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("15m", "1h"))
+        status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("5m", "15m", "1h"))
         if status_error:
             parser.error(status_error)
     else:

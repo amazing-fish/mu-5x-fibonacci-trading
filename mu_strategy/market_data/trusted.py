@@ -216,6 +216,9 @@ def refresh_market_data_once(
     }
     if len(stock_top) < limit:
         manifest["warnings"].append(f"stock_token_top_count_below_limit:{len(stock_top)}/{limit}")
+    empty_universe = limit > 0 and not symbols
+    if empty_universe:
+        manifest["warnings"].append("empty_universe")
 
     for ticker in symbols:
         interval_statuses = refresh_trusted_symbol_statuses(
@@ -233,7 +236,7 @@ def refresh_market_data_once(
             "intervals": {interval: status.to_dict() for interval, status in interval_statuses.items()},
         }
 
-    manifest["status"] = _manifest_status(manifest)
+    manifest["status"] = "invalid" if empty_universe else _manifest_status(manifest)
     _write_manifest(manifest, data_dir=data_dir)
     _append_run_log(manifest, data_dir=data_dir)
     return manifest
