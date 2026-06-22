@@ -152,6 +152,67 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("TimeoutError", status.error_type)
         self.assertEqual("blocked", status.message)
 
+    def test_refresh_interval_uses_injected_fetcher_with_warm_cache(self):
+        from mu_strategy.market_data.cache import read_csv, write_csv
+        from mu_strategy.market_data.trusted import refresh_trusted_interval
+
+        def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
+            self.assertEqual("BTC-USDT-SWAP", symbol)
+            self.assertEqual("5m", interval)
+            self.assertEqual(1, days)
+            return [_candle(0, 100), _candle(300_000, 101), _candle(600_000, 102)]
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
+            write_csv([_candle(0, 100), _candle(300_000, 101)], path)
+
+            with patch("mu_strategy.market_data.trusted.fetch_okx_incremental", side_effect=AssertionError("must not hit live OKX")):
+                status = refresh_trusted_interval(
+                    "BTC-USDT-SWAP",
+                    "5m",
+                    days=1,
+                    data_dir=data_dir,
+                    now_ms=900_000,
+                    fetcher=fetcher,
+                )
+
+            candles = read_csv(path)
+
+        self.assertTrue(status.is_valid)
+        self.assertFalse(status.is_stale)
+        self.assertEqual("ok", status.reason)
+        self.assertEqual([0, 300_000, 600_000], [candle.open_time_ms for candle in candles])
+
+    def test_refresh_interval_uses_injected_incremental_fetcher_with_warm_cache(self):
+        from mu_strategy.market_data.cache import read_csv, write_csv
+        from mu_strategy.market_data.trusted import refresh_trusted_interval
+
+        def incremental_fetcher(symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+            self.assertEqual("BTC-USDT-SWAP", symbol)
+            self.assertEqual("5m", interval)
+            self.assertEqual(0, since_time_ms)
+            return [_candle(300_000, 101), _candle(600_000, 102)]
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
+            write_csv([_candle(0, 100), _candle(300_000, 101)], path)
+
+            status = refresh_trusted_interval(
+                "BTC-USDT-SWAP",
+                "5m",
+                days=1,
+                data_dir=data_dir,
+                now_ms=900_000,
+                incremental_fetcher=incremental_fetcher,
+            )
+
+            candles = read_csv(path)
+
+        self.assertTrue(status.is_valid)
+        self.assertEqual([0, 300_000, 600_000], [candle.open_time_ms for candle in candles])
+
     def test_refresh_once_marks_manifest_invalid_when_any_interval_fails(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
 

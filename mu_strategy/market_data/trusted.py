@@ -22,6 +22,7 @@ from mu_strategy.models import Candle
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
+TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,8 @@ class DataStatus:
         return payload
 
 
-OKXHistoryFetcher = Callable[[str, str], list[Candle]]
+OKXHistoryFetcher = Callable[..., list[Candle]]
+OKXIncrementalFetcher = Callable[..., list[Candle]]
 
 
 def trusted_cache_path(symbol: str, interval: str, *, data_dir: Path = DEFAULT_LIVE_DATA_DIR) -> Path:
@@ -115,22 +117,28 @@ def refresh_trusted_interval(
     days: int,
     data_dir: Path = DEFAULT_LIVE_DATA_DIR,
     now_ms: int | None = None,
-    fetcher: Callable[..., list[Candle]] | None = None,
+    fetcher: OKXHistoryFetcher | None = None,
+    incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> DataStatus:
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     path = trusted_cache_path(symbol, interval, data_dir=data_dir)
     existing: list[Candle] = []
     cache_loaded = False
-    fetcher = fetcher or fetch_okx_historical
+    history_fetcher = fetcher or fetch_okx_historical
     try:
         existing = read_csv(path) if path.exists() else []
         cache_loaded = True
         if existing:
             since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
-            fetched = fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
+            if incremental_fetcher is not None:
+                fetched = incremental_fetcher(symbol, interval, since_time_ms=since_time_ms)
+            elif fetcher is not None:
+                fetched = history_fetcher(symbol, interval, days=days)
+            else:
+                fetched = fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
             candles = _merge_trusted_candles(existing, fetched, days=days)
         else:
-            candles = fetcher(symbol, interval, days=days)
+            candles = history_fetcher(symbol, interval, days=days)
             candles = _merge_trusted_candles([], candles, days=days)
         validate_close_to_next_open_gaps(candles)
         write_csv(candles, path)
@@ -168,7 +176,8 @@ def refresh_trusted_symbol_statuses(
     days: int,
     data_dir: Path = DEFAULT_LIVE_DATA_DIR,
     now_ms: int | None = None,
-    fetcher: Callable[..., list[Candle]] | None = None,
+    fetcher: OKXHistoryFetcher | None = None,
+    incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> dict[str, DataStatus]:
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     interval_statuses = {}
@@ -180,6 +189,7 @@ def refresh_trusted_symbol_statuses(
             data_dir=data_dir,
             now_ms=now_ms,
             fetcher=fetcher,
+            incremental_fetcher=incremental_fetcher,
         )
     _attach_built_native_validation(interval_statuses, data_dir=data_dir)
     return interval_statuses
@@ -194,7 +204,8 @@ def refresh_market_data_once(
     limit: int = 10,
     days: int = 180,
     intervals: tuple[str, ...] = DEFAULT_INTERVALS,
-    fetcher: Callable[..., list[Candle]] | None = None,
+    fetcher: OKXHistoryFetcher | None = None,
+    incremental_fetcher: OKXIncrementalFetcher | None = None,
     now_ms: int | None = None,
 ) -> dict:
     now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -230,6 +241,7 @@ def refresh_market_data_once(
             data_dir=data_dir,
             now_ms=now_ms,
             fetcher=fetcher,
+            incremental_fetcher=incremental_fetcher,
         )
         manifest["symbols"][ticker.inst_id] = {
             "source": ticker.source,

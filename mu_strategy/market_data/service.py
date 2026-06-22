@@ -3,21 +3,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
 
 from mu_strategy.market_data.cache import cached_historical, read_csv, validate_close_to_next_open_gaps
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted import (
     DataStatus,
+    OKXHistoryFetcher,
+    OKXIncrementalFetcher,
+    TRUSTED_REQUIRED_INTERVALS,
     aggregate_candles,
     refresh_trusted_symbol_statuses,
     trusted_cache_path,
     validate_built_native_candles,
 )
 from mu_strategy.models import Candle
-
-
-TRUSTED_REQUIRED_INTERVALS = ("5m", "15m", "1h")
 
 
 @dataclass(frozen=True)
@@ -74,7 +73,8 @@ def refresh_trusted_candle_bundle(
     days: int = 28,
     data_dir: Path = Path("data/live"),
     refresh: bool = False,
-    fetcher: Callable[..., list[Candle]] | None = None,
+    fetcher: OKXHistoryFetcher | None = None,
+    incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> CandleBundle:
     resolved = resolve_okx_swap_symbol(symbol)
     candles_by_interval: dict[str, list[Candle]] = {}
@@ -88,6 +88,7 @@ def refresh_trusted_candle_bundle(
             days=days,
             data_dir=data_dir,
             fetcher=fetcher,
+            incremental_fetcher=incremental_fetcher,
         )
     else:
         statuses_by_interval, cached_candles = _load_trusted_cache_statuses(
