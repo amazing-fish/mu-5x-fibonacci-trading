@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ class CandleValidationResult:
     missing_in_built: list[int] = field(default_factory=list)
     missing_in_native: list[int] = field(default_factory=list)
     misaligned_timestamps: list[int] = field(default_factory=list)
+    value_mismatches: list[dict[str, int | float | str]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -276,6 +278,9 @@ def validate_built_native_candles(
     *,
     interval: str,
     min_samples: int = 1,
+    value_rel_tol: float = 1e-8,
+    value_abs_tol: float = 1e-8,
+    max_value_mismatches: int = 20,
 ) -> CandleValidationResult:
     if not built:
         return CandleValidationResult(False, "built_empty")
@@ -300,6 +305,31 @@ def validate_built_native_candles(
     missing_in_native = sorted(built_times - native_times)
     if missing_in_native:
         return CandleValidationResult(False, "missing_in_native", missing_in_native=missing_in_native)
+    built_by_time = {bar.open_time_ms: bar for bar in built}
+    native_by_time = {bar.open_time_ms: bar for bar in native}
+    value_mismatches: list[dict[str, int | float | str]] = []
+    for timestamp in sorted(built_times):
+        built_bar = built_by_time[timestamp]
+        native_bar = native_by_time[timestamp]
+        for field_name in ("open", "high", "low", "close", "volume"):
+            built_value = getattr(built_bar, field_name)
+            native_value = getattr(native_bar, field_name)
+            if math.isclose(built_value, native_value, rel_tol=value_rel_tol, abs_tol=value_abs_tol):
+                continue
+            value_mismatches.append(
+                {
+                    "timestamp_ms": timestamp,
+                    "field": field_name,
+                    "built": built_value,
+                    "native": native_value,
+                }
+            )
+            if len(value_mismatches) >= max_value_mismatches:
+                break
+        if len(value_mismatches) >= max_value_mismatches:
+            break
+    if value_mismatches:
+        return CandleValidationResult(False, "ohlcv_mismatch", value_mismatches=value_mismatches)
     return CandleValidationResult(True, "ok")
 
 

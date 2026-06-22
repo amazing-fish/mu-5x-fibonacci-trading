@@ -8,8 +8,12 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
-from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.service import (
+    TRUSTED_REQUIRED_INTERVALS,
+    refresh_candle_bundle,
+    refresh_trusted_candle_bundle,
+    trusted_status_error,
+)
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -51,12 +55,12 @@ def main() -> None:
     if args.trusted_data:
         bundle = refresh_trusted_candle_bundle(
             args.symbol,
-            intervals=("5m", "15m", "1h"),
+            intervals=TRUSTED_REQUIRED_INTERVALS,
             days=args.days,
             data_dir=data_dir,
             refresh=args.refresh,
         )
-        status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("5m", "15m", "1h"))
+        status_error = trusted_status_error(bundle.statuses_by_interval)
         if status_error:
             parser.error(status_error)
         candles_15m = bundle.candles_by_interval["15m"]
@@ -90,18 +94,6 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_text, encoding="utf-8")
     print(f"Wrote {args.output.resolve()}")
-
-
-def _trusted_status_error(statuses: dict[str, DataStatus], *, required_intervals: tuple[str, ...]) -> str | None:
-    for interval in required_intervals:
-        status = statuses.get(interval)
-        if status is None:
-            return f"trusted data status missing for {interval}"
-        if not status.is_valid:
-            return f"trusted data invalid for {interval}: {status.reason}"
-        if status.is_stale:
-            return f"trusted data stale for {interval}: {status.reason}"
-    return None
 
 
 def render_html_visualization(

@@ -17,6 +17,9 @@ from mu_strategy.market_data.trusted import (
 from mu_strategy.models import Candle
 
 
+TRUSTED_REQUIRED_INTERVALS = ("5m", "15m", "1h")
+
+
 @dataclass(frozen=True)
 class CandleBundle:
     symbol: ResolvedSymbol
@@ -109,6 +112,22 @@ def refresh_trusted_candle_bundle(
         days=days,
         statuses_by_interval=statuses_by_interval,
     )
+
+
+def trusted_status_error(
+    statuses: dict[str, DataStatus],
+    *,
+    required_intervals: tuple[str, ...] = TRUSTED_REQUIRED_INTERVALS,
+) -> str | None:
+    for interval in required_intervals:
+        status = statuses.get(interval)
+        if status is None:
+            return f"trusted data status missing for {interval}"
+        if not status.is_valid:
+            return f"trusted data invalid for {interval}: {status.reason}"
+        if status.is_stale:
+            return f"trusted data stale for {interval}: {status.reason}"
+    return None
 
 
 def _validation_intervals(intervals: tuple[str, ...]) -> tuple[str, ...]:

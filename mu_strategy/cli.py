@@ -5,8 +5,12 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.indicators import ema, macd, rsi
-from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.service import (
+    TRUSTED_REQUIRED_INTERVALS,
+    refresh_candle_bundle,
+    refresh_trusted_candle_bundle,
+    trusted_status_error,
+)
 from mu_strategy.models import Candle
 from mu_strategy.reporting import render_markdown_report
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, one_hour_regime, selected_strategy_groups, with_fee_profile
@@ -43,12 +47,12 @@ def main() -> None:
     if args.trusted_data:
         bundle = refresh_trusted_candle_bundle(
             args.symbol,
-            intervals=("5m", "15m", "1h"),
+            intervals=TRUSTED_REQUIRED_INTERVALS,
             days=args.days,
             data_dir=data_dir,
             refresh=args.refresh,
         )
-        status_error = _trusted_status_error(bundle.statuses_by_interval, required_intervals=("5m", "15m", "1h"))
+        status_error = trusted_status_error(bundle.statuses_by_interval)
         if status_error:
             parser.error(status_error)
     else:
@@ -70,18 +74,6 @@ def main() -> None:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")
     print(report)
-
-
-def _trusted_status_error(statuses: dict[str, DataStatus], *, required_intervals: tuple[str, ...]) -> str | None:
-    for interval in required_intervals:
-        status = statuses.get(interval)
-        if status is None:
-            return f"trusted data status missing for {interval}"
-        if not status.is_valid:
-            return f"trusted data invalid for {interval}: {status.reason}"
-        if status.is_stale:
-            return f"trusted data stale for {interval}: {status.reason}"
-    return None
 
 
 def build_hourly_context(candles_15m: list[Candle], candles_1h: list[Candle]) -> dict[int, str]:

@@ -80,6 +80,18 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual("ok", result.reason)
 
+    def test_validate_built_native_rejects_ohlcv_mismatch(self):
+        from mu_strategy.market_data.trusted import validate_built_native_candles
+
+        built = [Candle(0, 100, 110, 90, 105, 123)]
+        native = [Candle(0, 100, 111, 90, 105, 123)]
+
+        result = validate_built_native_candles(built, native, interval="15m")
+
+        self.assertFalse(result.ok)
+        self.assertEqual("ohlcv_mismatch", result.reason)
+        self.assertEqual([{"timestamp_ms": 0, "field": "high", "built": 110, "native": 111}], result.value_mismatches)
+
 
 class TrustedRefreshStoreTests(unittest.TestCase):
     def test_refresh_once_writes_manifest_run_log_and_health_dashboard(self):
@@ -270,6 +282,51 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertFalse(status["is_valid"])
         self.assertEqual("cache_read_failed", status["reason"])
 
+    def test_refresh_once_marks_native_ohlcv_mismatch_invalid(self):
+        from mu_strategy.market_data.trusted import refresh_market_data_once
+
+        rows = [
+            {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "20"},
+        ]
+
+        def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
+            candles = _fake_fetcher(symbol, interval, days=days)
+            if interval == "15m":
+                first = candles[0]
+                candles[0] = Candle(
+                    first.open_time_ms,
+                    first.open,
+                    first.high + 1,
+                    first.low,
+                    first.close,
+                    first.volume,
+                )
+            return candles
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            manifest = refresh_market_data_once(
+                data_dir=data_dir,
+                ticker_rows=rows,
+                stock_token_inst_ids=set(),
+                limit=1,
+                days=1,
+                intervals=("5m", "15m"),
+                fetcher=fetcher,
+                now_ms=3_600_000,
+            )
+
+            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+
+        status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("invalid", persisted["status"])
+        self.assertEqual("invalid", run_log["status"])
+        self.assertFalse(status["is_valid"])
+        self.assertEqual("ohlcv_mismatch", status["reason"])
+        self.assertEqual("ohlcv_mismatch", status["validation"]["reason"])
+
 
 class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_attaches_built_native_validation(self):
@@ -405,9 +462,12 @@ def _candle(open_time_ms: int, close: float) -> Candle:
 
 
 def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
-    step = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}[interval]
-    count = {"5m": 12, "15m": 4, "1h": 1}[interval]
-    return [_candle(index * step, 100 + index) for index in range(count)]
+    five_minute = [_candle(index * 300_000, 100 + index) for index in range(12)]
+    if interval == "5m":
+        return five_minute
+    from mu_strategy.market_data.trusted import aggregate_candles
+
+    return aggregate_candles(five_minute, interval=interval)
 
 
 if __name__ == "__main__":
