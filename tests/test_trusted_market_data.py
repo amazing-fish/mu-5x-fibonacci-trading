@@ -434,6 +434,64 @@ class TrustedCandleBundleTests(unittest.TestCase):
         self.assertEqual(1, len(bundle.candles_by_interval["1h"]))
         self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
 
+    def test_refresh_trusted_candle_bundle_prunes_cached_window_and_statuses_to_days(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+        from mu_strategy.market_data.trusted import aggregate_candles
+        from mu_strategy.market_data.utils import DAY_MS
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            five_minute = _five_minute_candles(days=3)
+            candles_by_interval = {
+                "5m": five_minute,
+                "15m": aggregate_candles(five_minute, interval="15m"),
+                "1h": aggregate_candles(five_minute, interval="1h"),
+            }
+            manifest_intervals = {}
+            for interval, candles in candles_by_interval.items():
+                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                write_csv(candles, path)
+                manifest_intervals[interval] = {
+                    "symbol": "MU-USDT-SWAP",
+                    "interval": interval,
+                    "rows": 999,
+                    "first_timestamp_ms": candles[0].open_time_ms,
+                    "last_timestamp_ms": candles[-1].open_time_ms,
+                    "updated_at_ms": 3 * DAY_MS,
+                    "source_file": str(path),
+                    "is_valid": True,
+                    "is_stale": False,
+                    "reason": "ok",
+                    "warnings": [],
+                }
+            manifest = {"symbols": {"MU-USDT-SWAP": {"intervals": manifest_intervals}}}
+            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            bundle = refresh_trusted_candle_bundle(
+                "MU-USDT-SWAP",
+                intervals=("15m", "1h"),
+                days=1,
+                data_dir=data_dir,
+                refresh=False,
+            )
+
+        shared_end_time_ms = five_minute[-1].open_time_ms
+        earliest_allowed_time_ms = shared_end_time_ms - DAY_MS
+        for interval in ("5m", "15m", "1h"):
+            status = bundle.statuses_by_interval[interval]
+            self.assertNotEqual(999, status.rows)
+            self.assertGreaterEqual(status.first_timestamp_ms, earliest_allowed_time_ms)
+            self.assertLessEqual(status.last_timestamp_ms, shared_end_time_ms)
+        for interval in ("15m", "1h"):
+            candles = bundle.candles_by_interval[interval]
+            status = bundle.statuses_by_interval[interval]
+            self.assertTrue(candles)
+            self.assertEqual(len(candles), status.rows)
+            self.assertEqual(candles[0].open_time_ms, status.first_timestamp_ms)
+            self.assertEqual(candles[-1].open_time_ms, status.last_timestamp_ms)
+            self.assertTrue(status.validation.ok)
+
     def test_refresh_trusted_candle_bundle_preserves_manifest_failure_status(self):
         from mu_strategy.market_data.cache import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
@@ -529,6 +587,13 @@ def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
     from mu_strategy.market_data.trusted import aggregate_candles
 
     return aggregate_candles(five_minute, interval=interval)
+
+
+def _five_minute_candles(*, days: int) -> list[Candle]:
+    from mu_strategy.market_data.utils import DAY_MS
+
+    count = days * DAY_MS // 300_000
+    return [_candle(index * 300_000, 100 + index) for index in range(count)]
 
 
 if __name__ == "__main__":

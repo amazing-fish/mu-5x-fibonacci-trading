@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from mu_strategy.market_data.cache import (
+    prune_candles_to_window,
     read_csv,
     validate_close_to_next_open_gaps,
     write_csv,
@@ -394,12 +395,7 @@ def _attach_built_native_validation(interval_statuses: dict[str, DataStatus], *,
 
 
 def _merge_trusted_candles(existing: list[Candle], fetched: list[Candle], *, days: int) -> list[Candle]:
-    candles = dedupe_candles([*existing, *fetched])
-    if not candles:
-        return []
-    end_time_ms = max(candle.open_time_ms for candle in candles)
-    start_time_ms = end_time_ms - days * 86_400_000
-    return [candle for candle in candles if start_time_ms <= candle.open_time_ms <= end_time_ms]
+    return prune_candles_to_window(dedupe_candles([*existing, *fetched]), days=days)
 
 
 def _status_from_candles(

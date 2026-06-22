@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from mu_strategy.market_data.cache import cached_historical, read_csv, validate_close_to_next_open_gaps
+from mu_strategy.market_data.cache import cached_historical, prune_candles_to_window, read_csv, validate_close_to_next_open_gaps
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted import (
     DataStatus,
@@ -94,6 +94,7 @@ def refresh_trusted_candle_bundle(
         statuses_by_interval, cached_candles = _load_trusted_cache_statuses(
             resolved.inst_id,
             intervals=validation_intervals,
+            days=days,
             data_dir=data_dir,
         )
 
@@ -141,36 +142,77 @@ def _load_trusted_cache_statuses(
     symbol: str,
     *,
     intervals: tuple[str, ...],
+    days: int,
     data_dir: Path,
 ) -> tuple[dict[str, DataStatus], dict[str, list[Candle]]]:
     statuses: dict[str, DataStatus] = {}
     candles_by_interval: dict[str, list[Candle]] = {}
     manifest_statuses = _load_manifest_interval_statuses(symbol, intervals=intervals, data_dir=data_dir)
+    raw_candles_by_interval: dict[str, list[Candle]] = {}
     for interval in intervals:
         path = trusted_cache_path(symbol, interval, data_dir=data_dir)
         try:
-            candles = read_csv(path) if path.exists() else []
+            raw_candles_by_interval[interval] = read_csv(path) if path.exists() else []
+        except Exception as exc:
+            candles_by_interval[interval] = []
+            statuses[interval] = _cache_read_failed_status(symbol, interval, path, exc)
+
+    window_end_time_ms = _trusted_cache_window_end_time_ms(raw_candles_by_interval)
+    for interval in intervals:
+        if interval in statuses:
+            continue
+        path = trusted_cache_path(symbol, interval, data_dir=data_dir)
+        try:
+            candles = prune_candles_to_window(
+                raw_candles_by_interval.get(interval) or [],
+                days=days,
+                end_time_ms=window_end_time_ms,
+            )
             validate_close_to_next_open_gaps(candles)
             candles_by_interval[interval] = candles
             cache_status = _cache_status(symbol, interval, candles, path)
-            statuses[interval] = (manifest_statuses.get(interval) or cache_status) if cache_status.is_valid else cache_status
+            statuses[interval] = _status_with_manifest_health(cache_status, manifest_statuses.get(interval))
         except Exception as exc:
             candles_by_interval[interval] = []
-            statuses[interval] = DataStatus(
-                symbol=symbol,
-                interval=interval,
-                rows=0,
-                first_timestamp_ms=None,
-                last_timestamp_ms=None,
-                updated_at_ms=0,
-                source_file=path,
-                is_valid=False,
-                reason="cache_read_failed",
-                error_type=type(exc).__name__,
-                message=str(exc),
-            )
+            statuses[interval] = _cache_read_failed_status(symbol, interval, path, exc)
     _attach_cached_built_native_validation(statuses, candles_by_interval)
     return statuses, candles_by_interval
+
+
+def _cache_read_failed_status(symbol: str, interval: str, path: Path, exc: Exception) -> DataStatus:
+    return DataStatus(
+        symbol=symbol,
+        interval=interval,
+        rows=0,
+        first_timestamp_ms=None,
+        last_timestamp_ms=None,
+        updated_at_ms=0,
+        source_file=path,
+        is_valid=False,
+        reason="cache_read_failed",
+        error_type=type(exc).__name__,
+        message=str(exc),
+    )
+
+
+def _trusted_cache_window_end_time_ms(candles_by_interval: dict[str, list[Candle]]) -> int | None:
+    base_candles = candles_by_interval.get("5m") or []
+    if base_candles:
+        return max(candle.open_time_ms for candle in base_candles)
+    timestamps = [
+        candle.open_time_ms
+        for candles in candles_by_interval.values()
+        for candle in candles
+    ]
+    return max(timestamps) if timestamps else None
+
+
+def _status_with_manifest_health(cache_status: DataStatus, manifest_status: DataStatus | None) -> DataStatus:
+    if manifest_status is None:
+        return cache_status
+    if not manifest_status.is_valid or manifest_status.is_stale:
+        return manifest_status
+    return cache_status
 
 
 def _load_manifest_interval_statuses(
