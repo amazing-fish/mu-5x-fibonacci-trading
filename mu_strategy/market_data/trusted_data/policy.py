@@ -10,9 +10,10 @@ from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
     IntegrityState,
     IntervalPlan,
-    RefreshRun,
+    ManifestStatus,
     RefreshRunOutcome,
     TrustDecision,
+    TrustedLoadContext,
 )
 from mu_strategy.market_data.utils import interval_to_ms
 
@@ -60,15 +61,19 @@ class TrustPolicy:
     def decide(
         self,
         *,
+        context: TrustedLoadContext,
         health_by_interval: dict[str, DatasetHealth],
         required_intervals: tuple[str, ...],
-        run: RefreshRun | None = None,
-        manifest_reason: HealthReason | None = None,
     ) -> TrustDecision:
-        if manifest_reason is not None:
-            return TrustDecision(False, manifest_reason)
-        if run is not None and self.require_manifest_success and run.outcome == RefreshRunOutcome.FAILED:
-            return TrustDecision(False, HealthReason.RUN_FAILED)
+        if self.require_manifest_success:
+            if context.manifest.outcome == RefreshRunOutcome.FAILED:
+                return TrustDecision(False, HealthReason.RUN_FAILED)
+            if context.manifest.outcome == RefreshRunOutcome.PARTIAL:
+                return TrustDecision(False, HealthReason.RUN_PARTIAL)
+            if context.manifest.status == ManifestStatus.INVALID:
+                return TrustDecision(False, HealthReason.MANIFEST_INVALID)
+            if context.manifest.status == ManifestStatus.STALE:
+                return TrustDecision(False, HealthReason.MANIFEST_STALE)
         for interval in required_intervals:
             health = health_by_interval.get(interval)
             if health is None:
@@ -91,4 +96,4 @@ def research_strict_policy() -> TrustPolicy:
 
 
 def observe_only_policy() -> TrustPolicy:
-    return TrustPolicy(name="observe_only", require_manifest_success=False, require_fresh=False)
+    return TrustPolicy(name="observe_only", require_manifest_success=False, require_fresh=False, allow_invalid=True)

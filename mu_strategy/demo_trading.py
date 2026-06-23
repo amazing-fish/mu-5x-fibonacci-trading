@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -12,7 +11,10 @@ from typing import Any, Callable
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext, UniverseSnapshot
+from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
 from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.market_data.utils import interval_to_ms
@@ -61,15 +63,23 @@ def run_once(
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
     account_error: dict[str, str] | None = None
+    trusted_context: TrustedLoadContext | None = None
 
-    if config.dry_run:
+    if default_trusted_loader and not config.refresh:
         try:
-            tickers = _merge_watchlist_tickers(
-                _load_universe(config, universe_provider),
-                config.watchlist_symbols,
-            )
+            trusted_context = LoadTrustedBundle(TrustedDataStore(data_dir=config.data_dir)).open_context()
         except Exception as exc:
             universe_error = _universe_load_error(exc)
+
+    if config.dry_run:
+        if universe_error is None:
+            try:
+                tickers = _merge_watchlist_tickers(
+                    _load_universe(config, universe_provider, context=trusted_context),
+                    config.watchlist_symbols,
+                )
+            except Exception as exc:
+                universe_error = _universe_load_error(exc)
     else:
         if broker is None:
             raise RuntimeError("broker is required when dry_run is false")
@@ -84,13 +94,14 @@ def run_once(
         if account_error is None:
             open_exposure = _count_open_exposure(positions, open_orders)
             open_position_inst_ids = _open_position_inst_ids(positions)
-            try:
-                tickers = _merge_watchlist_tickers(
-                    _load_universe(config, universe_provider),
-                    config.watchlist_symbols,
-                )
-            except Exception as exc:
-                universe_error = _universe_load_error(exc)
+            if universe_error is None:
+                try:
+                    tickers = _merge_watchlist_tickers(
+                        _load_universe(config, universe_provider, context=trusted_context),
+                        config.watchlist_symbols,
+                    )
+                except Exception as exc:
+                    universe_error = _universe_load_error(exc)
     entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
 
     scans: list[dict[str, Any]] = []
@@ -113,6 +124,8 @@ def run_once(
             }
             if default_trusted_loader:
                 loader_kwargs["policy"] = trading_strict_policy()
+                if trusted_context is not None:
+                    loader_kwargs["context"] = trusted_context
             bundle = candle_loader(ticker.inst_id, **loader_kwargs)
         except Exception as exc:
             data_error = _market_data_load_error(ticker.inst_id, exc)
@@ -280,10 +293,16 @@ def generate_client_order_id(symbol: str, signal_time_ms: int | None, trigger_pr
 
 
 def trusted_manifest_universe_provider(*, limit: int, data_dir: Path = Path("data/live")) -> list[OKXSwapTicker]:
-    manifest_path = Path(data_dir) / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    universe = manifest.get("universes") or {}
-    rows = [*(universe.get("crypto_top") or []), *(universe.get("stock_token_top") or [])]
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    manifest_result = store.read_manifest()
+    if not manifest_result.ok or manifest_result.snapshot is None:
+        reason = manifest_result.reason.value if manifest_result.reason is not None else "manifest_blocked"
+        raise RuntimeError(f"{reason}: {manifest_result.message or reason}")
+    return _tickers_from_universe_snapshot(manifest_result.snapshot.universe_snapshot, limit=limit)
+
+
+def _tickers_from_universe_snapshot(snapshot: UniverseSnapshot, *, limit: int) -> list[OKXSwapTicker]:
+    rows = [*snapshot.crypto_top, *snapshot.stock_token_top]
     tickers: list[OKXSwapTicker] = []
     seen: set[str] = set()
     for row in rows:
@@ -304,8 +323,15 @@ def trusted_manifest_universe_provider(*, limit: int, data_dir: Path = Path("dat
     return tickers
 
 
-def _load_universe(config: DemoTradingConfig, universe_provider: UniverseProvider | None) -> list[OKXSwapTicker]:
+def _load_universe(
+    config: DemoTradingConfig,
+    universe_provider: UniverseProvider | None,
+    *,
+    context: TrustedLoadContext | None = None,
+) -> list[OKXSwapTicker]:
     if universe_provider is None:
+        if context is not None:
+            return _tickers_from_universe_snapshot(context.manifest.universe_snapshot, limit=config.universe_limit)
         return trusted_manifest_universe_provider(limit=config.universe_limit, data_dir=config.data_dir)
     return universe_provider(limit=config.universe_limit)
 
@@ -372,6 +398,8 @@ def _scan_payload(
     payload["source"] = source
     if getattr(bundle, "run_id", None):
         payload["run_id"] = bundle.run_id
+    if getattr(bundle, "observed_at_ms", None) is not None:
+        payload["observed_at_ms"] = bundle.observed_at_ms
     if second_pullback_wait_bars is not None:
         payload["second_pullback_wait_bars"] = second_pullback_wait_bars
     payload["data_files"] = {interval: str(path) for interval, path in bundle.files_by_interval.items()}
@@ -486,6 +514,8 @@ def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str,
     decision = getattr(bundle, "trust_decision", None)
     if decision is not None and not getattr(decision, "allowed", True):
         reason = getattr(getattr(decision, "reason", None), "value", getattr(decision, "reason", None))
+        load_context = getattr(bundle, "load_context", None)
+        manifest = getattr(load_context, "manifest", None)
         return {
             "symbol": symbol,
             "reason": "market_data_invalid",
@@ -495,6 +525,9 @@ def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str,
             "message": getattr(decision, "message", None),
             "latest_open_time_ms": None,
             "source_file": "",
+            "run_id": getattr(bundle, "run_id", None),
+            "manifest_outcome": getattr(getattr(manifest, "outcome", None), "value", None),
+            "manifest_status": getattr(getattr(manifest, "status", None), "value", None),
         }
     statuses = getattr(bundle, "statuses_by_interval", None) or {}
     for interval, status in statuses.items():

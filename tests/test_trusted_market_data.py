@@ -450,7 +450,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "warnings": [],
                 }
             (data_dir / "manifest.json").write_text(
-                json.dumps({"symbols": {"MU-USDT-SWAP": {"intervals": manifest_intervals}}}),
+                json.dumps(_manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})),
                 encoding="utf-8",
             )
 
@@ -464,6 +464,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     days=1,
                     data_dir=data_dir,
                     refresh=False,
+                    clock=_FixedClock(3_600_000),
                 )
 
         self.assertEqual(4, len(bundle.candles_by_interval["15m"]))
@@ -501,7 +502,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "reason": "ok",
                     "warnings": [],
                 }
-            manifest = {"symbols": {"MU-USDT-SWAP": {"intervals": manifest_intervals}}}
+            manifest = _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})
             (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
             bundle = refresh_trusted_candle_bundle(
@@ -510,6 +511,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 days=1,
                 data_dir=data_dir,
                 refresh=False,
+                clock=_FixedClock(3 * DAY_MS),
             )
 
         shared_end_time_ms = five_minute[-1].open_time_ms
@@ -537,8 +539,10 @@ class TrustedCandleBundleTests(unittest.TestCase):
             for interval in ("5m", "15m"):
                 path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
                 write_csv(_fake_fetcher("MU-USDT-SWAP", interval, days=1), path)
-            manifest = {
-                "symbols": {
+            manifest = _manifest(
+                outcome="failed",
+                status="invalid",
+                symbols={
                     "MU-USDT-SWAP": {
                         "intervals": {
                             "15m": {
@@ -558,8 +562,9 @@ class TrustedCandleBundleTests(unittest.TestCase):
                             }
                         }
                     }
-                }
-            }
+                },
+                cycle_error={"error_type": "TimeoutError", "message": "blocked"},
+            )
             (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
             bundle = refresh_trusted_candle_bundle(
@@ -568,6 +573,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 days=1,
                 data_dir=data_dir,
                 refresh=False,
+                clock=_FixedClock(3_600_000),
             )
 
         status = bundle.statuses_by_interval["15m"]
@@ -631,6 +637,37 @@ def _five_minute_candles(*, days: int) -> list[Candle]:
 
     count = days * DAY_MS // 300_000
     return [_candle(index * 300_000, 100 + index) for index in range(count)]
+
+
+def _manifest(
+    *,
+    symbols: dict,
+    outcome: str = "success",
+    status: str = "ok",
+    cycle_error: dict | None = None,
+) -> dict:
+    return {
+        "schema_version": 2,
+        "run_id": "test-run",
+        "outcome": outcome,
+        "status": status,
+        "started_at_ms": 0,
+        "completed_at_ms": 3_600_000,
+        "requested_intervals": ["15m", "1h"],
+        "effective_intervals": ["5m", "15m", "1h"],
+        "universes": {"crypto_top": [], "stock_token_top": []},
+        "symbols": symbols,
+        "warnings": [],
+        "cycle_error": cycle_error,
+    }
+
+
+class _FixedClock:
+    def __init__(self, now_ms: int):
+        self.now = now_ms
+
+    def now_ms(self) -> int:
+        return self.now
 
 
 if __name__ == "__main__":

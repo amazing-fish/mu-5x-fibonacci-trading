@@ -91,6 +91,235 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertTrue(bundle.trust_decision.allowed)
         self.assertLess(len(bundle.candles_by_interval["15m"]), 192)
 
+    def test_strict_policies_reject_failed_manifest_even_when_csv_is_valid(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy, trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                outcome="failed",
+                status="invalid",
+                run_id="run-failed",
+            )
+            loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000))
+
+            for policy in (trading_strict_policy(), research_strict_policy()):
+                with self.subTest(policy=policy.name):
+                    bundle = loader.execute(
+                        LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
+                        policy,
+                    )
+
+                    self.assertFalse(bundle.trust_decision.allowed)
+                    self.assertEqual(HealthReason.RUN_FAILED, bundle.trust_decision.reason)
+                    self.assertEqual("run-failed", bundle.run_id)
+
+    def test_strict_policy_rejects_partial_manifest_even_when_requested_symbol_is_valid(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                outcome="partial",
+                status="ok",
+                run_id="run-partial",
+            )
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.RUN_PARTIAL, bundle.trust_decision.reason)
+
+    def test_strict_policy_rejects_success_manifest_with_invalid_or_stale_status(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        cases = [
+            ("invalid", HealthReason.MANIFEST_INVALID),
+            ("stale", HealthReason.MANIFEST_STALE),
+        ]
+        for status, reason in cases:
+            with self.subTest(status=status):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp)
+                    _write_manifest_and_caches(
+                        data_dir,
+                        symbol="MU-USDT-SWAP",
+                        days=1,
+                        outcome="success",
+                        status=status,
+                    )
+                    bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                        LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
+                        trading_strict_policy(),
+                    )
+
+                self.assertFalse(bundle.trust_decision.allowed)
+                self.assertEqual(reason, bundle.trust_decision.reason)
+
+    def test_observe_only_failed_manifest_preserves_real_manifest_context(self):
+        from mu_strategy.market_data.trusted_data.contracts import ManifestStatus, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                outcome="failed",
+                status="invalid",
+                run_id="run-diagnostic",
+            )
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                observe_only_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed)
+        self.assertEqual("run-diagnostic", bundle.run_id)
+        self.assertIsNotNone(bundle.load_context)
+        self.assertEqual(RefreshRunOutcome.FAILED, bundle.load_context.manifest.outcome)
+        self.assertEqual(ManifestStatus.INVALID, bundle.load_context.manifest.status)
+
+    def test_malformed_schema_v2_fail_closed(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        cases = {
+            "missing_outcome": lambda manifest: manifest.pop("outcome"),
+            "unknown_outcome": lambda manifest: manifest.__setitem__("outcome", "unknown"),
+            "missing_status": lambda manifest: manifest.pop("status"),
+            "unknown_status": lambda manifest: manifest.__setitem__("status", "missing"),
+            "wrong_schema_version": lambda manifest: manifest.__setitem__("schema_version", 3),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp)
+                    manifest = _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+                    mutate(manifest)
+                    (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+                    bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                        LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                        observe_only_policy(),
+                    )
+
+                self.assertFalse(bundle.trust_decision.allowed)
+                self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
+    def test_default_wall_clock_marks_old_cache_stale(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            bundle = LoadTrustedBundle(
+                TrustedDataStore(data_dir=data_dir),
+                clock=_FakeClock(10 * 86_400_000),
+            ).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.STALE_BY_CLOCK, bundle.trust_decision.reason)
+        self.assertEqual(FreshnessState.STALE, bundle.health_by_interval["5m"].freshness)
+
+    def test_default_wall_clock_can_mark_cache_fresh(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed)
+
+    def test_query_now_ms_overrides_injected_clock(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        clock = _FakeClock(10 * 86_400_000)
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=clock).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1, now_ms=86_400_000),
+                trading_strict_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed)
+        self.assertEqual(0, clock.calls)
+        self.assertEqual(86_400_000, bundle.load_context.observed_at_ms)
+
+    def test_clock_is_read_once_per_execute_for_multi_interval_bundle(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        clock = _FakeClock(86_400_000)
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=clock).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed)
+        self.assertEqual(1, clock.calls)
+        self.assertEqual(86_400_000, bundle.load_context.observed_at_ms)
+
+    def test_refresh_trusted_bundle_facade_uses_wall_clock_by_default(self):
+        from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            bundle = refresh_trusted_candle_bundle(
+                "MU-USDT-SWAP",
+                intervals=("15m", "1h"),
+                days=1,
+                data_dir=data_dir,
+                refresh=False,
+                clock=_FakeClock(10 * 86_400_000),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.STALE_BY_CLOCK, bundle.trust_decision.reason)
+
     def test_compatibility_facades_do_not_import_okx_fetchers(self):
         import mu_strategy.market_data.service as service
         import mu_strategy.market_data.trusted as trusted
@@ -210,6 +439,53 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertFalse(run.datasets[("BTC-USDT-SWAP", "15m")].is_usable)
         self.assertTrue(run.datasets[("ETH-USDT-SWAP", "15m")].is_usable)
 
+    def test_manifest_status_uses_validity_and_freshness_dimensions_separately(self):
+        from mu_strategy.market_data.trusted_data.contracts import (
+            AvailabilityState,
+            FreshnessState,
+            IntegrityState,
+            RefreshRun,
+            RefreshRunOutcome,
+            UniverseSnapshot,
+        )
+
+        cases = [
+            ("valid_fresh", RefreshRunOutcome.SUCCESS, _health_state("BTC-USDT-SWAP", "5m"), "ok"),
+            (
+                "valid_stale",
+                RefreshRunOutcome.SUCCESS,
+                _health_state("BTC-USDT-SWAP", "5m", freshness=FreshnessState.STALE),
+                "stale",
+            ),
+            (
+                "invalid",
+                RefreshRunOutcome.SUCCESS,
+                _health_state("BTC-USDT-SWAP", "5m", integrity=IntegrityState.INVALID),
+                "invalid",
+            ),
+            (
+                "missing",
+                RefreshRunOutcome.SUCCESS,
+                _health_state("BTC-USDT-SWAP", "5m", availability=AvailabilityState.MISSING),
+                "invalid",
+            ),
+            ("failed_run", RefreshRunOutcome.FAILED, _health_state("BTC-USDT-SWAP", "5m"), "invalid"),
+        ]
+        for name, outcome, health, expected in cases:
+            with self.subTest(name=name):
+                run = RefreshRun(
+                    run_id=name,
+                    outcome=outcome,
+                    started_at_ms=0,
+                    completed_at_ms=0,
+                    requested_intervals=("5m",),
+                    effective_intervals=("5m",),
+                    universe_snapshot=UniverseSnapshot(),
+                    datasets={("BTC-USDT-SWAP", "5m"): health},
+                )
+
+                self.assertEqual(expected, run.manifest_status())
+
 
 class TrustedDemoConsumerTests(unittest.TestCase):
     def test_demo_defaults_to_live_trusted_store_and_cache_only_loader(self):
@@ -228,7 +504,14 @@ class TrustedDemoConsumerTests(unittest.TestCase):
             (data_dir / "manifest.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": 2,
                         "run_id": "run-abc",
+                        "outcome": "success",
+                        "status": "ok",
+                        "started_at_ms": 0,
+                        "completed_at_ms": 0,
+                        "requested_intervals": ["15m", "1h"],
+                        "effective_intervals": ["5m", "15m", "1h"],
                         "universes": {
                             "crypto_top": [
                                 {"inst_id": "BTC-USDT-SWAP", "last": 100, "volume_ccy_24h": 10, "source": "top"}
@@ -237,6 +520,9 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                                 {"inst_id": "MU-USDT-SWAP", "last": 5, "volume_ccy_24h": 8, "source": "stock_token"}
                             ],
                         },
+                        "symbols": {},
+                        "warnings": [],
+                        "cycle_error": None,
                     }
                 ),
                 encoding="utf-8",
@@ -269,6 +555,71 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
         self.assertEqual("skip", result["scans"][0]["action"])
 
+    def test_demo_default_strict_gate_blocks_failed_or_partial_manifest_before_scanner(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+
+        cases = [
+            ("failed", "invalid", "run_failed"),
+            ("partial", "ok", "run_partial"),
+        ]
+        for outcome, status, reason in cases:
+            with self.subTest(outcome=outcome):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp)
+                    _write_manifest_and_caches(
+                        data_dir,
+                        symbol="MU-USDT-SWAP",
+                        days=1,
+                        outcome=outcome,
+                        status=status,
+                        universe_symbols=("MU-USDT-SWAP",),
+                    )
+                    with patch("mu_strategy.demo_trading.time.time", return_value=86_400):
+                        result = run_once(
+                            DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                            broker=None,
+                            scanner=lambda *args, **kwargs: self.fail("scanner must not run for blocked trusted data"),
+                        )
+
+                self.assertEqual([], result["orders"])
+                self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+                self.assertEqual(reason, result["data_errors"][0]["status_reason"])
+
+    def test_demo_default_cycle_reuses_single_manifest_snapshot_and_observed_time(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for symbol in ("BTC-USDT-SWAP", "MU-USDT-SWAP"):
+                _write_manifest_and_caches(
+                    data_dir,
+                    symbol=symbol,
+                    days=1,
+                    run_id="run-shared",
+                    universe_symbols=("BTC-USDT-SWAP", "MU-USDT-SWAP"),
+                )
+            read_calls = []
+            original_read_manifest = TrustedDataStore.read_manifest
+
+            def counted_read_manifest(store, *args, **kwargs):
+                read_calls.append(store.manifest_path)
+                return original_read_manifest(store, *args, **kwargs)
+
+            with patch.object(TrustedDataStore, "read_manifest", counted_read_manifest):
+                with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                    with patch("mu_strategy.demo_trading.time.time", return_value=86_400):
+                        result = run_once(
+                            DemoTradingConfig(universe_limit=2, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                            broker=None,
+                            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _wait(symbol),
+                        )
+
+        self.assertEqual(1, len(read_calls))
+        self.assertEqual(["BTC-USDT-SWAP", "MU-USDT-SWAP"], [scan["symbol"] for scan in result["scans"]])
+        self.assertEqual({"run-shared"}, {scan["run_id"] for scan in result["scans"]})
+        self.assertEqual({86_400_000}, {scan["observed_at_ms"] for scan in result["scans"]})
+
     def test_okx_demo_loop_cli_defaults_to_live_data_dir(self):
         from mu_strategy.commands.okx_demo_loop import main
 
@@ -283,7 +634,16 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         self.assertEqual(Path("data/live"), captured["data_dir"])
 
 
-def _write_manifest_and_caches(data_dir: Path, *, symbol: str, days: int) -> None:
+def _write_manifest_and_caches(
+    data_dir: Path,
+    *,
+    symbol: str,
+    days: int,
+    outcome: str = "success",
+    status: str = "ok",
+    run_id: str = "run-1",
+    universe_symbols: tuple[str, ...] | None = None,
+) -> dict:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
@@ -298,7 +658,12 @@ def _write_manifest_and_caches(data_dir: Path, *, symbol: str, days: int) -> Non
         "15m": aggregate_candles(five, interval="15m"),
         "1h": aggregate_candles(five, interval="1h"),
     }
-    symbols = {symbol: {"intervals": {}}}
+    manifest_path = data_dir / "manifest.json"
+    previous_symbols = {}
+    if manifest_path.exists():
+        previous_symbols = json.loads(manifest_path.read_text(encoding="utf-8")).get("symbols") or {}
+    symbols = dict(previous_symbols)
+    symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in by_interval.items():
         path = store.cache_path(symbol, interval)
         store.write_csv(candles, path)
@@ -313,22 +678,76 @@ def _write_manifest_and_caches(data_dir: Path, *, symbol: str, days: int) -> Non
             "source_file": str(path),
             "validation": {"ok": True, "reason": "ok"},
         }
-    store.write_manifest(
-        {
-            "schema_version": 2,
-            "run_id": "run-1",
-            "outcome": "success",
-            "status": "ok",
-            "started_at_ms": 0,
-            "completed_at_ms": 0,
-            "requested_intervals": ["15m", "1h"],
-            "effective_intervals": ["5m", "15m", "1h"],
-            "universes": {"crypto_top": [], "stock_token_top": []},
-            "symbols": symbols,
-            "warnings": [],
-            "cycle_error": None,
-        }
+    universe_rows = [
+        {"inst_id": item, "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}
+        for item in (universe_symbols or ())
+    ]
+    manifest = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "outcome": outcome,
+        "status": status,
+        "started_at_ms": 0,
+        "completed_at_ms": 0,
+        "requested_intervals": ["15m", "1h"],
+        "effective_intervals": ["5m", "15m", "1h"],
+        "universes": {"crypto_top": universe_rows, "stock_token_top": []},
+        "symbols": symbols,
+        "warnings": [],
+        "cycle_error": {"error_type": "TimeoutError", "message": "blocked"} if outcome == "failed" else None,
+    }
+    store.write_manifest(manifest)
+    return manifest
+
+
+def _health_state(
+    symbol: str,
+    interval: str,
+    *,
+    availability=None,
+    integrity=None,
+    freshness=None,
+):
+    from mu_strategy.market_data.trusted_data.contracts import (
+        AvailabilityState,
+        DatasetHealth,
+        DatasetKey,
+        FreshnessState,
+        HealthReason,
+        IntegrityState,
     )
+
+    availability = availability or AvailabilityState.AVAILABLE
+    integrity = integrity or IntegrityState.VALID
+    freshness = freshness or FreshnessState.FRESH
+    reasons = (HealthReason.OK,)
+    if availability == AvailabilityState.MISSING:
+        reasons = (HealthReason.CACHE_MISSING,)
+    elif integrity == IntegrityState.INVALID:
+        reasons = (HealthReason.REFRESH_FAILED,)
+    elif freshness == FreshnessState.STALE:
+        reasons = (HealthReason.STALE_BY_CLOCK,)
+    return DatasetHealth(
+        key=DatasetKey(symbol, interval),
+        availability=availability,
+        integrity=integrity,
+        freshness=freshness,
+        reasons=reasons,
+        rows=1 if availability == AvailabilityState.AVAILABLE else 0,
+        first_timestamp_ms=0 if availability == AvailabilityState.AVAILABLE else None,
+        last_timestamp_ms=0 if availability == AvailabilityState.AVAILABLE else None,
+        source_file=Path(f"data/live/okx/{symbol}/{interval}.csv"),
+    )
+
+
+class _FakeClock:
+    def __init__(self, now_ms: int):
+        self.now = now_ms
+        self.calls = 0
+
+    def now_ms(self) -> int:
+        self.calls += 1
+        return self.now
 
 
 def _invalid_bundle(symbol):

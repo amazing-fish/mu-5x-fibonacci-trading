@@ -456,6 +456,31 @@ class VisualizationTests(unittest.TestCase):
 
         self.assertNotEqual(0, raised.exception.code)
 
+    def test_visualize_trusted_data_rejects_failed_manifest_with_valid_csv(self):
+        from mu_strategy import visualize
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            output_path = Path(tmp) / "chart.html"
+            _write_failed_manifest_with_valid_csv(data_dir)
+            argv = [
+                "mu_strategy.visualize",
+                "--trusted-data",
+                "--data-dir",
+                str(data_dir),
+                "--output",
+                str(output_path),
+            ]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.viz.backtest.run_backtest", return_value=BacktestResult(10_000, 10_000, [], [(0, 10_000)])):
+                    with patch("sys.stderr", new_callable=io.StringIO):
+                        with self.assertRaises(SystemExit) as raised:
+                            visualize.main()
+
+            self.assertFalse(output_path.exists())
+
+        self.assertNotEqual(0, raised.exception.code)
+
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
@@ -482,6 +507,55 @@ def _status(
         is_valid=is_valid,
         is_stale=is_stale,
         reason=reason,
+    )
+
+
+def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+    from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+    from mu_strategy.market_data.utils import DAY_MS
+
+    symbol = "MU-USDT-SWAP"
+    store = TrustedDataStore(data_dir=data_dir)
+    five = [_candle(index * 300_000, 100 + index) for index in range(DAY_MS // 300_000)]
+    by_interval = {
+        "5m": five,
+        "15m": aggregate_candles(five, interval="15m"),
+        "1h": aggregate_candles(five, interval="1h"),
+    }
+    symbols = {symbol: {"intervals": {}}}
+    for interval, candles in by_interval.items():
+        path = store.cache_path(symbol, interval)
+        store.write_csv(candles, path)
+        symbols[symbol]["intervals"][interval] = {
+            "symbol": symbol,
+            "interval": interval,
+            "availability": "available",
+            "integrity": "valid",
+            "freshness": "fresh",
+            "reasons": ["ok"],
+            "rows": len(candles),
+            "first_timestamp_ms": candles[0].open_time_ms,
+            "last_timestamp_ms": candles[-1].open_time_ms,
+            "updated_at_ms": 86_400_000,
+            "source_file": str(path),
+            "validation": {"ok": True, "reason": "ok"},
+        }
+    store.write_manifest(
+        {
+            "schema_version": 2,
+            "run_id": "failed-run",
+            "outcome": "failed",
+            "status": "invalid",
+            "started_at_ms": 0,
+            "completed_at_ms": 86_400_000,
+            "requested_intervals": ["5m", "15m", "1h"],
+            "effective_intervals": ["5m", "15m", "1h"],
+            "universes": {"crypto_top": [], "stock_token_top": []},
+            "symbols": symbols,
+            "warnings": [],
+            "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
+        }
     )
 
 

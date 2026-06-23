@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,6 +11,7 @@ from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_ok
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
+    Clock,
     DatasetHealth,
     DatasetKey,
     FreshnessState,
@@ -19,6 +19,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     IntegrityState,
     RefreshRun,
     RefreshRunOutcome,
+    SystemClock,
     UniverseSnapshot,
     ValidationReport,
 )
@@ -92,6 +93,7 @@ def refresh_with_okx_provider(
     history_fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
     history_days_fallback: int | None = None,
+    clock: Clock | None = None,
 ) -> RefreshRun:
     provider = OKXMarketDataProvider(
         ticker_rows=ticker_rows,
@@ -99,7 +101,7 @@ def refresh_with_okx_provider(
         incremental_fetcher=incremental_fetcher,
         history_days_fallback=history_days_fallback,
     )
-    return RefreshTrustedMarketData(store, provider).execute(request)
+    return RefreshTrustedMarketData(store, provider, clock=clock).execute(request)
 
 
 @dataclass(frozen=True)
@@ -122,14 +124,16 @@ class RefreshTrustedMarketData:
         *,
         planner: IntervalDependencyPlanner | None = None,
         freshness_policy: FreshnessPolicy | None = None,
+        clock: Clock | None = None,
     ):
         self.store = store
         self.provider = provider or OKXMarketDataProvider()
         self.planner = planner or IntervalDependencyPlanner()
         self.freshness_policy = freshness_policy or FreshnessPolicy(max_staleness_bars=3)
+        self.clock = clock or SystemClock()
 
     def execute(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
-        started_at_ms = _now_ms(request.now_ms)
+        started_at_ms = _now_ms(request.now_ms, self.clock)
         plan = self.planner.plan(request.requested_intervals)
         run_id = request.run_id or uuid.uuid4().hex
         try:
@@ -139,7 +143,7 @@ class RefreshTrustedMarketData:
                 run_id=run_id,
                 outcome=RefreshRunOutcome.FAILED,
                 started_at_ms=started_at_ms,
-                completed_at_ms=_now_ms(request.now_ms),
+                completed_at_ms=_now_ms(request.now_ms, self.clock),
                 requested_intervals=plan.requested_intervals,
                 effective_intervals=plan.effective_intervals,
                 universe_snapshot=UniverseSnapshot(),
@@ -175,7 +179,7 @@ class RefreshTrustedMarketData:
             run_id=run_id,
             outcome=outcome,
             started_at_ms=started_at_ms,
-            completed_at_ms=_now_ms(request.now_ms),
+            completed_at_ms=_now_ms(request.now_ms, self.clock),
             requested_intervals=plan.requested_intervals,
             effective_intervals=plan.effective_intervals,
             universe_snapshot=universe,
@@ -388,16 +392,20 @@ def _health(
 def _refresh_outcome(datasets: dict[tuple[str, str], DatasetHealth]) -> RefreshRunOutcome:
     if not datasets:
         return RefreshRunOutcome.FAILED
-    usable_count = sum(1 for health in datasets.values() if health.is_usable)
-    if usable_count == len(datasets):
+    valid_count = sum(
+        1
+        for health in datasets.values()
+        if health.availability == AvailabilityState.AVAILABLE and health.integrity == IntegrityState.VALID
+    )
+    if valid_count == len(datasets):
         return RefreshRunOutcome.SUCCESS
-    if usable_count == 0:
+    if valid_count == 0:
         return RefreshRunOutcome.FAILED
     return RefreshRunOutcome.PARTIAL
 
 
-def _now_ms(value: int | None) -> int:
-    return int(value if value is not None else time.time() * 1000)
+def _now_ms(value: int | None, clock: Clock) -> int:
+    return int(value if value is not None else clock.now_ms())
 
 
 def _ticker_dict(ticker: OKXSwapTicker) -> dict:

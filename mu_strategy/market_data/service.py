@@ -9,7 +9,7 @@ from mu_strategy.market_data.trusted import (
     DataStatus,
     refresh_trusted_symbol_statuses,
 )
-from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, TrustDecision, UniverseSnapshot
+from mu_strategy.market_data.trusted_data.contracts import Clock, DatasetHealth, TrustDecision, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.refresh import (
@@ -37,6 +37,8 @@ class CandleBundle:
     run_id: str | None = None
     trust_decision: TrustDecision | None = None
     universe_snapshot: UniverseSnapshot | None = None
+    load_context: TrustedLoadContext | None = None
+    observed_at_ms: int | None = None
 
 
 def refresh_candle_bundle(
@@ -87,6 +89,8 @@ def refresh_trusted_candle_bundle(
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
     policy: TrustPolicy | None = None,
+    clock: Clock | None = None,
+    context: TrustedLoadContext | None = None,
 ) -> CandleBundle:
     resolved = resolve_okx_swap_symbol(symbol)
     store = TrustedDataStore(data_dir=Path(data_dir))
@@ -104,14 +108,16 @@ def refresh_trusted_candle_bundle(
             history_fetcher=fetcher,
             incremental_fetcher=incremental_fetcher,
             history_days_fallback=days,
+            clock=clock,
         )
-    bundle = LoadTrustedBundle(store).execute(
+    bundle = LoadTrustedBundle(store, clock=clock).execute(
         LoadTrustedBundleQuery(
             resolved.inst_id,
             intervals=requested_intervals,
             days=days,
         ),
         policy or research_strict_policy(),
+        context=context,
     )
     return _compat_bundle(resolved, bundle)
 
@@ -157,6 +163,8 @@ def _compat_bundle(resolved: ResolvedSymbol, bundle) -> CandleBundle:
         run_id=bundle.run_id,
         trust_decision=bundle.trust_decision,
         universe_snapshot=bundle.universe_snapshot,
+        load_context=bundle.load_context,
+        observed_at_ms=bundle.load_context.observed_at_ms if bundle.load_context else None,
     )
 
 

@@ -9,20 +9,26 @@ from pathlib import Path
 from typing import Any
 
 from mu_strategy.market_data.cache import CSV_FIELDS
-from mu_strategy.market_data.trusted_data.contracts import HealthReason
+from mu_strategy.market_data.trusted_data.contracts import (
+    HealthReason,
+    ManifestSchemaError,
+    TrustedManifestSnapshot,
+    trusted_manifest_snapshot_from_dict,
+)
 from mu_strategy.models import Candle
 
 
 @dataclass(frozen=True)
 class ManifestReadResult:
-    payload: dict[str, Any] | None
+    snapshot: TrustedManifestSnapshot | None
+    payload: dict[str, Any] | None = None
     reason: HealthReason | None = None
     error_type: str | None = None
     message: str | None = None
 
     @property
     def ok(self) -> bool:
-        return self.payload is not None and self.reason is None
+        return self.snapshot is not None and self.reason is None
 
 
 class TrustedDataStore:
@@ -64,15 +70,26 @@ class TrustedDataStore:
         path = self.manifest_path
         if not path.exists():
             if compatibility_mode:
-                return ManifestReadResult({"schema_version": 1, "symbols": {}, "status": "missing"})
-            return ManifestReadResult(None, HealthReason.MANIFEST_MISSING)
+                payload = {"schema_version": 1, "symbols": {}, "status": "missing"}
+                try:
+                    return ManifestReadResult(
+                        trusted_manifest_snapshot_from_dict(payload, compatibility_mode=True),
+                        payload,
+                    )
+                except ManifestSchemaError as exc:
+                    return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
+            return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
-            return ManifestReadResult(None, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
+            return ManifestReadResult(None, None, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
         if not isinstance(payload, dict):
-            return ManifestReadResult(None, HealthReason.MALFORMED_MANIFEST, "TypeError", "manifest root must be object")
-        return ManifestReadResult(payload)
+            return ManifestReadResult(None, None, HealthReason.MALFORMED_MANIFEST, "TypeError", "manifest root must be object")
+        try:
+            snapshot = trusted_manifest_snapshot_from_dict(payload, compatibility_mode=compatibility_mode)
+        except Exception as exc:
+            return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
+        return ManifestReadResult(snapshot, payload)
 
     def write_manifest(self, manifest: dict[str, Any]) -> Path:
         path = self.manifest_path

@@ -2,20 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
 
 from mu_strategy.market_data.cache import prune_candles_to_window
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
+    Clock,
     DatasetHealth,
     DatasetKey,
     FreshnessState,
     HealthReason,
     IntegrityState,
+    SystemClock,
     TrustDecision,
     TrustedBundle,
-    UniverseSnapshot,
+    TrustedLoadContext,
+    TrustedManifestSnapshot,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -43,26 +45,64 @@ class LoadTrustedBundle:
         *,
         planner: IntervalDependencyPlanner | None = None,
         freshness_policy: FreshnessPolicy | None = None,
+        clock: Clock | None = None,
     ):
         self.store = store
         self.planner = planner or IntervalDependencyPlanner()
         self.freshness_policy = freshness_policy or FreshnessPolicy(max_staleness_bars=3)
+        self.clock = clock or SystemClock()
 
-    def execute(self, query: LoadTrustedBundleQuery, policy: TrustPolicy) -> TrustedBundle:
+    def open_context(
+        self,
+        *,
+        now_ms: int | None = None,
+        compatibility_mode: bool = False,
+    ) -> TrustedLoadContext:
+        observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        manifest_result = self.store.read_manifest(compatibility_mode=compatibility_mode)
+        if not manifest_result.ok or manifest_result.snapshot is None:
+            reason = manifest_result.reason or HealthReason.MANIFEST_BLOCKED
+            message = manifest_result.message or reason.value
+            raise RuntimeError(f"{reason.value}: {message}")
+        return TrustedLoadContext(manifest=manifest_result.snapshot, observed_at_ms=observed_at_ms)
+
+    def execute(
+        self,
+        query: LoadTrustedBundleQuery,
+        policy: TrustPolicy,
+        *,
+        context: TrustedLoadContext | None = None,
+    ) -> TrustedBundle:
         resolved = resolve_okx_swap_symbol(query.symbol)
         plan = self.planner.plan(query.intervals)
-        manifest_result = self.store.read_manifest(compatibility_mode=query.compatibility_mode)
-        if not manifest_result.ok:
+        if context is None:
+            observed_at_ms = int(query.now_ms if query.now_ms is not None else self.clock.now_ms())
+            manifest_result = self.store.read_manifest(compatibility_mode=query.compatibility_mode)
+            if not manifest_result.ok or manifest_result.snapshot is None:
+                return TrustedBundle(
+                    symbol=resolved.inst_id,
+                    candles_by_interval={interval: [] for interval in plan.requested_intervals},
+                    files_by_interval={interval: self.store.cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
+                    days=query.days,
+                    health_by_interval={},
+                    trust_decision=TrustDecision(
+                        False,
+                        manifest_result.reason or HealthReason.MANIFEST_BLOCKED,
+                        manifest_result.message,
+                    ),
+                )
+            context = TrustedLoadContext(manifest=manifest_result.snapshot, observed_at_ms=observed_at_ms)
+        elif context.manifest is None:
             return TrustedBundle(
                 symbol=resolved.inst_id,
                 candles_by_interval={interval: [] for interval in plan.requested_intervals},
                 files_by_interval={interval: self.store.cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
                 days=query.days,
                 health_by_interval={},
-                trust_decision=TrustDecision(False, manifest_result.reason or HealthReason.MANIFEST_BLOCKED),
+                trust_decision=TrustDecision(False, HealthReason.MANIFEST_BLOCKED),
             )
 
-        manifest = manifest_result.payload or {}
+        manifest = context.manifest
         manifest_health = _manifest_health_by_interval(manifest, resolved.inst_id, data_dir=self.store.data_dir)
         raw_candles_by_interval: dict[str, list[Candle]] = {}
         candles_by_interval: dict[str, list[Candle]] = {}
@@ -100,10 +140,11 @@ class LoadTrustedBundle:
                     integrity=IntegrityState.INVALID,
                     freshness=FreshnessState.STALE,
                     validation=validation,
+                    updated_at_ms=context.observed_at_ms,
                 )
             else:
                 freshness = self.freshness_policy.assess(
-                    now_ms=query.now_ms if query.now_ms is not None else (candles[-1].open_time_ms if candles else 0),
+                    now_ms=context.observed_at_ms,
                     interval=interval,
                     last_confirmed_open_time_ms=candles[-1].open_time_ms if candles else None,
                 )
@@ -116,6 +157,7 @@ class LoadTrustedBundle:
                     integrity=IntegrityState.VALID,
                     freshness=freshness.state,
                     validation=validation,
+                    updated_at_ms=context.observed_at_ms,
                 )
             health = _merge_manifest_health(health, manifest_health.get(interval))
             health_by_interval[interval] = health
@@ -123,6 +165,7 @@ class LoadTrustedBundle:
 
         self._attach_built_native_validation(health_by_interval, candles_by_interval)
         decision = policy.decide(
+            context=context,
             health_by_interval=health_by_interval,
             required_intervals=plan.effective_intervals,
         )
@@ -141,8 +184,9 @@ class LoadTrustedBundle:
             days=query.days,
             health_by_interval=health_by_interval,
             trust_decision=decision,
-            run_id=manifest.get("run_id"),
-            universe_snapshot=_universe_from_manifest(manifest),
+            run_id=manifest.run_id,
+            universe_snapshot=manifest.universe_snapshot,
+            load_context=context,
         )
 
     def _attach_built_native_validation(
@@ -175,31 +219,34 @@ class LoadTrustedBundle:
 
 
 def _manifest_health_by_interval(
-    manifest: dict[str, Any],
+    manifest: TrustedManifestSnapshot,
     symbol: str,
     *,
     data_dir: Path,
 ) -> dict[str, DatasetHealth]:
-    interval_payloads = ((manifest.get("symbols") or {}).get(symbol, {}) or {}).get("intervals", {})
     output: dict[str, DatasetHealth] = {}
-    if not isinstance(interval_payloads, dict):
-        return output
-    for interval, payload in interval_payloads.items():
-        if not isinstance(payload, dict):
+    for (health_symbol, interval), health in manifest.datasets.items():
+        if health_symbol != symbol:
             continue
-        health = DatasetHealth.from_dict(symbol, str(interval), payload)
         if str(health.source_file) == "":
             health = replace(health, source_file=data_dir / "okx" / symbol / f"{interval}.csv")
-        output[str(interval)] = health
+        output[interval] = health
     return output
 
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:
         return cache_health
-    if manifest_health.integrity != IntegrityState.VALID or manifest_health.freshness == FreshnessState.STALE:
-        return manifest_health
-    return cache_health
+    return replace(
+        cache_health,
+        availability=_worst_availability(cache_health.availability, manifest_health.availability),
+        integrity=_worst_integrity(cache_health.integrity, manifest_health.integrity),
+        freshness=_worst_freshness(cache_health.freshness, manifest_health.freshness),
+        reasons=_merge_reasons(manifest_health.reasons, cache_health.reasons),
+        error_type=manifest_health.error_type or cache_health.error_type,
+        message=manifest_health.message or cache_health.message,
+        warnings=_merge_warnings(manifest_health.warnings, cache_health.warnings),
+    )
 
 
 def _health_from_candles(
@@ -212,6 +259,7 @@ def _health_from_candles(
     integrity: IntegrityState,
     freshness: FreshnessState,
     validation,
+    updated_at_ms: int = 0,
 ) -> DatasetHealth:
     return DatasetHealth(
         key=DatasetKey(symbol, interval),
@@ -224,6 +272,7 @@ def _health_from_candles(
         last_timestamp_ms=candles[-1].open_time_ms if candles else None,
         source_file=path,
         validation=validation,
+        updated_at_ms=updated_at_ms,
     )
 
 
@@ -263,9 +312,44 @@ def _shared_window_end(candles_by_interval: dict[str, list[Candle]]) -> int | No
     return max(timestamps) if timestamps else None
 
 
-def _universe_from_manifest(manifest: dict[str, Any]) -> UniverseSnapshot:
-    universe = manifest.get("universes") or {}
-    return UniverseSnapshot(
-        crypto_top=tuple(dict(item) for item in universe.get("crypto_top") or ()),
-        stock_token_top=tuple(dict(item) for item in universe.get("stock_token_top") or ()),
-    )
+def _worst_availability(left: AvailabilityState, right: AvailabilityState) -> AvailabilityState:
+    if AvailabilityState.MISSING in {left, right}:
+        return AvailabilityState.MISSING
+    return AvailabilityState.AVAILABLE
+
+
+def _worst_integrity(left: IntegrityState, right: IntegrityState) -> IntegrityState:
+    order = {
+        IntegrityState.VALID: 0,
+        IntegrityState.UNKNOWN: 1,
+        IntegrityState.INVALID: 2,
+    }
+    return left if order[left] >= order[right] else right
+
+
+def _worst_freshness(left: FreshnessState, right: FreshnessState) -> FreshnessState:
+    order = {
+        FreshnessState.FRESH: 0,
+        FreshnessState.UNKNOWN: 1,
+        FreshnessState.STALE: 2,
+    }
+    return left if order[left] >= order[right] else right
+
+
+def _merge_reasons(*groups: tuple[HealthReason, ...]) -> tuple[HealthReason, ...]:
+    values: list[HealthReason] = []
+    for group in groups:
+        for reason in group:
+            if reason not in values:
+                values.append(reason)
+    non_ok = [reason for reason in values if reason != HealthReason.OK]
+    return tuple(non_ok or [HealthReason.OK])
+
+
+def _merge_warnings(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    values: list[str] = []
+    for group in groups:
+        for warning in group:
+            if warning not in values:
+                values.append(warning)
+    return tuple(values)

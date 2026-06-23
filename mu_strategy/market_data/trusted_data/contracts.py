@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from mu_strategy.models import Candle
 
@@ -31,6 +32,12 @@ class RefreshRunOutcome(Enum):
     FAILED = "failed"
 
 
+class ManifestStatus(Enum):
+    OK = "ok"
+    STALE = "stale"
+    INVALID = "invalid"
+
+
 class HealthReason(Enum):
     OK = "ok"
     CACHE_MISSING = "cache_missing"
@@ -42,6 +49,9 @@ class HealthReason(Enum):
     MALFORMED_MANIFEST = "malformed_manifest"
     MANIFEST_BLOCKED = "manifest_blocked"
     RUN_FAILED = "run_failed"
+    RUN_PARTIAL = "run_partial"
+    MANIFEST_INVALID = "manifest_invalid"
+    MANIFEST_STALE = "manifest_stale"
     STALE_BY_CLOCK = "stale_by_clock"
     BUILT_EMPTY = "built_empty"
     NATIVE_EMPTY = "native_empty"
@@ -53,6 +63,20 @@ class HealthReason(Enum):
     OHLCV_MISMATCH = "ohlcv_mismatch"
     OHLCV_INVALID = "ohlcv_invalid"
     CONTINUITY_GAP = "continuity_gap"
+
+
+class Clock(Protocol):
+    def now_ms(self) -> int:
+        ...
+
+
+class SystemClock:
+    def now_ms(self) -> int:
+        return time.time_ns() // 1_000_000
+
+
+class ManifestSchemaError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -205,6 +229,28 @@ class UniverseSnapshot:
 
 
 @dataclass(frozen=True)
+class TrustedManifestSnapshot:
+    schema_version: int
+    run_id: str
+    outcome: RefreshRunOutcome
+    status: ManifestStatus
+    started_at_ms: int
+    completed_at_ms: int
+    requested_intervals: tuple[str, ...]
+    effective_intervals: tuple[str, ...]
+    universe_snapshot: UniverseSnapshot
+    datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    cycle_error: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class TrustedLoadContext:
+    manifest: TrustedManifestSnapshot
+    observed_at_ms: int
+
+
+@dataclass(frozen=True)
 class RefreshRun:
     run_id: str
     outcome: RefreshRunOutcome
@@ -220,7 +266,9 @@ class RefreshRun:
     def manifest_status(self) -> str:
         if self.outcome == RefreshRunOutcome.FAILED:
             return "invalid"
-        if any(not health.is_usable for health in self.datasets.values()):
+        if any(health.availability != AvailabilityState.AVAILABLE for health in self.datasets.values()):
+            return "invalid"
+        if any(health.integrity != IntegrityState.VALID for health in self.datasets.values()):
             return "invalid"
         if any(health.freshness == FreshnessState.STALE for health in self.datasets.values()):
             return "stale"
@@ -288,6 +336,45 @@ class TrustedBundle:
     trust_decision: TrustDecision
     run_id: str | None = None
     universe_snapshot: UniverseSnapshot | None = None
+    load_context: TrustedLoadContext | None = None
+
+
+def trusted_manifest_snapshot_from_dict(
+    payload: dict[str, Any],
+    *,
+    compatibility_mode: bool = False,
+) -> TrustedManifestSnapshot:
+    schema_version = payload.get("schema_version")
+    if not _is_int(schema_version):
+        if compatibility_mode and (schema_version is None or schema_version == 1):
+            return _legacy_manifest_snapshot(payload)
+        raise ManifestSchemaError("manifest schema_version must be integer v2")
+    if int(schema_version) != 2:
+        if compatibility_mode and int(schema_version) == 1:
+            return _legacy_manifest_snapshot(payload)
+        raise ManifestSchemaError(f"unsupported manifest schema_version: {schema_version}")
+
+    run_id = _required_str(payload, "run_id")
+    outcome = _required_enum(payload, "outcome", RefreshRunOutcome)
+    status = _required_enum(payload, "status", ManifestStatus)
+    requested_intervals = _required_str_tuple(payload, "requested_intervals")
+    effective_intervals = _required_str_tuple(payload, "effective_intervals")
+    symbols = _required_dict(payload, "symbols")
+    universes = _required_dict(payload, "universes")
+    return TrustedManifestSnapshot(
+        schema_version=2,
+        run_id=run_id,
+        outcome=outcome,
+        status=status,
+        started_at_ms=_required_int(payload, "started_at_ms"),
+        completed_at_ms=_required_int(payload, "completed_at_ms"),
+        requested_intervals=requested_intervals,
+        effective_intervals=effective_intervals,
+        universe_snapshot=_universe_snapshot_from_dict(universes),
+        datasets=_datasets_from_symbols(symbols),
+        warnings=_optional_str_tuple(payload, "warnings"),
+        cycle_error=_optional_str_dict(payload.get("cycle_error")),
+    )
 
 
 def health_reason(value: Any) -> HealthReason:
@@ -321,3 +408,125 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapshot:
+    symbols = payload.get("symbols") if isinstance(payload.get("symbols"), dict) else {}
+    status_value = str(payload.get("status") or "invalid")
+    status = ManifestStatus.OK if status_value == "ok" else ManifestStatus.STALE if status_value == "stale" else ManifestStatus.INVALID
+    outcome = RefreshRunOutcome.SUCCESS if status in {ManifestStatus.OK, ManifestStatus.STALE} else RefreshRunOutcome.FAILED
+    intervals = tuple(str(item) for item in payload.get("intervals") or ())
+    if not intervals:
+        intervals = tuple(dict.fromkeys(interval for _, interval in _datasets_from_symbols(symbols)))
+    universe_payload = payload.get("universes") if isinstance(payload.get("universes"), dict) else {}
+    return TrustedManifestSnapshot(
+        schema_version=1,
+        run_id=str(payload.get("run_id") or "legacy-manifest"),
+        outcome=outcome,
+        status=status,
+        started_at_ms=int(payload.get("started_at_ms") or 0),
+        completed_at_ms=int(payload.get("completed_at_ms") or payload.get("updated_at_ms") or 0),
+        requested_intervals=intervals,
+        effective_intervals=intervals,
+        universe_snapshot=_universe_snapshot_from_dict(universe_payload),
+        datasets=_datasets_from_symbols(symbols),
+        warnings=tuple(str(value) for value in payload.get("warnings") or ()),
+        cycle_error=_optional_str_dict(payload.get("cycle_error")),
+    )
+
+
+def _datasets_from_symbols(symbols: dict[str, Any]) -> dict[tuple[str, str], DatasetHealth]:
+    datasets: dict[tuple[str, str], DatasetHealth] = {}
+    for symbol, symbol_payload in symbols.items():
+        if not isinstance(symbol_payload, dict):
+            raise ManifestSchemaError("manifest symbols entries must be objects")
+        intervals = symbol_payload.get("intervals") or {}
+        if not isinstance(intervals, dict):
+            raise ManifestSchemaError("manifest interval entries must be objects")
+        for interval, payload in intervals.items():
+            if not isinstance(payload, dict):
+                raise ManifestSchemaError("manifest dataset health entries must be objects")
+            health = DatasetHealth.from_dict(str(symbol), str(interval), payload)
+            datasets[(health.key.symbol, health.key.interval)] = health
+    return datasets
+
+
+def _universe_snapshot_from_dict(payload: dict[str, Any]) -> UniverseSnapshot:
+    return UniverseSnapshot(
+        crypto_top=_universe_rows(payload.get("crypto_top") or ()),
+        stock_token_top=_universe_rows(payload.get("stock_token_top") or ()),
+    )
+
+
+def _universe_rows(value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ManifestSchemaError("manifest universe rows must be arrays")
+    rows: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ManifestSchemaError("manifest universe row must be object")
+        rows.append(dict(item))
+    return tuple(rows)
+
+
+def _required_dict(payload: dict[str, Any], key: str) -> dict[str, Any]:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise ManifestSchemaError(f"manifest {key} must be object")
+    return value
+
+
+def _required_str(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise ManifestSchemaError(f"manifest {key} must be non-empty string")
+    return value
+
+
+def _required_int(payload: dict[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if not _is_int(value):
+        raise ManifestSchemaError(f"manifest {key} must be integer")
+    return int(value)
+
+
+def _required_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if not isinstance(value, (list, tuple)):
+        raise ManifestSchemaError(f"manifest {key} must be array")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ManifestSchemaError(f"manifest {key} entries must be strings")
+    return tuple(value)
+
+
+def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ManifestSchemaError(f"manifest {key} must be array")
+    if any(not isinstance(item, str) for item in value):
+        raise ManifestSchemaError(f"manifest {key} entries must be strings")
+    return tuple(value)
+
+
+def _required_enum(payload: dict[str, Any], key: str, enum_type):
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise ManifestSchemaError(f"manifest {key} must be string")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ManifestSchemaError(f"unknown manifest {key}: {value}") from exc
+
+
+def _optional_str_dict(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ManifestSchemaError("manifest cycle_error must be object or null")
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
