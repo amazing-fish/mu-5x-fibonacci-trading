@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, ValidationReport
+from mu_strategy.market_data.trusted_data.contracts import DatasetHealth, TrustedConsumerRefreshError, ValidationReport
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_INTERVALS,
     DEFAULT_LIVE_DATA_DIR,
@@ -26,6 +26,11 @@ from mu_strategy.models import Candle
 
 
 TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
+PER_SYMBOL_REFRESH_ERROR = (
+    "trusted per-symbol refresh APIs are deprecated; run "
+    "python -m mu_strategy.commands.refresh_market_data for canonical refresh, "
+    "then use LoadTrustedBundle or refresh_trusted_candle_bundle for cache-only load"
+)
 
 
 @dataclass(frozen=True)
@@ -80,16 +85,7 @@ def refresh_trusted_interval(
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> DataStatus:
-    statuses = refresh_trusted_symbol_statuses(
-        symbol,
-        intervals=(interval,),
-        days=days,
-        data_dir=data_dir,
-        now_ms=now_ms,
-        fetcher=fetcher,
-        incremental_fetcher=incremental_fetcher,
-    )
-    return statuses[interval]
+    raise TrustedConsumerRefreshError(PER_SYMBOL_REFRESH_ERROR)
 
 
 def refresh_trusted_symbol_statuses(
@@ -102,25 +98,7 @@ def refresh_trusted_symbol_statuses(
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
 ) -> dict[str, DataStatus]:
-    run = refresh_with_okx_provider(
-        TrustedDataStore(data_dir=Path(data_dir)),
-        RefreshTrustedMarketDataRequest(
-            requested_intervals=intervals,
-            days=days,
-            limit=0,
-            explicit_symbols=(symbol,),
-            stock_token_inst_ids=set(),
-            now_ms=now_ms,
-        ),
-        history_fetcher=fetcher,
-        incremental_fetcher=incremental_fetcher,
-        history_days_fallback=days,
-    )
-    return {
-        interval: _data_status_from_health(health)
-        for (health_symbol, interval), health in run.datasets.items()
-        if health_symbol == symbol
-    }
+    raise TrustedConsumerRefreshError(PER_SYMBOL_REFRESH_ERROR)
 
 
 def refresh_market_data_once(

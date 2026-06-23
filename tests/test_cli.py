@@ -107,6 +107,37 @@ class CliTests(unittest.TestCase):
         self.assertFalse(trusted_calls[0][1]["refresh"])
         self.assertEqual("market", configs[0].fee_profile)
 
+    def test_cli_rejects_trusted_refresh_before_loading_or_backtesting(self):
+        from mu_strategy import cli
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            report_path = Path(tmp) / "report.md"
+            manifest_path = data_dir / "manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text("canonical manifest", encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
+            argv = [
+                "mu_strategy.cli",
+                "--trusted-data",
+                "--refresh",
+                "--data-dir",
+                str(data_dir),
+                "--report",
+                str(report_path),
+            ]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=AssertionError("trusted loader")):
+                    with patch("mu_strategy.cli.run_backtest", side_effect=AssertionError("backtest")):
+                        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                            with self.assertRaises(SystemExit) as raised:
+                                cli.main()
+
+            self.assertNotEqual(0, raised.exception.code)
+            self.assertIn("refresh_market_data", stderr.getvalue())
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
+            self.assertFalse(report_path.exists())
+
     def test_cli_trusted_data_rejects_invalid_base_5m_status(self):
         from mu_strategy import cli
 

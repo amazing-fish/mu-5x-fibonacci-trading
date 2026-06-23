@@ -79,6 +79,10 @@ class ManifestSchemaError(ValueError):
     pass
 
 
+class TrustedConsumerRefreshError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DatasetKey:
     symbol: str

@@ -486,6 +486,60 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
                 self.assertEqual(expected, run.manifest_status())
 
+    def test_explicit_symbol_refresh_request_is_rejected_before_manifest_publish(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            with patch.object(store, "write_manifest", side_effect=AssertionError("write_manifest")):
+                with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
+                    with self.assertRaisesRegex(ValueError, "explicit_symbols"):
+                        RefreshTrustedMarketData(store, _Provider(ticker_rows=[])).execute(
+                            RefreshTrustedMarketDataRequest(
+                                requested_intervals=("5m",),
+                                days=1,
+                                limit=0,
+                                explicit_symbols=("BTC-USDT-SWAP",),
+                                stock_token_inst_ids=set(),
+                            )
+                        )
+
+    def test_refresh_market_data_command_is_canonical_writer(self):
+        from mu_strategy.commands.refresh_market_data import main
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            html_output = Path(tmp) / "health.html"
+            with patch(
+                "mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers",
+                return_value=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            ):
+                with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=_fake_fetcher):
+                    exit_code = main(
+                        [
+                            "--limit",
+                            "1",
+                            "--days",
+                            "1",
+                            "--data-dir",
+                            str(data_dir),
+                            "--html-output",
+                            str(html_output),
+                        ],
+                        stdout=_Sink(),
+                    )
+
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+            html_exists = html_output.exists()
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(["BTC-USDT-SWAP"], [row["inst_id"] for row in manifest["universes"]["crypto_top"]])
+        self.assertEqual("success", manifest["outcome"])
+        self.assertEqual("success", run_log["outcome"])
+        self.assertTrue(html_exists)
+
 
 class TrustedDemoConsumerTests(unittest.TestCase):
     def test_demo_defaults_to_live_trusted_store_and_cache_only_loader(self):
@@ -619,6 +673,122 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         self.assertEqual(["BTC-USDT-SWAP", "MU-USDT-SWAP"], [scan["symbol"] for scan in result["scans"]])
         self.assertEqual({"run-shared"}, {scan["run_id"] for scan in result["scans"]})
         self.assertEqual({86_400_000}, {scan["observed_at_ms"] for scan in result["scans"]})
+
+    def test_demo_default_trusted_loader_rejects_refresh_before_broker_universe_or_scanner(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
+
+        class Broker:
+            def get_positions(self, **kwargs):
+                raise AssertionError("broker positions")
+
+            def get_open_orders(self, **kwargs):
+                raise AssertionError("broker orders")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                run_id="run-shared",
+                universe_symbols=("BTC-USDT-SWAP", "MU-USDT-SWAP"),
+            )
+            manifest_path = data_dir / "manifest.json"
+            manifest_before = manifest_path.read_bytes()
+
+            with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
+                run_once(
+                    DemoTradingConfig(refresh=True, dry_run=False, data_dir=data_dir),
+                    broker=Broker(),
+                    universe_provider=lambda limit: self.fail("universe provider"),
+                    scanner=lambda *args, **kwargs: self.fail("scanner"),
+                )
+
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
+
+    def test_manifest_universe_limit_zero_and_one_are_exact(self):
+        from mu_strategy.demo_trading import _tickers_from_universe_snapshot
+        from mu_strategy.market_data.trusted_data.contracts import UniverseSnapshot
+
+        snapshot = UniverseSnapshot(
+            crypto_top=(
+                {"inst_id": "BTC-USDT-SWAP", "last": 100, "volume_ccy_24h": 10, "source": "top"},
+                {"inst_id": "ETH-USDT-SWAP", "last": 90, "volume_ccy_24h": 9, "source": "top"},
+            ),
+            stock_token_top=(
+                {"inst_id": "MU-USDT-SWAP", "last": 5, "volume_ccy_24h": 8, "source": "stock_token"},
+            ),
+        )
+
+        self.assertEqual([], _tickers_from_universe_snapshot(snapshot, limit=0))
+        self.assertEqual(["BTC-USDT-SWAP"], [ticker.inst_id for ticker in _tickers_from_universe_snapshot(snapshot, limit=1)])
+
+    def test_trusted_manifest_universe_provider_limit_zero_returns_empty_without_manifest(self):
+        from mu_strategy.demo_trading import trusted_manifest_universe_provider
+
+        with TemporaryDirectory() as tmp:
+            self.assertEqual([], trusted_manifest_universe_provider(limit=0, data_dir=Path(tmp)))
+
+    def test_consumer_paths_do_not_call_manifest_writers(self):
+        import mu_strategy.demo_trading as demo_trading
+        import mu_strategy.market_data.service as service
+        from mu_strategy import cli, visualize
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                run_id="run-shared",
+                universe_symbols=("MU-USDT-SWAP",),
+            )
+
+            with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("write_manifest")):
+                with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                        service.refresh_trusted_candle_bundle(
+                            "MU-USDT-SWAP",
+                            intervals=("15m", "1h"),
+                            days=1,
+                            data_dir=data_dir,
+                            refresh=False,
+                            clock=_FakeClock(86_400_000),
+                        )
+                        with patch("sys.argv", ["mu_strategy.cli", "--trusted-data", "--data-dir", str(data_dir), "--report", str(data_dir / "report.md")]):
+                            with patch("mu_strategy.cli.run_backtest", return_value=_empty_backtest()):
+                                with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
+                                    with patch("sys.stdout", new_callable=_Sink):
+                                        cli.main()
+                        with patch(
+                            "sys.argv",
+                            ["mu_strategy.visualize", "--trusted-data", "--data-dir", str(data_dir), "--output", str(data_dir / "chart.html")],
+                        ):
+                            with patch("mu_strategy.viz.backtest.run_backtest", return_value=_empty_backtest()):
+                                with patch("sys.stdout", new_callable=_Sink):
+                                    visualize.main()
+                        demo_trading.run_once(
+                            demo_trading.DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                            broker=None,
+                            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _wait(symbol),
+                        )
+
+    def test_consumer_modules_do_not_reference_canonical_refresh_or_manifest_writers(self):
+        for relative_path in (
+            "mu_strategy/market_data/service.py",
+            "mu_strategy/cli.py",
+            "mu_strategy/viz/backtest.py",
+            "mu_strategy/demo_trading.py",
+            "mu_strategy/commands/okx_demo_loop.py",
+        ):
+            source = Path(relative_path).read_text(encoding="utf-8")
+            with self.subTest(path=relative_path):
+                self.assertNotIn("refresh_with_okx_provider", source)
+                self.assertNotIn("RefreshTrustedMarketData", source)
+                self.assertNotIn(".write_manifest(", source)
+                self.assertNotIn(".append_run_log(", source)
 
     def test_okx_demo_loop_cli_defaults_to_live_data_dir(self):
         from mu_strategy.commands.okx_demo_loop import main
@@ -824,6 +994,12 @@ def _wait(symbol):
     )
 
 
+def _empty_backtest():
+    from mu_strategy.models import BacktestResult
+
+    return BacktestResult(10_000, 10_000, [], [])
+
+
 class _Sink:
     def write(self, value):
         return len(value)
@@ -871,6 +1047,10 @@ def _candles(interval: str) -> list[Candle]:
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
 
     return aggregate_candles(five, interval=interval)
+
+
+def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
+    return _candles(interval)
 
 
 if __name__ == "__main__":

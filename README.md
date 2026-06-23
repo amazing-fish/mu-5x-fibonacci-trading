@@ -77,9 +77,10 @@ python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report report
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
 
-使用可信 OKX cache-only 数据运行回测或可视化。该路径只读取 `data/live/manifest.json` 和对应 CSV，不访问网络、不写缓存：
+使用可信 OKX cache-only 数据运行回测或可视化。该路径只读取 `data/live/manifest.json` 和对应 CSV，不访问网络、不写缓存。`--trusted-data --refresh` 不受支持；需要先运行独立刷新命令发布 canonical manifest：
 
 ```powershell
+python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 python -m mu_strategy.cli --trusted-data --days 14 --report reports\mu_okx_trusted_backtest.md
 python -m mu_strategy.visualize --trusted-data --days 14 --output reports\mu_okx_trusted_backtest.html
 ```
@@ -121,13 +122,13 @@ OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；demo 模式�
 python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
 ```
 
-运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认从 trusted manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist：
+运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认从 trusted manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist。`--limit 0` 表示 watchlist-only，不读取动态 universe；`--limit` 必须非负：
 
 ```powershell
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
-刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`：
+刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`。这是 `data/live/manifest.json` canonical trusted universe snapshot 的唯一发布流程：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
@@ -165,7 +166,9 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
 - 可信数据层 v1 只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
-- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是唯一刷新入口；backtest、visualization 和 demo 默认只走 cache-only load。
+- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/manifest.json` canonical trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
+- `--trusted-data --refresh` 会被 backtest 和 visualization 拒绝；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli --trusted-data ...`、`python -m mu_strategy.visualize --trusted-data ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
+- 兼容 facade `refresh_trusted_candle_bundle(..., refresh=True)`、`refresh_trusted_interval()` 和 `refresh_trusted_symbol_statuses()` 不会执行 per-symbol canonical refresh；需要刷新时使用独立 refresh command。
 - 可信数据层 v1 固定使用 CSV + `data/live/manifest.json` + `data/live/refresh_runs.jsonl`；manifest schema v2 包含 `run_id`、`outcome`、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。
 - freshness 按当前 clock、interval 和最后一根已确认 K 线计算；不会因为上次 fetch 成功就默认 fresh。
@@ -178,6 +181,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - OKX API 工具默认使用环境变量读取密钥，不应把 API key、secret、passphrase 写入代码、报告或命令输出。
 - 生产实盘下单入口尚未实现；当前只允许 read-only、shadow、本地 dry-run，以及显式确认后的 OKX demo trading 下单。
 - OKX Demo loop 已实现 `clOrdId` 幂等、open exposure 上限、isolated `5x` 和限价买入；仍不处理生产订单生命周期、撤单/重试、成交回报、仓位同步或风控熔断。
+- OKX Demo loop 的 `--limit 0` 表示只扫描 watchlist；不会从 manifest dynamic universe 追加标的。`--limit < 0` 是无效配置。
 
 ## 策略组说明
 

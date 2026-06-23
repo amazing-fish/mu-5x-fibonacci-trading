@@ -25,7 +25,15 @@ def main(
     dashboard_writer: DashboardWriter = write_entry_dashboard,
 ) -> int:
     stdout = stdout or sys.stdout
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.refresh:
+        parser.error(
+            "--refresh is not supported by the trusted demo loop; run "
+            "python -m mu_strategy.commands.refresh_market_data before scanning trusted data"
+        )
+    if args.limit < 0:
+        parser.error("--limit must be non-negative; use --limit 0 for watchlist-only scans")
     dry_run = args.dry_run or not args.confirm_demo_orders
     config = DemoTradingConfig(
         universe_limit=args.limit,
@@ -73,10 +81,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Plan orders without private account calls or placement.")
     parser.add_argument("--confirm-demo-orders", action="store_true", help="Allow real OKX demo trading order placement.")
     parser.add_argument("--interval-seconds", type=int, default=300)
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=10, help="Trusted manifest universe limit. Use 0 for watchlist-only; must be non-negative.")
     parser.add_argument("--days", type=int, default=28)
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
-    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Unsupported with the trusted demo loop; run python -m mu_strategy.commands.refresh_market_data first.",
+    )
     parser.add_argument("--notional-usdt", type=float, default=10.0)
     parser.add_argument("--max-open-positions", type=int, default=3)
     parser.add_argument("--leverage", type=int, default=5)

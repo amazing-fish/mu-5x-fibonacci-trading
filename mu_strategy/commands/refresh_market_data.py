@@ -18,7 +18,10 @@ from mu_strategy.viz.data_health import write_data_health_dashboard
 
 def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
     stdout = stdout or sys.stdout
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.limit < 0:
+        parser.error("--limit must be non-negative")
     if args.loop and args.interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
     intervals = tuple(args.interval or DEFAULT_INTERVALS)
@@ -50,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Refresh trusted OKX market data and write data-health artifacts.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument("--stock-token-config", type=Path, default=Path("config/okx_stock_tokens.json"))
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--limit", type=int, default=10, help="Canonical universe limit per Top bucket. Must be non-negative.")
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--interval", action="append", choices=DEFAULT_INTERVALS)
     parser.add_argument("--html-output", type=Path, default=Path("reports/live/data_health.html"))

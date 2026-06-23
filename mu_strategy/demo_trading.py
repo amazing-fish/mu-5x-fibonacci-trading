@@ -10,8 +10,8 @@ from typing import Any, Callable
 
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
-from mu_strategy.market_data.service import CandleBundle, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext, UniverseSnapshot
+from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
 from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -42,6 +42,9 @@ class DemoTradingConfig:
     max_candle_staleness_bars: int = 3
     watchlist_symbols: tuple[str, ...] = DEFAULT_WATCHLIST_SYMBOLS
 
+    def __post_init__(self) -> None:
+        validate_universe_limit(self.universe_limit)
+
 
 def run_once(
     config: DemoTradingConfig | None = None,
@@ -53,6 +56,8 @@ def run_once(
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
     default_trusted_loader = candle_loader is None
+    if default_trusted_loader and config.refresh:
+        raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
     candle_loader = candle_loader or refresh_trusted_candle_bundle
     tickers: list[OKXSwapTicker] = []
     universe_error: dict[str, Any] | None = None
@@ -293,6 +298,9 @@ def generate_client_order_id(symbol: str, signal_time_ms: int | None, trigger_pr
 
 
 def trusted_manifest_universe_provider(*, limit: int, data_dir: Path = Path("data/live")) -> list[OKXSwapTicker]:
+    limit = validate_universe_limit(limit)
+    if limit == 0:
+        return []
     store = TrustedDataStore(data_dir=Path(data_dir))
     manifest_result = store.read_manifest()
     if not manifest_result.ok or manifest_result.snapshot is None:
@@ -302,6 +310,9 @@ def trusted_manifest_universe_provider(*, limit: int, data_dir: Path = Path("dat
 
 
 def _tickers_from_universe_snapshot(snapshot: UniverseSnapshot, *, limit: int) -> list[OKXSwapTicker]:
+    limit = validate_universe_limit(limit)
+    if limit == 0:
+        return []
     rows = [*snapshot.crypto_top, *snapshot.stock_token_top]
     tickers: list[OKXSwapTicker] = []
     seen: set[str] = set()
@@ -329,11 +340,20 @@ def _load_universe(
     *,
     context: TrustedLoadContext | None = None,
 ) -> list[OKXSwapTicker]:
+    limit = validate_universe_limit(config.universe_limit)
+    if limit == 0:
+        return []
     if universe_provider is None:
         if context is not None:
-            return _tickers_from_universe_snapshot(context.manifest.universe_snapshot, limit=config.universe_limit)
-        return trusted_manifest_universe_provider(limit=config.universe_limit, data_dir=config.data_dir)
-    return universe_provider(limit=config.universe_limit)
+            return _tickers_from_universe_snapshot(context.manifest.universe_snapshot, limit=limit)
+        return trusted_manifest_universe_provider(limit=limit, data_dir=config.data_dir)
+    return universe_provider(limit=limit)
+
+
+def validate_universe_limit(limit: int) -> int:
+    if limit < 0:
+        raise ValueError("universe_limit must be non-negative")
+    return limit
 
 
 def _build_order_plan(result: EntryScanResult, config: DemoTradingConfig) -> dict[str, Any]:

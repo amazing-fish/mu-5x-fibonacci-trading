@@ -21,9 +21,17 @@ def main() -> None:
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
     parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh legacy cached_historical data. Not supported with --trusted-data; run python -m mu_strategy.commands.refresh_market_data first.",
+    )
     parser.add_argument("--data-dir", type=Path)
-    parser.add_argument("--trusted-data", action="store_true", help="Use the trusted OKX data layer instead of legacy cached_historical.")
+    parser.add_argument(
+        "--trusted-data",
+        action="store_true",
+        help="Use the trusted OKX cache-only data layer instead of legacy cached_historical.",
+    )
     parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_backtest.md"))
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
     parser.add_argument(
@@ -33,6 +41,11 @@ def main() -> None:
         help="Backtest cost assumption: market/taker=0.0500%%, limit/maker=0.0200%%.",
     )
     args = parser.parse_args()
+    if args.trusted_data and args.refresh:
+        parser.error(
+            "--trusted-data --refresh is not supported; run "
+            "python -m mu_strategy.commands.refresh_market_data before loading trusted data"
+        )
 
     try:
         groups = selected_strategy_groups(args.symbol, [args.strategy])
@@ -50,7 +63,7 @@ def main() -> None:
             intervals=TRUSTED_REQUIRED_INTERVALS,
             days=args.days,
             data_dir=data_dir,
-            refresh=args.refresh,
+            refresh=False,
         )
         status_error = trusted_bundle_error(bundle)
         if status_error:

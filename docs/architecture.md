@@ -15,7 +15,7 @@ Package: `mu_strategy.market_data`
 - `trusted_data/policy.py`: interval dependency planning, freshness policy, and trading/research/observe trust policies.
 - `trusted_data/validation.py`: in-memory candle normalization plus `5m -> 15m/1h` built/native validation.
 - `trusted_data/store.py`: CSV, JSON manifest, and JSONL run-log repository with atomic per-file writes.
-- `trusted_data/refresh.py`: the only trusted refresh use case; it owns OKX provider calls, ticker universe fetch, CSV writes, manifest writes, and run-log appends.
+- `trusted_data/refresh.py`: the canonical trusted refresh use case; it owns OKX provider calls, ticker universe fetch, CSV writes, manifest writes, and run-log appends.
 - `trusted_data/load.py`: the only trusted cache-only load use case; it never accesses the network and never writes CSV, manifest, or run-log files.
 - `trusted.py`: compatibility facade for old public imports; implementation delegates to `trusted_data`.
 - `service.py`: thin application facade that adapts legacy `CandleBundle` callers to `trusted_data` refresh/load use cases.
@@ -27,13 +27,16 @@ Rules:
 - Existing OKX caches are incrementally updated and pruned to the requested `days` window.
 - Adjacent candle continuity is gated by `previous close -> next open`; gaps above 2% raise `DataQualityError`.
 - If an incremental OKX refresh fails, existing cached data is still usable.
-- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo default to cache-only load.
+- `data/live/manifest.json` is the canonical complete trusted universe snapshot. The global refresh command/use case is the only writer for that manifest and the matching canonical CSV set.
+- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo are cache-only consumers.
+- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. `--trusted-data --refresh` is rejected; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli --trusted-data`, `python -m mu_strategy.visualize --trusted-data`, or `python -m mu_strategy.commands.okx_demo_loop`.
+- Compatibility per-symbol refresh APIs are deprecated and fail fast. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical manifest.
 - Trusted storage v1 is CSV + versioned JSON manifest + JSONL run log. It does not use DB, Parquet, or a local web service.
 - Manifest schema v2 records `run_id`, refresh `outcome`, requested/effective intervals, universe snapshot, warnings, cycle-level error, and dataset health for every `symbol/interval`.
 - Run outcome is global cycle health (`success`, `partial`, `failed`). Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, and validation report.
 - Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
-- Missing or malformed manifest is fail-closed for trading strict policy. Explicit compatibility behavior is limited to old public wrappers and tests.
+- Missing or malformed manifest is fail-closed for trading strict policy. Explicit compatibility behavior is limited to old public wrappers and tests, and cannot overwrite the canonical manifest.
 
 ## Strategies
 
@@ -144,6 +147,7 @@ Boundaries:
 - Missing credentials are acceptable in dry-run and fail before order submission in confirmed mode.
 - Dry-run and confirmed demo use the same trusted gate. Invalid, stale, missing, malformed, or failed-run trusted data blocks scanner calls and order generation.
 - A scan cycle carries the trusted `run_id` from the loaded manifest into scan payloads when available.
+- Dynamic universe limit semantics are explicit: `limit > 0` returns at most that many manifest universe symbols, `limit == 0` means watchlist-only, and `limit < 0` is rejected.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, or risk kill-switches.
 - If no `planned` order exists, the dashboard explicitly reports no order suggestion and no cancel target.
 

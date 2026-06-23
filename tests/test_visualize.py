@@ -259,32 +259,36 @@ class VisualizationTests(unittest.TestCase):
 
         self.assertFalse(trusted_calls[0][1]["refresh"])
 
-    def test_visualize_trusted_data_refresh_flag_requests_refresh(self):
+    def test_visualize_rejects_trusted_refresh_before_rendering_or_writing_output(self):
         from mu_strategy import visualize
 
-        trusted_calls = []
-
-        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
-            trusted_calls.append((symbol, kwargs))
-            return SimpleNamespace(
-                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
-                statuses_by_interval={
-                    "5m": _status("MU-USDT-SWAP", "5m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/5m.csv")),
-                    "15m": _status("MU-USDT-SWAP", "15m", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/15m.csv")),
-                    "1h": _status("MU-USDT-SWAP", "1h", rows=1, path=Path("data/live/okx/MU-USDT-SWAP/1h.csv")),
-                },
-            )
-
         with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
             output_path = Path(tmp) / "chart.html"
-            argv = ["mu_strategy.visualize", "--trusted-data", "--refresh", "--output", str(output_path)]
+            manifest_path = data_dir / "manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text("canonical manifest", encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
+            argv = [
+                "mu_strategy.visualize",
+                "--trusted-data",
+                "--refresh",
+                "--data-dir",
+                str(data_dir),
+                "--output",
+                str(output_path),
+            ]
             with patch("sys.argv", argv):
-                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
-                    with patch("mu_strategy.viz.backtest.run_backtest", return_value=BacktestResult(10_000, 10_000, [], [(0, 10_000)])):
-                        with patch("sys.stdout", new_callable=io.StringIO):
-                            visualize.main()
+                with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=AssertionError("trusted loader")):
+                    with patch("mu_strategy.viz.backtest.run_backtest", side_effect=AssertionError("backtest")):
+                        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                            with self.assertRaises(SystemExit) as raised:
+                                visualize.main()
 
-        self.assertTrue(trusted_calls[0][1]["refresh"])
+            self.assertNotEqual(0, raised.exception.code)
+            self.assertIn("refresh_market_data", stderr.getvalue())
+            self.assertFalse(output_path.exists())
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
 
     def test_visualize_cli_can_use_trusted_data_layer(self):
         from mu_strategy import visualize

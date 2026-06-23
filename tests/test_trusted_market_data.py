@@ -151,84 +151,47 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertIn("MU-USDT-SWAP", html)
         self.assertIn("stock_token_top", html)
 
-    def test_refresh_interval_marks_stale_when_incremental_fetch_fails(self):
-        from mu_strategy.market_data.cache import write_csv
+    def test_refresh_interval_is_deprecated_and_preserves_canonical_store(self):
         from mu_strategy.market_data.trusted import refresh_trusted_interval
+        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
-            write_csv([_candle(0, 100), _candle(300_000, 101)], path)
+            manifest_path = data_dir / "manifest.json"
+            run_log_path = data_dir / "refresh_runs.jsonl"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
+            run_log_path.write_text('{"run_id":"canonical"}\n', encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
+            run_log_before = run_log_path.read_bytes()
 
-            with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental", side_effect=TimeoutError("blocked")):
-                status = refresh_trusted_interval("BTC-USDT-SWAP", "5m", days=1, data_dir=data_dir, now_ms=900_000)
+            with patch("mu_strategy.market_data.trusted.refresh_with_okx_provider", side_effect=AssertionError("refresh provider")):
+                with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
+                    refresh_trusted_interval("BTC-USDT-SWAP", "5m", days=1, data_dir=data_dir, now_ms=900_000)
 
-        self.assertTrue(status.is_stale)
-        self.assertFalse(status.is_valid)
-        self.assertEqual("incremental_refresh_failed", status.reason)
-        self.assertEqual("TimeoutError", status.error_type)
-        self.assertEqual("blocked", status.message)
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
+            self.assertEqual(run_log_before, run_log_path.read_bytes())
 
-    def test_refresh_interval_uses_injected_fetcher_with_warm_cache(self):
-        from mu_strategy.market_data.cache import read_csv, write_csv
-        from mu_strategy.market_data.trusted import refresh_trusted_interval
-
-        def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
-            self.assertEqual("BTC-USDT-SWAP", symbol)
-            self.assertEqual("5m", interval)
-            self.assertEqual(1, days)
-            return [_candle(0, 100), _candle(300_000, 101), _candle(600_000, 102)]
+    def test_refresh_symbol_statuses_is_deprecated_and_preserves_canonical_store(self):
+        from mu_strategy.market_data.trusted import refresh_trusted_symbol_statuses
+        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
-            write_csv([_candle(0, 100), _candle(300_000, 101)], path)
+            manifest_path = data_dir / "manifest.json"
+            run_log_path = data_dir / "refresh_runs.jsonl"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
+            run_log_path.write_text('{"run_id":"canonical"}\n', encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
+            run_log_before = run_log_path.read_bytes()
 
-            with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental", side_effect=AssertionError("must not hit live OKX")):
-                status = refresh_trusted_interval(
-                    "BTC-USDT-SWAP",
-                    "5m",
-                    days=1,
-                    data_dir=data_dir,
-                    now_ms=900_000,
-                    fetcher=fetcher,
-                )
+            with patch("mu_strategy.market_data.trusted.refresh_with_okx_provider", side_effect=AssertionError("refresh provider")):
+                with self.assertRaisesRegex(TrustedConsumerRefreshError, "LoadTrustedBundle"):
+                    refresh_trusted_symbol_statuses("BTC-USDT-SWAP", intervals=("5m",), days=1, data_dir=data_dir)
 
-            candles = read_csv(path)
-
-        self.assertTrue(status.is_valid)
-        self.assertFalse(status.is_stale)
-        self.assertEqual("ok", status.reason)
-        self.assertEqual([0, 300_000, 600_000], [candle.open_time_ms for candle in candles])
-
-    def test_refresh_interval_uses_injected_incremental_fetcher_with_warm_cache(self):
-        from mu_strategy.market_data.cache import read_csv, write_csv
-        from mu_strategy.market_data.trusted import refresh_trusted_interval
-
-        def incremental_fetcher(symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
-            self.assertEqual("BTC-USDT-SWAP", symbol)
-            self.assertEqual("5m", interval)
-            self.assertEqual(0, since_time_ms)
-            return [_candle(300_000, 101), _candle(600_000, 102)]
-
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
-            write_csv([_candle(0, 100), _candle(300_000, 101)], path)
-
-            status = refresh_trusted_interval(
-                "BTC-USDT-SWAP",
-                "5m",
-                days=1,
-                data_dir=data_dir,
-                now_ms=900_000,
-                incremental_fetcher=incremental_fetcher,
-            )
-
-            candles = read_csv(path)
-
-        self.assertTrue(status.is_valid)
-        self.assertEqual([0, 300_000, 600_000], [candle.open_time_ms for candle in candles])
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
+            self.assertEqual(run_log_before, run_log_path.read_bytes())
 
     def test_refresh_once_marks_manifest_invalid_when_any_interval_fails(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
@@ -407,27 +370,34 @@ class TrustedRefreshStoreTests(unittest.TestCase):
 
 
 class TrustedCandleBundleTests(unittest.TestCase):
-    def test_refresh_trusted_candle_bundle_attaches_built_native_validation(self):
+    def test_refresh_trusted_candle_bundle_refresh_true_fails_before_provider_or_writes(self):
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         with TemporaryDirectory() as tmp:
-            bundle = refresh_trusted_candle_bundle(
-                "MU-USDT-SWAP",
-                intervals=("15m", "1h"),
-                days=1,
-                data_dir=Path(tmp),
-                refresh=True,
-                fetcher=_fake_fetcher,
-            )
+            data_dir = Path(tmp)
+            with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
+                with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("write_manifest")):
+                    with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
+                        with patch("mu_strategy.market_data.service.refresh_with_okx_provider", side_effect=AssertionError("provider"), create=True):
+                            with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
+                                refresh_trusted_candle_bundle(
+                                    "MU-USDT-SWAP",
+                                    intervals=("15m", "1h"),
+                                    days=1,
+                                    data_dir=data_dir,
+                                    refresh=True,
+                                    fetcher=lambda *args, **kwargs: self.fail("fetcher must not run"),
+                                )
 
-        self.assertEqual(["15m", "1h"], list(bundle.candles_by_interval))
-        self.assertIn("5m", bundle.statuses_by_interval)
-        self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
-        self.assertTrue(bundle.statuses_by_interval["1h"].validation.ok)
+            self.assertFalse((data_dir / "manifest.json").exists())
+            self.assertFalse((data_dir / "refresh_runs.jsonl").exists())
 
     def test_refresh_trusted_candle_bundle_honors_refresh_false(self):
         from mu_strategy.market_data.cache import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -454,18 +424,17 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch(
-                "mu_strategy.market_data.service.refresh_trusted_symbol_statuses",
-                side_effect=AssertionError("refresh=False must not refresh trusted data"),
-            ):
-                bundle = refresh_trusted_candle_bundle(
-                    "MU-USDT-SWAP",
-                    intervals=("15m", "1h"),
-                    days=1,
-                    data_dir=data_dir,
-                    refresh=False,
-                    clock=_FixedClock(3_600_000),
-                )
+            with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("write_manifest")):
+                with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
+                    with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
+                        bundle = refresh_trusted_candle_bundle(
+                            "MU-USDT-SWAP",
+                            intervals=("15m", "1h"),
+                            days=1,
+                            data_dir=data_dir,
+                            refresh=False,
+                            clock=_FixedClock(3_600_000),
+                        )
 
         self.assertEqual(4, len(bundle.candles_by_interval["15m"]))
         self.assertEqual(1, len(bundle.candles_by_interval["1h"]))
@@ -584,29 +553,22 @@ class TrustedCandleBundleTests(unittest.TestCase):
         self.assertEqual("blocked", status.message)
         self.assertEqual([], bundle.candles_by_interval["15m"])
 
-    def test_refresh_trusted_candle_bundle_does_not_reread_invalid_status_file(self):
+    def test_refresh_trusted_candle_bundle_refresh_true_preserves_existing_manifest_and_run_log(self):
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
-        from mu_strategy.market_data.trusted import DataStatus
+        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            corrupt_cache = data_dir / "okx" / "MU-USDT-SWAP" / "15m.csv"
-            corrupt_cache.parent.mkdir(parents=True)
-            corrupt_cache.write_text("not,a,valid,candle\n1,2,3,4\n", encoding="utf-8")
-            status = DataStatus(
-                symbol="MU-USDT-SWAP",
-                interval="15m",
-                rows=0,
-                first_timestamp_ms=None,
-                last_timestamp_ms=None,
-                updated_at_ms=0,
-                source_file=corrupt_cache,
-                is_valid=False,
-                reason="cache_read_failed",
-            )
+            manifest_path = data_dir / "manifest.json"
+            run_log_path = data_dir / "refresh_runs.jsonl"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
+            run_log_path.write_text('{"run_id":"canonical"}\n', encoding="utf-8")
+            manifest_before = manifest_path.read_bytes()
+            run_log_before = run_log_path.read_bytes()
 
-            with patch("mu_strategy.market_data.service.refresh_trusted_symbol_statuses", return_value={"15m": status}):
-                bundle = refresh_trusted_candle_bundle(
+            with self.assertRaises(TrustedConsumerRefreshError):
+                refresh_trusted_candle_bundle(
                     "MU-USDT-SWAP",
                     intervals=("15m",),
                     days=1,
@@ -615,8 +577,8 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     fetcher=_fake_fetcher,
                 )
 
-        self.assertEqual([], bundle.candles_by_interval["15m"])
-        self.assertEqual("cache_read_failed", bundle.statuses_by_interval["15m"].reason)
+            self.assertEqual(manifest_before, manifest_path.read_bytes())
+            self.assertEqual(run_log_before, run_log_path.read_bytes())
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:

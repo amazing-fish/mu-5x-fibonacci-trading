@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -40,6 +41,11 @@ DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
 OKXIncrementalFetcher = Callable[..., list[Candle]]
+
+
+class RefreshScope(Enum):
+    CANONICAL_UNIVERSE = "canonical_universe"
+    EXPLICIT_SYMBOLS = "explicit_symbols"
 
 
 class MarketDataProvider(Protocol):
@@ -114,6 +120,19 @@ class RefreshTrustedMarketDataRequest:
     explicit_symbols: tuple[str, ...] = ()
     now_ms: int | None = None
     run_id: str | None = None
+    scope: RefreshScope = RefreshScope.CANONICAL_UNIVERSE
+
+    def __post_init__(self) -> None:
+        scope = self.scope
+        if not isinstance(scope, RefreshScope):
+            scope = RefreshScope(str(scope))
+            object.__setattr__(self, "scope", scope)
+        if self.limit < 0:
+            raise ValueError("limit must be non-negative")
+        if scope != RefreshScope.CANONICAL_UNIVERSE:
+            raise ValueError("non-canonical trusted refresh scopes cannot publish canonical manifest")
+        if self.explicit_symbols:
+            raise ValueError("canonical trusted market-data refresh cannot use explicit_symbols")
 
 
 class RefreshTrustedMarketData:
@@ -190,18 +209,6 @@ class RefreshTrustedMarketData:
         return run
 
     def _universe(self, request: RefreshTrustedMarketDataRequest) -> UniverseSnapshot:
-        if request.explicit_symbols:
-            return UniverseSnapshot(
-                crypto_top=tuple(
-                    {
-                        "inst_id": resolve_okx_swap_symbol(symbol).inst_id,
-                        "last": 0.0,
-                        "volume_ccy_24h": 0.0,
-                        "source": "requested",
-                    }
-                    for symbol in request.explicit_symbols
-                )
-            )
         rows = self.provider.fetch_tickers()
         stock_ids = request.stock_token_inst_ids
         if stock_ids is None:

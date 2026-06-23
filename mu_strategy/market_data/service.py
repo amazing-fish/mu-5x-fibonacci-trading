@@ -2,29 +2,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from mu_strategy.market_data.cache import cached_historical
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted import (
-    DataStatus,
-    refresh_trusted_symbol_statuses,
+from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.trusted_data.contracts import (
+    Clock,
+    DatasetHealth,
+    TrustDecision,
+    TrustedConsumerRefreshError,
+    TrustedLoadContext,
+    UniverseSnapshot,
 )
-from mu_strategy.market_data.trusted_data.contracts import Clock, DatasetHealth, TrustDecision, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_LIVE_DATA_DIR,
     DEFAULT_INTERVALS,
-    OKXHistoryFetcher,
-    OKXIncrementalFetcher,
-    RefreshTrustedMarketDataRequest,
-    refresh_with_okx_provider,
 )
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import Candle
 
 
 TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
+TRUSTED_CONSUMER_REFRESH_ERROR = (
+    "trusted bundle loading is cache-only; run "
+    "python -m mu_strategy.commands.refresh_market_data "
+    "before loading trusted data"
+)
+OKXHistoryFetcher = Callable[..., list[Candle]]
+OKXIncrementalFetcher = Callable[..., list[Candle]]
 
 
 @dataclass(frozen=True)
@@ -92,24 +100,11 @@ def refresh_trusted_candle_bundle(
     clock: Clock | None = None,
     context: TrustedLoadContext | None = None,
 ) -> CandleBundle:
+    if refresh:
+        raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
     resolved = resolve_okx_swap_symbol(symbol)
     store = TrustedDataStore(data_dir=Path(data_dir))
     requested_intervals = tuple(dict.fromkeys(intervals))
-    if refresh:
-        refresh_with_okx_provider(
-            store,
-            RefreshTrustedMarketDataRequest(
-                requested_intervals=requested_intervals,
-                days=days,
-                limit=0,
-                explicit_symbols=(resolved.inst_id,),
-                stock_token_inst_ids=set(),
-            ),
-            history_fetcher=fetcher,
-            incremental_fetcher=incremental_fetcher,
-            history_days_fallback=days,
-            clock=clock,
-        )
     bundle = LoadTrustedBundle(store, clock=clock).execute(
         LoadTrustedBundleQuery(
             resolved.inst_id,
