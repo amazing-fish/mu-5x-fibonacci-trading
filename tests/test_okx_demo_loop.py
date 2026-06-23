@@ -966,6 +966,23 @@ def _bundle(symbol: str) -> CandleBundle:
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:
+    from mu_strategy.market_data.trusted import DataStatus
+
+    statuses = {
+        interval: DataStatus(
+            symbol=symbol,
+            interval=interval,
+            rows=1,
+            first_timestamp_ms=0,
+            last_timestamp_ms=0,
+            updated_at_ms=0,
+            source_file=Path(f"{interval}.csv"),
+            is_valid=True,
+            is_stale=True,
+            reason="stale_by_clock",
+        )
+        for interval in ("15m", "1h")
+    }
     return CandleBundle(
         symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
         candles_by_interval={
@@ -974,6 +991,7 @@ def _stale_bundle(symbol: str) -> CandleBundle:
         },
         files_by_interval={},
         days=28,
+        statuses_by_interval=statuses,
     )
 
 

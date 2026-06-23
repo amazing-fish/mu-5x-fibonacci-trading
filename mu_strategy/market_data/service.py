@@ -16,7 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     UniverseSnapshot,
 )
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
-from mu_strategy.market_data.trusted_data.policy import TrustPolicy, research_strict_policy
+from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_LIVE_DATA_DIR,
     DEFAULT_INTERVALS,
@@ -97,6 +97,7 @@ def refresh_trusted_candle_bundle(
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
     policy: TrustPolicy | None = None,
+    freshness_policy: FreshnessPolicy | None = None,
     clock: Clock | None = None,
     context: TrustedLoadContext | None = None,
 ) -> CandleBundle:
@@ -105,7 +106,7 @@ def refresh_trusted_candle_bundle(
     resolved = resolve_okx_swap_symbol(symbol)
     store = TrustedDataStore(data_dir=Path(data_dir))
     requested_intervals = tuple(dict.fromkeys(intervals))
-    bundle = LoadTrustedBundle(store, clock=clock).execute(
+    bundle = LoadTrustedBundle(store, clock=clock, freshness_policy=freshness_policy).execute(
         LoadTrustedBundleQuery(
             resolved.inst_id,
             intervals=requested_intervals,

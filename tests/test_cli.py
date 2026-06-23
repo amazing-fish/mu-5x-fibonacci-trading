@@ -222,6 +222,33 @@ class CliTests(unittest.TestCase):
 
         self.assertNotEqual(0, raised.exception.code)
 
+    def test_cli_trusted_data_rejects_unpublished_symbol_before_backtest(self):
+        from mu_strategy import cli
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            report_path = Path(tmp) / "report.md"
+            _write_manifest_with_valid_csv(data_dir, symbol="BTC-USDT-SWAP", outcome="success", status="ok")
+            _write_csv_only(data_dir, symbol="MU-USDT-SWAP")
+            argv = [
+                "mu_strategy.cli",
+                "--trusted-data",
+                "--data-dir",
+                str(data_dir),
+                "--report",
+                str(report_path),
+            ]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.cli.run_backtest", side_effect=AssertionError("backtest must not run")):
+                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        with self.assertRaises(SystemExit) as raised:
+                            cli.main()
+
+            self.assertFalse(report_path.exists())
+
+        self.assertNotEqual(0, raised.exception.code)
+        self.assertIn("not_published", stderr.getvalue())
+
     def test_cli_accepts_limit_fee_profile_for_cost_sensitivity(self):
         from mu_strategy import cli
 
@@ -283,11 +310,14 @@ def _status(symbol: str, interval: str, path: Path, *, is_valid: bool = True, is
 
 
 def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
+    _write_manifest_with_valid_csv(data_dir, symbol="MU-USDT-SWAP", outcome="failed", status="invalid")
+
+
+def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str, status: str) -> None:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
 
-    symbol = "MU-USDT-SWAP"
     store = TrustedDataStore(data_dir=data_dir)
     five = [_candle(index * 300_000, 100 + index) for index in range(DAY_MS // 300_000)]
     by_interval = {
@@ -316,9 +346,9 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
     store.write_manifest(
         {
             "schema_version": 2,
-            "run_id": "failed-run",
-            "outcome": "failed",
-            "status": "invalid",
+            "run_id": f"{outcome}-run",
+            "outcome": outcome,
+            "status": status,
             "started_at_ms": 0,
             "completed_at_ms": 86_400_000,
             "requested_intervals": ["5m", "15m", "1h"],
@@ -329,6 +359,22 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
             "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
         }
     )
+
+
+def _write_csv_only(data_dir: Path, *, symbol: str) -> None:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+    from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+    from mu_strategy.market_data.utils import DAY_MS
+
+    store = TrustedDataStore(data_dir=data_dir)
+    five = [_candle(index * 300_000, 100 + index) for index in range(DAY_MS // 300_000)]
+    by_interval = {
+        "5m": five,
+        "15m": aggregate_candles(five, interval="15m"),
+        "1h": aggregate_candles(five, interval="1h"),
+    }
+    for interval, candles in by_interval.items():
+        store.write_csv(candles, store.cache_path(symbol, interval))
 
 
 if __name__ == "__main__":

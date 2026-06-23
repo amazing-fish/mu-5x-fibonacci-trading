@@ -409,6 +409,10 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 manifest_intervals[interval] = {
                     "symbol": "MU-USDT-SWAP",
                     "interval": interval,
+                    "availability": "available",
+                    "integrity": "valid",
+                    "freshness": "fresh",
+                    "reasons": ["ok"],
                     "rows": len(candles),
                     "first_timestamp_ms": candles[0].open_time_ms,
                     "last_timestamp_ms": candles[-1].open_time_ms,
@@ -418,6 +422,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "is_stale": False,
                     "reason": "ok",
                     "warnings": [],
+                    "validation": {"ok": True, "reason": "ok"},
                 }
             (data_dir / "manifest.json").write_text(
                 json.dumps(_manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})),
@@ -461,6 +466,10 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 manifest_intervals[interval] = {
                     "symbol": "MU-USDT-SWAP",
                     "interval": interval,
+                    "availability": "available",
+                    "integrity": "valid",
+                    "freshness": "fresh",
+                    "reasons": ["ok"],
                     "rows": 999,
                     "first_timestamp_ms": candles[0].open_time_ms,
                     "last_timestamp_ms": candles[-1].open_time_ms,
@@ -470,6 +479,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "is_stale": False,
                     "reason": "ok",
                     "warnings": [],
+                    "validation": {"ok": True, "reason": "ok"},
                 }
             manifest = _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})
             (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -517,6 +527,10 @@ class TrustedCandleBundleTests(unittest.TestCase):
                             "15m": {
                                 "symbol": "MU-USDT-SWAP",
                                 "interval": "15m",
+                                "availability": "available",
+                                "integrity": "invalid",
+                                "freshness": "stale",
+                                "reasons": ["incremental_refresh_failed"],
                                 "rows": 4,
                                 "first_timestamp_ms": 0,
                                 "last_timestamp_ms": 2_700_000,
@@ -528,6 +542,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                                 "error_type": "TimeoutError",
                                 "message": "blocked",
                                 "warnings": [],
+                                "validation": {"ok": False, "reason": "incremental_refresh_failed"},
                             }
                         }
                     }

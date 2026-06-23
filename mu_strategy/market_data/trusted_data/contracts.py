@@ -38,8 +38,14 @@ class ManifestStatus(Enum):
     INVALID = "invalid"
 
 
+class PublicationState(Enum):
+    PUBLISHED = "published"
+    NOT_PUBLISHED = "not_published"
+
+
 class HealthReason(Enum):
     OK = "ok"
+    NOT_PUBLISHED = "not_published"
     CACHE_MISSING = "cache_missing"
     CACHE_READ_FAILED = "cache_read_failed"
     EMPTY = "empty"
@@ -120,12 +126,12 @@ class ValidationReport:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None) -> "ValidationReport | None":
+    def from_dict(cls, payload: dict[str, Any] | None, *, strict: bool = False) -> "ValidationReport | None":
         if not isinstance(payload, dict):
             return None
         return cls(
             ok=bool(payload.get("ok")),
-            reason=health_reason(payload.get("reason")),
+            reason=health_reason(payload.get("reason"), strict=strict),
             missing_in_built=tuple(int(value) for value in payload.get("missing_in_built") or ()),
             missing_in_native=tuple(int(value) for value in payload.get("missing_in_native") or ()),
             misaligned_timestamps=tuple(int(value) for value in payload.get("misaligned_timestamps") or ()),
@@ -195,29 +201,44 @@ class DatasetHealth:
         }
 
     @classmethod
-    def from_dict(cls, symbol: str, interval: str, payload: dict[str, Any]) -> "DatasetHealth":
-        reasons = payload.get("reasons")
-        if not reasons:
-            reasons = [payload.get("reason") or HealthReason.OK.value]
-        availability = _availability(payload.get("availability"), payload)
-        integrity = _integrity(payload.get("integrity"), payload)
-        freshness = _freshness(payload.get("freshness"), payload)
-        return cls(
-            key=DatasetKey(str(payload.get("symbol") or symbol), str(payload.get("interval") or interval)),
+    def from_dict(cls, symbol: str, interval: str, payload: dict[str, Any], *, strict: bool = True) -> "DatasetHealth":
+        if strict:
+            payload_symbol = _required_str(payload, "symbol")
+            payload_interval = _required_str(payload, "interval")
+            if payload_symbol != symbol or payload_interval != interval:
+                raise ManifestSchemaError("manifest dataset key must match payload symbol/interval")
+            reasons = _required_str_tuple(payload, "reasons")
+            availability = AvailabilityState(_required_str(payload, "availability"))
+            integrity = IntegrityState(_required_str(payload, "integrity"))
+            freshness = FreshnessState(_required_str(payload, "freshness"))
+            rows = _required_int(payload, "rows")
+        else:
+            payload_symbol = str(payload.get("symbol") or symbol)
+            payload_interval = str(payload.get("interval") or interval)
+            reasons = tuple(payload.get("reasons") or [payload.get("reason") or HealthReason.OK.value])
+            availability = _availability(payload.get("availability"), payload)
+            integrity = _integrity(payload.get("integrity"), payload)
+            freshness = _freshness(payload.get("freshness"), payload)
+            rows = int(payload.get("rows") or 0)
+        health = cls(
+            key=DatasetKey(payload_symbol, payload_interval),
             availability=availability,
             integrity=integrity,
             freshness=freshness,
-            reasons=tuple(health_reason(value) for value in reasons),
-            rows=int(payload.get("rows") or 0),
+            reasons=tuple(health_reason(value, strict=strict) for value in reasons),
+            rows=rows,
             first_timestamp_ms=_optional_int(payload.get("first_timestamp_ms")),
             last_timestamp_ms=_optional_int(payload.get("last_timestamp_ms")),
             updated_at_ms=int(payload.get("updated_at_ms") or 0),
             source_file=Path(payload.get("source_file") or ""),
-            validation=ValidationReport.from_dict(payload.get("validation")),
+            validation=ValidationReport.from_dict(payload.get("validation"), strict=strict),
             error_type=payload.get("error_type"),
             message=payload.get("message"),
             warnings=tuple(str(value) for value in payload.get("warnings") or ()),
         )
+        if strict:
+            _validate_dataset_health(health)
+        return health
 
 
 @dataclass(frozen=True)
@@ -246,6 +267,53 @@ class TrustedManifestSnapshot:
     datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class DatasetPublication:
+    key: DatasetKey
+    state: PublicationState
+    health: DatasetHealth | None = None
+
+    @property
+    def is_published(self) -> bool:
+        return self.state == PublicationState.PUBLISHED and self.health is not None
+
+
+@dataclass(frozen=True)
+class PublishedDatasetCatalog:
+    datasets: dict[tuple[str, str], DatasetHealth]
+    data_dir: Path
+
+    @classmethod
+    def from_manifest(cls, manifest: TrustedManifestSnapshot, *, data_dir: Path) -> "PublishedDatasetCatalog":
+        datasets: dict[tuple[str, str], DatasetHealth] = {}
+        for key, health in manifest.datasets.items():
+            if str(health.source_file) == "":
+                health = DatasetHealth(
+                    key=health.key,
+                    availability=health.availability,
+                    integrity=health.integrity,
+                    freshness=health.freshness,
+                    reasons=health.reasons,
+                    rows=health.rows,
+                    first_timestamp_ms=health.first_timestamp_ms,
+                    last_timestamp_ms=health.last_timestamp_ms,
+                    source_file=Path(data_dir) / "okx" / health.key.symbol / f"{health.key.interval}.csv",
+                    validation=health.validation,
+                    updated_at_ms=health.updated_at_ms,
+                    error_type=health.error_type,
+                    message=health.message,
+                    warnings=health.warnings,
+                )
+            datasets[key] = health
+        return cls(datasets=datasets, data_dir=Path(data_dir))
+
+    def resolve_dataset(self, key: DatasetKey) -> DatasetPublication:
+        health = self.datasets.get(key.tuple())
+        if health is None:
+            return DatasetPublication(key=key, state=PublicationState.NOT_PUBLISHED)
+        return DatasetPublication(key=key, state=PublicationState.PUBLISHED, health=health)
 
 
 @dataclass(frozen=True)
@@ -365,7 +433,7 @@ def trusted_manifest_snapshot_from_dict(
     effective_intervals = _required_str_tuple(payload, "effective_intervals")
     symbols = _required_dict(payload, "symbols")
     universes = _required_dict(payload, "universes")
-    return TrustedManifestSnapshot(
+    snapshot = TrustedManifestSnapshot(
         schema_version=2,
         run_id=run_id,
         outcome=outcome,
@@ -379,14 +447,18 @@ def trusted_manifest_snapshot_from_dict(
         warnings=_optional_str_tuple(payload, "warnings"),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
     )
+    _validate_manifest_snapshot(snapshot)
+    return snapshot
 
 
-def health_reason(value: Any) -> HealthReason:
+def health_reason(value: Any, *, strict: bool = False) -> HealthReason:
     if isinstance(value, HealthReason):
         return value
     try:
         return HealthReason(str(value))
     except Exception:
+        if strict:
+            raise ManifestSchemaError(f"unknown health reason: {value}") from None
         return HealthReason.REFRESH_FAILED
 
 
@@ -433,13 +505,13 @@ def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapsho
         requested_intervals=intervals,
         effective_intervals=intervals,
         universe_snapshot=_universe_snapshot_from_dict(universe_payload),
-        datasets=_datasets_from_symbols(symbols),
+        datasets=_datasets_from_symbols(symbols, strict=False),
         warnings=tuple(str(value) for value in payload.get("warnings") or ()),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
     )
 
 
-def _datasets_from_symbols(symbols: dict[str, Any]) -> dict[tuple[str, str], DatasetHealth]:
+def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> dict[tuple[str, str], DatasetHealth]:
     datasets: dict[tuple[str, str], DatasetHealth] = {}
     for symbol, symbol_payload in symbols.items():
         if not isinstance(symbol_payload, dict):
@@ -450,9 +522,52 @@ def _datasets_from_symbols(symbols: dict[str, Any]) -> dict[tuple[str, str], Dat
         for interval, payload in intervals.items():
             if not isinstance(payload, dict):
                 raise ManifestSchemaError("manifest dataset health entries must be objects")
-            health = DatasetHealth.from_dict(str(symbol), str(interval), payload)
+            health = DatasetHealth.from_dict(str(symbol), str(interval), payload, strict=strict)
             datasets[(health.key.symbol, health.key.interval)] = health
     return datasets
+
+
+def _validate_dataset_health(health: DatasetHealth) -> None:
+    if health.rows < 0:
+        raise ManifestSchemaError("manifest dataset rows must be non-negative")
+    if health.availability == AvailabilityState.AVAILABLE:
+        if health.rows <= 0:
+            raise ManifestSchemaError("available manifest dataset must have rows")
+        if health.first_timestamp_ms is None or health.last_timestamp_ms is None:
+            raise ManifestSchemaError("available manifest dataset must have timestamp range")
+        if health.first_timestamp_ms > health.last_timestamp_ms:
+            raise ManifestSchemaError("manifest dataset timestamp range is inverted")
+    if health.availability == AvailabilityState.MISSING:
+        if health.rows != 0:
+            raise ManifestSchemaError("missing manifest dataset cannot have rows")
+        if health.integrity == IntegrityState.VALID:
+            raise ManifestSchemaError("missing manifest dataset cannot have valid integrity")
+    if health.integrity == IntegrityState.VALID and health.availability != AvailabilityState.AVAILABLE:
+        raise ManifestSchemaError("valid manifest dataset must be available")
+
+
+def _validate_manifest_snapshot(snapshot: TrustedManifestSnapshot) -> None:
+    effective = set(snapshot.effective_intervals)
+    requested = set(snapshot.requested_intervals)
+    if not requested.issubset(effective):
+        raise ManifestSchemaError("manifest requested_intervals must be a subset of effective_intervals")
+    if any(interval in effective for interval in ("15m", "1h")) and "5m" not in effective:
+        raise ManifestSchemaError("manifest effective_intervals must include 5m when native intervals are present")
+    if snapshot.outcome == RefreshRunOutcome.FAILED and snapshot.status != ManifestStatus.INVALID:
+        raise ManifestSchemaError("failed manifest outcome must have invalid status")
+    if snapshot.outcome == RefreshRunOutcome.PARTIAL and snapshot.status == ManifestStatus.OK:
+        raise ManifestSchemaError("partial manifest outcome cannot have ok status")
+    if snapshot.outcome == RefreshRunOutcome.SUCCESS and snapshot.status == ManifestStatus.OK:
+        for health in snapshot.datasets.values():
+            if not health.is_usable:
+                raise ManifestSchemaError("success/ok manifest cannot contain unusable datasets")
+        for row in [*snapshot.universe_snapshot.crypto_top, *snapshot.universe_snapshot.stock_token_top]:
+            inst_id = str(row.get("inst_id") or row.get("instId") or "")
+            if not inst_id:
+                raise ManifestSchemaError("manifest universe row must include inst_id")
+            for interval in snapshot.effective_intervals:
+                if (inst_id, interval) not in snapshot.datasets:
+                    raise ManifestSchemaError("success/ok manifest catalog is incomplete for canonical universe")
 
 
 def _universe_snapshot_from_dict(payload: dict[str, Any]) -> UniverseSnapshot:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -13,11 +12,10 @@ from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
-from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -129,6 +127,9 @@ def run_once(
             }
             if default_trusted_loader:
                 loader_kwargs["policy"] = trading_strict_policy()
+                loader_kwargs["freshness_policy"] = FreshnessPolicy(
+                    max_staleness_bars=config.max_candle_staleness_bars
+                )
                 if trusted_context is not None:
                     loader_kwargs["context"] = trusted_context
             bundle = candle_loader(ticker.inst_id, **loader_kwargs)
@@ -143,8 +144,6 @@ def run_once(
             data_error = _market_data_freshness_error(
                 symbol=ticker.inst_id,
                 bundle=bundle,
-                config=config,
-                now_ms=int(time.time() * 1000),
             )
             if data_error is not None:
                 data_errors.append(data_error)
@@ -498,13 +497,10 @@ def _market_data_freshness_error(
     *,
     symbol: str,
     bundle: CandleBundle,
-    config: DemoTradingConfig,
-    now_ms: int,
 ) -> dict[str, Any] | None:
     status_error = _market_data_status_error(symbol=symbol, bundle=bundle)
     if status_error is not None:
         return status_error
-    max_staleness_bars = max(1, config.max_candle_staleness_bars)
     for interval, candles in bundle.candles_by_interval.items():
         if not candles:
             return {
@@ -512,20 +508,7 @@ def _market_data_freshness_error(
                 "reason": "market_data_missing",
                 "interval": interval,
                 "latest_open_time_ms": None,
-                "age_ms": None,
-                "max_age_ms": interval_to_ms(interval) * max_staleness_bars,
-            }
-        latest_open_time_ms = max(candle.open_time_ms for candle in candles)
-        max_age_ms = interval_to_ms(interval) * max_staleness_bars
-        age_ms = now_ms - latest_open_time_ms
-        if age_ms > max_age_ms:
-            return {
-                "symbol": symbol,
-                "reason": "market_data_stale",
-                "interval": interval,
-                "latest_open_time_ms": latest_open_time_ms,
-                "age_ms": age_ms,
-                "max_age_ms": max_age_ms,
+                "source_file": str(bundle.files_by_interval.get(interval, "")),
             }
     return None
 
@@ -557,7 +540,7 @@ def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str,
             continue
         return {
             "symbol": symbol,
-            "reason": "market_data_invalid" if not is_valid else "market_data_cache_stale",
+            "reason": "market_data_invalid" if not is_valid else "market_data_stale",
             "interval": interval,
             "status_reason": getattr(status, "reason", None),
             "error_type": getattr(status, "error_type", None),

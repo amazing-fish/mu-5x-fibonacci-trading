@@ -13,6 +13,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     FreshnessState,
     HealthReason,
     IntegrityState,
+    PublishedDatasetCatalog,
     SystemClock,
     TrustDecision,
     TrustedBundle,
@@ -103,12 +104,20 @@ class LoadTrustedBundle:
             )
 
         manifest = context.manifest
-        manifest_health = _manifest_health_by_interval(manifest, resolved.inst_id, data_dir=self.store.data_dir)
+        publications = PublishedDatasetCatalog.from_manifest(manifest, data_dir=self.store.data_dir)
+        published_health_by_interval: dict[str, DatasetHealth] = {}
         raw_candles_by_interval: dict[str, list[Candle]] = {}
         candles_by_interval: dict[str, list[Candle]] = {}
         health_by_interval: dict[str, DatasetHealth] = {}
         for interval in plan.effective_intervals:
             path = self.store.cache_path(resolved.inst_id, interval)
+            publication = publications.resolve_dataset(DatasetKey(resolved.inst_id, interval))
+            if not publication.is_published:
+                health_by_interval[interval] = _not_published_health(resolved.inst_id, interval, path)
+                raw_candles_by_interval[interval] = []
+                continue
+            assert publication.health is not None
+            published_health_by_interval[interval] = publication.health
             try:
                 raw_candles_by_interval[interval] = self.store.read_csv(path) if path.exists() else []
             except Exception as exc:
@@ -159,7 +168,7 @@ class LoadTrustedBundle:
                     validation=validation,
                     updated_at_ms=context.observed_at_ms,
                 )
-            health = _merge_manifest_health(health, manifest_health.get(interval))
+            health = _merge_manifest_health(health, published_health_by_interval.get(interval))
             health_by_interval[interval] = health
             candles_by_interval[interval] = candles if health.integrity == IntegrityState.VALID else []
 
@@ -195,12 +204,12 @@ class LoadTrustedBundle:
         candles_by_interval: dict[str, list[Candle]],
     ) -> None:
         base_health = health_by_interval.get("5m")
-        if base_health is None or not base_health.is_usable:
+        if base_health is None or not _has_validation_inputs(base_health):
             return
         five = candles_by_interval.get("5m") or []
         for interval in ("15m", "1h"):
             native_health = health_by_interval.get(interval)
-            if native_health is None or not native_health.is_usable:
+            if native_health is None or not _has_validation_inputs(native_health):
                 continue
             report = validate_built_native_candles(
                 aggregate_candles(five, interval=interval),
@@ -246,6 +255,20 @@ def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: Dataset
         error_type=manifest_health.error_type or cache_health.error_type,
         message=manifest_health.message or cache_health.message,
         warnings=_merge_warnings(manifest_health.warnings, cache_health.warnings),
+    )
+
+
+def _not_published_health(symbol: str, interval: str, path: Path) -> DatasetHealth:
+    return DatasetHealth(
+        key=DatasetKey(symbol, interval),
+        availability=AvailabilityState.MISSING,
+        integrity=IntegrityState.INVALID,
+        freshness=FreshnessState.UNKNOWN,
+        reasons=(HealthReason.NOT_PUBLISHED,),
+        rows=0,
+        first_timestamp_ms=None,
+        last_timestamp_ms=None,
+        source_file=path,
     )
 
 
@@ -353,3 +376,11 @@ def _merge_warnings(*groups: tuple[str, ...]) -> tuple[str, ...]:
             if warning not in values:
                 values.append(warning)
     return tuple(values)
+
+
+def _has_validation_inputs(health: DatasetHealth) -> bool:
+    return (
+        health.availability == AvailabilityState.AVAILABLE
+        and health.integrity == IntegrityState.VALID
+        and health.rows > 0
+    )

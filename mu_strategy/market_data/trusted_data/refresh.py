@@ -299,13 +299,13 @@ class RefreshTrustedMarketData:
         candles_by_key: dict[tuple[str, str], list[Candle]],
     ) -> None:
         base_health = datasets.get((symbol, "5m"))
-        if base_health is None or not base_health.is_usable:
+        if base_health is None or not _has_validation_inputs(base_health):
             return
         five = candles_by_key.get((symbol, "5m")) or []
         for interval in ("15m", "1h"):
             key = (symbol, interval)
             native_health = datasets.get(key)
-            if native_health is None or not native_health.is_usable:
+            if native_health is None or not _has_validation_inputs(native_health):
                 continue
             report = validate_built_native_candles(
                 aggregate_candles(five, interval=interval),
@@ -429,3 +429,11 @@ def _dedupe_tickers(tickers: list[dict]) -> list[dict]:
     for ticker in tickers:
         by_symbol.setdefault(str(ticker["inst_id"]), ticker)
     return list(by_symbol.values())
+
+
+def _has_validation_inputs(health: DatasetHealth) -> bool:
+    return (
+        health.availability == AvailabilityState.AVAILABLE
+        and health.integrity == IntegrityState.VALID
+        and health.rows > 0
+    )
