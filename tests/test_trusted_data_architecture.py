@@ -674,19 +674,20 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 return_value=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             ):
                 with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=_fake_fetcher):
-                    exit_code = main(
-                        [
-                            "--limit",
-                            "1",
-                            "--days",
-                            "1",
-                            "--data-dir",
-                            str(data_dir),
-                            "--html-output",
-                            str(html_output),
-                        ],
-                        stdout=_Sink(),
-                    )
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=3_600_000):
+                        exit_code = main(
+                            [
+                                "--limit",
+                                "1",
+                                "--days",
+                                "1",
+                                "--data-dir",
+                                str(data_dir),
+                                "--html-output",
+                                str(html_output),
+                            ],
+                            stdout=_Sink(),
+                        )
 
             manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
