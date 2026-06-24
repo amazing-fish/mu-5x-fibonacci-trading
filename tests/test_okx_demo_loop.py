@@ -446,6 +446,32 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("market_data_stale", result["scans"][0]["reason"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
+    def test_run_once_blocks_legacy_bundle_when_candles_are_stale(self):
+        broker = StubBroker()
+        stale_bundle = _legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_001):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=False,
+                    max_open_positions=3,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=broker,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: stale_bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail("stale legacy data must not be scanned"),
+            )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
+        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
     def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
         stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
 
@@ -992,6 +1018,18 @@ def _stale_bundle(symbol: str) -> CandleBundle:
         files_by_interval={},
         days=28,
         statuses_by_interval=statuses,
+    )
+
+
+def _legacy_bundle(symbol: str, *, last_open_time_ms: int) -> CandleBundle:
+    return CandleBundle(
+        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
+        candles_by_interval={
+            "15m": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        },
+        files_by_interval={},
+        days=28,
     )
 
 

@@ -10,7 +10,7 @@ from typing import Any, Callable
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
+from mu_strategy.market_data.trusted_data.contracts import FreshnessState, SystemClock, TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -144,6 +144,7 @@ def run_once(
             data_error = _market_data_freshness_error(
                 symbol=ticker.inst_id,
                 bundle=bundle,
+                max_staleness_bars=config.max_candle_staleness_bars,
             )
             if data_error is not None:
                 data_errors.append(data_error)
@@ -514,6 +515,7 @@ def _market_data_freshness_error(
     *,
     symbol: str,
     bundle: CandleBundle,
+    max_staleness_bars: int,
 ) -> dict[str, Any] | None:
     status_error = _market_data_status_error(symbol=symbol, bundle=bundle)
     if status_error is not None:
@@ -527,6 +529,13 @@ def _market_data_freshness_error(
                 "latest_open_time_ms": None,
                 "source_file": str(bundle.files_by_interval.get(interval, "")),
             }
+    legacy_staleness_error = _legacy_market_data_staleness_error(
+        symbol=symbol,
+        bundle=bundle,
+        max_staleness_bars=max_staleness_bars,
+    )
+    if legacy_staleness_error is not None:
+        return legacy_staleness_error
     return None
 
 
@@ -564,6 +573,40 @@ def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str,
             "message": getattr(status, "message", None),
             "latest_open_time_ms": getattr(status, "last_timestamp_ms", None),
             "source_file": str(getattr(status, "source_file", "")),
+        }
+    return None
+
+
+def _legacy_market_data_staleness_error(
+    *,
+    symbol: str,
+    bundle: CandleBundle,
+    max_staleness_bars: int,
+) -> dict[str, Any] | None:
+    if getattr(bundle, "trust_decision", None) is not None:
+        return None
+    if getattr(bundle, "statuses_by_interval", None):
+        return None
+    policy = FreshnessPolicy(max_staleness_bars=max_staleness_bars)
+    observed_at_ms = SystemClock().now_ms()
+    for interval, candles in bundle.candles_by_interval.items():
+        latest_open_time_ms = max(candle.open_time_ms for candle in candles)
+        assessment = policy.assess(
+            now_ms=observed_at_ms,
+            interval=interval,
+            last_confirmed_open_time_ms=latest_open_time_ms,
+        )
+        if assessment.state == FreshnessState.FRESH:
+            continue
+        return {
+            "symbol": symbol,
+            "reason": "market_data_stale" if assessment.state == FreshnessState.STALE else "market_data_invalid",
+            "interval": interval,
+            "status_reason": assessment.reason.value,
+            "error_type": None,
+            "message": None,
+            "latest_open_time_ms": latest_open_time_ms,
+            "source_file": str(bundle.files_by_interval.get(interval, "")),
         }
     return None
 

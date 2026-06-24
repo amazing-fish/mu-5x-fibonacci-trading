@@ -515,7 +515,7 @@ def _refresh_outcome(datasets: dict[tuple[str, str], DatasetHealth]) -> RefreshR
     if valid_count == len(datasets):
         return RefreshRunOutcome.SUCCESS
     if valid_count == 0:
-        return RefreshRunOutcome.FAILED if len(datasets) == 1 else RefreshRunOutcome.PARTIAL
+        return RefreshRunOutcome.FAILED
     return RefreshRunOutcome.PARTIAL
 
 

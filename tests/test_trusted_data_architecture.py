@@ -120,7 +120,7 @@ class TrustedDataValidationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
+        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
         base_health = run.datasets[("BTC-USDT-SWAP", "5m")]
         native_health = run.datasets[("BTC-USDT-SWAP", "15m")]
         self.assertEqual(HealthReason.TIMESTAMP_GAP, base_health.primary_reason)
@@ -983,6 +983,32 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
         self.assertFalse(run.datasets[("BTC-USDT-SWAP", "15m")].is_usable)
         self.assertTrue(run.datasets[("ETH-USDT-SWAP", "15m")].is_usable)
+
+    def test_all_invalid_materialized_datasets_are_failed_not_partial(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        provider = _Provider(
+            ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            fail_history={("BTC-USDT-SWAP", "5m"), ("BTC-USDT-SWAP", "15m")},
+        )
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m", "15m"),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
+        self.assertEqual("failed", manifest["outcome"])
+        self.assertEqual("invalid", manifest["status"])
 
     def test_refresh_still_runs_built_native_validation_for_stale_structural_inputs(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason

@@ -178,7 +178,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
+        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
         health = run.datasets[(SYMBOL, "15m")]
         self.assertFalse(health.validation.ok)
         self.assertEqual(HealthReason.MISSING_IN_BUILT, health.validation.reason)
