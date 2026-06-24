@@ -81,7 +81,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Plan orders without private account calls or placement.")
     parser.add_argument("--confirm-demo-orders", action="store_true", help="Allow real OKX demo trading order placement.")
     parser.add_argument("--interval-seconds", type=int, default=300)
-    parser.add_argument("--limit", type=int, default=10, help="Trusted manifest universe limit. Use 0 for watchlist-only; must be non-negative.")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help=(
+            "Trusted manifest universe limit per bucket: up to N crypto symbols plus up to N stock-token symbols. "
+            "Use 0 for watchlist-only; must be non-negative."
+        ),
+    )
     parser.add_argument("--days", type=int, default=28)
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument(

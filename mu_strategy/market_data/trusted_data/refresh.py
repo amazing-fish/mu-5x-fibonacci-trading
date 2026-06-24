@@ -334,7 +334,7 @@ class RefreshTrustedMarketData:
                         reason=validation.reason,
                         validation=validation,
                     )
-                    candles_by_key[key] = []
+                    candles_by_key[key] = candles if validation.reason == HealthReason.TIMESTAMP_GAP else []
                     continue
                 self.store.write_csv(candles, candidate.path)
                 freshness = self.freshness_policy.assess(
@@ -382,19 +382,21 @@ class RefreshTrustedMarketData:
         candles_by_key: dict[tuple[str, str], list[Candle]],
     ) -> None:
         base_health = datasets.get((symbol, "5m"))
-        if base_health is None or not _has_validation_inputs(base_health):
+        if base_health is None or not _has_built_native_validation_inputs(base_health):
             return
         five = candles_by_key.get((symbol, "5m")) or []
         for interval in ("15m", "1h"):
             key = (symbol, interval)
             native_health = datasets.get(key)
-            if native_health is None or not _has_validation_inputs(native_health):
+            if native_health is None or not _has_built_native_validation_inputs(native_health):
                 continue
             report = validate_built_native_candles(
                 aggregate_candles(five, interval=interval),
                 candles_by_key.get(key) or [],
                 interval=interval,
             )
+            if report.ok and native_health.integrity != IntegrityState.VALID:
+                continue
             datasets[key] = replace(
                 native_health,
                 integrity=IntegrityState.VALID if report.ok else IntegrityState.INVALID,
@@ -497,7 +499,7 @@ def _refresh_outcome(datasets: dict[tuple[str, str], DatasetHealth]) -> RefreshR
     if valid_count == len(datasets):
         return RefreshRunOutcome.SUCCESS
     if valid_count == 0:
-        return RefreshRunOutcome.FAILED
+        return RefreshRunOutcome.FAILED if len(datasets) == 1 else RefreshRunOutcome.PARTIAL
     return RefreshRunOutcome.PARTIAL
 
 
@@ -526,4 +528,15 @@ def _has_validation_inputs(health: DatasetHealth) -> bool:
         health.availability == AvailabilityState.AVAILABLE
         and health.integrity == IntegrityState.VALID
         and health.rows > 0
+    )
+
+
+def _has_built_native_validation_inputs(health: DatasetHealth) -> bool:
+    if _has_validation_inputs(health):
+        return True
+    return (
+        health.availability == AvailabilityState.AVAILABLE
+        and health.rows > 0
+        and health.validation is not None
+        and health.validation.reason == HealthReason.TIMESTAMP_GAP
     )

@@ -312,12 +312,19 @@ def _tickers_from_universe_snapshot(snapshot: UniverseSnapshot, *, limit: int) -
     limit = validate_universe_limit(limit)
     if limit == 0:
         return []
-    rows = [*snapshot.crypto_top, *snapshot.stock_token_top]
+    crypto = _tickers_from_universe_rows(snapshot.crypto_top, limit=limit)
+    stocks = _tickers_from_universe_rows(snapshot.stock_token_top, limit=limit)
+    return _dedupe_manifest_tickers([*crypto, *stocks])
+
+
+def _tickers_from_universe_rows(rows: tuple[dict, ...], *, limit: int) -> list[OKXSwapTicker]:
+    limit = validate_universe_limit(limit)
+    if limit == 0:
+        return []
     tickers: list[OKXSwapTicker] = []
-    seen: set[str] = set()
     for row in rows:
         inst_id = str(row.get("inst_id") or row.get("instId") or "")
-        if not inst_id or inst_id in seen:
+        if not inst_id:
             continue
         tickers.append(
             OKXSwapTicker(
@@ -327,10 +334,20 @@ def _tickers_from_universe_snapshot(snapshot: UniverseSnapshot, *, limit: int) -
                 source=str(row.get("source") or "trusted_manifest"),
             )
         )
-        seen.add(inst_id)
         if len(tickers) >= limit:
             break
     return tickers
+
+
+def _dedupe_manifest_tickers(tickers: list[OKXSwapTicker]) -> list[OKXSwapTicker]:
+    deduped: list[OKXSwapTicker] = []
+    seen: set[str] = set()
+    for ticker in tickers:
+        if ticker.inst_id in seen:
+            continue
+        deduped.append(ticker)
+        seen.add(ticker.inst_id)
+    return deduped
 
 
 def _load_universe(

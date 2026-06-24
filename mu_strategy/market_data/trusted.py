@@ -40,6 +40,7 @@ class CandleValidationResult:
     missing_in_built: list[int] = field(default_factory=list)
     missing_in_native: list[int] = field(default_factory=list)
     misaligned_timestamps: list[int] = field(default_factory=list)
+    timestamp_gaps: list[dict[str, int]] = field(default_factory=list)
     value_mismatches: list[dict[str, int | float | str]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -181,6 +182,7 @@ def _validation_result_from_report(report: ValidationReport) -> CandleValidation
         missing_in_built=list(report.missing_in_built),
         missing_in_native=list(report.missing_in_native),
         misaligned_timestamps=list(report.misaligned_timestamps),
+        timestamp_gaps=[dict(value) for value in report.timestamp_gaps],
         value_mismatches=[dict(value) for value in report.value_mismatches],
     )
 

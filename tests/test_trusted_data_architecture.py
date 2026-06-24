@@ -40,6 +40,140 @@ class TrustedDataPolicyTests(unittest.TestCase):
         self.assertEqual("stale_by_clock", stale.reason.value)
 
 
+class TrustedDataValidationTests(unittest.TestCase):
+    def test_normalization_rejects_missing_five_minute_candle_with_diagnostics(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, ValidationReport
+        from mu_strategy.market_data.trusted_data.validation import normalize_and_validate_candles
+
+        candles = _constant_candles((0, 600_000))
+
+        ordered, report = normalize_and_validate_candles(candles, interval="5m")
+
+        expected_gap = {
+            "previous_timestamp_ms": 0,
+            "current_timestamp_ms": 600_000,
+            "expected_interval_ms": 300_000,
+            "actual_interval_ms": 600_000,
+            "missing_count": 1,
+        }
+        self.assertEqual([0, 600_000], [candle.open_time_ms for candle in ordered])
+        self.assertFalse(report.ok)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, report.reason)
+        self.assertEqual((expected_gap,), getattr(report, "timestamp_gaps", ()))
+        payload = report.to_dict()
+        self.assertEqual([expected_gap], payload.get("timestamp_gaps"))
+        self.assertEqual((expected_gap,), getattr(ValidationReport.from_dict(payload), "timestamp_gaps", ()))
+
+    def test_normalization_rejects_missing_fifteen_minute_and_one_hour_candles(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.validation import normalize_and_validate_candles
+
+        cases = (
+            ("15m", (0, 1_800_000), 900_000),
+            ("1h", (0, 7_200_000), 3_600_000),
+        )
+        for interval, timestamps, expected_ms in cases:
+            with self.subTest(interval=interval):
+                _, report = normalize_and_validate_candles(_constant_candles(timestamps), interval=interval)
+
+                self.assertFalse(report.ok)
+                self.assertEqual(HealthReason.TIMESTAMP_GAP, report.reason)
+                self.assertEqual(expected_ms, getattr(report, "timestamp_gaps", ({},))[0].get("expected_interval_ms"))
+                self.assertEqual(1, getattr(report, "timestamp_gaps", ({},))[0].get("missing_count"))
+
+    def test_normalization_allows_continuous_and_deduped_candles(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.validation import normalize_and_validate_candles
+
+        candles = [*_constant_candles((0, 300_000)), _constant_candles((300_000,))[0]]
+
+        ordered, report = normalize_and_validate_candles(candles, interval="5m")
+
+        self.assertTrue(report.ok)
+        self.assertEqual(HealthReason.OK, report.reason)
+        self.assertEqual([0, 300_000], [candle.open_time_ms for candle in ordered])
+
+    def test_matching_holes_are_blocked_by_single_interval_normalization(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            if interval == "5m":
+                return _constant_candles((0, 300_000, 600_000, 1_800_000, 2_100_000, 2_400_000))
+            if interval == "15m":
+                return [Candle(0, 100.0, 101.0, 99.0, 100.0, 30.0), Candle(1_800_000, 100.0, 101.0, 99.0, 100.0, 30.0)]
+            raise AssertionError(interval)
+
+        provider = _Provider(
+            ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            history_fetcher=fetch_history,
+        )
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+
+        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
+        base_health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        native_health = run.datasets[("BTC-USDT-SWAP", "15m")]
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, base_health.primary_reason)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, base_health.validation.reason)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, native_health.primary_reason)
+
+    def test_refresh_command_rejects_and_does_not_publish_holey_candles(self):
+        from mu_strategy.commands.refresh_market_data import main
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            self.assertEqual("5m", interval)
+            return _constant_candles((0, 600_000))
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            stock_config = Path(tmp) / "stock.json"
+            stock_config.write_text("[]", encoding="utf-8")
+            stdout = _TextSink()
+            with patch(
+                "mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers",
+                return_value=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            ):
+                with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=fetch_history):
+                    exit_code = main(
+                        [
+                            "--limit",
+                            "1",
+                            "--days",
+                            "1",
+                            "--interval",
+                            "5m",
+                            "--data-dir",
+                            str(data_dir),
+                            "--stock-token-config",
+                            str(stock_config),
+                            "--html-output",
+                            str(Path(tmp) / "health.html"),
+                        ],
+                        stdout=stdout,
+                    )
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            csv_path = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
+            command_result = json.loads(stdout.text)
+
+        self.assertNotEqual(0, exit_code)
+        self.assertFalse(command_result["usable"])
+        self.assertEqual("failed", command_result["outcome"])
+        self.assertEqual("invalid", command_result["status"])
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("timestamp_gap", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
+        self.assertFalse(csv_path.exists())
+
+
 class TrustedDataStoreLoadTests(unittest.TestCase):
     def test_load_missing_and_malformed_manifest_fail_closed_with_distinct_reasons(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -344,6 +478,29 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertTrue(health.validation.ok)
         self.assertEqual(HealthReason.OK, health.validation.reason)
         self.assertEqual((), health.validation.warnings)
+
+    def test_load_path_blocks_manifest_csv_with_internal_timestamp_gap(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            store = TrustedDataStore(data_dir=data_dir)
+            write_csv(_constant_candles((0, 1_800_000)), store.cache_path("MU-USDT-SWAP", "15m"))
+
+            bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, bundle.health_by_interval["15m"].primary_reason)
+        self.assertFalse(bundle.health_by_interval["15m"].validation.ok)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, bundle.health_by_interval["15m"].validation.reason)
 
     def test_malformed_schema_v2_fail_closed(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -1054,7 +1211,165 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         )
 
         self.assertEqual([], _tickers_from_universe_snapshot(snapshot, limit=0))
-        self.assertEqual(["BTC-USDT-SWAP"], [ticker.inst_id for ticker in _tickers_from_universe_snapshot(snapshot, limit=1)])
+        self.assertEqual(
+            ["BTC-USDT-SWAP", "MU-USDT-SWAP"],
+            [ticker.inst_id for ticker in _tickers_from_universe_snapshot(snapshot, limit=1)],
+        )
+
+    def test_manifest_universe_limit_applies_per_bucket(self):
+        from mu_strategy.demo_trading import _tickers_from_universe_snapshot
+        from mu_strategy.market_data.trusted_data.contracts import UniverseSnapshot
+
+        snapshot = UniverseSnapshot(
+            crypto_top=tuple(
+                {"inst_id": f"CRYPTO-{index}-USDT-SWAP", "last": index, "volume_ccy_24h": 100 - index, "source": "top"}
+                for index in range(10)
+            ),
+            stock_token_top=tuple(
+                {"inst_id": f"STOCK-{index}-USDT-SWAP", "last": index, "volume_ccy_24h": 10 - index, "source": "stock_token"}
+                for index in range(3)
+            ),
+        )
+
+        tickers = _tickers_from_universe_snapshot(snapshot, limit=10)
+
+        self.assertEqual(13, len(tickers))
+        self.assertEqual([f"STOCK-{index}-USDT-SWAP" for index in range(3)], [ticker.inst_id for ticker in tickers[-3:]])
+
+    def test_manifest_universe_limit_can_return_ten_crypto_plus_ten_stock_tokens(self):
+        from mu_strategy.demo_trading import _tickers_from_universe_snapshot
+        from mu_strategy.market_data.trusted_data.contracts import UniverseSnapshot
+
+        snapshot = UniverseSnapshot(
+            crypto_top=tuple({"inst_id": f"CRYPTO-{index}-USDT-SWAP"} for index in range(10)),
+            stock_token_top=tuple({"inst_id": f"STOCK-{index}-USDT-SWAP"} for index in range(10)),
+        )
+
+        tickers = _tickers_from_universe_snapshot(snapshot, limit=10)
+
+        self.assertEqual(20, len(tickers))
+        self.assertEqual([f"CRYPTO-{index}-USDT-SWAP" for index in range(10)], [ticker.inst_id for ticker in tickers[:10]])
+        self.assertEqual([f"STOCK-{index}-USDT-SWAP" for index in range(10)], [ticker.inst_id for ticker in tickers[10:]])
+
+    def test_manifest_universe_small_limit_keeps_each_bucket_order(self):
+        from mu_strategy.demo_trading import _tickers_from_universe_snapshot
+        from mu_strategy.market_data.trusted_data.contracts import UniverseSnapshot
+
+        snapshot = UniverseSnapshot(
+            crypto_top=tuple({"inst_id": f"CRYPTO-{index}-USDT-SWAP"} for index in range(5)),
+            stock_token_top=tuple({"inst_id": f"STOCK-{index}-USDT-SWAP"} for index in range(5)),
+        )
+
+        tickers = _tickers_from_universe_snapshot(snapshot, limit=2)
+
+        self.assertEqual(
+            ["CRYPTO-0-USDT-SWAP", "CRYPTO-1-USDT-SWAP", "STOCK-0-USDT-SWAP", "STOCK-1-USDT-SWAP"],
+            [ticker.inst_id for ticker in tickers],
+        )
+
+    def test_manifest_universe_dedupes_across_buckets_after_bucket_limits(self):
+        from mu_strategy.demo_trading import _tickers_from_universe_snapshot
+        from mu_strategy.market_data.trusted_data.contracts import UniverseSnapshot
+
+        snapshot = UniverseSnapshot(
+            crypto_top=(
+                {"inst_id": "BTC-USDT-SWAP", "source": "top"},
+                {"inst_id": "ETH-USDT-SWAP", "source": "top"},
+            ),
+            stock_token_top=(
+                {"inst_id": "BTC-USDT-SWAP", "source": "stock_token"},
+                {"inst_id": "MU-USDT-SWAP", "source": "stock_token"},
+            ),
+        )
+
+        tickers = _tickers_from_universe_snapshot(snapshot, limit=2)
+
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP", "MU-USDT-SWAP"], [ticker.inst_id for ticker in tickers])
+
+    def test_demo_dry_run_scans_crypto_and_stock_token_manifest_symbols(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+
+        scanned = []
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="BTC-USDT-SWAP",
+                days=1,
+                universe_symbols=("BTC-USDT-SWAP",),
+                stock_token_symbols=("MU-USDT-SWAP",),
+            )
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                universe_symbols=("BTC-USDT-SWAP",),
+                stock_token_symbols=("MU-USDT-SWAP",),
+            )
+
+            with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                result = run_once(
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                    broker=None,
+                    scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
+                )
+
+        self.assertEqual(["BTC-USDT-SWAP", "MU-USDT-SWAP"], [item["inst_id"] for item in result["universe"]])
+        self.assertEqual(["BTC-USDT-SWAP", "MU-USDT-SWAP"], scanned)
+
+    def test_demo_confirmed_mode_keeps_stock_token_when_crypto_bucket_is_full(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+
+        scanned = []
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for symbol in ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "MU-USDT-SWAP"):
+                _write_manifest_and_caches(
+                    data_dir,
+                    symbol=symbol,
+                    days=1,
+                    universe_symbols=("BTC-USDT-SWAP", "ETH-USDT-SWAP"),
+                    stock_token_symbols=("MU-USDT-SWAP",),
+                )
+            with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                result = run_once(
+                    DemoTradingConfig(universe_limit=2, dry_run=False, data_dir=data_dir, watchlist_symbols=()),
+                    broker=_EmptyBroker(),
+                    scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
+                )
+
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP", "MU-USDT-SWAP"], [item["inst_id"] for item in result["universe"]])
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP", "MU-USDT-SWAP"], scanned)
+        self.assertEqual([], result["orders"])
+
+    def test_demo_watchlist_duplicate_is_not_scanned_twice(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+
+        scanned = []
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                universe_symbols=("BTC-USDT-SWAP",),
+                stock_token_symbols=("MU-USDT-SWAP",),
+            )
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="BTC-USDT-SWAP",
+                days=1,
+                universe_symbols=("BTC-USDT-SWAP",),
+                stock_token_symbols=("MU-USDT-SWAP",),
+            )
+            with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                run_once(
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=("MU-USDT-SWAP",)),
+                    broker=None,
+                    scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
+                )
+
+        self.assertEqual(["BTC-USDT-SWAP", "MU-USDT-SWAP"], scanned)
 
     def test_trusted_manifest_universe_provider_limit_zero_returns_empty_without_manifest(self):
         from mu_strategy.demo_trading import trusted_manifest_universe_provider
@@ -1191,6 +1506,34 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
         self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
 
+    def test_demo_blocks_timestamp_gap_before_scanner(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                universe_symbols=("MU-USDT-SWAP",),
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            write_csv(_constant_candles((0, 1_800_000)), store.cache_path("MU-USDT-SWAP", "15m"))
+
+            with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                result = run_once(
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                    broker=None,
+                    scanner=lambda *args, **kwargs: self.fail("scanner must not run for timestamp_gap data"),
+                )
+
+        self.assertEqual([], result["orders"])
+        self.assertEqual([], [scan for scan in result["scans"] if scan["action"] == "enter"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("timestamp_gap", result["data_errors"][0]["status_reason"])
+
 
 def _write_manifest_and_caches(
     data_dir: Path,
@@ -1203,6 +1546,7 @@ def _write_manifest_and_caches(
     freshness: str = "fresh",
     run_id: str = "run-1",
     universe_symbols: tuple[str, ...] | None = None,
+    stock_token_symbols: tuple[str, ...] | None = None,
 ) -> dict:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
@@ -1252,6 +1596,10 @@ def _write_manifest_and_caches(
         {"inst_id": item, "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}
         for item in (universe_symbols or ())
     ]
+    stock_token_rows = [
+        {"inst_id": item, "last": 100.0, "volume_ccy_24h": 10.0, "source": "stock_token"}
+        for item in (stock_token_symbols or ())
+    ]
     manifest = {
         "schema_version": 2,
         "run_id": run_id,
@@ -1261,7 +1609,7 @@ def _write_manifest_and_caches(
         "completed_at_ms": 0,
         "requested_intervals": ["15m", "1h"],
         "effective_intervals": ["5m", "15m", "1h"],
-        "universes": {"crypto_top": universe_rows, "stock_token_top": []},
+        "universes": {"crypto_top": universe_rows, "stock_token_top": stock_token_rows},
         "symbols": symbols,
         "warnings": [],
         "cycle_error": {"error_type": "TimeoutError", "message": "blocked"} if outcome == "failed" else None,
@@ -1287,6 +1635,10 @@ def _write_orphan_caches(data_dir: Path, *, symbol: str, days: int) -> None:
     }
     for interval, candles in by_interval.items():
         store.write_csv(candles, store.cache_path(symbol, interval))
+
+
+def _constant_candles(timestamps: tuple[int, ...]) -> list[Candle]:
+    return [Candle(timestamp, 100.0, 101.0, 99.0, 100.0, 10.0) for timestamp in timestamps]
 
 
 def _health_state(
@@ -1427,6 +1779,22 @@ class _Sink:
         return None
 
 
+class _TextSink:
+    def __init__(self):
+        self.values = []
+
+    def write(self, value):
+        self.values.append(value)
+        return len(value)
+
+    def flush(self):
+        return None
+
+    @property
+    def text(self):
+        return "".join(self.values)
+
+
 class _Provider:
     def __init__(self, *, ticker_rows=None, fail_history=None, history_fetcher=None):
         self.ticker_rows = ticker_rows or []
@@ -1460,6 +1828,14 @@ class _TickerFailureProvider:
 
     def fetch_incremental(self, symbol, interval, *, since_time_ms):
         raise AssertionError("must not fetch incremental")
+
+
+class _EmptyBroker:
+    def get_positions(self, **kwargs):
+        return {"code": "0", "data": []}
+
+    def get_open_orders(self, **kwargs):
+        return {"code": "0", "data": []}
 
 
 def _candles(interval: str) -> list[Candle]:

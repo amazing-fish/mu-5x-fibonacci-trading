@@ -66,6 +66,7 @@ class HealthReason(Enum):
     BUILT_SAMPLE_COUNT_BELOW_MINIMUM = "built_sample_count_below_minimum"
     NATIVE_SAMPLE_COUNT_BELOW_MINIMUM = "native_sample_count_below_minimum"
     TIMESTAMP_MISALIGNED = "timestamp_misaligned"
+    TIMESTAMP_GAP = "timestamp_gap"
     MISSING_IN_BUILT = "missing_in_built"
     MISSING_IN_NATIVE = "missing_in_native"
     OHLCV_MISMATCH = "ohlcv_mismatch"
@@ -113,6 +114,7 @@ class ValidationReport:
     missing_in_built: tuple[int, ...] = ()
     missing_in_native: tuple[int, ...] = ()
     misaligned_timestamps: tuple[int, ...] = ()
+    timestamp_gaps: tuple[dict[str, int], ...] = ()
     value_mismatches: tuple[dict[str, int | float | str], ...] = ()
     warnings: tuple[str, ...] = ()
 
@@ -123,6 +125,7 @@ class ValidationReport:
             "missing_in_built": list(self.missing_in_built),
             "missing_in_native": list(self.missing_in_native),
             "misaligned_timestamps": list(self.misaligned_timestamps),
+            "timestamp_gaps": [dict(value) for value in self.timestamp_gaps],
             "value_mismatches": list(self.value_mismatches),
             "warnings": list(self.warnings),
         }
@@ -137,6 +140,7 @@ class ValidationReport:
             missing_in_built=tuple(int(value) for value in payload.get("missing_in_built") or ()),
             missing_in_native=tuple(int(value) for value in payload.get("missing_in_native") or ()),
             misaligned_timestamps=tuple(int(value) for value in payload.get("misaligned_timestamps") or ()),
+            timestamp_gaps=tuple(dict(value) for value in payload.get("timestamp_gaps") or ()),
             value_mismatches=tuple(dict(value) for value in payload.get("value_mismatches") or ()),
             warnings=tuple(str(value) for value in payload.get("warnings") or ()),
         )

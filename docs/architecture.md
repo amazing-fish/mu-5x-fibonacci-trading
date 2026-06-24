@@ -147,7 +147,7 @@ Boundaries:
 - Missing credentials are acceptable in dry-run and fail before order submission in confirmed mode.
 - Dry-run and confirmed demo use the same trusted gate. Invalid, stale, missing, malformed, or failed-run trusted data blocks scanner calls and order generation.
 - A scan cycle carries the trusted `run_id` from the loaded manifest into scan payloads when available.
-- Dynamic universe limit semantics are explicit: `limit > 0` returns at most that many manifest universe symbols, `limit == 0` means watchlist-only, and `limit < 0` is rejected.
+- Dynamic universe limit semantics are explicit: in the default trusted-manifest mode, `limit > 0` returns up to that many crypto universe symbols plus up to that many stock-token universe symbols, `limit == 0` means watchlist-only, and `limit < 0` is rejected.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, or risk kill-switches.
 - If no `planned` order exists, the dashboard explicitly reports no order suggestion and no cancel target.
 

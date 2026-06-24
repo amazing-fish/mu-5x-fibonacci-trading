@@ -12,6 +12,7 @@ def normalize_and_validate_candles(
     *,
     interval: str,
     max_gap_pct: float = 0.02,
+    max_timestamp_gaps: int = 20,
 ) -> tuple[list[Candle], ValidationReport]:
     ordered = dedupe_candles(candles)
     if not ordered:
@@ -20,6 +21,24 @@ def normalize_and_validate_candles(
     misaligned = tuple(candle.open_time_ms for candle in ordered if candle.open_time_ms % interval_ms != 0)
     if misaligned:
         return ordered, ValidationReport(False, HealthReason.TIMESTAMP_MISALIGNED, misaligned_timestamps=misaligned)
+    timestamp_gaps: list[dict[str, int]] = []
+    for previous, current in zip(ordered, ordered[1:]):
+        delta_ms = current.open_time_ms - previous.open_time_ms
+        if delta_ms == interval_ms:
+            continue
+        timestamp_gaps.append(
+            {
+                "previous_timestamp_ms": previous.open_time_ms,
+                "current_timestamp_ms": current.open_time_ms,
+                "expected_interval_ms": interval_ms,
+                "actual_interval_ms": delta_ms,
+                "missing_count": max(0, (delta_ms // interval_ms) - 1),
+            }
+        )
+        if len(timestamp_gaps) >= max_timestamp_gaps:
+            break
+    if timestamp_gaps:
+        return ordered, ValidationReport(False, HealthReason.TIMESTAMP_GAP, timestamp_gaps=tuple(timestamp_gaps))
     for candle in ordered:
         if (
             candle.high < max(candle.open, candle.close)
