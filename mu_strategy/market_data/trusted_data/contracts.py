@@ -58,7 +58,9 @@ class HealthReason(Enum):
     RUN_PARTIAL = "run_partial"
     MANIFEST_INVALID = "manifest_invalid"
     MANIFEST_STALE = "manifest_stale"
+    FRESHNESS_UNKNOWN = "freshness_unknown"
     STALE_BY_CLOCK = "stale_by_clock"
+    FUTURE_TIMESTAMP = "future_timestamp"
     BUILT_EMPTY = "built_empty"
     NATIVE_EMPTY = "native_empty"
     BUILT_SAMPLE_COUNT_BELOW_MINIMUM = "built_sample_count_below_minimum"
@@ -170,7 +172,7 @@ class DatasetHealth:
         return (
             self.availability == AvailabilityState.AVAILABLE
             and self.integrity == IntegrityState.VALID
-            and self.freshness != FreshnessState.STALE
+            and self.freshness == FreshnessState.FRESH
             and self.rows > 0
         )
 
@@ -179,6 +181,11 @@ class DatasetHealth:
         return self.reasons[0] if self.reasons else HealthReason.OK
 
     def to_dict(self) -> dict[str, Any]:
+        reason = self.primary_reason
+        if reason == HealthReason.OK and self.freshness == FreshnessState.UNKNOWN:
+            reason = HealthReason.FRESHNESS_UNKNOWN
+        elif reason == HealthReason.OK and self.freshness == FreshnessState.STALE:
+            reason = HealthReason.STALE_BY_CLOCK
         return {
             "symbol": self.key.symbol,
             "interval": self.key.interval,
@@ -192,8 +199,8 @@ class DatasetHealth:
             "updated_at_ms": self.updated_at_ms,
             "source_file": str(self.source_file),
             "is_valid": self.integrity == IntegrityState.VALID and self.availability == AvailabilityState.AVAILABLE,
-            "is_stale": self.freshness == FreshnessState.STALE,
-            "reason": self.primary_reason.value,
+            "is_stale": self.freshness != FreshnessState.FRESH,
+            "reason": reason.value,
             "error_type": self.error_type,
             "message": self.message,
             "warnings": list(self.warnings),
@@ -322,6 +329,25 @@ class TrustedLoadContext:
     observed_at_ms: int
 
 
+def derive_manifest_status(
+    outcome: RefreshRunOutcome,
+    datasets: dict[tuple[str, str], DatasetHealth],
+) -> ManifestStatus:
+    if outcome in {RefreshRunOutcome.FAILED, RefreshRunOutcome.PARTIAL}:
+        return ManifestStatus.INVALID
+    if not datasets:
+        return ManifestStatus.INVALID
+    if any(health.availability != AvailabilityState.AVAILABLE for health in datasets.values()):
+        return ManifestStatus.INVALID
+    if any(health.integrity != IntegrityState.VALID for health in datasets.values()):
+        return ManifestStatus.INVALID
+    if any(health.freshness == FreshnessState.UNKNOWN for health in datasets.values()):
+        return ManifestStatus.INVALID
+    if any(health.freshness == FreshnessState.STALE for health in datasets.values()):
+        return ManifestStatus.STALE
+    return ManifestStatus.OK
+
+
 @dataclass(frozen=True)
 class RefreshRun:
     run_id: str
@@ -336,15 +362,7 @@ class RefreshRun:
     cycle_error: dict[str, str] | None = None
 
     def manifest_status(self) -> str:
-        if self.outcome == RefreshRunOutcome.FAILED:
-            return "invalid"
-        if any(health.availability != AvailabilityState.AVAILABLE for health in self.datasets.values()):
-            return "invalid"
-        if any(health.integrity != IntegrityState.VALID for health in self.datasets.values()):
-            return "invalid"
-        if any(health.freshness == FreshnessState.STALE for health in self.datasets.values()):
-            return "stale"
-        return "ok"
+        return derive_manifest_status(self.outcome, self.datasets).value
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -553,14 +571,16 @@ def _validate_manifest_snapshot(snapshot: TrustedManifestSnapshot) -> None:
         raise ManifestSchemaError("manifest requested_intervals must be a subset of effective_intervals")
     if any(interval in effective for interval in ("15m", "1h")) and "5m" not in effective:
         raise ManifestSchemaError("manifest effective_intervals must include 5m when native intervals are present")
+    derived_status = derive_manifest_status(snapshot.outcome, snapshot.datasets)
+    if snapshot.status != derived_status:
+        raise ManifestSchemaError(
+            f"manifest status must match derived status: declared={snapshot.status.value}, derived={derived_status.value}"
+        )
     if snapshot.outcome == RefreshRunOutcome.FAILED and snapshot.status != ManifestStatus.INVALID:
         raise ManifestSchemaError("failed manifest outcome must have invalid status")
     if snapshot.outcome == RefreshRunOutcome.PARTIAL and snapshot.status == ManifestStatus.OK:
         raise ManifestSchemaError("partial manifest outcome cannot have ok status")
     if snapshot.outcome == RefreshRunOutcome.SUCCESS and snapshot.status == ManifestStatus.OK:
-        for health in snapshot.datasets.values():
-            if not health.is_usable:
-                raise ManifestSchemaError("success/ok manifest cannot contain unusable datasets")
         for row in [*snapshot.universe_snapshot.crypto_top, *snapshot.universe_snapshot.stock_token_top]:
             inst_id = str(row.get("inst_id") or row.get("instId") or "")
             if not inst_id:

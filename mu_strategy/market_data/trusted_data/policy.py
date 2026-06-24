@@ -46,6 +46,8 @@ class FreshnessPolicy:
             return FreshnessAssessment(FreshnessState.STALE, HealthReason.CACHE_MISSING)
         max_age_ms = interval_to_ms(interval) * max(1, self.max_staleness_bars)
         age_ms = now_ms - last_confirmed_open_time_ms
+        if age_ms < 0:
+            return FreshnessAssessment(FreshnessState.UNKNOWN, HealthReason.FUTURE_TIMESTAMP, age_ms, max_age_ms)
         if age_ms > max_age_ms:
             return FreshnessAssessment(FreshnessState.STALE, HealthReason.STALE_BY_CLOCK, age_ms, max_age_ms)
         return FreshnessAssessment(FreshnessState.FRESH, HealthReason.OK, age_ms, max_age_ms)
@@ -82,8 +84,8 @@ class TrustPolicy:
                 return TrustDecision(False, health.primary_reason)
             if health.integrity != IntegrityState.VALID and not self.allow_invalid:
                 return TrustDecision(False, health.primary_reason)
-            if health.freshness == FreshnessState.STALE and self.require_fresh:
-                return TrustDecision(False, health.primary_reason)
+            if health.freshness != FreshnessState.FRESH and self.require_fresh:
+                return TrustDecision(False, _freshness_block_reason(health))
         return TrustDecision(True, HealthReason.OK)
 
 
@@ -97,3 +99,12 @@ def research_strict_policy() -> TrustPolicy:
 
 def observe_only_policy() -> TrustPolicy:
     return TrustPolicy(name="observe_only", require_manifest_success=False, require_fresh=False, allow_invalid=True)
+
+
+def _freshness_block_reason(health: DatasetHealth) -> HealthReason:
+    reason = health.primary_reason
+    if reason != HealthReason.OK:
+        return reason
+    if health.freshness == FreshnessState.STALE:
+        return HealthReason.STALE_BY_CLOCK
+    return HealthReason.FRESHNESS_UNKNOWN

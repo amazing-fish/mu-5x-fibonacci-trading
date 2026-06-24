@@ -151,10 +151,10 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         cases = [
-            ("invalid", HealthReason.MANIFEST_INVALID),
-            ("stale", HealthReason.MANIFEST_STALE),
+            ("invalid", HealthReason.MANIFEST_INVALID, {"integrity": "invalid"}),
+            ("stale", HealthReason.MANIFEST_STALE, {"freshness": "stale"}),
         ]
-        for status, reason in cases:
+        for status, reason, health_kwargs in cases:
             with self.subTest(status=status):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
@@ -164,6 +164,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                         days=1,
                         outcome="success",
                         status=status,
+                        **health_kwargs,
                     )
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
                         LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
@@ -1198,6 +1199,8 @@ def _write_manifest_and_caches(
     days: int,
     outcome: str = "success",
     status: str = "ok",
+    integrity: str = "valid",
+    freshness: str = "fresh",
     run_id: str = "run-1",
     universe_symbols: tuple[str, ...] | None = None,
 ) -> dict:
@@ -1224,19 +1227,26 @@ def _write_manifest_and_caches(
     for interval, candles in by_interval.items():
         path = store.cache_path(symbol, interval)
         store.write_csv(candles, path)
+        reason = "ok"
+        if integrity == "invalid":
+            reason = "refresh_failed"
+        elif freshness == "stale":
+            reason = "stale_by_clock"
+        elif freshness == "unknown":
+            reason = "freshness_unknown"
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
             "interval": interval,
             "availability": "available",
-            "integrity": "valid",
-            "freshness": "fresh",
-            "reasons": ["ok"],
+            "integrity": integrity,
+            "freshness": freshness,
+            "reasons": [reason],
             "rows": len(candles),
             "first_timestamp_ms": candles[0].open_time_ms,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
             "source_file": str(path),
-            "validation": {"ok": True, "reason": "ok"},
+            "validation": {"ok": integrity == "valid", "reason": "ok" if integrity == "valid" else reason},
         }
     universe_rows = [
         {"inst_id": item, "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}

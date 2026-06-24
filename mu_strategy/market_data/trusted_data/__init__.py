@@ -17,6 +17,7 @@ from .contracts import (
     TrustedBundle,
     UniverseSnapshot,
     ValidationReport,
+    derive_manifest_status,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "TrustedBundle",
     "UniverseSnapshot",
     "ValidationReport",
+    "derive_manifest_status",
 ]
