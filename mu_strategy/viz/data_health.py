@@ -11,27 +11,38 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     for symbol, payload in sorted((manifest.get("symbols") or {}).items()):
         source = payload.get("source")
         for interval, status in sorted((payload.get("intervals") or {}).items()):
-            state = "ok" if status.get("is_valid") and not status.get("is_stale") else "bad"
+            state_label = _state_label(status)
+            state = "ok" if state_label == "fresh" else "bad"
             rows.append(
                 f"""
         <tr>
           <td>{_e(symbol)}</td>
           <td>{_e(source)}</td>
           <td>{_e(interval)}</td>
-          <td><span class="badge {state}">{_e(_state_label(status))}</span></td>
+          <td><span class="badge {state}">{_e(state_label)}</span></td>
+          <td>{_e(status.get("availability") or "-")}</td>
+          <td>{_e(status.get("integrity") or "-")}</td>
           <td class="num">{_e(status.get("rows"))}</td>
           <td>{_e(_format_time_ms(status.get("last_timestamp_ms")))}</td>
-          <td>{_e(status.get("reason"))}</td>
+          <td>{_e(status.get("reason") or _reasons_text(status))}</td>
           <td class="mono">{_e(status.get("source_file"))}</td>
         </tr>"""
             )
-    body = "\n".join(rows) if rows else '<tr><td colspan="8">暂无数据</td></tr>'
+    body = "\n".join(rows) if rows else '<tr><td colspan="10">暂无数据</td></tr>'
     universe = manifest.get("universes") or {}
     crypto_count = len(universe.get("crypto_top") or [])
     stock_count = len(universe.get("stock_token_top") or [])
     warnings = manifest.get("warnings") or []
     warning_html = "".join(f"<li>{_e(item)}</li>" for item in warnings) or "<li>无</li>"
     generated_at = _format_time_ms(manifest.get("updated_at_ms"))
+    requested = ", ".join(str(item) for item in manifest.get("requested_intervals") or manifest.get("intervals") or [])
+    effective = ", ".join(str(item) for item in manifest.get("effective_intervals") or manifest.get("intervals") or [])
+    cycle_error = manifest.get("cycle_error")
+    cycle_error_html = (
+        f"<pre>{_e(cycle_error)}</pre>"
+        if cycle_error
+        else "<p>无</p>"
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -60,21 +71,29 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
 <body>
 <main>
   <h1>OKX 数据健康看板</h1>
-  <div>生成时间：{_e(generated_at)} · 数据源：OKX public market data · 存储：CSV + manifest</div>
+  <div>生成时间：{_e(generated_at)} · 数据源：OKX public market data · 存储：CSV + JSON manifest + JSONL run log</div>
   <div class="summary">
     {_metric("状态", manifest.get("status"))}
+    {_metric("run outcome", manifest.get("outcome") or manifest.get("status"))}
+    {_metric("run_id", manifest.get("run_id") or "-")}
+    {_metric("symbols", len(manifest.get("symbols") or {}))}
     {_metric("crypto_top", crypto_count)}
     {_metric("stock_token_top", stock_count)}
-    {_metric("symbols", len(manifest.get("symbols") or {}))}
+    {_metric("requested", requested or "-")}
+    {_metric("effective", effective or "-")}
   </div>
   <section>
     <h2>Warnings</h2>
     <ul>{warning_html}</ul>
   </section>
   <section>
+    <h2>Cycle error</h2>
+    {cycle_error_html}
+  </section>
+  <section>
     <h2>Intervals</h2>
     <table>
-      <thead><tr><th>symbol</th><th>universe</th><th>interval</th><th>status</th><th>rows</th><th>latest</th><th>reason</th><th>source_file</th></tr></thead>
+      <thead><tr><th>symbol</th><th>universe</th><th>interval</th><th>freshness</th><th>availability</th><th>integrity</th><th>rows</th><th>latest</th><th>reason</th><th>source_file</th></tr></thead>
       <tbody>{body}</tbody>
     </table>
   </section>
@@ -91,11 +110,17 @@ def write_data_health_dashboard(manifest: dict[str, Any], output_path: Path) -> 
 
 
 def _state_label(status: dict[str, Any]) -> str:
+    if status.get("freshness"):
+        return str(status.get("freshness"))
     if status.get("is_stale"):
         return "stale"
     if not status.get("is_valid"):
         return "invalid"
-    return "ok"
+    return "fresh"
+
+
+def _reasons_text(status: dict[str, Any]) -> str:
+    return ", ".join(str(item) for item in status.get("reasons") or []) or "-"
 
 
 def _metric(label: str, value: Any) -> str:

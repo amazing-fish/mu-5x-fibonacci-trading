@@ -1,22 +1,38 @@
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
-from mu_strategy.market_data.cache import cached_historical, prune_candles_to_window, read_csv, validate_close_to_next_open_gaps
+from mu_strategy.market_data.cache import cached_historical
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted import (
-    DataStatus,
-    OKXHistoryFetcher,
-    OKXIncrementalFetcher,
-    TRUSTED_REQUIRED_INTERVALS,
-    aggregate_candles,
-    refresh_trusted_symbol_statuses,
-    trusted_cache_path,
-    validate_built_native_candles,
+from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.trusted_data.contracts import (
+    Clock,
+    DatasetHealth,
+    TrustDecision,
+    TrustedConsumerRefreshError,
+    TrustedLoadContext,
+    UniverseSnapshot,
 )
+from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, TrustPolicy, research_strict_policy
+from mu_strategy.market_data.trusted_data.refresh import (
+    DEFAULT_LIVE_DATA_DIR,
+    DEFAULT_INTERVALS,
+)
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import Candle
+
+
+TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
+TRUSTED_CONSUMER_REFRESH_ERROR = (
+    "trusted bundle loading is cache-only; run "
+    "python -m mu_strategy.commands.refresh_market_data "
+    "before loading trusted data"
+)
+OKXHistoryFetcher = Callable[..., list[Candle]]
+OKXIncrementalFetcher = Callable[..., list[Candle]]
 
 
 @dataclass(frozen=True)
@@ -26,6 +42,11 @@ class CandleBundle:
     files_by_interval: dict[str, Path]
     days: int
     statuses_by_interval: dict[str, DataStatus] = field(default_factory=dict)
+    run_id: str | None = None
+    trust_decision: TrustDecision | None = None
+    universe_snapshot: UniverseSnapshot | None = None
+    load_context: TrustedLoadContext | None = None
+    observed_at_ms: int | None = None
 
 
 def refresh_candle_bundle(
@@ -71,49 +92,41 @@ def refresh_trusted_candle_bundle(
     *,
     intervals: tuple[str, ...] = ("15m", "1h"),
     days: int = 28,
-    data_dir: Path = Path("data/live"),
+    data_dir: Path = DEFAULT_LIVE_DATA_DIR,
     refresh: bool = False,
     fetcher: OKXHistoryFetcher | None = None,
     incremental_fetcher: OKXIncrementalFetcher | None = None,
+    policy: TrustPolicy | None = None,
+    freshness_policy: FreshnessPolicy | None = None,
+    clock: Clock | None = None,
+    context: TrustedLoadContext | None = None,
 ) -> CandleBundle:
-    resolved = resolve_okx_swap_symbol(symbol)
-    candles_by_interval: dict[str, list[Candle]] = {}
-    files_by_interval: dict[str, Path] = {}
-    requested_intervals = tuple(dict.fromkeys(intervals))
-    validation_intervals = _validation_intervals(requested_intervals)
     if refresh:
-        statuses_by_interval = refresh_trusted_symbol_statuses(
+        raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
+    resolved = resolve_okx_swap_symbol(symbol)
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    requested_intervals = tuple(dict.fromkeys(intervals))
+    bundle = LoadTrustedBundle(store, clock=clock, freshness_policy=freshness_policy).execute(
+        LoadTrustedBundleQuery(
             resolved.inst_id,
-            intervals=validation_intervals,
+            intervals=requested_intervals,
             days=days,
-            data_dir=data_dir,
-            fetcher=fetcher,
-            incremental_fetcher=incremental_fetcher,
-        )
-    else:
-        statuses_by_interval, cached_candles = _load_trusted_cache_statuses(
-            resolved.inst_id,
-            intervals=validation_intervals,
-            days=days,
-            data_dir=data_dir,
-        )
-
-    for interval in requested_intervals:
-        status = statuses_by_interval[interval]
-        files_by_interval[interval] = status.source_file
-        if not status.is_valid:
-            candles_by_interval[interval] = []
-        elif refresh:
-            candles_by_interval[interval] = read_csv(status.source_file)
-        else:
-            candles_by_interval[interval] = cached_candles[interval]
-    return CandleBundle(
-        symbol=resolved,
-        candles_by_interval=candles_by_interval,
-        files_by_interval=files_by_interval,
-        days=days,
-        statuses_by_interval=statuses_by_interval,
+        ),
+        policy or research_strict_policy(),
+        context=context,
     )
+    return _compat_bundle(resolved, bundle)
+
+
+def trusted_bundle_error(
+    bundle: CandleBundle,
+    *,
+    required_intervals: tuple[str, ...] = TRUSTED_REQUIRED_INTERVALS,
+) -> str | None:
+    decision = getattr(bundle, "trust_decision", None)
+    if decision is not None and not decision.allowed:
+        return f"trusted data blocked: {decision.reason.value}"
+    return trusted_status_error(bundle.statuses_by_interval, required_intervals=required_intervals)
 
 
 def trusted_status_error(
@@ -132,170 +145,52 @@ def trusted_status_error(
     return None
 
 
-def _validation_intervals(intervals: tuple[str, ...]) -> tuple[str, ...]:
-    if any(interval in {"15m", "1h"} for interval in intervals):
-        return tuple(dict.fromkeys(("5m", *intervals)))
-    return intervals
+def _compat_bundle(resolved: ResolvedSymbol, bundle) -> CandleBundle:
+    statuses = {
+        interval: _data_status_from_health(health)
+        for interval, health in bundle.health_by_interval.items()
+    }
+    return CandleBundle(
+        symbol=resolved,
+        candles_by_interval=bundle.candles_by_interval,
+        files_by_interval=bundle.files_by_interval,
+        days=bundle.days,
+        statuses_by_interval=statuses,
+        run_id=bundle.run_id,
+        trust_decision=bundle.trust_decision,
+        universe_snapshot=bundle.universe_snapshot,
+        load_context=bundle.load_context,
+        observed_at_ms=bundle.load_context.observed_at_ms if bundle.load_context else None,
+    )
 
 
-def _load_trusted_cache_statuses(
-    symbol: str,
-    *,
-    intervals: tuple[str, ...],
-    days: int,
-    data_dir: Path,
-) -> tuple[dict[str, DataStatus], dict[str, list[Candle]]]:
-    statuses: dict[str, DataStatus] = {}
-    candles_by_interval: dict[str, list[Candle]] = {}
-    manifest_statuses = _load_manifest_interval_statuses(symbol, intervals=intervals, data_dir=data_dir)
-    raw_candles_by_interval: dict[str, list[Candle]] = {}
-    for interval in intervals:
-        path = trusted_cache_path(symbol, interval, data_dir=data_dir)
-        try:
-            raw_candles_by_interval[interval] = read_csv(path) if path.exists() else []
-        except Exception as exc:
-            candles_by_interval[interval] = []
-            statuses[interval] = _cache_read_failed_status(symbol, interval, path, exc)
+def _data_status_from_health(health: DatasetHealth) -> DataStatus:
+    payload = health.to_dict()
+    validation = payload.get("validation")
+    from mu_strategy.market_data.trusted import CandleValidationResult
 
-    window_end_time_ms = _trusted_cache_window_end_time_ms(raw_candles_by_interval)
-    for interval in intervals:
-        if interval in statuses:
-            continue
-        path = trusted_cache_path(symbol, interval, data_dir=data_dir)
-        try:
-            candles = prune_candles_to_window(
-                raw_candles_by_interval.get(interval) or [],
-                days=days,
-                end_time_ms=window_end_time_ms,
-            )
-            validate_close_to_next_open_gaps(candles)
-            candles_by_interval[interval] = candles
-            cache_status = _cache_status(symbol, interval, candles, path)
-            statuses[interval] = _status_with_manifest_health(cache_status, manifest_statuses.get(interval))
-        except Exception as exc:
-            candles_by_interval[interval] = []
-            statuses[interval] = _cache_read_failed_status(symbol, interval, path, exc)
-    _attach_cached_built_native_validation(statuses, candles_by_interval)
-    return statuses, candles_by_interval
-
-
-def _cache_read_failed_status(symbol: str, interval: str, path: Path, exc: Exception) -> DataStatus:
     return DataStatus(
-        symbol=symbol,
-        interval=interval,
-        rows=0,
-        first_timestamp_ms=None,
-        last_timestamp_ms=None,
-        updated_at_ms=0,
-        source_file=path,
-        is_valid=False,
-        reason="cache_read_failed",
-        error_type=type(exc).__name__,
-        message=str(exc),
-    )
-
-
-def _trusted_cache_window_end_time_ms(candles_by_interval: dict[str, list[Candle]]) -> int | None:
-    base_candles = candles_by_interval.get("5m") or []
-    if base_candles:
-        return max(candle.open_time_ms for candle in base_candles)
-    timestamps = [
-        candle.open_time_ms
-        for candles in candles_by_interval.values()
-        for candle in candles
-    ]
-    return max(timestamps) if timestamps else None
-
-
-def _status_with_manifest_health(cache_status: DataStatus, manifest_status: DataStatus | None) -> DataStatus:
-    if manifest_status is None:
-        return cache_status
-    if not manifest_status.is_valid or manifest_status.is_stale:
-        return manifest_status
-    return cache_status
-
-
-def _load_manifest_interval_statuses(
-    symbol: str,
-    *,
-    intervals: tuple[str, ...],
-    data_dir: Path,
-) -> dict[str, DataStatus]:
-    path = Path(data_dir) / "manifest.json"
-    if not path.exists():
-        return {}
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    interval_payloads = (
-        (manifest.get("symbols") or {})
-        .get(symbol, {})
-        .get("intervals", {})
-    )
-    statuses: dict[str, DataStatus] = {}
-    for interval in intervals:
-        payload = interval_payloads.get(interval)
-        if not isinstance(payload, dict):
-            continue
-        statuses[interval] = DataStatus(
-            symbol=str(payload.get("symbol") or symbol),
-            interval=str(payload.get("interval") or interval),
-            rows=int(payload.get("rows") or 0),
-            first_timestamp_ms=payload.get("first_timestamp_ms"),
-            last_timestamp_ms=payload.get("last_timestamp_ms"),
-            updated_at_ms=int(payload.get("updated_at_ms") or 0),
-            source_file=Path(payload.get("source_file") or trusted_cache_path(symbol, interval, data_dir=data_dir)),
-            is_valid=bool(payload.get("is_valid", True)),
-            is_stale=bool(payload.get("is_stale")),
-            reason=str(payload.get("reason") or "ok"),
-            error_type=payload.get("error_type"),
-            message=payload.get("message"),
-            warnings=tuple(payload.get("warnings") or ()),
+        symbol=health.key.symbol,
+        interval=health.key.interval,
+        rows=health.rows,
+        first_timestamp_ms=health.first_timestamp_ms,
+        last_timestamp_ms=health.last_timestamp_ms,
+        updated_at_ms=health.updated_at_ms,
+        source_file=health.source_file,
+        is_valid=bool(payload["is_valid"]),
+        is_stale=bool(payload["is_stale"]),
+        reason=str(payload["reason"]),
+        error_type=health.error_type,
+        message=health.message,
+        warnings=health.warnings,
+        validation=CandleValidationResult(
+            ok=bool(validation.get("ok")),
+            reason=str(validation.get("reason")),
+            missing_in_built=list(validation.get("missing_in_built") or []),
+            missing_in_native=list(validation.get("missing_in_native") or []),
+            misaligned_timestamps=list(validation.get("misaligned_timestamps") or []),
+            value_mismatches=list(validation.get("value_mismatches") or []),
         )
-    return statuses
-
-
-def _cache_status(symbol: str, interval: str, candles: list[Candle], path: Path) -> DataStatus:
-    rows = len(candles)
-    reason = "ok"
-    if not path.exists():
-        reason = "cache_missing"
-    elif not candles:
-        reason = "empty"
-    return DataStatus(
-        symbol=symbol,
-        interval=interval,
-        rows=rows,
-        first_timestamp_ms=candles[0].open_time_ms if candles else None,
-        last_timestamp_ms=candles[-1].open_time_ms if candles else None,
-        updated_at_ms=0,
-        source_file=path,
-        is_valid=rows > 0,
-        reason=reason,
+        if isinstance(validation, dict)
+        else None,
     )
-
-
-def _attach_cached_built_native_validation(
-    statuses: dict[str, DataStatus],
-    candles_by_interval: dict[str, list[Candle]],
-) -> None:
-    five_minute_status = statuses.get("5m")
-    if five_minute_status is None or not five_minute_status.is_valid:
-        return
-    five_minute = candles_by_interval.get("5m") or []
-    for interval in ("15m", "1h"):
-        native_status = statuses.get(interval)
-        if native_status is None or not native_status.is_valid:
-            continue
-        validation = validate_built_native_candles(
-            aggregate_candles(five_minute, interval=interval),
-            candles_by_interval.get(interval) or [],
-            interval=interval,
-        )
-        statuses[interval] = replace(
-            native_status,
-            is_valid=native_status.is_valid and validation.ok,
-            reason=native_status.reason if validation.ok else validation.reason,
-            validation=validation,
-        )

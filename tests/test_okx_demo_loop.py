@@ -150,6 +150,88 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual([], output["watchlist_symbols"])
         self.assertEqual(1, output["limit"])
 
+    def test_run_once_limit_zero_skips_universe_provider_and_scans_watchlist_only(self):
+        scanned = []
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=("MU-USDT-SWAP", "MU-USDT-SWAP")),
+            broker=None,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol)
+            or _scan_result(symbol, action="wait", trigger_price=None),
+        )
+
+        self.assertEqual(["MU-USDT-SWAP"], scanned)
+        self.assertEqual(["MU-USDT-SWAP"], [row["inst_id"] for row in result["universe"]])
+        self.assertEqual(["watchlist"], [row["source"] for row in result["universe"]])
+        self.assertEqual([], result["orders"])
+
+    def test_run_once_limit_zero_without_watchlist_skips_loader_scanner_and_orders(self):
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=()),
+            broker=None,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: self.fail("empty universe must not load candles"),
+            scanner=lambda *args, **kwargs: self.fail("empty universe must not scan"),
+        )
+
+        self.assertEqual("dry_run", result["mode"])
+        self.assertEqual([], result["universe"])
+        self.assertEqual([], result["scans"])
+        self.assertEqual([], result["orders"])
+
+    def test_run_once_confirmed_limit_zero_orders_only_watchlist(self):
+        broker = StubBroker()
+        scanned = []
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=False, notional_usdt=10.0, watchlist_symbols=("MU-USDT-SWAP",)),
+            broker=broker,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol)
+            or _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual(["MU-USDT-SWAP"], scanned)
+        self.assertEqual(["MU-USDT-SWAP"], [row["inst_id"] for row in result["universe"]])
+        self.assertEqual(["MU-USDT-SWAP"], [row["symbol"] for row in result["orders"]])
+        self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
+
+    def test_run_once_rejects_negative_universe_limit(self):
+        with self.assertRaisesRegex(ValueError, "universe_limit must be non-negative"):
+            DemoTradingConfig(universe_limit=-1)
+
+    def test_cli_rejects_negative_limit_before_runner(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                main(
+                    ["--once", "--dry-run", "--limit", "-1"],
+                    stdout=io.StringIO(),
+                    runner=lambda config, broker: self.fail("runner must not run"),
+                )
+
+        self.assertNotEqual(0, raised.exception.code)
+        self.assertIn("non-negative", stderr.getvalue())
+
+    def test_cli_rejects_refresh_before_runner_or_broker(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        with patch("mu_strategy.commands.okx_demo_loop.OKXRestClient", side_effect=AssertionError("broker")):
+            with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    main(
+                        ["--once", "--dry-run", "--refresh"],
+                        stdout=io.StringIO(),
+                        runner=lambda config, broker: self.fail("runner must not run"),
+                    )
+
+        self.assertNotEqual(0, raised.exception.code)
+        self.assertIn("refresh_market_data", stderr.getvalue())
+
     def test_run_once_blocks_when_open_exposure_limit_is_reached(self):
         class FullBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
@@ -884,6 +966,23 @@ def _bundle(symbol: str) -> CandleBundle:
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:
+    from mu_strategy.market_data.trusted import DataStatus
+
+    statuses = {
+        interval: DataStatus(
+            symbol=symbol,
+            interval=interval,
+            rows=1,
+            first_timestamp_ms=0,
+            last_timestamp_ms=0,
+            updated_at_ms=0,
+            source_file=Path(f"{interval}.csv"),
+            is_valid=True,
+            is_stale=True,
+            reason="stale_by_clock",
+        )
+        for interval in ("15m", "1h")
+    }
     return CandleBundle(
         symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
         candles_by_interval={
@@ -892,6 +991,7 @@ def _stale_bundle(symbol: str) -> CandleBundle:
         },
         files_by_interval={},
         days=28,
+        statuses_by_interval=statuses,
     )
 
 
