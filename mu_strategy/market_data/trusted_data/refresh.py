@@ -24,7 +24,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
     normalize_and_validate_candles,
@@ -353,6 +353,7 @@ class RefreshTrustedMarketData:
                     freshness=freshness.state,
                     reason=freshness.reason,
                     validation=validation,
+                    content_sha256=candles_content_sha256(candles),
                 )
                 candles_by_key[key] = candles
             except Exception as exc:
@@ -470,6 +471,7 @@ def _health(
     validation: ValidationReport | None = None,
     error_type: str | None = None,
     message: str | None = None,
+    content_sha256: str | None = None,
 ) -> DatasetHealth:
     return DatasetHealth(
         key=DatasetKey(symbol, interval),
@@ -485,6 +487,7 @@ def _health(
         validation=validation,
         error_type=error_type,
         message=message,
+        content_sha256=content_sha256,
     )
 
 

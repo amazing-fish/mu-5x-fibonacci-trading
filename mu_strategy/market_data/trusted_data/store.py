@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import uuid
@@ -105,6 +106,17 @@ class TrustedDataStore:
             handle.write("\n")
             _flush_and_fsync(handle)
         return path
+
+
+def candles_content_sha256(candles: list[Candle]) -> str:
+    digest = hashlib.sha256()
+    for candle in candles:
+        row = candle.to_csv_row()
+        for field in CSV_FIELDS:
+            digest.update(str(row[field]).encode("utf-8"))
+            digest.update(b"\0")
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

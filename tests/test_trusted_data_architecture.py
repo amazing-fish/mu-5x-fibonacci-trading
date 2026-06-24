@@ -502,6 +502,66 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertFalse(bundle.health_by_interval["15m"].validation.ok)
         self.assertEqual(HealthReason.TIMESTAMP_GAP, bundle.health_by_interval["15m"].validation.reason)
 
+    def test_strict_load_rejects_csv_content_not_bound_to_manifest(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            store = TrustedDataStore(data_dir=data_dir)
+            original = store.read_csv(store.cache_path("MU-USDT-SWAP", "5m"))
+            replacement = [
+                Candle(
+                    candle.open_time_ms,
+                    candle.open + 10_000,
+                    candle.high + 10_000,
+                    candle.low + 10_000,
+                    candle.close + 10_000,
+                    candle.volume,
+                )
+                for candle in original
+            ]
+            write_csv(replacement, store.cache_path("MU-USDT-SWAP", "5m"))
+
+            bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("5m",), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.CACHE_CONTENT_MISMATCH, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.CACHE_CONTENT_MISMATCH, bundle.health_by_interval["5m"].primary_reason)
+        self.assertEqual([], bundle.candles_by_interval["5m"])
+
+    def test_strict_load_rejects_valid_manifest_without_content_hash(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"].pop("content_sha256")
+            store = TrustedDataStore(data_dir=data_dir)
+            store.write_manifest(manifest)
+
+            bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("5m",), days=1),
+                trading_strict_policy(),
+            )
+
+        health = bundle.health_by_interval["5m"]
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.CACHE_CONTENT_MISMATCH, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.CACHE_CONTENT_MISMATCH, health.primary_reason)
+        self.assertEqual("manifest dataset is missing content_sha256", health.message)
+        self.assertEqual([], bundle.candles_by_interval["5m"])
+
     def test_malformed_schema_v2_fail_closed(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -1548,7 +1608,7 @@ def _write_manifest_and_caches(
     universe_symbols: tuple[str, ...] | None = None,
     stock_token_symbols: tuple[str, ...] | None = None,
 ) -> dict:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
 
@@ -1590,6 +1650,7 @@ def _write_manifest_and_caches(
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
             "source_file": str(path),
+            "content_sha256": candles_content_sha256(candles) if integrity == "valid" else None,
             "validation": {"ok": integrity == "valid", "reason": "ok" if integrity == "valid" else reason},
         }
     universe_rows = [

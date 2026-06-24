@@ -415,7 +415,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_honors_refresh_false(self):
         from mu_strategy.market_data.cache import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
-        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -440,6 +440,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "is_stale": False,
                     "reason": "ok",
                     "warnings": [],
+                    "content_sha256": candles_content_sha256(candles),
                     "validation": {"ok": True, "reason": "ok"},
                 }
             (data_dir / "manifest.json").write_text(
@@ -467,6 +468,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
         from mu_strategy.market_data.cache import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
         from mu_strategy.market_data.trusted import aggregate_candles
+        from mu_strategy.market_data.trusted_data.store import candles_content_sha256
         from mu_strategy.market_data.utils import DAY_MS
 
         with TemporaryDirectory() as tmp:
@@ -497,6 +499,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "is_stale": False,
                     "reason": "ok",
                     "warnings": [],
+                    "content_sha256": candles_content_sha256(candles),
                     "validation": {"ok": True, "reason": "ok"},
                 }
             manifest = _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})

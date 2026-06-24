@@ -314,7 +314,7 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
 
 
 def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str, status: str) -> None:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
 
@@ -341,6 +341,7 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
             "source_file": str(path),
+            "content_sha256": candles_content_sha256(candles),
             "validation": {"ok": True, "reason": "ok"},
         }
     store.write_manifest(

@@ -72,6 +72,7 @@ class HealthReason(Enum):
     OHLCV_MISMATCH = "ohlcv_mismatch"
     OHLCV_INVALID = "ohlcv_invalid"
     CONTINUITY_GAP = "continuity_gap"
+    CACHE_CONTENT_MISMATCH = "cache_content_mismatch"
 
 
 class Clock(Protocol):
@@ -170,6 +171,7 @@ class DatasetHealth:
     error_type: str | None = None
     message: str | None = None
     warnings: tuple[str, ...] = ()
+    content_sha256: str | None = None
 
     @property
     def is_usable(self) -> bool:
@@ -208,6 +210,7 @@ class DatasetHealth:
             "error_type": self.error_type,
             "message": self.message,
             "warnings": list(self.warnings),
+            "content_sha256": self.content_sha256,
             "validation": self.validation.to_dict() if self.validation else None,
         }
 
@@ -246,6 +249,7 @@ class DatasetHealth:
             error_type=payload.get("error_type"),
             message=payload.get("message"),
             warnings=tuple(str(value) for value in payload.get("warnings") or ()),
+            content_sha256=str(payload["content_sha256"]) if payload.get("content_sha256") is not None else None,
         )
         if strict:
             _validate_dataset_health(health)
@@ -316,6 +320,7 @@ class PublishedDatasetCatalog:
                     error_type=health.error_type,
                     message=health.message,
                     warnings=health.warnings,
+                    content_sha256=health.content_sha256,
                 )
             datasets[key] = health
         return cls(datasets=datasets, data_dir=Path(data_dir))

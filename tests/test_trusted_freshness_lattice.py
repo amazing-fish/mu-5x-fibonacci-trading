@@ -456,7 +456,7 @@ def _health_payload(*, availability: str = "available", integrity: str = "valid"
 
 
 def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -> None:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
 
@@ -478,6 +478,7 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
                 "first_timestamp_ms": candles[0].open_time_ms,
                 "last_timestamp_ms": candles[-1].open_time_ms,
                 "source_file": str(path),
+                "content_sha256": candles_content_sha256(candles),
             }
         )
         symbols["MU-USDT-SWAP"]["intervals"][interval] = health

@@ -21,7 +21,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
     normalize_and_validate_candles,
@@ -186,7 +186,10 @@ class LoadTrustedBundle:
                     validation=validation,
                     updated_at_ms=context.observed_at_ms,
                 )
-            health = _merge_manifest_health(health, published_health_by_interval.get(interval))
+            manifest_health = published_health_by_interval.get(interval)
+            cached_candles = raw_candles_by_interval.get(interval) or []
+            health = _verify_manifest_bound_content(health, manifest_health, cached_candles)
+            health = _merge_manifest_health(health, manifest_health)
             health_by_interval[interval] = health
             candles_by_interval[interval] = candles if health.integrity == IntegrityState.VALID else []
 
@@ -274,8 +277,40 @@ def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: Dataset
         error_type=manifest_health.error_type or cache_health.error_type,
         message=manifest_health.message or cache_health.message,
         warnings=_merge_warnings(manifest_health.warnings, cache_health.warnings),
+        content_sha256=cache_health.content_sha256 or manifest_health.content_sha256,
     )
     return _ensure_validation_report_consistency(merged)
+
+
+def _verify_manifest_bound_content(
+    cache_health: DatasetHealth,
+    manifest_health: DatasetHealth | None,
+    cached_candles: list[Candle],
+) -> DatasetHealth:
+    expected_hash = manifest_health.content_sha256 if manifest_health is not None else None
+    if manifest_health is None or cache_health.integrity != IntegrityState.VALID or not cached_candles:
+        return cache_health
+    if manifest_health.integrity != IntegrityState.VALID:
+        return cache_health
+    actual_hash = candles_content_sha256(cached_candles)
+    if not expected_hash:
+        return replace(
+            cache_health,
+            integrity=IntegrityState.INVALID,
+            freshness=FreshnessState.STALE,
+            reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
+            content_sha256=actual_hash,
+            message="manifest dataset is missing content_sha256",
+        )
+    if actual_hash == expected_hash:
+        return replace(cache_health, content_sha256=actual_hash)
+    return replace(
+        cache_health,
+        integrity=IntegrityState.INVALID,
+        freshness=FreshnessState.STALE,
+        reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
+        content_sha256=actual_hash,
+    )
 
 
 def _merge_validation_report(
@@ -341,6 +376,7 @@ def _health_from_candles(
         source_file=path,
         validation=validation,
         updated_at_ms=updated_at_ms,
+        content_sha256=candles_content_sha256(candles) if candles and integrity == IntegrityState.VALID else None,
     )
 
 
