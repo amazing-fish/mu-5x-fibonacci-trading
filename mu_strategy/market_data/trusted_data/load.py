@@ -19,6 +19,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     TrustedBundle,
     TrustedLoadContext,
     TrustedManifestSnapshot,
+    ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -28,6 +29,21 @@ from mu_strategy.market_data.trusted_data.validation import (
     validate_built_native_candles,
 )
 from mu_strategy.models import Candle
+
+
+_VALIDATION_FAILURE_REASONS = {
+    HealthReason.EMPTY,
+    HealthReason.BUILT_EMPTY,
+    HealthReason.NATIVE_EMPTY,
+    HealthReason.BUILT_SAMPLE_COUNT_BELOW_MINIMUM,
+    HealthReason.NATIVE_SAMPLE_COUNT_BELOW_MINIMUM,
+    HealthReason.TIMESTAMP_MISALIGNED,
+    HealthReason.MISSING_IN_BUILT,
+    HealthReason.MISSING_IN_NATIVE,
+    HealthReason.OHLCV_MISMATCH,
+    HealthReason.OHLCV_INVALID,
+    HealthReason.CONTINUITY_GAP,
+}
 
 
 @dataclass(frozen=True)
@@ -245,17 +261,44 @@ def _manifest_health_by_interval(
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:
-        return cache_health
-    return replace(
+        return _ensure_validation_report_consistency(cache_health)
+    merged = replace(
         cache_health,
         availability=_worst_availability(cache_health.availability, manifest_health.availability),
         integrity=_worst_integrity(cache_health.integrity, manifest_health.integrity),
         freshness=_worst_freshness(cache_health.freshness, manifest_health.freshness),
         reasons=_merge_reasons(manifest_health.reasons, cache_health.reasons),
+        validation=_merge_validation_report(cache_health, manifest_health),
         error_type=manifest_health.error_type or cache_health.error_type,
         message=manifest_health.message or cache_health.message,
         warnings=_merge_warnings(manifest_health.warnings, cache_health.warnings),
     )
+    return _ensure_validation_report_consistency(merged)
+
+
+def _merge_validation_report(
+    cache_health: DatasetHealth,
+    manifest_health: DatasetHealth,
+) -> ValidationReport | None:
+    manifest_validation = manifest_health.validation
+    cache_validation = cache_health.validation
+    if manifest_validation is not None and not manifest_validation.ok:
+        return manifest_validation
+    if cache_validation is not None and not cache_validation.ok:
+        return cache_validation
+    if cache_validation is not None:
+        return cache_validation
+    return manifest_validation
+
+
+def _ensure_validation_report_consistency(health: DatasetHealth) -> DatasetHealth:
+    reason = health.primary_reason
+    if reason not in _VALIDATION_FAILURE_REASONS:
+        return health
+    validation = health.validation
+    if validation is not None and not validation.ok and validation.reason == reason:
+        return health
+    return replace(health, validation=ValidationReport(False, reason))
 
 
 def _not_published_health(symbol: str, interval: str, path: Path) -> DatasetHealth:

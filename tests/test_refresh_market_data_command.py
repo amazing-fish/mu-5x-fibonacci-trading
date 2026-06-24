@@ -79,6 +79,58 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual(0, output["symbols"])
         self.assertEqual("TimeoutError", output["cycle_error"]["error_type"])
 
+    def test_limit_zero_one_shot_exits_non_zero_without_provider_config_or_symbol_csv(self):
+        from mu_strategy.commands.refresh_market_data import main
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            html_path = Path(tmp) / "health.html"
+            stock_config = Path(tmp) / "missing-stock-tokens.json"
+            stdout = io.StringIO()
+            with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers", side_effect=AssertionError("ticker fetch")) as fetch_tickers:
+                with patch("mu_strategy.market_data.trusted_data.refresh.load_stock_token_inst_ids", side_effect=AssertionError("stock config")) as load_config:
+                    exit_code = main(
+                        [
+                            "--data-dir",
+                            str(data_dir),
+                            "--html-output",
+                            str(html_path),
+                            "--stock-token-config",
+                            str(stock_config),
+                            "--limit",
+                            "0",
+                            "--days",
+                            "1",
+                            "--interval",
+                            "5m",
+                        ],
+                        stdout=stdout,
+                    )
+
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
+            csv_paths = list(data_dir.rglob("*.csv"))
+            html_exists = html_path.exists()
+
+        fetch_tickers.assert_not_called()
+        load_config.assert_not_called()
+        output = json.loads(stdout.getvalue())
+        self.assertNotEqual(0, exit_code)
+        self.assertEqual("failed", output["outcome"])
+        self.assertEqual("invalid", output["status"])
+        self.assertFalse(output["usable"])
+        self.assertEqual(0, output["symbols"])
+        self.assertEqual("publication_not_usable", output["reason"])
+        self.assertEqual("failed", manifest["outcome"])
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual({"crypto_top": [], "stock_token_top": []}, manifest["universes"])
+        self.assertEqual({}, manifest["symbols"])
+        self.assertEqual("failed", run_log[-1]["outcome"])
+        self.assertEqual("invalid", run_log[-1]["status"])
+        self.assertEqual(0, run_log[-1]["symbol_count"])
+        self.assertEqual([], csv_paths)
+        self.assertTrue(html_exists)
+
     def test_partial_one_shot_exits_non_zero_after_writing_artifacts(self):
         from mu_strategy.commands.refresh_market_data import main
 

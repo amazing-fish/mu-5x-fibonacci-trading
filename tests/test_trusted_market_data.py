@@ -27,6 +27,24 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
         self.assertEqual(["top", "top"], [item.source for item in crypto])
         self.assertEqual(["stock_token", "stock_token"], [item.source for item in stocks])
 
+    def test_selectors_honor_zero_and_reject_negative_limits(self):
+        from mu_strategy.market_data.trusted import select_top_okx_crypto_swaps, select_top_okx_stock_tokens
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
+
+        rows = [
+            {"instId": "MU-USDT-SWAP", "last": "5", "volCcy24h": "1000000"},
+            {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "10"},
+        ]
+
+        self.assertEqual([], select_top_okx_stock_tokens(rows, stock_token_inst_ids={"MU-USDT-SWAP"}, limit=0))
+        self.assertEqual([], select_top_okx_crypto_swaps(rows, stock_token_inst_ids={"MU-USDT-SWAP"}, limit=0))
+        with self.assertRaisesRegex(ValueError, "limit"):
+            select_top_okx_stock_tokens(rows, stock_token_inst_ids={"MU-USDT-SWAP"}, limit=-1)
+        with self.assertRaisesRegex(ValueError, "limit"):
+            select_top_okx_crypto_swaps(rows, stock_token_inst_ids={"MU-USDT-SWAP"}, limit=-1)
+        with self.assertRaisesRegex(ValueError, "limit"):
+            RefreshTrustedMarketDataRequest(limit=-1)
+
 
 class TrustedCandleValidationTests(unittest.TestCase):
     def test_validate_built_native_rejects_empty_built(self):

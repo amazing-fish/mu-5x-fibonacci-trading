@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mu_strategy.models import Candle
 
@@ -199,6 +199,150 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertIsNotNone(bundle.load_context)
         self.assertEqual(RefreshRunOutcome.FAILED, bundle.load_context.manifest.outcome)
         self.assertEqual(ManifestStatus.INVALID, bundle.load_context.manifest.status)
+
+    def test_manifest_failed_ohlcv_validation_report_survives_local_valid_cache(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy, trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        mismatch = {"timestamp_ms": 0, "field": "high", "built": 101.0, "native": 102.0}
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                outcome="failed",
+                status="invalid",
+                run_id="run-validation-failed",
+            )
+            status = manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["15m"]
+            status.update(
+                {
+                    "integrity": "invalid",
+                    "freshness": "stale",
+                    "reasons": ["ohlcv_mismatch"],
+                    "validation": {
+                        "ok": False,
+                        "reason": "ohlcv_mismatch",
+                        "value_mismatches": [mismatch],
+                    },
+                }
+            )
+            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000))
+
+            strict = loader.execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                trading_strict_policy(),
+            )
+            observed = loader.execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                observe_only_policy(),
+            )
+
+        self.assertFalse(strict.trust_decision.allowed)
+        self.assertEqual(HealthReason.RUN_FAILED, strict.trust_decision.reason)
+        health = observed.health_by_interval["15m"]
+        payload = health.to_dict()
+        self.assertTrue(observed.trust_decision.allowed)
+        self.assertEqual(HealthReason.OHLCV_MISMATCH, health.primary_reason)
+        self.assertFalse(health.validation.ok)
+        self.assertEqual(HealthReason.OHLCV_MISMATCH, health.validation.reason)
+        self.assertEqual((mismatch,), health.validation.value_mismatches)
+        self.assertEqual("ohlcv_mismatch", payload["reason"])
+        self.assertFalse(payload["validation"]["ok"])
+        self.assertEqual("ohlcv_mismatch", payload["validation"]["reason"])
+        self.assertEqual([mismatch], payload["validation"]["value_mismatches"])
+
+    def test_manifest_failed_missing_native_report_survives_local_valid_cache(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = _write_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                outcome="failed",
+                status="invalid",
+            )
+            status = manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["15m"]
+            status.update(
+                {
+                    "integrity": "invalid",
+                    "freshness": "stale",
+                    "reasons": ["missing_in_native"],
+                    "validation": {
+                        "ok": False,
+                        "reason": "missing_in_native",
+                        "missing_in_native": [900_000, 1_800_000],
+                    },
+                }
+            )
+            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                observe_only_policy(),
+            )
+
+        health = bundle.health_by_interval["15m"]
+        self.assertEqual(HealthReason.MISSING_IN_NATIVE, health.primary_reason)
+        self.assertFalse(health.validation.ok)
+        self.assertEqual(HealthReason.MISSING_IN_NATIVE, health.validation.reason)
+        self.assertEqual((900_000, 1_800_000), health.validation.missing_in_native)
+
+    def test_local_failed_validation_overrides_successful_manifest_report(self):
+        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            store = TrustedDataStore(data_dir=data_dir)
+            write_csv([Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0)], store.cache_path("MU-USDT-SWAP", "15m"))
+
+            bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                observe_only_policy(),
+            )
+
+        health = bundle.health_by_interval["15m"]
+        self.assertEqual(HealthReason.TIMESTAMP_MISALIGNED, health.primary_reason)
+        self.assertFalse(health.validation.ok)
+        self.assertEqual(HealthReason.TIMESTAMP_MISALIGNED, health.validation.reason)
+        self.assertEqual((60_000,), health.validation.misaligned_timestamps)
+
+    def test_local_valid_validation_overrides_successful_manifest_report(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            manifest_status = manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["15m"]
+            manifest_status["validation"] = {"ok": True, "reason": "ok", "warnings": ["manifest-only"]}
+            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
+                observe_only_policy(),
+            )
+
+        health = bundle.health_by_interval["15m"]
+        self.assertEqual(HealthReason.OK, health.primary_reason)
+        self.assertTrue(health.validation.ok)
+        self.assertEqual(HealthReason.OK, health.validation.reason)
+        self.assertEqual((), health.validation.warnings)
 
     def test_malformed_schema_v2_fail_closed(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -662,6 +806,48 @@ class TrustedDataRefreshTests(unittest.TestCase):
                                 stock_token_inst_ids=set(),
                             )
                         )
+
+    def test_canonical_refresh_limit_zero_short_circuits_before_provider_config_or_candles(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        provider = Mock()
+        provider.fetch_tickers.side_effect = AssertionError("fetch_tickers")
+        provider.fetch_history.side_effect = AssertionError("fetch_history")
+        provider.fetch_incremental.side_effect = AssertionError("fetch_incremental")
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            with patch("mu_strategy.market_data.trusted_data.refresh.load_stock_token_inst_ids", side_effect=AssertionError("stock config")) as load_config:
+                run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
+                    RefreshTrustedMarketDataRequest(
+                        requested_intervals=("5m",),
+                        days=1,
+                        limit=0,
+                        stock_token_config=data_dir / "missing-stock-config.json",
+                        now_ms=3_600_000,
+                    )
+                )
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+            csv_paths = list(data_dir.rglob("*.csv"))
+
+        provider.fetch_tickers.assert_not_called()
+        provider.fetch_history.assert_not_called()
+        provider.fetch_incremental.assert_not_called()
+        load_config.assert_not_called()
+        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
+        self.assertEqual({}, run.datasets)
+        self.assertEqual((), run.universe_snapshot.crypto_top)
+        self.assertEqual((), run.universe_snapshot.stock_token_top)
+        self.assertEqual("failed", manifest["outcome"])
+        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual({"crypto_top": [], "stock_token_top": []}, manifest["universes"])
+        self.assertEqual({}, manifest["symbols"])
+        self.assertEqual("failed", run_log["outcome"])
+        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual(0, run_log["symbol_count"])
+        self.assertEqual([], csv_paths)
 
     def test_refresh_market_data_command_is_canonical_writer(self):
         from mu_strategy.commands.refresh_market_data import main

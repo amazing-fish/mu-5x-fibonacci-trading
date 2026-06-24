@@ -209,6 +209,8 @@ class RefreshTrustedMarketData:
         return run
 
     def _universe(self, request: RefreshTrustedMarketDataRequest) -> UniverseSnapshot:
+        if request.limit == 0:
+            return UniverseSnapshot()
         rows = self.provider.fetch_tickers()
         stock_ids = request.stock_token_inst_ids
         if stock_ids is None:
@@ -338,6 +340,9 @@ def select_top_okx_crypto_swaps(
     stock_token_inst_ids: set[str],
     limit: int,
 ) -> list[OKXSwapTicker]:
+    _validate_selection_limit(limit)
+    if limit == 0:
+        return []
     filtered_rows = [row for row in rows if str(row.get("instId") or "") not in stock_token_inst_ids]
     return select_top_okx_usdt_swaps(filtered_rows, limit=limit)
 
@@ -348,20 +353,24 @@ def select_top_okx_stock_tokens(
     stock_token_inst_ids: set[str],
     limit: int,
 ) -> list[OKXSwapTicker]:
-    selected: list[OKXSwapTicker] = []
-    for ticker in select_top_okx_usdt_swaps(rows, limit=len(rows)):
-        if ticker.inst_id in stock_token_inst_ids:
-            selected.append(
-                OKXSwapTicker(
-                    inst_id=ticker.inst_id,
-                    last=ticker.last,
-                    volume_ccy_24h=ticker.volume_ccy_24h,
-                    source="stock_token",
-                )
-            )
-        if len(selected) >= limit:
-            break
-    return selected
+    _validate_selection_limit(limit)
+    if limit == 0:
+        return []
+    return [
+        OKXSwapTicker(
+            inst_id=ticker.inst_id,
+            last=ticker.last,
+            volume_ccy_24h=ticker.volume_ccy_24h,
+            source="stock_token",
+        )
+        for ticker in select_top_okx_usdt_swaps(rows, limit=len(rows))
+        if ticker.inst_id in stock_token_inst_ids
+    ][:limit]
+
+
+def _validate_selection_limit(limit: int) -> None:
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
 
 
 def _health(
