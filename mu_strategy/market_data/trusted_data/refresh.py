@@ -7,7 +7,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
-from mu_strategy.market_data.cache import prune_candles_to_window
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
@@ -31,6 +30,7 @@ from mu_strategy.market_data.trusted_data.validation import (
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
+from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
 from mu_strategy.models import Candle
@@ -135,6 +135,17 @@ class RefreshTrustedMarketDataRequest:
             raise ValueError("canonical trusted market-data refresh cannot use explicit_symbols")
 
 
+@dataclass(frozen=True)
+class DatasetRefreshCandidate:
+    key: DatasetKey
+    path: Path
+    candles: list[Candle]
+    had_existing: bool = False
+    fetch_reason: HealthReason | None = None
+    error_type: str | None = None
+    message: str | None = None
+
+
 class RefreshTrustedMarketData:
     def __init__(
         self,
@@ -175,16 +186,23 @@ class RefreshTrustedMarketData:
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top]):
             symbol = str(ticker["inst_id"])
+            candidates: dict[tuple[str, str], DatasetRefreshCandidate] = {}
             for interval in plan.effective_intervals:
-                health, candles = self._refresh_dataset(
+                candidate = self._fetch_dataset_candidate(
                     symbol=symbol,
                     interval=interval,
                     days=request.days,
-                    now_ms=started_at_ms,
                 )
-                datasets[(symbol, interval)] = health
-                candles_by_key[(symbol, interval)] = candles
-            self._attach_built_native_validation(symbol, datasets, candles_by_key)
+                candidates[(symbol, interval)] = candidate
+            symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
+                symbol=symbol,
+                intervals=plan.effective_intervals,
+                candidates=candidates,
+                days=request.days,
+                now_ms=started_at_ms,
+            )
+            datasets.update(symbol_datasets)
+            candles_by_key.update(symbol_candles)
 
         warnings: list[str] = []
         if request.limit > 0 and not datasets:
@@ -222,14 +240,13 @@ class RefreshTrustedMarketData:
             stock_token_top=tuple(_ticker_dict(ticker) for ticker in stock_top),
         )
 
-    def _refresh_dataset(
+    def _fetch_dataset_candidate(
         self,
         *,
         symbol: str,
         interval: str,
         days: int,
-        now_ms: int,
-    ) -> tuple[DatasetHealth, list[Candle]]:
+    ) -> DatasetRefreshCandidate:
         path = self.store.cache_path(symbol, interval)
         existing: list[Candle] = []
         cache_loaded = False
@@ -242,57 +259,121 @@ class RefreshTrustedMarketData:
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
             else:
                 fetched = self.provider.fetch_history(symbol, interval, days=days)
-            candles = prune_candles_to_window(dedupe_candles([*existing, *fetched]), days=days)
-            candles, validation = normalize_and_validate_candles(candles, interval=interval)
-            if not validation.ok:
-                return _health(
-                    symbol,
-                    interval,
-                    path,
-                    candles,
-                    now_ms=now_ms,
-                    availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
-                    integrity=IntegrityState.INVALID,
-                    freshness=FreshnessState.STALE,
-                    reason=validation.reason,
-                    validation=validation,
-                ), candles
-            self.store.write_csv(candles, path)
-            freshness = self.freshness_policy.assess(
-                now_ms=now_ms,
-                interval=interval,
-                last_confirmed_open_time_ms=candles[-1].open_time_ms if candles else None,
+            return DatasetRefreshCandidate(
+                key=DatasetKey(symbol, interval),
+                path=path,
+                candles=dedupe_candles([*existing, *fetched]),
+                had_existing=bool(existing),
             )
-            return _health(
-                symbol,
-                interval,
-                path,
-                candles,
-                now_ms=now_ms,
-                availability=AvailabilityState.AVAILABLE,
-                integrity=IntegrityState.VALID,
-                freshness=freshness.state,
-                reason=freshness.reason,
-                validation=validation,
-            ), candles
         except Exception as exc:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED if existing else HealthReason.REFRESH_FAILED
             if path.exists() and not cache_loaded:
                 reason = HealthReason.CACHE_READ_FAILED
                 existing = []
-            return _health(
-                symbol,
-                interval,
-                path,
-                prune_candles_to_window(dedupe_candles(existing), days=days),
-                now_ms=now_ms,
-                availability=AvailabilityState.AVAILABLE if existing else AvailabilityState.MISSING,
-                integrity=IntegrityState.INVALID,
-                freshness=FreshnessState.STALE,
-                reason=reason,
+            return DatasetRefreshCandidate(
+                key=DatasetKey(symbol, interval),
+                path=path,
+                candles=dedupe_candles(existing),
+                had_existing=bool(existing),
+                fetch_reason=reason,
                 error_type=type(exc).__name__,
                 message=str(exc),
-            ), []
+            )
+
+    def _materialize_symbol_bundle(
+        self,
+        *,
+        symbol: str,
+        intervals: tuple[str, ...],
+        candidates: dict[tuple[str, str], DatasetRefreshCandidate],
+        days: int,
+        now_ms: int,
+    ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], list[Candle]]]:
+        raw_candles_by_interval = {
+            interval: candidates[(symbol, interval)].candles
+            for interval in intervals
+        }
+        window_plan = resolve_shared_window(raw_candles_by_interval, days=days)
+        pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
+        datasets: dict[tuple[str, str], DatasetHealth] = {}
+        candles_by_key: dict[tuple[str, str], list[Candle]] = {}
+
+        for interval in intervals:
+            candidate = candidates[(symbol, interval)]
+            key = candidate.key.tuple()
+            candles = pruned_candles_by_interval.get(interval) or []
+            if candidate.fetch_reason is not None:
+                datasets[key] = _health(
+                    symbol,
+                    interval,
+                    candidate.path,
+                    candles,
+                    now_ms=now_ms,
+                    availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
+                    integrity=IntegrityState.INVALID,
+                    freshness=FreshnessState.STALE,
+                    reason=candidate.fetch_reason,
+                    error_type=candidate.error_type,
+                    message=candidate.message,
+                )
+                candles_by_key[key] = []
+                continue
+
+            try:
+                candles, validation = normalize_and_validate_candles(candles, interval=interval)
+                if not validation.ok:
+                    datasets[key] = _health(
+                        symbol,
+                        interval,
+                        candidate.path,
+                        candles,
+                        now_ms=now_ms,
+                        availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
+                        integrity=IntegrityState.INVALID,
+                        freshness=FreshnessState.STALE,
+                        reason=validation.reason,
+                        validation=validation,
+                    )
+                    candles_by_key[key] = []
+                    continue
+                self.store.write_csv(candles, candidate.path)
+                freshness = self.freshness_policy.assess(
+                    now_ms=now_ms,
+                    interval=interval,
+                    last_confirmed_open_time_ms=candles[-1].open_time_ms if candles else None,
+                )
+                datasets[key] = _health(
+                    symbol,
+                    interval,
+                    candidate.path,
+                    candles,
+                    now_ms=now_ms,
+                    availability=AvailabilityState.AVAILABLE,
+                    integrity=IntegrityState.VALID,
+                    freshness=freshness.state,
+                    reason=freshness.reason,
+                    validation=validation,
+                )
+                candles_by_key[key] = candles
+            except Exception as exc:
+                reason = HealthReason.INCREMENTAL_REFRESH_FAILED if candidate.had_existing else HealthReason.REFRESH_FAILED
+                datasets[key] = _health(
+                    symbol,
+                    interval,
+                    candidate.path,
+                    candles,
+                    now_ms=now_ms,
+                    availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
+                    integrity=IntegrityState.INVALID,
+                    freshness=FreshnessState.STALE,
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+                candles_by_key[key] = []
+
+        self._attach_built_native_validation(symbol, datasets, candles_by_key)
+        return datasets, candles_by_key
 
     def _attach_built_native_validation(
         self,

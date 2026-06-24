@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from mu_strategy.market_data.cache import prune_candles_to_window
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
@@ -28,6 +27,7 @@ from mu_strategy.market_data.trusted_data.validation import (
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
+from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
 from mu_strategy.models import Candle
 
 
@@ -147,13 +147,14 @@ class LoadTrustedBundle:
                 )
                 raw_candles_by_interval[interval] = []
 
-        end_time_ms = _shared_window_end(raw_candles_by_interval)
+        window_plan = resolve_shared_window(raw_candles_by_interval, days=query.days)
+        pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
         for interval in plan.effective_intervals:
             if interval in health_by_interval:
                 candles_by_interval[interval] = []
                 continue
             path = self.store.cache_path(resolved.inst_id, interval)
-            candles = prune_candles_to_window(raw_candles_by_interval.get(interval) or [], days=query.days, end_time_ms=end_time_ms)
+            candles = pruned_candles_by_interval.get(interval) or []
             candles, validation = normalize_and_validate_candles(candles, interval=interval)
             if not validation.ok:
                 health = _health_from_candles(
@@ -364,18 +365,6 @@ def _failed_health(
         error_type=error_type,
         message=message,
     )
-
-
-def _shared_window_end(candles_by_interval: dict[str, list[Candle]]) -> int | None:
-    five = candles_by_interval.get("5m") or []
-    if five:
-        return max(candle.open_time_ms for candle in five)
-    timestamps = [
-        candle.open_time_ms
-        for candles in candles_by_interval.values()
-        for candle in candles
-    ]
-    return max(timestamps) if timestamps else None
 
 
 def _worst_availability(left: AvailabilityState, right: AvailabilityState) -> AvailabilityState:
