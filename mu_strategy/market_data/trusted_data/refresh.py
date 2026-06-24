@@ -199,7 +199,7 @@ class RefreshTrustedMarketData:
                 intervals=plan.effective_intervals,
                 candidates=candidates,
                 days=request.days,
-                now_ms=started_at_ms,
+                now_ms=_now_ms(request.now_ms, self.clock),
             )
             datasets.update(symbol_datasets)
             candles_by_key.update(symbol_candles)

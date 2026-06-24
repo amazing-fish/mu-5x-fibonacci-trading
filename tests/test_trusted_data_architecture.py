@@ -871,6 +871,36 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
         self.assertEqual([("BTC-USDT-SWAP", "5m", 3_000_000)], provider.incremental_calls)
 
+    def test_refresh_freshness_uses_current_clock_after_long_fetch(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        provider = _Provider(
+            ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            history_fetcher=lambda symbol, interval, *, days: [
+                Candle(0, 100.0, 101.0, 99.0, 100.0, 10.0),
+                Candle(300_000, 101.0, 102.0, 100.0, 101.0, 10.0),
+            ],
+        )
+        clock = _SequenceClock(0, 600_000, 600_000)
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), provider, clock=clock).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                )
+            )
+
+        health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        self.assertEqual(0, run.started_at_ms)
+        self.assertEqual(600_000, run.completed_at_ms)
+        self.assertEqual(600_000, health.updated_at_ms)
+        self.assertEqual(FreshnessState.FRESH, health.freshness)
+        self.assertEqual(HealthReason.OK, health.primary_reason)
+
     def test_ticker_timeout_produces_failed_run_log(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
@@ -1750,6 +1780,18 @@ class _FakeClock:
     def now_ms(self) -> int:
         self.calls += 1
         return self.now
+
+
+class _SequenceClock:
+    def __init__(self, *values: int):
+        self.values = list(values)
+        self.calls = 0
+
+    def now_ms(self) -> int:
+        self.calls += 1
+        if self.values:
+            return self.values.pop(0)
+        raise AssertionError("sequence clock exhausted")
 
 
 def _invalid_bundle(symbol):
