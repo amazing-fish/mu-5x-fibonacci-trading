@@ -901,6 +901,40 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(FreshnessState.FRESH, health.freshness)
         self.assertEqual(HealthReason.OK, health.primary_reason)
 
+    def test_refresh_keeps_fresh_cache_usable_when_incremental_fetch_fails(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_csv(_candles("5m"), store.cache_path("BTC-USDT-SWAP", "5m"))
+
+            run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+            manifest = json.loads((Path(tmp) / "manifest.json").read_text(encoding="utf-8"))
+
+        health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        manifest_health = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
+        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
+        self.assertEqual("ok", manifest["status"])
+        self.assertEqual(IntegrityState.VALID, health.integrity)
+        self.assertEqual(FreshnessState.FRESH, health.freshness)
+        self.assertEqual(HealthReason.OK, health.primary_reason)
+        self.assertIn("incremental_refresh_failed", health.warnings)
+        self.assertTrue(manifest_health["is_valid"])
+        self.assertFalse(manifest_health["is_stale"])
+        self.assertEqual("ok", manifest_health["reason"])
+        self.assertIn("incremental_refresh_failed", manifest_health["warnings"])
+        self.assertIsNotNone(manifest_health["content_sha256"])
+
     def test_ticker_timeout_produces_failed_run_log(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
@@ -1931,6 +1965,17 @@ class _TickerFailureProvider:
 
     def fetch_incremental(self, symbol, interval, *, since_time_ms):
         raise AssertionError("must not fetch incremental")
+
+
+class _IncrementalFailureProvider:
+    def fetch_tickers(self):
+        return [{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}]
+
+    def fetch_history(self, symbol, interval, *, days):
+        raise AssertionError("cache should force incremental path")
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        raise TimeoutError("blocked incremental")
 
 
 class _EmptyBroker:

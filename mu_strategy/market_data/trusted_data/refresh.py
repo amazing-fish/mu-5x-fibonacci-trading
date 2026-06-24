@@ -302,7 +302,8 @@ class RefreshTrustedMarketData:
             candidate = candidates[(symbol, interval)]
             key = candidate.key.tuple()
             candles = pruned_candles_by_interval.get(interval) or []
-            if candidate.fetch_reason is not None:
+            fetch_warnings = _fetch_warnings(candidate)
+            if candidate.fetch_reason is not None and (not candidate.had_existing or not candles):
                 datasets[key] = _health(
                     symbol,
                     interval,
@@ -315,6 +316,7 @@ class RefreshTrustedMarketData:
                     reason=candidate.fetch_reason,
                     error_type=candidate.error_type,
                     message=candidate.message,
+                    warnings=fetch_warnings,
                 )
                 candles_by_key[key] = []
                 continue
@@ -333,6 +335,7 @@ class RefreshTrustedMarketData:
                         freshness=FreshnessState.STALE,
                         reason=validation.reason,
                         validation=validation,
+                        warnings=fetch_warnings,
                     )
                     candles_by_key[key] = candles if validation.reason == HealthReason.TIMESTAMP_GAP else []
                     continue
@@ -354,6 +357,7 @@ class RefreshTrustedMarketData:
                     reason=freshness.reason,
                     validation=validation,
                     content_sha256=candles_content_sha256(candles),
+                    warnings=fetch_warnings,
                 )
                 candles_by_key[key] = candles
             except Exception as exc:
@@ -370,6 +374,7 @@ class RefreshTrustedMarketData:
                     reason=reason,
                     error_type=type(exc).__name__,
                     message=str(exc),
+                    warnings=fetch_warnings,
                 )
                 candles_by_key[key] = []
 
@@ -471,6 +476,7 @@ def _health(
     validation: ValidationReport | None = None,
     error_type: str | None = None,
     message: str | None = None,
+    warnings: tuple[str, ...] = (),
     content_sha256: str | None = None,
 ) -> DatasetHealth:
     return DatasetHealth(
@@ -487,8 +493,15 @@ def _health(
         validation=validation,
         error_type=error_type,
         message=message,
+        warnings=warnings,
         content_sha256=content_sha256,
     )
+
+
+def _fetch_warnings(candidate: DatasetRefreshCandidate) -> tuple[str, ...]:
+    if candidate.fetch_reason is None:
+        return ()
+    return (candidate.fetch_reason.value,)
 
 
 def _refresh_outcome(datasets: dict[tuple[str, str], DatasetHealth]) -> RefreshRunOutcome:

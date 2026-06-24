@@ -219,7 +219,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertEqual(HealthReason.MISSING_IN_NATIVE, health.validation.reason)
         self.assertIn(missing_native, health.validation.missing_in_native)
 
-    def test_failed_base_interval_does_not_publish_pseudo_healthy_validation(self):
+    def test_failed_base_incremental_refresh_keeps_fresh_cache_with_warning(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -243,11 +243,15 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
             )
             manifest = _manifest(store)
 
-        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
+        self.assertEqual("ok", manifest["status"])
         base_health = run.datasets[(SYMBOL, "5m")]
-        self.assertEqual(HealthReason.INCREMENTAL_REFRESH_FAILED, base_health.primary_reason)
-        self.assertFalse(base_health.is_usable)
+        native_health = run.datasets[(SYMBOL, "15m")]
+        self.assertEqual(HealthReason.OK, base_health.primary_reason)
+        self.assertTrue(base_health.is_usable)
+        self.assertIn("incremental_refresh_failed", base_health.warnings)
+        self.assertTrue(native_health.validation.ok)
+        self.assertIn("incremental_refresh_failed", manifest["symbols"][SYMBOL]["intervals"]["5m"]["warnings"])
 
     def test_loader_and_refresh_share_window_planner_contract(self):
         from mu_strategy.market_data.trusted_data import load
