@@ -11,13 +11,14 @@ from .contracts import (
     IntervalPlan,
     PublicationState,
     PublishedDatasetCatalog,
+    RefreshAttemptStatus,
     RefreshRun,
-    RefreshRunOutcome,
+    SnapshotUsability,
     TrustDecision,
     TrustedBundle,
     UniverseSnapshot,
     ValidationReport,
-    derive_manifest_status,
+    derive_snapshot_usability,
 )
 
 __all__ = [
@@ -31,11 +32,12 @@ __all__ = [
     "IntervalPlan",
     "PublicationState",
     "PublishedDatasetCatalog",
+    "RefreshAttemptStatus",
     "RefreshRun",
-    "RefreshRunOutcome",
+    "SnapshotUsability",
     "TrustDecision",
     "TrustedBundle",
     "UniverseSnapshot",
     "ValidationReport",
-    "derive_manifest_status",
+    "derive_snapshot_usability",
 ]

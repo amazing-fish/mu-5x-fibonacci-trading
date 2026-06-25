@@ -346,16 +346,17 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
         }
     store.write_manifest(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": f"{outcome}-run",
-            "outcome": outcome,
-            "status": status,
+            "attempt_status": "failed" if outcome == "failed" else "degraded" if outcome == "partial" else "success",
+            "snapshot_usability": "usable" if status == "ok" else status,
             "started_at_ms": 0,
             "completed_at_ms": 86_400_000,
             "requested_intervals": ["5m", "15m", "1h"],
             "effective_intervals": ["5m", "15m", "1h"],
             "universes": {"crypto_top": [], "stock_token_top": []},
             "symbols": symbols,
+            "provider_failures": [],
             "warnings": [],
             "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
         }

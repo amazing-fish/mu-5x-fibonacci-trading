@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -18,10 +17,12 @@ from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
     IntegrityState,
     RefreshRun,
-    RefreshRunOutcome,
+    RefreshAttemptStatus,
+    SnapshotUsability,
     SystemClock,
     UniverseSnapshot,
     ValidationReport,
+    derive_snapshot_usability,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
@@ -41,11 +42,6 @@ DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
 OKXIncrementalFetcher = Callable[..., list[Candle]]
-
-
-class RefreshScope(Enum):
-    CANONICAL_UNIVERSE = "canonical_universe"
-    EXPLICIT_SYMBOLS = "explicit_symbols"
 
 
 class MarketDataProvider(Protocol):
@@ -117,22 +113,12 @@ class RefreshTrustedMarketDataRequest:
     limit: int = 10
     stock_token_config: Path = DEFAULT_STOCK_TOKEN_CONFIG
     stock_token_inst_ids: set[str] | None = None
-    explicit_symbols: tuple[str, ...] = ()
     now_ms: int | None = None
     run_id: str | None = None
-    scope: RefreshScope = RefreshScope.CANONICAL_UNIVERSE
 
     def __post_init__(self) -> None:
-        scope = self.scope
-        if not isinstance(scope, RefreshScope):
-            scope = RefreshScope(str(scope))
-            object.__setattr__(self, "scope", scope)
         if self.limit < 0:
             raise ValueError("limit must be non-negative")
-        if scope != RefreshScope.CANONICAL_UNIVERSE:
-            raise ValueError("non-canonical trusted refresh scopes cannot publish canonical manifest")
-        if self.explicit_symbols:
-            raise ValueError("canonical trusted market-data refresh cannot use explicit_symbols")
 
 
 @dataclass(frozen=True)
@@ -171,12 +157,22 @@ class RefreshTrustedMarketData:
         except Exception as exc:
             run = RefreshRun(
                 run_id=run_id,
-                outcome=RefreshRunOutcome.FAILED,
+                attempt_status=RefreshAttemptStatus.FAILED,
+                snapshot_usability=SnapshotUsability.INVALID,
                 started_at_ms=started_at_ms,
                 completed_at_ms=_now_ms(request.now_ms, self.clock),
                 requested_intervals=plan.requested_intervals,
                 effective_intervals=plan.effective_intervals,
                 universe_snapshot=UniverseSnapshot(),
+                provider_failures=(
+                    {
+                        "symbol": "*",
+                        "interval": "*",
+                        "reason": HealthReason.REFRESH_FAILED.value,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                ),
                 cycle_error={"error_type": type(exc).__name__, "message": str(exc)},
             )
             self._persist_run(run)
@@ -209,18 +205,23 @@ class RefreshTrustedMarketData:
             warnings.append("empty_universe")
         if len(universe.stock_token_top) < request.limit:
             warnings.append(f"stock_token_top_count_below_limit:{len(universe.stock_token_top)}/{request.limit}")
-        outcome = _refresh_outcome(datasets)
+        provider_failures = _provider_failures(datasets)
+        attempt_status = _refresh_attempt_status(datasets, provider_failures)
+        snapshot_usability = derive_snapshot_usability(datasets)
         if request.limit > 0 and not datasets:
-            outcome = RefreshRunOutcome.FAILED
+            attempt_status = RefreshAttemptStatus.FAILED
+            snapshot_usability = SnapshotUsability.INVALID
         run = RefreshRun(
             run_id=run_id,
-            outcome=outcome,
+            attempt_status=attempt_status,
+            snapshot_usability=snapshot_usability,
             started_at_ms=started_at_ms,
             completed_at_ms=_now_ms(request.now_ms, self.clock),
             requested_intervals=plan.requested_intervals,
             effective_intervals=plan.effective_intervals,
             universe_snapshot=universe,
             datasets=datasets,
+            provider_failures=provider_failures,
             warnings=tuple(warnings),
         )
         self._persist_run(run)
@@ -335,6 +336,8 @@ class RefreshTrustedMarketData:
                         freshness=FreshnessState.STALE,
                         reason=validation.reason,
                         validation=validation,
+                        error_type=candidate.error_type,
+                        message=candidate.message,
                         warnings=fetch_warnings,
                     )
                     candles_by_key[key] = candles if validation.reason == HealthReason.TIMESTAMP_GAP else []
@@ -356,6 +359,8 @@ class RefreshTrustedMarketData:
                     freshness=freshness.state,
                     reason=freshness.reason,
                     validation=validation,
+                    error_type=candidate.error_type,
+                    message=candidate.message,
                     content_sha256=candles_content_sha256(candles),
                     warnings=fetch_warnings,
                 )
@@ -504,19 +509,37 @@ def _fetch_warnings(candidate: DatasetRefreshCandidate) -> tuple[str, ...]:
     return (candidate.fetch_reason.value,)
 
 
-def _refresh_outcome(datasets: dict[tuple[str, str], DatasetHealth]) -> RefreshRunOutcome:
+def _provider_failures(datasets: dict[tuple[str, str], DatasetHealth]) -> tuple[dict[str, str], ...]:
+    failures: list[dict[str, str]] = []
+    for (symbol, interval), health in datasets.items():
+        reason = health.primary_reason
+        if HealthReason.INCREMENTAL_REFRESH_FAILED.value in health.warnings:
+            reason = HealthReason.INCREMENTAL_REFRESH_FAILED
+        if reason not in {HealthReason.REFRESH_FAILED, HealthReason.INCREMENTAL_REFRESH_FAILED}:
+            continue
+        failures.append(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "reason": reason.value,
+                "error_type": health.error_type or "",
+                "message": health.message or "",
+            }
+        )
+    return tuple(failures)
+
+
+def _refresh_attempt_status(
+    datasets: dict[tuple[str, str], DatasetHealth],
+    provider_failures: tuple[dict[str, str], ...],
+) -> RefreshAttemptStatus:
     if not datasets:
-        return RefreshRunOutcome.FAILED
-    valid_count = sum(
-        1
-        for health in datasets.values()
-        if health.availability == AvailabilityState.AVAILABLE and health.integrity == IntegrityState.VALID
-    )
-    if valid_count == len(datasets):
-        return RefreshRunOutcome.SUCCESS
-    if valid_count == 0:
-        return RefreshRunOutcome.FAILED
-    return RefreshRunOutcome.PARTIAL
+        return RefreshAttemptStatus.FAILED
+    if provider_failures and not any(health.is_usable for health in datasets.values()):
+        return RefreshAttemptStatus.FAILED
+    if provider_failures:
+        return RefreshAttemptStatus.DEGRADED
+    return RefreshAttemptStatus.SUCCESS
 
 
 def _now_ms(value: int | None, clock: Clock) -> int:

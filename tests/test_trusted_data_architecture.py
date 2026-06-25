@@ -94,7 +94,7 @@ class TrustedDataValidationTests(unittest.TestCase):
         self.assertEqual([0, 300_000], [candle.open_time_ms for candle in ordered])
 
     def test_matching_holes_are_blocked_by_single_interval_normalization(self):
-        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -120,7 +120,8 @@ class TrustedDataValidationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         base_health = run.datasets[("BTC-USDT-SWAP", "5m")]
         native_health = run.datasets[("BTC-USDT-SWAP", "15m")]
         self.assertEqual(HealthReason.TIMESTAMP_GAP, base_health.primary_reason)
@@ -167,9 +168,9 @@ class TrustedDataValidationTests(unittest.TestCase):
 
         self.assertNotEqual(0, exit_code)
         self.assertFalse(command_result["usable"])
-        self.assertEqual("failed", command_result["outcome"])
-        self.assertEqual("invalid", command_result["status"])
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("success", command_result["attempt_status"])
+        self.assertEqual("invalid", command_result["snapshot_usability"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertEqual("timestamp_gap", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
         self.assertFalse(csv_path.exists())
 
@@ -238,7 +239,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 symbol="MU-USDT-SWAP",
                 days=1,
                 outcome="failed",
-                status="invalid",
+                status="ok",
                 run_id="run-failed",
             )
             loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000))
@@ -254,7 +255,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                     self.assertEqual(HealthReason.RUN_FAILED, bundle.trust_decision.reason)
                     self.assertEqual("run-failed", bundle.run_id)
 
-    def test_strict_policy_rejects_partial_manifest_even_when_requested_symbol_is_valid(self):
+    def test_strict_policy_rejects_degraded_invalid_manifest_even_when_requested_symbol_is_valid(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
@@ -268,6 +269,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 days=1,
                 outcome="partial",
                 status="invalid",
+                integrity="invalid",
                 run_id="run-partial",
             )
             bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
@@ -276,7 +278,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             )
 
         self.assertFalse(bundle.trust_decision.allowed)
-        self.assertEqual(HealthReason.RUN_PARTIAL, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.MANIFEST_INVALID, bundle.trust_decision.reason)
 
     def test_strict_policy_rejects_success_manifest_with_invalid_or_stale_status(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -309,7 +311,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 self.assertEqual(reason, bundle.trust_decision.reason)
 
     def test_observe_only_failed_manifest_preserves_real_manifest_context(self):
-        from mu_strategy.market_data.trusted_data.contracts import ManifestStatus, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import observe_only_policy
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -321,7 +323,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 symbol="MU-USDT-SWAP",
                 days=1,
                 outcome="failed",
-                status="invalid",
+                status="ok",
                 run_id="run-diagnostic",
             )
             bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=_FakeClock(86_400_000)).execute(
@@ -332,8 +334,8 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertTrue(bundle.trust_decision.allowed)
         self.assertEqual("run-diagnostic", bundle.run_id)
         self.assertIsNotNone(bundle.load_context)
-        self.assertEqual(RefreshRunOutcome.FAILED, bundle.load_context.manifest.outcome)
-        self.assertEqual(ManifestStatus.INVALID, bundle.load_context.manifest.status)
+        self.assertEqual(RefreshAttemptStatus.FAILED, bundle.load_context.manifest.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, bundle.load_context.manifest.snapshot_usability)
 
     def test_manifest_failed_ohlcv_validation_report_survives_local_valid_cache(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -572,11 +574,11 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             return manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"]
 
         cases = {
-            "missing_outcome": lambda manifest: manifest.pop("outcome"),
-            "unknown_outcome": lambda manifest: manifest.__setitem__("outcome", "unknown"),
-            "missing_status": lambda manifest: manifest.pop("status"),
-            "unknown_status": lambda manifest: manifest.__setitem__("status", "missing"),
-            "wrong_schema_version": lambda manifest: manifest.__setitem__("schema_version", 3),
+            "missing_attempt_status": lambda manifest: manifest.pop("attempt_status"),
+            "unknown_attempt_status": lambda manifest: manifest.__setitem__("attempt_status", "unknown"),
+            "missing_snapshot_usability": lambda manifest: manifest.pop("snapshot_usability"),
+            "unknown_snapshot_usability": lambda manifest: manifest.__setitem__("snapshot_usability", "missing"),
+            "wrong_schema_version": lambda manifest: manifest.__setitem__("schema_version", 2),
             "missing_nested_availability": lambda manifest: first_dataset(manifest).pop("availability"),
             "unknown_nested_reason": lambda manifest: first_dataset(manifest).__setitem__("reasons", ["new_reason"]),
             "dataset_key_payload_mismatch": lambda manifest: first_dataset(manifest).__setitem__("symbol", "BTC-USDT-SWAP"),
@@ -820,14 +822,14 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
             with patch("mu_strategy.market_data.trusted_data.store.os.replace", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
-                    store.write_manifest({"schema_version": 2, "status": "ok"})
+                    store.write_manifest({"schema_version": 3, "snapshot_usability": "usable"})
 
             self.assertFalse(target.exists())
 
 
 class TrustedDataRefreshTests(unittest.TestCase):
     def test_refresh_records_requested_and_effective_intervals(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -845,7 +847,8 @@ class TrustedDataRefreshTests(unittest.TestCase):
             )
             manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
         self.assertEqual(["15m", "1h"], manifest["requested_intervals"])
         self.assertEqual(["5m", "15m", "1h"], manifest["effective_intervals"])
 
@@ -902,7 +905,13 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(HealthReason.OK, health.primary_reason)
 
     def test_refresh_keeps_fresh_cache_usable_when_incremental_fetch_fails(self):
-        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import (
+            FreshnessState,
+            HealthReason,
+            IntegrityState,
+            RefreshAttemptStatus,
+            SnapshotUsability,
+        )
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -923,8 +932,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         health = run.datasets[("BTC-USDT-SWAP", "5m")]
         manifest_health = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
-        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
-        self.assertEqual("ok", manifest["status"])
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual("usable", manifest["snapshot_usability"])
         self.assertEqual(IntegrityState.VALID, health.integrity)
         self.assertEqual(FreshnessState.FRESH, health.freshness)
         self.assertEqual(HealthReason.OK, health.primary_reason)
@@ -936,7 +946,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertIsNotNone(manifest_health["content_sha256"])
 
     def test_ticker_timeout_produces_failed_run_log(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -953,12 +963,12 @@ class TrustedDataRefreshTests(unittest.TestCase):
             )
             log_rows = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
-        self.assertEqual("failed", log_rows[-1]["outcome"])
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual("failed", log_rows[-1]["attempt_status"])
         self.assertEqual("TimeoutError", log_rows[-1]["cycle_error"]["error_type"])
 
-    def test_single_interval_failure_is_partial_and_other_intervals_continue(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+    def test_single_interval_failure_is_degraded_and_other_intervals_continue(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -980,12 +990,13 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         self.assertFalse(run.datasets[("BTC-USDT-SWAP", "15m")].is_usable)
         self.assertTrue(run.datasets[("ETH-USDT-SWAP", "15m")].is_usable)
 
-    def test_all_invalid_materialized_datasets_are_failed_not_partial(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+    def test_all_invalid_materialized_datasets_are_failed_not_degraded(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -1006,9 +1017,10 @@ class TrustedDataRefreshTests(unittest.TestCase):
             )
             manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
-        self.assertEqual("failed", manifest["outcome"])
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
 
     def test_refresh_still_runs_built_native_validation_for_stale_structural_inputs(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -1049,74 +1061,49 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(HealthReason.OHLCV_MISMATCH, native_health.primary_reason)
         self.assertFalse(native_health.validation.ok)
 
-    def test_manifest_status_uses_validity_and_freshness_dimensions_separately(self):
+    def test_snapshot_usability_uses_validity_and_freshness_dimensions_separately(self):
         from mu_strategy.market_data.trusted_data.contracts import (
             AvailabilityState,
             FreshnessState,
             IntegrityState,
-            RefreshRun,
-            RefreshRunOutcome,
-            UniverseSnapshot,
+            SnapshotUsability,
+            derive_snapshot_usability,
         )
 
         cases = [
-            ("valid_fresh", RefreshRunOutcome.SUCCESS, _health_state("BTC-USDT-SWAP", "5m"), "ok"),
+            ("valid_fresh", _health_state("BTC-USDT-SWAP", "5m"), SnapshotUsability.USABLE),
             (
                 "valid_stale",
-                RefreshRunOutcome.SUCCESS,
                 _health_state("BTC-USDT-SWAP", "5m", freshness=FreshnessState.STALE),
-                "stale",
+                SnapshotUsability.STALE,
             ),
             (
                 "invalid",
-                RefreshRunOutcome.SUCCESS,
                 _health_state("BTC-USDT-SWAP", "5m", integrity=IntegrityState.INVALID),
-                "invalid",
+                SnapshotUsability.INVALID,
             ),
             (
                 "missing",
-                RefreshRunOutcome.SUCCESS,
                 _health_state("BTC-USDT-SWAP", "5m", availability=AvailabilityState.MISSING),
-                "invalid",
+                SnapshotUsability.INVALID,
             ),
-            ("failed_run", RefreshRunOutcome.FAILED, _health_state("BTC-USDT-SWAP", "5m"), "invalid"),
         ]
-        for name, outcome, health, expected in cases:
+        for name, health, expected in cases:
             with self.subTest(name=name):
-                run = RefreshRun(
-                    run_id=name,
-                    outcome=outcome,
-                    started_at_ms=0,
-                    completed_at_ms=0,
-                    requested_intervals=("5m",),
-                    effective_intervals=("5m",),
-                    universe_snapshot=UniverseSnapshot(),
-                    datasets={("BTC-USDT-SWAP", "5m"): health},
-                )
+                self.assertEqual(expected, derive_snapshot_usability({("BTC-USDT-SWAP", "5m"): health}))
 
-                self.assertEqual(expected, run.manifest_status())
+    def test_refresh_request_no_longer_accepts_explicit_symbol_scope(self):
+        from dataclasses import fields
 
-    def test_explicit_symbol_refresh_request_is_rejected_before_manifest_publish(self):
-        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
-        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
 
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            with patch.object(store, "write_manifest", side_effect=AssertionError("write_manifest")):
-                with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
-                    with self.assertRaisesRegex(ValueError, "explicit_symbols"):
-                        RefreshTrustedMarketData(store, _Provider(ticker_rows=[])).execute(
-                            RefreshTrustedMarketDataRequest(
-                                requested_intervals=("5m",),
-                                days=1,
-                                limit=0,
-                                explicit_symbols=("BTC-USDT-SWAP",),
-                                stock_token_inst_ids=set(),
-                            )
-                        )
+        names = {field.name for field in fields(RefreshTrustedMarketDataRequest)}
+
+        self.assertNotIn("explicit_symbols", names)
+        self.assertNotIn("scope", names)
 
     def test_canonical_refresh_limit_zero_short_circuits_before_provider_config_or_candles(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -1144,16 +1131,17 @@ class TrustedDataRefreshTests(unittest.TestCase):
         provider.fetch_history.assert_not_called()
         provider.fetch_incremental.assert_not_called()
         load_config.assert_not_called()
-        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         self.assertEqual({}, run.datasets)
         self.assertEqual((), run.universe_snapshot.crypto_top)
         self.assertEqual((), run.universe_snapshot.stock_token_top)
-        self.assertEqual("failed", manifest["outcome"])
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertEqual({"crypto_top": [], "stock_token_top": []}, manifest["universes"])
         self.assertEqual({}, manifest["symbols"])
-        self.assertEqual("failed", run_log["outcome"])
-        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual("failed", run_log["attempt_status"])
+        self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertEqual(0, run_log["symbol_count"])
         self.assertEqual([], csv_paths)
 
@@ -1189,8 +1177,10 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(["BTC-USDT-SWAP"], [row["inst_id"] for row in manifest["universes"]["crypto_top"]])
-        self.assertEqual("success", manifest["outcome"])
-        self.assertEqual("success", run_log["outcome"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("usable", manifest["snapshot_usability"])
+        self.assertEqual("success", run_log["attempt_status"])
+        self.assertEqual("usable", run_log["snapshot_usability"])
         self.assertTrue(html_exists)
 
 
@@ -1254,10 +1244,10 @@ class TrustedDemoConsumerTests(unittest.TestCase):
         from mu_strategy.demo_trading import DemoTradingConfig, run_once
 
         cases = [
-            ("failed", "invalid", "run_failed"),
-            ("partial", "invalid", "run_partial"),
+            ("failed", "ok", "run_failed", {}),
+            ("partial", "invalid", "manifest_invalid", {"integrity": "invalid"}),
         ]
-        for outcome, status, reason in cases:
+        for outcome, status, reason, health_kwargs in cases:
             with self.subTest(outcome=outcome):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
@@ -1268,6 +1258,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                         outcome=outcome,
                         status=status,
                         universe_symbols=("MU-USDT-SWAP",),
+                        **health_kwargs,
                     )
                     result = run_once(
                         DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
@@ -1698,6 +1689,10 @@ def _write_manifest_and_caches(
     universe_symbols: tuple[str, ...] | None = None,
     stock_token_symbols: tuple[str, ...] | None = None,
 ) -> dict:
+    from mu_strategy.market_data.trusted_data.contracts import (
+        RefreshAttemptStatus,
+        SnapshotUsability,
+    )
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
     from mu_strategy.market_data.trusted_data.validation import aggregate_candles
     from mu_strategy.market_data.utils import DAY_MS
@@ -1751,17 +1746,33 @@ def _write_manifest_and_caches(
         {"inst_id": item, "last": 100.0, "volume_ccy_24h": 10.0, "source": "stock_token"}
         for item in (stock_token_symbols or ())
     ]
+    attempt_status = (
+        RefreshAttemptStatus.FAILED.value
+        if outcome == "failed"
+        else RefreshAttemptStatus.DEGRADED.value
+        if outcome == "partial"
+        else RefreshAttemptStatus.SUCCESS.value
+    )
+    if status == "ok":
+        snapshot_usability = SnapshotUsability.USABLE.value
+    elif status == "stale":
+        snapshot_usability = SnapshotUsability.STALE.value
+    elif status == "invalid":
+        snapshot_usability = SnapshotUsability.INVALID.value
+    else:
+        snapshot_usability = status
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": run_id,
-        "outcome": outcome,
-        "status": status,
+        "attempt_status": attempt_status,
+        "snapshot_usability": snapshot_usability,
         "started_at_ms": 0,
         "completed_at_ms": 0,
         "requested_intervals": ["15m", "1h"],
         "effective_intervals": ["5m", "15m", "1h"],
         "universes": {"crypto_top": universe_rows, "stock_token_top": stock_token_rows},
         "symbols": symbols,
+        "provider_failures": [],
         "warnings": [],
         "cycle_error": {"error_type": "TimeoutError", "message": "blocked"} if outcome == "failed" else None,
     }

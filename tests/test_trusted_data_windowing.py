@@ -17,7 +17,7 @@ SECOND_SYMBOL = "ETH-USDT-SWAP"
 
 class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
     def test_warm_cache_refresh_uses_shared_window_before_native_validation(self):
-        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -39,8 +39,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
             )
             manifest = _manifest(store)
 
-            self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
-            self.assertEqual("ok", manifest["status"])
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+            self.assertEqual("usable", manifest["snapshot_usability"])
             for interval in ("15m", "1h"):
                 health = run.datasets[(SYMBOL, interval)]
                 self.assertTrue(health.validation.ok)
@@ -124,7 +125,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertLess(persisted_1h[-1].open_time_ms, five_end)
 
     def test_cold_history_refresh_uses_shared_window_before_native_validation(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -148,13 +149,14 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
             self.assertTrue(run.datasets[(SYMBOL, "15m")].validation.ok)
             self.assertTrue(run.datasets[(SYMBOL, "1h")].validation.ok)
             _assert_health_matches_csv(self, store, run, SYMBOL, ("5m", "15m", "1h"))
 
     def test_internal_missing_five_minute_bucket_still_fails_exact_validation(self):
-        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -178,14 +180,15 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.FAILED, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         health = run.datasets[(SYMBOL, "15m")]
         self.assertFalse(health.validation.ok)
         self.assertEqual(HealthReason.MISSING_IN_BUILT, health.validation.reason)
         self.assertIn(DAY_MS + 2 * ONE_HOUR_MS, health.validation.missing_in_built)
 
     def test_internal_missing_native_candle_still_fails_exact_validation(self):
-        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -213,14 +216,15 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshRunOutcome.PARTIAL, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         health = run.datasets[(SYMBOL, "15m")]
         self.assertFalse(health.validation.ok)
         self.assertEqual(HealthReason.MISSING_IN_NATIVE, health.validation.reason)
         self.assertIn(missing_native, health.validation.missing_in_native)
 
     def test_failed_base_incremental_refresh_keeps_fresh_cache_with_warning(self):
-        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -243,8 +247,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
             )
             manifest = _manifest(store)
 
-        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
-        self.assertEqual("ok", manifest["status"])
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual("usable", manifest["snapshot_usability"])
         base_health = run.datasets[(SYMBOL, "5m")]
         native_health = run.datasets[(SYMBOL, "15m")]
         self.assertEqual(HealthReason.OK, base_health.primary_reason)
@@ -274,7 +279,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertIn("resolve_shared_window", load_source)
 
     def test_multiple_symbols_resolve_independent_shared_windows(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -299,7 +304,8 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
             first_15m = store.read_csv(store.cache_path(SYMBOL, "15m"))
             second_15m = store.read_csv(store.cache_path(SECOND_SYMBOL, "15m"))
 
-        self.assertEqual(RefreshRunOutcome.SUCCESS, run.outcome)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
         self.assertTrue(run.datasets[(SYMBOL, "15m")].validation.ok)
         self.assertTrue(run.datasets[(SECOND_SYMBOL, "15m")].validation.ok)
         self.assertEqual(DAY_MS + ONE_HOUR_MS, first_15m[0].open_time_ms)

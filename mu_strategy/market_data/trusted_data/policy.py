@@ -10,8 +10,8 @@ from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
     IntegrityState,
     IntervalPlan,
-    ManifestStatus,
-    RefreshRunOutcome,
+    RefreshAttemptStatus,
+    SnapshotUsability,
     TrustDecision,
     TrustedLoadContext,
 )
@@ -68,13 +68,11 @@ class TrustPolicy:
         required_intervals: tuple[str, ...],
     ) -> TrustDecision:
         if self.require_manifest_success:
-            if context.manifest.outcome == RefreshRunOutcome.FAILED:
+            if context.manifest.attempt_status == RefreshAttemptStatus.FAILED:
                 return TrustDecision(False, HealthReason.RUN_FAILED)
-            if context.manifest.outcome == RefreshRunOutcome.PARTIAL:
-                return TrustDecision(False, HealthReason.RUN_PARTIAL)
-            if context.manifest.status == ManifestStatus.INVALID:
+            if context.manifest.snapshot_usability == SnapshotUsability.INVALID:
                 return TrustDecision(False, HealthReason.MANIFEST_INVALID)
-            if context.manifest.status == ManifestStatus.STALE:
+            if context.manifest.snapshot_usability == SnapshotUsability.STALE:
                 return TrustDecision(False, HealthReason.MANIFEST_STALE)
         for interval in required_intervals:
             health = health_by_interval.get(interval)

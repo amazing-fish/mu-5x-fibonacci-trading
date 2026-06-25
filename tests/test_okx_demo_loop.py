@@ -440,13 +440,14 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
         self.assertEqual("BTC-USDT-SWAP", result["data_errors"][0]["symbol"])
         self.assertEqual("skip", result["scans"][0]["action"])
-        self.assertEqual("market_data_stale", result["scans"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["scans"][0]["reason"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
-    def test_run_once_blocks_legacy_bundle_when_candles_are_stale(self):
+    def test_run_once_blocks_legacy_bundle_without_trusted_decision(self):
         broker = StubBroker()
         stale_bundle = _legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
 
@@ -467,9 +468,9 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
-        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
-        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("manifest_blocked", result["data_errors"][0]["status_reason"])
+        self.assertIsNone(result["data_errors"][0]["interval"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
@@ -504,9 +505,10 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
         self.assertEqual("expired", result["expired_orders"][0]["status"])
-        self.assertEqual("market_data_stale", result["expired_orders"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["expired_orders"][0]["reason"])
         self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
@@ -977,6 +979,8 @@ class OKXDemoLoopTests(unittest.TestCase):
 
 
 def _bundle(symbol: str) -> CandleBundle:
+    from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
     last_open_time_ms = int(time.time() * 1000) - 900_000
     first_open_time_ms = last_open_time_ms - (39 * 900_000)
     candles = [
@@ -988,6 +992,7 @@ def _bundle(symbol: str) -> CandleBundle:
         candles_by_interval={"15m": candles, "1h": candles},
         files_by_interval={},
         days=28,
+        trust_decision=TrustDecision(True, HealthReason.OK),
     )
 
 

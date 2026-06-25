@@ -10,9 +10,10 @@ from typing import Any, Callable
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted_data.contracts import FreshnessState, SystemClock, TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
+from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bundle, trust_error_payload
+from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
+from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
@@ -127,12 +128,11 @@ def run_once(
             }
             if default_trusted_loader:
                 loader_kwargs["policy"] = trading_strict_policy()
-                loader_kwargs["freshness_policy"] = FreshnessPolicy(
-                    max_staleness_bars=config.max_candle_staleness_bars
-                )
+                loader_kwargs["max_staleness_bars"] = config.max_candle_staleness_bars
                 if trusted_context is not None:
                     loader_kwargs["context"] = trusted_context
             bundle = candle_loader(ticker.inst_id, **loader_kwargs)
+            bundle = ensure_trusted_candle_bundle(bundle)
         except Exception as exc:
             data_error = _market_data_load_error(ticker.inst_id, exc)
             data_errors.append(data_error)
@@ -140,12 +140,8 @@ def run_once(
             scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
 
         if bundle is not None:
-            cycle_run_id = cycle_run_id or getattr(bundle, "run_id", None)
-            data_error = _market_data_freshness_error(
-                symbol=ticker.inst_id,
-                bundle=bundle,
-                max_staleness_bars=config.max_candle_staleness_bars,
-            )
+            cycle_run_id = cycle_run_id or bundle.run_id
+            data_error = _market_data_freshness_error(symbol=ticker.inst_id, bundle=bundle)
             if data_error is not None:
                 data_errors.append(data_error)
                 result = _stale_scan_result(ticker.inst_id, bundle, data_error)
@@ -433,9 +429,9 @@ def _scan_payload(
 ) -> dict[str, Any]:
     payload = asdict(result)
     payload["source"] = source
-    if getattr(bundle, "run_id", None):
+    if bundle.run_id:
         payload["run_id"] = bundle.run_id
-    if getattr(bundle, "observed_at_ms", None) is not None:
+    if bundle.observed_at_ms is not None:
         payload["observed_at_ms"] = bundle.observed_at_ms
     if second_pullback_wait_bars is not None:
         payload["second_pullback_wait_bars"] = second_pullback_wait_bars
@@ -515,11 +511,10 @@ def _market_data_freshness_error(
     *,
     symbol: str,
     bundle: CandleBundle,
-    max_staleness_bars: int,
 ) -> dict[str, Any] | None:
-    status_error = _market_data_status_error(symbol=symbol, bundle=bundle)
-    if status_error is not None:
-        return status_error
+    trust_error = trust_error_payload(symbol, bundle)
+    if trust_error is not None:
+        return trust_error
     for interval, candles in bundle.candles_by_interval.items():
         if not candles:
             return {
@@ -529,85 +524,6 @@ def _market_data_freshness_error(
                 "latest_open_time_ms": None,
                 "source_file": str(bundle.files_by_interval.get(interval, "")),
             }
-    legacy_staleness_error = _legacy_market_data_staleness_error(
-        symbol=symbol,
-        bundle=bundle,
-        max_staleness_bars=max_staleness_bars,
-    )
-    if legacy_staleness_error is not None:
-        return legacy_staleness_error
-    return None
-
-
-def _market_data_status_error(*, symbol: str, bundle: CandleBundle) -> dict[str, Any] | None:
-    decision = getattr(bundle, "trust_decision", None)
-    if decision is not None and not getattr(decision, "allowed", True):
-        reason = getattr(getattr(decision, "reason", None), "value", getattr(decision, "reason", None))
-        load_context = getattr(bundle, "load_context", None)
-        manifest = getattr(load_context, "manifest", None)
-        return {
-            "symbol": symbol,
-            "reason": "market_data_invalid",
-            "interval": None,
-            "status_reason": reason,
-            "error_type": None,
-            "message": getattr(decision, "message", None),
-            "latest_open_time_ms": None,
-            "source_file": "",
-            "run_id": getattr(bundle, "run_id", None),
-            "manifest_outcome": getattr(getattr(manifest, "outcome", None), "value", None),
-            "manifest_status": getattr(getattr(manifest, "status", None), "value", None),
-        }
-    statuses = getattr(bundle, "statuses_by_interval", None) or {}
-    for interval, status in statuses.items():
-        is_valid = bool(getattr(status, "is_valid", True))
-        is_stale = bool(getattr(status, "is_stale", False))
-        if is_valid and not is_stale:
-            continue
-        return {
-            "symbol": symbol,
-            "reason": "market_data_invalid" if not is_valid else "market_data_stale",
-            "interval": interval,
-            "status_reason": getattr(status, "reason", None),
-            "error_type": getattr(status, "error_type", None),
-            "message": getattr(status, "message", None),
-            "latest_open_time_ms": getattr(status, "last_timestamp_ms", None),
-            "source_file": str(getattr(status, "source_file", "")),
-        }
-    return None
-
-
-def _legacy_market_data_staleness_error(
-    *,
-    symbol: str,
-    bundle: CandleBundle,
-    max_staleness_bars: int,
-) -> dict[str, Any] | None:
-    if getattr(bundle, "trust_decision", None) is not None:
-        return None
-    if getattr(bundle, "statuses_by_interval", None):
-        return None
-    policy = FreshnessPolicy(max_staleness_bars=max_staleness_bars)
-    observed_at_ms = SystemClock().now_ms()
-    for interval, candles in bundle.candles_by_interval.items():
-        latest_open_time_ms = max(candle.open_time_ms for candle in candles)
-        assessment = policy.assess(
-            now_ms=observed_at_ms,
-            interval=interval,
-            last_confirmed_open_time_ms=latest_open_time_ms,
-        )
-        if assessment.state == FreshnessState.FRESH:
-            continue
-        return {
-            "symbol": symbol,
-            "reason": "market_data_stale" if assessment.state == FreshnessState.STALE else "market_data_invalid",
-            "interval": interval,
-            "status_reason": assessment.reason.value,
-            "error_type": None,
-            "message": None,
-            "latest_open_time_ms": latest_open_time_ms,
-            "source_file": str(bundle.files_by_interval.get(interval, "")),
-        }
     return None
 
 

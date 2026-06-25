@@ -26,14 +26,14 @@ class FreshnessState(Enum):
     UNKNOWN = "unknown"
 
 
-class RefreshRunOutcome(Enum):
+class RefreshAttemptStatus(Enum):
     SUCCESS = "success"
-    PARTIAL = "partial"
+    DEGRADED = "degraded"
     FAILED = "failed"
 
 
-class ManifestStatus(Enum):
-    OK = "ok"
+class SnapshotUsability(Enum):
+    USABLE = "usable"
     STALE = "stale"
     INVALID = "invalid"
 
@@ -55,7 +55,7 @@ class HealthReason(Enum):
     MALFORMED_MANIFEST = "malformed_manifest"
     MANIFEST_BLOCKED = "manifest_blocked"
     RUN_FAILED = "run_failed"
-    RUN_PARTIAL = "run_partial"
+    RUN_DEGRADED = "run_degraded"
     MANIFEST_INVALID = "manifest_invalid"
     MANIFEST_STALE = "manifest_stale"
     FRESHNESS_UNKNOWN = "freshness_unknown"
@@ -272,14 +272,15 @@ class UniverseSnapshot:
 class TrustedManifestSnapshot:
     schema_version: int
     run_id: str
-    outcome: RefreshRunOutcome
-    status: ManifestStatus
+    attempt_status: RefreshAttemptStatus
+    snapshot_usability: SnapshotUsability
     started_at_ms: int
     completed_at_ms: int
     requested_intervals: tuple[str, ...]
     effective_intervals: tuple[str, ...]
     universe_snapshot: UniverseSnapshot
     datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
+    provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
 
@@ -338,40 +339,36 @@ class TrustedLoadContext:
     observed_at_ms: int
 
 
-def derive_manifest_status(
-    outcome: RefreshRunOutcome,
+def derive_snapshot_usability(
     datasets: dict[tuple[str, str], DatasetHealth],
-) -> ManifestStatus:
-    if outcome in {RefreshRunOutcome.FAILED, RefreshRunOutcome.PARTIAL}:
-        return ManifestStatus.INVALID
+) -> SnapshotUsability:
     if not datasets:
-        return ManifestStatus.INVALID
+        return SnapshotUsability.INVALID
     if any(health.availability != AvailabilityState.AVAILABLE for health in datasets.values()):
-        return ManifestStatus.INVALID
+        return SnapshotUsability.INVALID
     if any(health.integrity != IntegrityState.VALID for health in datasets.values()):
-        return ManifestStatus.INVALID
+        return SnapshotUsability.INVALID
     if any(health.freshness == FreshnessState.UNKNOWN for health in datasets.values()):
-        return ManifestStatus.INVALID
+        return SnapshotUsability.INVALID
     if any(health.freshness == FreshnessState.STALE for health in datasets.values()):
-        return ManifestStatus.STALE
-    return ManifestStatus.OK
+        return SnapshotUsability.STALE
+    return SnapshotUsability.USABLE
 
 
 @dataclass(frozen=True)
 class RefreshRun:
     run_id: str
-    outcome: RefreshRunOutcome
+    attempt_status: RefreshAttemptStatus
+    snapshot_usability: SnapshotUsability
     started_at_ms: int
     completed_at_ms: int
     requested_intervals: tuple[str, ...]
     effective_intervals: tuple[str, ...]
     universe_snapshot: UniverseSnapshot
     datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
+    provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
-
-    def manifest_status(self) -> str:
-        return derive_manifest_status(self.outcome, self.datasets).value
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -387,10 +384,10 @@ class RefreshRun:
             symbols[str(inst_id)]["last"] = item.get("last")
             symbols[str(inst_id)]["volume_ccy_24h"] = item.get("volume_ccy_24h")
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": self.run_id,
-            "outcome": self.outcome.value,
-            "status": self.manifest_status(),
+            "attempt_status": self.attempt_status.value,
+            "snapshot_usability": self.snapshot_usability.value,
             "started_at_ms": self.started_at_ms,
             "completed_at_ms": self.completed_at_ms,
             "updated_at_ms": self.completed_at_ms,
@@ -399,6 +396,7 @@ class RefreshRun:
             "intervals": list(self.effective_intervals),
             "universes": self.universe_snapshot.to_dict(),
             "symbols": symbols,
+            "provider_failures": [dict(value) for value in self.provider_failures],
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
@@ -407,12 +405,13 @@ class RefreshRun:
         invalid_count = sum(1 for health in self.datasets.values() if not health.is_usable)
         return {
             "run_id": self.run_id,
-            "outcome": self.outcome.value,
-            "status": self.manifest_status(),
+            "attempt_status": self.attempt_status.value,
+            "snapshot_usability": self.snapshot_usability.value,
             "started_at_ms": self.started_at_ms,
             "completed_at_ms": self.completed_at_ms,
             "symbol_count": len({symbol for symbol, _ in self.datasets}),
             "invalid_count": invalid_count,
+            "provider_failures": [dict(value) for value in self.provider_failures],
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
@@ -447,30 +446,33 @@ def trusted_manifest_snapshot_from_dict(
     if not _is_int(schema_version):
         if compatibility_mode and (schema_version is None or schema_version == 1):
             return _legacy_manifest_snapshot(payload)
-        raise ManifestSchemaError("manifest schema_version must be integer v2")
-    if int(schema_version) != 2:
+        raise ManifestSchemaError("manifest schema_version must be integer v3")
+    if int(schema_version) != 3:
         if compatibility_mode and int(schema_version) == 1:
+            return _legacy_manifest_snapshot(payload)
+        if compatibility_mode and int(schema_version) == 2:
             return _legacy_manifest_snapshot(payload)
         raise ManifestSchemaError(f"unsupported manifest schema_version: {schema_version}")
 
     run_id = _required_str(payload, "run_id")
-    outcome = _required_enum(payload, "outcome", RefreshRunOutcome)
-    status = _required_enum(payload, "status", ManifestStatus)
+    attempt_status = _required_enum(payload, "attempt_status", RefreshAttemptStatus)
+    snapshot_usability = _required_enum(payload, "snapshot_usability", SnapshotUsability)
     requested_intervals = _required_str_tuple(payload, "requested_intervals")
     effective_intervals = _required_str_tuple(payload, "effective_intervals")
     symbols = _required_dict(payload, "symbols")
     universes = _required_dict(payload, "universes")
     snapshot = TrustedManifestSnapshot(
-        schema_version=2,
+        schema_version=3,
         run_id=run_id,
-        outcome=outcome,
-        status=status,
+        attempt_status=attempt_status,
+        snapshot_usability=snapshot_usability,
         started_at_ms=_required_int(payload, "started_at_ms"),
         completed_at_ms=_required_int(payload, "completed_at_ms"),
         requested_intervals=requested_intervals,
         effective_intervals=effective_intervals,
         universe_snapshot=_universe_snapshot_from_dict(universes),
         datasets=_datasets_from_symbols(symbols),
+        provider_failures=_provider_failures(payload.get("provider_failures") or ()),
         warnings=_optional_str_tuple(payload, "warnings"),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
     )
@@ -516,8 +518,21 @@ def _optional_int(value: Any) -> int | None:
 def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapshot:
     symbols = payload.get("symbols") if isinstance(payload.get("symbols"), dict) else {}
     status_value = str(payload.get("status") or "invalid")
-    status = ManifestStatus.OK if status_value == "ok" else ManifestStatus.STALE if status_value == "stale" else ManifestStatus.INVALID
-    outcome = RefreshRunOutcome.SUCCESS if status in {ManifestStatus.OK, ManifestStatus.STALE} else RefreshRunOutcome.FAILED
+    snapshot_usability = (
+        SnapshotUsability.USABLE
+        if status_value == "ok"
+        else SnapshotUsability.STALE
+        if status_value == "stale"
+        else SnapshotUsability.INVALID
+    )
+    outcome_value = str(payload.get("outcome") or "")
+    attempt_status = (
+        RefreshAttemptStatus.FAILED
+        if outcome_value == "failed" or snapshot_usability == SnapshotUsability.INVALID
+        else RefreshAttemptStatus.DEGRADED
+        if outcome_value == "partial"
+        else RefreshAttemptStatus.SUCCESS
+    )
     intervals = tuple(str(item) for item in payload.get("intervals") or ())
     if not intervals:
         intervals = tuple(dict.fromkeys(interval for _, interval in _datasets_from_symbols(symbols)))
@@ -525,14 +540,15 @@ def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapsho
     return TrustedManifestSnapshot(
         schema_version=1,
         run_id=str(payload.get("run_id") or "legacy-manifest"),
-        outcome=outcome,
-        status=status,
+        attempt_status=attempt_status,
+        snapshot_usability=snapshot_usability,
         started_at_ms=int(payload.get("started_at_ms") or 0),
         completed_at_ms=int(payload.get("completed_at_ms") or payload.get("updated_at_ms") or 0),
         requested_intervals=intervals,
         effective_intervals=intervals,
         universe_snapshot=_universe_snapshot_from_dict(universe_payload),
         datasets=_datasets_from_symbols(symbols, strict=False),
+        provider_failures=_provider_failures(payload.get("provider_failures") or ()),
         warnings=tuple(str(value) for value in payload.get("warnings") or ()),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
     )
@@ -580,23 +596,20 @@ def _validate_manifest_snapshot(snapshot: TrustedManifestSnapshot) -> None:
         raise ManifestSchemaError("manifest requested_intervals must be a subset of effective_intervals")
     if any(interval in effective for interval in ("15m", "1h")) and "5m" not in effective:
         raise ManifestSchemaError("manifest effective_intervals must include 5m when native intervals are present")
-    derived_status = derive_manifest_status(snapshot.outcome, snapshot.datasets)
-    if snapshot.status != derived_status:
+    derived_usability = derive_snapshot_usability(snapshot.datasets)
+    if snapshot.snapshot_usability != derived_usability:
         raise ManifestSchemaError(
-            f"manifest status must match derived status: declared={snapshot.status.value}, derived={derived_status.value}"
+            "manifest snapshot_usability must match derived usability: "
+            f"declared={snapshot.snapshot_usability.value}, derived={derived_usability.value}"
         )
-    if snapshot.outcome == RefreshRunOutcome.FAILED and snapshot.status != ManifestStatus.INVALID:
-        raise ManifestSchemaError("failed manifest outcome must have invalid status")
-    if snapshot.outcome == RefreshRunOutcome.PARTIAL and snapshot.status == ManifestStatus.OK:
-        raise ManifestSchemaError("partial manifest outcome cannot have ok status")
-    if snapshot.outcome == RefreshRunOutcome.SUCCESS and snapshot.status == ManifestStatus.OK:
+    if snapshot.snapshot_usability == SnapshotUsability.USABLE:
         for row in [*snapshot.universe_snapshot.crypto_top, *snapshot.universe_snapshot.stock_token_top]:
             inst_id = str(row.get("inst_id") or row.get("instId") or "")
             if not inst_id:
                 raise ManifestSchemaError("manifest universe row must include inst_id")
             for interval in snapshot.effective_intervals:
                 if (inst_id, interval) not in snapshot.datasets:
-                    raise ManifestSchemaError("success/ok manifest catalog is incomplete for canonical universe")
+                    raise ManifestSchemaError("usable manifest catalog is incomplete for canonical universe")
 
 
 def _universe_snapshot_from_dict(payload: dict[str, Any]) -> UniverseSnapshot:
@@ -674,6 +687,21 @@ def _optional_str_dict(value: Any) -> dict[str, str] | None:
     if not isinstance(value, dict):
         raise ManifestSchemaError("manifest cycle_error must be object or null")
     return {str(key): str(item) for key, item in value.items()}
+
+
+def _provider_failures(value: Any) -> tuple[dict[str, str], ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ManifestSchemaError("manifest provider_failures must be an array")
+    failures: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ManifestSchemaError("manifest provider_failures entries must be objects")
+        failure = {str(key): str(payload_value) for key, payload_value in item.items()}
+        for key in ("symbol", "interval", "reason", "error_type", "message"):
+            if not failure.get(key):
+                raise ManifestSchemaError(f"manifest provider failure must include {key}")
+        failures.append(failure)
+    return tuple(failures)
 
 
 def _is_int(value: Any) -> bool:

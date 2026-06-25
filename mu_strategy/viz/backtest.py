@@ -8,12 +8,9 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
-from mu_strategy.market_data.service import (
-    TRUSTED_REQUIRED_INTERVALS,
-    refresh_candle_bundle,
-    refresh_trusted_candle_bundle,
-    trusted_bundle_error,
-)
+from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
+from mu_strategy.market_data.trusted_data.refresh import DEFAULT_INTERVALS as TRUSTED_REQUIRED_INTERVALS
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -78,7 +75,7 @@ def main() -> None:
             parser.error(status_error)
         candles_15m = bundle.candles_by_interval["15m"]
         candles_1h = bundle.candles_by_interval["1h"]
-        data_source_note = "trusted OKX data layer (CSV + manifest-compatible status gate)"
+        data_source_note = "trusted OKX data layer (CSV + TrustDecision gate)"
     else:
         bundle = refresh_candle_bundle(
             args.symbol,

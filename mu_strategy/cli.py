@@ -5,12 +5,9 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.indicators import ema, macd, rsi
-from mu_strategy.market_data.service import (
-    TRUSTED_REQUIRED_INTERVALS,
-    refresh_candle_bundle,
-    refresh_trusted_candle_bundle,
-    trusted_bundle_error,
-)
+from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
+from mu_strategy.market_data.trusted_data.refresh import DEFAULT_INTERVALS as TRUSTED_REQUIRED_INTERVALS
 from mu_strategy.models import Candle
 from mu_strategy.reporting import render_markdown_report
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, one_hour_regime, selected_strategy_groups, with_fee_profile

@@ -25,7 +25,7 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertEqual([], result["orders"])
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
         self.assertEqual("native_empty", result["data_errors"][0]["status_reason"])
-        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertIsNone(result["data_errors"][0]["interval"])
         self.assertEqual("skip", result["scans"][0]["action"])
 
 

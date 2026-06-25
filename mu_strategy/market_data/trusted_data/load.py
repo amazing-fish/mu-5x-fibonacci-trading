@@ -110,15 +110,6 @@ class LoadTrustedBundle:
                     ),
                 )
             context = TrustedLoadContext(manifest=manifest_result.snapshot, observed_at_ms=observed_at_ms)
-        elif context.manifest is None:
-            return TrustedBundle(
-                symbol=resolved.inst_id,
-                candles_by_interval={interval: [] for interval in plan.requested_intervals},
-                files_by_interval={interval: self.store.cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
-                days=query.days,
-                health_by_interval={},
-                trust_decision=TrustDecision(False, HealthReason.MANIFEST_BLOCKED),
-            )
 
         manifest = context.manifest
         publications = PublishedDatasetCatalog.from_manifest(manifest, data_dir=self.store.data_dir)

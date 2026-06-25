@@ -156,7 +156,8 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             run_log_path = data_dir / "refresh_runs.jsonl"
             self.assertTrue(manifest_path.exists())
             self.assertTrue(run_log_path.exists())
-            self.assertEqual("ok", manifest["status"])
+            self.assertEqual("success", manifest["attempt_status"])
+            self.assertEqual("usable", manifest["snapshot_usability"])
             self.assertEqual(["BTC-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["crypto_top"]])
             self.assertEqual(["MU-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["stock_token_top"]])
             self.assertTrue((data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv").exists())
@@ -169,47 +170,11 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertIn("MU-USDT-SWAP", html)
         self.assertIn("stock_token_top", html)
 
-    def test_refresh_interval_is_deprecated_and_preserves_canonical_store(self):
-        from mu_strategy.market_data.trusted import refresh_trusted_interval
-        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
+    def test_per_symbol_refresh_facades_are_removed(self):
+        import mu_strategy.market_data.trusted as trusted
 
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            manifest_path = data_dir / "manifest.json"
-            run_log_path = data_dir / "refresh_runs.jsonl"
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
-            run_log_path.write_text('{"run_id":"canonical"}\n', encoding="utf-8")
-            manifest_before = manifest_path.read_bytes()
-            run_log_before = run_log_path.read_bytes()
-
-            with patch("mu_strategy.market_data.trusted.refresh_with_okx_provider", side_effect=AssertionError("refresh provider")):
-                with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
-                    refresh_trusted_interval("BTC-USDT-SWAP", "5m", days=1, data_dir=data_dir, now_ms=900_000)
-
-            self.assertEqual(manifest_before, manifest_path.read_bytes())
-            self.assertEqual(run_log_before, run_log_path.read_bytes())
-
-    def test_refresh_symbol_statuses_is_deprecated_and_preserves_canonical_store(self):
-        from mu_strategy.market_data.trusted import refresh_trusted_symbol_statuses
-        from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
-
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            manifest_path = data_dir / "manifest.json"
-            run_log_path = data_dir / "refresh_runs.jsonl"
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
-            run_log_path.write_text('{"run_id":"canonical"}\n', encoding="utf-8")
-            manifest_before = manifest_path.read_bytes()
-            run_log_before = run_log_path.read_bytes()
-
-            with patch("mu_strategy.market_data.trusted.refresh_with_okx_provider", side_effect=AssertionError("refresh provider")):
-                with self.assertRaisesRegex(TrustedConsumerRefreshError, "LoadTrustedBundle"):
-                    refresh_trusted_symbol_statuses("BTC-USDT-SWAP", intervals=("5m",), days=1, data_dir=data_dir)
-
-            self.assertEqual(manifest_before, manifest_path.read_bytes())
-            self.assertEqual(run_log_before, run_log_path.read_bytes())
+        self.assertFalse(hasattr(trusted, "refresh_trusted_interval"))
+        self.assertFalse(hasattr(trusted, "refresh_trusted_symbol_statuses"))
 
     def test_refresh_once_marks_manifest_invalid_when_any_interval_fails(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
@@ -240,9 +205,12 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
-        self.assertEqual("invalid", manifest["status"])
-        self.assertEqual("invalid", persisted["status"])
-        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual("degraded", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("degraded", persisted["attempt_status"])
+        self.assertEqual("invalid", persisted["snapshot_usability"])
+        self.assertEqual("degraded", run_log["attempt_status"])
+        self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertEqual(2, run_log["invalid_count"])
         self.assertFalse(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
         self.assertEqual("refresh_failed", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["reason"])
@@ -269,9 +237,12 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
-        self.assertEqual("invalid", manifest["status"])
-        self.assertEqual("invalid", persisted["status"])
-        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("failed", persisted["attempt_status"])
+        self.assertEqual("invalid", persisted["snapshot_usability"])
+        self.assertEqual("failed", run_log["attempt_status"])
+        self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertEqual({}, manifest["symbols"])
         self.assertIn("empty_universe", manifest["warnings"])
 
@@ -302,7 +273,8 @@ class TrustedRefreshStoreTests(unittest.TestCase):
 
         btc_status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
         eth_status = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertFalse(btc_status["is_valid"])
         self.assertEqual("cache_read_failed", btc_status["reason"])
         self.assertTrue(eth_status["is_valid"])
@@ -335,9 +307,12 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
-        self.assertEqual("invalid", manifest["status"])
-        self.assertEqual("invalid", persisted["status"])
-        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("success", persisted["attempt_status"])
+        self.assertEqual("invalid", persisted["snapshot_usability"])
+        self.assertEqual("success", run_log["attempt_status"])
+        self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertFalse(status["is_valid"])
         self.assertEqual("cache_read_failed", status["reason"])
 
@@ -379,9 +354,12 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
-        self.assertEqual("invalid", manifest["status"])
-        self.assertEqual("invalid", persisted["status"])
-        self.assertEqual("invalid", run_log["status"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("success", persisted["attempt_status"])
+        self.assertEqual("invalid", persisted["snapshot_usability"])
+        self.assertEqual("success", run_log["attempt_status"])
+        self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertFalse(status["is_valid"])
         self.assertEqual("ohlcv_mismatch", status["reason"])
         self.assertEqual("ohlcv_mismatch", status["validation"]["reason"])
@@ -406,7 +384,6 @@ class TrustedCandleBundleTests(unittest.TestCase):
                                     days=1,
                                     data_dir=data_dir,
                                     refresh=True,
-                                    fetcher=lambda *args, **kwargs: self.fail("fetcher must not run"),
                                 )
 
             self.assertFalse((data_dir / "manifest.json").exists())
@@ -610,7 +587,6 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     days=1,
                     data_dir=data_dir,
                     refresh=True,
-                    fetcher=_fake_fetcher,
                 )
 
             self.assertEqual(manifest_before, manifest_path.read_bytes())
@@ -644,17 +620,20 @@ def _manifest(
     status: str = "ok",
     cycle_error: dict | None = None,
 ) -> dict:
+    attempt_status = "failed" if outcome == "failed" else "degraded" if outcome == "partial" else "success"
+    snapshot_usability = "usable" if status == "ok" else status
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": "test-run",
-        "outcome": outcome,
-        "status": status,
+        "attempt_status": attempt_status,
+        "snapshot_usability": snapshot_usability,
         "started_at_ms": 0,
         "completed_at_ms": 3_600_000,
         "requested_intervals": ["15m", "1h"],
         "effective_intervals": ["5m", "15m", "1h"],
         "universes": {"crypto_top": [], "stock_token_top": []},
         "symbols": symbols,
+        "provider_failures": [],
         "warnings": [],
         "cycle_error": cycle_error,
     }

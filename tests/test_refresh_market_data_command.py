@@ -32,8 +32,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual(
             {
                 "run_id": "run-ok",
-                "outcome": "success",
-                "status": "ok",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
                 "usable": True,
                 "symbols": 1,
             },
@@ -69,12 +69,12 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("failed", manifest["outcome"])
-        self.assertEqual("invalid", manifest["status"])
-        self.assertEqual("failed", run_log[-1]["outcome"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("failed", run_log[-1]["attempt_status"])
         self.assertTrue(html_exists)
-        self.assertEqual("failed", output["outcome"])
-        self.assertEqual("invalid", output["status"])
+        self.assertEqual("failed", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
         self.assertFalse(output["usable"])
         self.assertEqual(0, output["symbols"])
         self.assertEqual("TimeoutError", output["cycle_error"]["error_type"])
@@ -116,22 +116,22 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         load_config.assert_not_called()
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("failed", output["outcome"])
-        self.assertEqual("invalid", output["status"])
+        self.assertEqual("failed", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
         self.assertFalse(output["usable"])
         self.assertEqual(0, output["symbols"])
-        self.assertEqual("publication_not_usable", output["reason"])
-        self.assertEqual("failed", manifest["outcome"])
-        self.assertEqual("invalid", manifest["status"])
+        self.assertEqual("publication_not_fully_healthy", output["reason"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertEqual({"crypto_top": [], "stock_token_top": []}, manifest["universes"])
         self.assertEqual({}, manifest["symbols"])
-        self.assertEqual("failed", run_log[-1]["outcome"])
-        self.assertEqual("invalid", run_log[-1]["status"])
+        self.assertEqual("failed", run_log[-1]["attempt_status"])
+        self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
         self.assertEqual(0, run_log[-1]["symbol_count"])
         self.assertEqual([], csv_paths)
         self.assertTrue(html_exists)
 
-    def test_partial_one_shot_exits_non_zero_after_writing_artifacts(self):
+    def test_degraded_invalid_one_shot_exits_non_zero_after_writing_artifacts(self):
         from mu_strategy.commands.refresh_market_data import main
 
         def fetch_history(symbol: str, interval: str, *, days: int):
@@ -178,11 +178,11 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("partial", output["outcome"])
-        self.assertEqual("invalid", output["status"])
+        self.assertEqual("degraded", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
         self.assertFalse(output["usable"])
-        self.assertEqual("partial", manifest["outcome"])
-        self.assertEqual("partial", run_log[-1]["outcome"])
+        self.assertEqual("degraded", manifest["attempt_status"])
+        self.assertEqual("degraded", run_log[-1]["attempt_status"])
         self.assertTrue(html_exists)
 
     def test_success_stale_one_shot_exits_non_zero_after_writing_artifacts(self):
@@ -225,12 +225,12 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("success", output["outcome"])
-        self.assertEqual("stale", output["status"])
+        self.assertEqual("success", output["attempt_status"])
+        self.assertEqual("stale", output["snapshot_usability"])
         self.assertFalse(output["usable"])
-        self.assertEqual("success", manifest["outcome"])
-        self.assertEqual("stale", manifest["status"])
-        self.assertEqual("stale", run_log[-1]["status"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("stale", manifest["snapshot_usability"])
+        self.assertEqual("stale", run_log[-1]["snapshot_usability"])
         self.assertTrue(html_exists)
 
     def test_loop_reports_cycle_failure_and_continues(self):
@@ -269,18 +269,18 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
             rows[0],
         )
         self.assertEqual(
-            {"run_id": "run-ok", "outcome": "success", "status": "ok", "usable": True, "symbols": 1},
+            {"run_id": "run-ok", "attempt_status": "success", "snapshot_usability": "usable", "usable": True, "symbols": 1},
             rows[1],
         )
         write_dashboard.assert_called_once()
 
     def test_loop_reports_failed_partial_and_stale_domain_results_and_continues(self):
         from mu_strategy.commands.refresh_market_data import main
-        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, RefreshRunOutcome
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, RefreshAttemptStatus
 
         runs = [
-            _run("run-failed", outcome=RefreshRunOutcome.FAILED, cycle_error={"error_type": "TimeoutError", "message": "ticker timeout"}),
-            _run("run-partial", outcome=RefreshRunOutcome.PARTIAL),
+            _run("run-failed", attempt_status=RefreshAttemptStatus.FAILED, cycle_error={"error_type": "TimeoutError", "message": "ticker timeout"}),
+            _run("run-degraded", attempt_status=RefreshAttemptStatus.DEGRADED),
             _run("run-stale", freshness=FreshnessState.STALE),
             _run("run-ok"),
         ]
@@ -308,8 +308,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(4, len(calls))
-        self.assertEqual(["failed", "partial", "success", "success"], [row["outcome"] for row in rows])
-        self.assertEqual(["invalid", "invalid", "stale", "ok"], [row["status"] for row in rows])
+        self.assertEqual(["failed", "degraded", "success", "success"], [row["attempt_status"] for row in rows])
+        self.assertEqual(["invalid", "invalid", "stale", "usable"], [row["snapshot_usability"] for row in rows])
         self.assertEqual([False, False, False, True], [row["usable"] for row in rows])
         self.assertEqual([1, 1, 1, 1], sleeps)
         self.assertEqual(4, write_dashboard.call_count)
@@ -331,7 +331,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 def _run(
     run_id: str,
     *,
-    outcome=None,
+    attempt_status=None,
     freshness=None,
     cycle_error=None,
 ):
@@ -342,16 +342,18 @@ def _run(
         FreshnessState,
         HealthReason,
         IntegrityState,
+        RefreshAttemptStatus,
         RefreshRun,
-        RefreshRunOutcome,
+        SnapshotUsability,
         UniverseSnapshot,
+        derive_snapshot_usability,
     )
 
-    outcome = outcome or RefreshRunOutcome.SUCCESS
+    attempt_status = attempt_status or RefreshAttemptStatus.SUCCESS
     freshness = freshness or FreshnessState.FRESH
     reason = HealthReason.STALE_BY_CLOCK if freshness == FreshnessState.STALE else HealthReason.OK
     integrity = IntegrityState.VALID
-    if outcome == RefreshRunOutcome.PARTIAL:
+    if attempt_status in {RefreshAttemptStatus.DEGRADED, RefreshAttemptStatus.FAILED}:
         integrity = IntegrityState.INVALID
         reason = HealthReason.REFRESH_FAILED
     health = DatasetHealth(
@@ -366,9 +368,11 @@ def _run(
         updated_at_ms=0,
         source_file=Path("data/live/okx/BTC-USDT-SWAP/5m.csv"),
     )
+    datasets = {("BTC-USDT-SWAP", "5m"): health}
     return RefreshRun(
         run_id=run_id,
-        outcome=outcome,
+        attempt_status=attempt_status,
+        snapshot_usability=derive_snapshot_usability(datasets),
         started_at_ms=0,
         completed_at_ms=0,
         requested_intervals=("5m",),
@@ -376,7 +380,7 @@ def _run(
         universe_snapshot=UniverseSnapshot(
             crypto_top=({"inst_id": "BTC-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"},)
         ),
-        datasets={("BTC-USDT-SWAP", "5m"): health},
+        datasets=datasets,
         cycle_error=cycle_error,
     )
 

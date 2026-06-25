@@ -23,98 +23,89 @@ class DatasetHealthUsabilityTests(unittest.TestCase):
         self.assertFalse(_health("MU-USDT-SWAP", "5m", freshness=FreshnessState.UNKNOWN).is_usable)
 
 
-class ManifestStatusDerivationTests(unittest.TestCase):
-    def test_derive_manifest_status_fails_closed_on_unknown_or_unusable_state(self):
+class SnapshotUsabilityDerivationTests(unittest.TestCase):
+    def test_derive_snapshot_usability_fails_closed_on_unknown_or_unusable_state(self):
         from mu_strategy.market_data.trusted_data.contracts import (
             AvailabilityState,
             FreshnessState,
             IntegrityState,
-            ManifestStatus,
-            RefreshRunOutcome,
-            derive_manifest_status,
+            SnapshotUsability,
+            derive_snapshot_usability,
         )
 
         cases = [
             (
                 "all_fresh",
-                RefreshRunOutcome.SUCCESS,
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m")},
-                ManifestStatus.OK,
+                SnapshotUsability.USABLE,
             ),
             (
                 "one_stale",
-                RefreshRunOutcome.SUCCESS,
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m", freshness=FreshnessState.STALE)},
-                ManifestStatus.STALE,
+                SnapshotUsability.STALE,
             ),
             (
                 "one_unknown",
-                RefreshRunOutcome.SUCCESS,
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m", freshness=FreshnessState.UNKNOWN)},
-                ManifestStatus.INVALID,
+                SnapshotUsability.INVALID,
             ),
             (
                 "one_invalid",
-                RefreshRunOutcome.SUCCESS,
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m", integrity=IntegrityState.INVALID)},
-                ManifestStatus.INVALID,
+                SnapshotUsability.INVALID,
             ),
             (
                 "one_missing",
-                RefreshRunOutcome.SUCCESS,
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m", availability=AvailabilityState.MISSING)},
-                ManifestStatus.INVALID,
+                SnapshotUsability.INVALID,
             ),
-            ("failed_outcome", RefreshRunOutcome.FAILED, {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m")}, ManifestStatus.INVALID),
-            ("partial_outcome", RefreshRunOutcome.PARTIAL, {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m")}, ManifestStatus.INVALID),
-            ("empty_catalog", RefreshRunOutcome.SUCCESS, {}, ManifestStatus.INVALID),
+            ("empty_catalog", {}, SnapshotUsability.INVALID),
         ]
-        for name, outcome, datasets, expected in cases:
+        for name, datasets, expected in cases:
             with self.subTest(name=name):
-                self.assertEqual(expected, derive_manifest_status(outcome, datasets))
+                self.assertEqual(expected, derive_snapshot_usability(datasets))
 
-    def test_refresh_run_manifest_status_delegates_to_derived_lattice(self):
+    def test_refresh_run_snapshot_usability_delegates_to_derived_lattice(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState
 
         run = _run(freshness=FreshnessState.UNKNOWN)
 
-        self.assertEqual("invalid", run.manifest_status())
+        self.assertEqual("invalid", run.snapshot_usability.value)
 
 
 class ManifestSchemaConsistencyTests(unittest.TestCase):
-    def test_schema_v2_rejects_declared_status_that_disagrees_with_derived_status(self):
+    def test_schema_v3_rejects_declared_usability_that_disagrees_with_derived_usability(self):
         from mu_strategy.market_data.trusted_data.contracts import ManifestSchemaError, trusted_manifest_snapshot_from_dict
 
         invalid_cases = [
-            ("success_ok_unknown", _manifest(status="ok", freshness="unknown")),
-            ("success_ok_empty", _manifest(status="ok", include_datasets=False)),
-            ("success_ok_invalid", _manifest(status="ok", integrity="invalid")),
-            ("success_stale_all_fresh", _manifest(status="stale")),
-            ("success_invalid_all_fresh", _manifest(status="invalid")),
-            ("partial_ok", _manifest(outcome="partial", status="ok")),
-            ("failed_stale", _manifest(outcome="failed", status="stale")),
+            ("success_usable_unknown", _manifest(snapshot_usability="usable", freshness="unknown")),
+            ("success_usable_empty", _manifest(snapshot_usability="usable", include_datasets=False)),
+            ("success_usable_invalid", _manifest(snapshot_usability="usable", integrity="invalid")),
+            ("success_stale_all_fresh", _manifest(snapshot_usability="stale")),
+            ("success_invalid_all_fresh", _manifest(snapshot_usability="invalid")),
         ]
         for name, payload in invalid_cases:
             with self.subTest(name=name):
                 with self.assertRaises(ManifestSchemaError):
                     trusted_manifest_snapshot_from_dict(payload)
 
-    def test_schema_v2_accepts_only_statuses_matching_the_derived_lattice(self):
+    def test_schema_v3_accepts_only_usability_matching_the_derived_lattice(self):
         from mu_strategy.market_data.trusted_data.contracts import trusted_manifest_snapshot_from_dict
 
         valid_cases = [
-            ("success_ok_fresh", _manifest(status="ok")),
-            ("success_stale", _manifest(status="stale", freshness="stale")),
-            ("success_invalid_unknown", _manifest(status="invalid", freshness="unknown")),
-            ("success_invalid_integrity", _manifest(status="invalid", integrity="invalid")),
-            ("success_invalid_missing", _manifest(status="invalid", availability="missing", integrity="invalid", freshness="unknown")),
-            ("partial_invalid", _manifest(outcome="partial", status="invalid")),
-            ("failed_invalid", _manifest(outcome="failed", status="invalid")),
+            ("success_usable_fresh", _manifest(snapshot_usability="usable")),
+            ("success_stale", _manifest(snapshot_usability="stale", freshness="stale")),
+            ("success_invalid_unknown", _manifest(snapshot_usability="invalid", freshness="unknown")),
+            ("success_invalid_integrity", _manifest(snapshot_usability="invalid", integrity="invalid")),
+            ("success_invalid_missing", _manifest(snapshot_usability="invalid", availability="missing", integrity="invalid", freshness="unknown")),
+            ("degraded_invalid", _manifest(attempt_status="degraded", snapshot_usability="invalid", integrity="invalid")),
+            ("failed_invalid", _manifest(attempt_status="failed", snapshot_usability="invalid", integrity="invalid")),
+            ("failed_usable", _manifest(attempt_status="failed", snapshot_usability="usable")),
         ]
         for name, payload in valid_cases:
             with self.subTest(name=name):
                 snapshot = trusted_manifest_snapshot_from_dict(payload)
-                self.assertEqual(payload["status"], snapshot.status.value)
+                self.assertEqual(payload["snapshot_usability"], snapshot.snapshot_usability.value)
 
 
 class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
@@ -259,21 +250,17 @@ class DemoUnknownFreshnessGateTests(unittest.TestCase):
 
 
 class LegacyCompatibilityFreshnessTests(unittest.TestCase):
-    def test_unknown_freshness_maps_to_stale_legacy_status_and_blocks_legacy_gate(self):
-        from mu_strategy.market_data import service
-        from mu_strategy.market_data import trusted
-        from mu_strategy.market_data.service import trusted_status_error
+    def test_unknown_freshness_maps_to_stale_legacy_status_through_single_adapter(self):
+        from mu_strategy.market_data.trusted_data.compat import data_status_from_health
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
 
         health = _health("MU-USDT-SWAP", "5m", freshness=FreshnessState.UNKNOWN, reason=HealthReason.OK)
 
-        for adapter in (service._data_status_from_health, trusted._data_status_from_health):
-            with self.subTest(adapter=adapter.__module__):
-                status = adapter(health)
-                self.assertTrue(status.is_valid)
-                self.assertTrue(status.is_stale)
-                self.assertNotEqual("ok", status.reason)
-                self.assertIsNotNone(trusted_status_error({"5m": status}, required_intervals=("5m",)))
+        status = data_status_from_health(health)
+
+        self.assertTrue(status.is_valid)
+        self.assertTrue(status.is_stale)
+        self.assertNotEqual("ok", status.reason)
 
 
 class FutureTimestampFreshnessTests(unittest.TestCase):
@@ -303,7 +290,7 @@ class FutureTimestampFreshnessTests(unittest.TestCase):
         self.assertFalse(strict.allowed)
         self.assertEqual(HealthReason.FUTURE_TIMESTAMP, strict.reason)
         self.assertTrue(observe.allowed)
-        self.assertEqual("invalid", run.manifest_status())
+        self.assertEqual("invalid", run.snapshot_usability.value)
 
 
 class RefreshCommandUnknownFreshnessTests(unittest.TestCase):
@@ -314,7 +301,7 @@ class RefreshCommandUnknownFreshnessTests(unittest.TestCase):
         result = classify_refresh_run(_run(freshness=FreshnessState.UNKNOWN))
 
         self.assertFalse(result.usable)
-        self.assertEqual("invalid", result.manifest_status)
+        self.assertEqual("invalid", result.snapshot_usability)
         self.assertEqual(REFRESH_COMMAND_UNUSABLE_EXIT_CODE, result.exit_code)
 
 
@@ -360,19 +347,20 @@ def _health(symbol, interval, *, availability=None, integrity=None, freshness=No
 
 def _context_with_status(status: str):
     from mu_strategy.market_data.trusted_data.contracts import (
-        ManifestStatus,
-        RefreshRunOutcome,
+        RefreshAttemptStatus,
+        SnapshotUsability,
         TrustedLoadContext,
         TrustedManifestSnapshot,
         UniverseSnapshot,
     )
+    snapshot_usability = "usable" if status == "ok" else status
 
     return TrustedLoadContext(
         manifest=TrustedManifestSnapshot(
-            schema_version=2,
+            schema_version=3,
             run_id=f"run-{status}",
-            outcome=RefreshRunOutcome.SUCCESS,
-            status=ManifestStatus(status),
+            attempt_status=RefreshAttemptStatus.SUCCESS,
+            snapshot_usability=SnapshotUsability(snapshot_usability),
             started_at_ms=0,
             completed_at_ms=0,
             requested_intervals=("5m",),
@@ -385,25 +373,32 @@ def _context_with_status(status: str):
 
 
 def _run(*, freshness=None, reason=None):
-    from mu_strategy.market_data.trusted_data.contracts import RefreshRun, RefreshRunOutcome, UniverseSnapshot
+    from mu_strategy.market_data.trusted_data.contracts import (
+        RefreshAttemptStatus,
+        RefreshRun,
+        UniverseSnapshot,
+        derive_snapshot_usability,
+    )
 
     health = _health("MU-USDT-SWAP", "5m", freshness=freshness, reason=reason)
+    datasets = {("MU-USDT-SWAP", "5m"): health}
     return RefreshRun(
         run_id="run-lattice",
-        outcome=RefreshRunOutcome.SUCCESS,
+        attempt_status=RefreshAttemptStatus.SUCCESS,
+        snapshot_usability=derive_snapshot_usability(datasets),
         started_at_ms=0,
         completed_at_ms=0,
         requested_intervals=("5m",),
         effective_intervals=("5m",),
         universe_snapshot=UniverseSnapshot(crypto_top=({"inst_id": "MU-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"},)),
-        datasets={("MU-USDT-SWAP", "5m"): health},
+        datasets=datasets,
     )
 
 
 def _manifest(
     *,
-    outcome: str = "success",
-    status: str,
+    attempt_status: str = "success",
+    snapshot_usability: str,
     availability: str = "available",
     integrity: str = "valid",
     freshness: str = "fresh",
@@ -413,16 +408,17 @@ def _manifest(
     if include_datasets:
         symbols = {"MU-USDT-SWAP": {"intervals": {"5m": _health_payload(availability=availability, integrity=integrity, freshness=freshness)}}}
     return {
-        "schema_version": 2,
-        "run_id": f"{outcome}-{status}",
-        "outcome": outcome,
-        "status": status,
+        "schema_version": 3,
+        "run_id": f"{attempt_status}-{snapshot_usability}",
+        "attempt_status": attempt_status,
+        "snapshot_usability": snapshot_usability,
         "started_at_ms": 0,
         "completed_at_ms": 86_400_000,
         "requested_intervals": ["5m"],
         "effective_intervals": ["5m"],
         "universes": {"crypto_top": [], "stock_token_top": []},
         "symbols": symbols,
+        "provider_failures": [],
         "warnings": [],
         "cycle_error": None,
     }
@@ -484,10 +480,10 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
         symbols["MU-USDT-SWAP"]["intervals"][interval] = health
     store.write_manifest(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": f"run-{status}-{freshness}",
-            "outcome": "success",
-            "status": status,
+            "attempt_status": "success",
+            "snapshot_usability": "usable" if status == "ok" else status,
             "started_at_ms": 0,
             "completed_at_ms": 86_400_000,
             "requested_intervals": ["5m", "15m", "1h"],
@@ -497,6 +493,7 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
                 "stock_token_top": [],
             },
             "symbols": symbols,
+            "provider_failures": [],
             "warnings": [],
             "cycle_error": None,
         }
