@@ -15,6 +15,7 @@ from tests.factories.trusted_publication import (
     current_generation_dir,
     generation_manifest,
     read_current,
+    write_flat_v1_publication,
     write_flat_v2_publication,
     write_flat_v3_publication,
     write_generation_pointer,
@@ -432,7 +433,28 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         self.assertNotIn(".cache_path(", load_source)
         self.assertEqual(1, load_source.count("self.store.read_manifest("))
 
-    def test_flat_v2_and_v3_read_from_canonical_dataset_path_with_relative_data_dir(self):
+    def test_flat_manifest_strict_and_compatibility_read_matrix(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        cases = (
+            ("flat v3 strict", write_flat_v3_publication, False, True, None),
+            ("flat v2 strict", write_flat_v2_publication, False, False, HealthReason.MALFORMED_MANIFEST),
+            ("flat v2 compatibility", write_flat_v2_publication, True, True, None),
+            ("flat v1 strict", write_flat_v1_publication, False, False, HealthReason.MALFORMED_MANIFEST),
+            ("flat v1 compatibility", write_flat_v1_publication, True, True, None),
+        )
+        for name, writer, compatibility_mode, expected_ok, expected_reason in cases:
+            with self.subTest(name=name):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp)
+                    writer(data_dir)
+                    result = TrustedDataStore(data_dir=data_dir).read_manifest(compatibility_mode=compatibility_mode)
+
+                self.assertEqual(expected_ok, result.ok)
+                self.assertEqual(expected_reason, result.reason)
+
+    def test_flat_v3_reads_from_canonical_dataset_path_with_relative_data_dir(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -443,26 +465,24 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             lambda data_dir, symbol, interval, path: str(path.resolve()),
             lambda data_dir, symbol, interval, path: "",
         )
-        writers = (write_flat_v2_publication, write_flat_v3_publication)
-        for writer in writers:
-            for source_form in source_forms:
-                with self.subTest(writer=writer.__name__, source_form=source_form):
-                    with TemporaryDirectory() as tmp:
-                        temp_root = Path(tmp)
-                        old_cwd = Path.cwd()
-                        os.chdir(temp_root)
-                        try:
-                            data_dir = Path("data/live")
-                            writer(data_dir, source_file=lambda symbol, interval, path: source_form(data_dir, symbol, interval, path))
-                            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
-                                trading_strict_policy(),
-                            )
-                        finally:
-                            os.chdir(old_cwd)
+        for source_form in source_forms:
+            with self.subTest(source_form=source_form):
+                with TemporaryDirectory() as tmp:
+                    temp_root = Path(tmp)
+                    old_cwd = Path.cwd()
+                    os.chdir(temp_root)
+                    try:
+                        data_dir = Path("data/live")
+                        write_flat_v3_publication(data_dir, source_file=lambda symbol, interval, path: source_form(data_dir, symbol, interval, path))
+                        bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                            LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                            trading_strict_policy(),
+                        )
+                    finally:
+                        os.chdir(old_cwd)
 
-                    self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
-                    self.assertEqual(Path("data/live/okx") / SYMBOL / "5m.csv", bundle.files_by_interval["5m"])
+                self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+                self.assertEqual(Path("data/live/okx") / SYMBOL / "5m.csv", bundle.files_by_interval["5m"])
 
     def test_generation_mode_rejects_schema_v2_even_with_compatibility_mode(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -507,6 +527,8 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             self.assertEqual(flat_manifest_before, (data_dir / "manifest.json").read_bytes())
             self.assertEqual(flat_csv_before, (data_dir / "okx" / SYMBOL / "5m.csv").read_bytes())
             self.assertEqual("run-next", read_current(data_dir)["generation_id"])
+            manifest = generation_manifest(data_dir, "run-next")
+            self.assertEqual(3, manifest["schema_version"])
             self.assertTrue((data_dir / "generations" / "run-next" / "manifest.json").exists())
 
     def test_publication_order_is_csv_manifest_current_then_audit_log(self):

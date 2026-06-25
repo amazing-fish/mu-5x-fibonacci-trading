@@ -134,6 +134,14 @@ def write_flat_v2_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: s
     return manifest
 
 
+def write_flat_v1_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: str = "flat-v1-run", source_file=None) -> dict:
+    manifest = write_flat_v2_publication(data_dir, symbol=symbol, run_id=run_id, source_file=source_file)
+    manifest["schema_version"] = 1
+    manifest.pop("outcome", None)
+    (data_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    return manifest
+
+
 def write_generation_pointer(data_dir: Path, *, generation_id: str, manifest: dict) -> Path:
     generation_dir = data_dir / "generations" / generation_id
     generation_dir.mkdir(parents=True)

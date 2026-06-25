@@ -109,7 +109,7 @@ class TrustedDataStore:
 
     def read_manifest(self, *, compatibility_mode: bool = False) -> ManifestReadResult:
         if self.current_path.exists():
-            return self._read_current_manifest(compatibility_mode=compatibility_mode)
+            return self._read_current_manifest()
         path = self.flat_manifest_path
         if not path.exists():
             if compatibility_mode:
@@ -124,9 +124,9 @@ class TrustedDataStore:
                 except ManifestSchemaError as exc:
                     return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
             return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
-        return self._read_manifest_file(path, compatibility_mode=True, generation_root=self.data_dir)
+        return self._read_manifest_file(path, compatibility_mode=compatibility_mode, generation_root=self.data_dir)
 
-    def _read_current_manifest(self, *, compatibility_mode: bool = False) -> ManifestReadResult:
+    def _read_current_manifest(self) -> ManifestReadResult:
         try:
             pointer = json.loads(self.current_path.read_text(encoding="utf-8"))
         except Exception as exc:
