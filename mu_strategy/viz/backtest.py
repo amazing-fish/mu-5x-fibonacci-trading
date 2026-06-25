@@ -10,12 +10,13 @@ from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
 from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
-from mu_strategy.market_data.trusted_data.refresh import DEFAULT_INTERVALS as TRUSTED_REQUIRED_INTERVALS
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import selected_strategy_groups
+
+TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 def main() -> None:
@@ -65,12 +66,12 @@ def main() -> None:
     if args.trusted_data:
         bundle = refresh_trusted_candle_bundle(
             args.symbol,
-            intervals=TRUSTED_REQUIRED_INTERVALS,
+            intervals=TRUSTED_REQUESTED_INTERVALS,
             days=args.days,
             data_dir=data_dir,
             refresh=False,
         )
-        status_error = trusted_bundle_error(bundle)
+        status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
         if status_error:
             parser.error(status_error)
         candles_15m = bundle.candles_by_interval["15m"]

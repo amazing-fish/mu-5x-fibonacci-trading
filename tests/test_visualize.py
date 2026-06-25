@@ -336,7 +336,7 @@ class VisualizationTests(unittest.TestCase):
             html = output_path.read_text(encoding="utf-8")
 
         self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
-        self.assertEqual(("5m", "15m", "1h"), trusted_calls[0][1]["intervals"])
+        self.assertEqual(("15m", "1h"), trusted_calls[0][1]["intervals"])
         self.assertEqual(7, trusted_calls[0][1]["days"])
         self.assertIn("trusted OKX data layer", html)
 

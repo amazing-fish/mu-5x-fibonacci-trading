@@ -275,7 +275,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         eth_status = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]
         self.assertEqual("degraded", manifest["attempt_status"])
         self.assertEqual("invalid", manifest["snapshot_usability"])
-        self.assertEqual("cache_read_failed", manifest["provider_failures"][0]["reason"])
+        self.assertEqual([], manifest["provider_failures"])
         self.assertFalse(btc_status["is_valid"])
         self.assertEqual("cache_read_failed", btc_status["reason"])
         self.assertTrue(eth_status["is_valid"])
@@ -314,7 +314,9 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("invalid", persisted["snapshot_usability"])
         self.assertEqual("degraded", run_log["attempt_status"])
         self.assertEqual("invalid", run_log["snapshot_usability"])
-        self.assertEqual("cache_read_failed", manifest["provider_failures"][0]["reason"])
+        self.assertEqual([], manifest["provider_failures"])
+        self.assertEqual([], persisted["provider_failures"])
+        self.assertEqual([], run_log["provider_failures"])
         self.assertFalse(status["is_valid"])
         self.assertEqual("cache_read_failed", status["reason"])
 

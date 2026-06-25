@@ -469,7 +469,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
-        self.assertEqual("manifest_blocked", result["data_errors"][0]["status_reason"])
+        self.assertEqual("cache_missing", result["data_errors"][0]["status_reason"])
         self.assertIsNone(result["data_errors"][0]["interval"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
@@ -1012,7 +1012,7 @@ def _stale_bundle(symbol: str) -> CandleBundle:
             is_stale=True,
             reason="stale_by_clock",
         )
-        for interval in ("15m", "1h")
+        for interval in ("5m", "15m", "1h")
     }
     return CandleBundle(
         symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),

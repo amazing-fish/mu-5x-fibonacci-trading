@@ -1177,7 +1177,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
         self.assertEqual("failed", manifest["attempt_status"])
         self.assertEqual("failed", run_log["attempt_status"])
-        self.assertEqual("cache_read_failed", run.provider_failures[0]["reason"])
+        self.assertEqual((), run.provider_failures)
+        self.assertEqual([], manifest["provider_failures"])
+        self.assertEqual([], run_log["provider_failures"])
         self.assertEqual([], provider.history_calls)
         self.assertEqual([], provider.incremental_calls)
 

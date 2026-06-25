@@ -15,6 +15,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     ValidationReport,
     health_reason,
 )
+from mu_strategy.market_data.trusted_data.policy import IntervalDependencyPlanner
 from mu_strategy.models import Candle
 
 
@@ -90,23 +91,52 @@ def candle_bundle_from_trusted_bundle(resolved: ResolvedSymbol, bundle: TrustedB
     )
 
 
-def ensure_trusted_candle_bundle(bundle):
+def ensure_trusted_candle_bundle(
+    bundle,
+    *,
+    requested_intervals: tuple[str, ...],
+) -> CandleBundle:
+    if not requested_intervals:
+        raise ValueError("requested_intervals must not be empty")
     if getattr(bundle, "trust_decision", None) is not None:
         return bundle
-    decision = trust_decision_from_legacy_statuses(getattr(bundle, "statuses_by_interval", None) or {})
+    candles_by_interval = getattr(bundle, "candles_by_interval", None)
+    statuses = getattr(bundle, "statuses_by_interval", None)
+    if not isinstance(candles_by_interval, dict) or statuses is None:
+        raise TypeError("legacy candle bundle must expose candles_by_interval and statuses_by_interval")
+    decision = trust_decision_from_legacy_statuses(
+        statuses,
+        requested_intervals=requested_intervals,
+        candle_intervals=tuple(candles_by_interval.keys()),
+    )
     if isinstance(bundle, CandleBundle):
         return replace(bundle, trust_decision=decision)
-    try:
-        setattr(bundle, "trust_decision", decision)
-    except Exception:
-        pass
-    return bundle
+    return CandleBundle(
+        symbol=getattr(bundle, "symbol", None),
+        candles_by_interval=candles_by_interval,
+        files_by_interval=getattr(bundle, "files_by_interval", {}),
+        days=getattr(bundle, "days", 0),
+        statuses_by_interval=statuses,
+        run_id=getattr(bundle, "run_id", None),
+        trust_decision=decision,
+        universe_snapshot=getattr(bundle, "universe_snapshot", None),
+        load_context=getattr(bundle, "load_context", None),
+        observed_at_ms=getattr(bundle, "observed_at_ms", None),
+    )
 
 
-def trust_decision_from_legacy_statuses(statuses: dict[str, DataStatus]) -> TrustDecision:
-    if not statuses:
-        return TrustDecision(False, HealthReason.MANIFEST_BLOCKED, "legacy candle bundle is missing trusted status")
-    for status in statuses.values():
+def trust_decision_from_legacy_statuses(
+    statuses: dict[str, DataStatus],
+    *,
+    requested_intervals: tuple[str, ...],
+    candle_intervals: tuple[str, ...] = (),
+) -> TrustDecision:
+    required = IntervalDependencyPlanner().plan(requested_intervals).effective_intervals
+    intervals = tuple(dict.fromkeys((*required, *candle_intervals)))
+    for interval in intervals:
+        status = statuses.get(interval)
+        if status is None:
+            return TrustDecision(False, HealthReason.CACHE_MISSING, f"legacy trusted status missing for {interval}")
         if not status.is_valid:
             return TrustDecision(False, health_reason(status.reason), status.message)
         if status.is_stale:
@@ -114,8 +144,8 @@ def trust_decision_from_legacy_statuses(statuses: dict[str, DataStatus]) -> Trus
     return TrustDecision(True, HealthReason.OK)
 
 
-def trusted_bundle_error(bundle: CandleBundle) -> str | None:
-    decision = ensure_trusted_candle_bundle(bundle).trust_decision
+def trusted_bundle_error(bundle: CandleBundle, *, requested_intervals: tuple[str, ...]) -> str | None:
+    decision = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals).trust_decision
     if decision is not None and not decision.allowed:
         return f"trusted data blocked: {decision.reason.value}"
     return None
@@ -153,8 +183,8 @@ def validation_result_from_report(report: ValidationReport) -> CandleValidationR
     )
 
 
-def trust_error_payload(symbol: str, bundle: CandleBundle) -> dict[str, Any] | None:
-    normalized = ensure_trusted_candle_bundle(bundle)
+def trust_error_payload(symbol: str, bundle: CandleBundle, *, requested_intervals: tuple[str, ...]) -> dict[str, Any] | None:
+    normalized = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
     decision = normalized.trust_decision
     if decision is None or decision.allowed:
         return None

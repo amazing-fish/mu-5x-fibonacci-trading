@@ -518,7 +518,6 @@ def _provider_failures(datasets: dict[tuple[str, str], DatasetHealth]) -> tuple[
         if HealthReason.INCREMENTAL_REFRESH_FAILED.value in health.warnings:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED
         if reason not in {
-            HealthReason.CACHE_READ_FAILED,
             HealthReason.REFRESH_FAILED,
             HealthReason.INCREMENTAL_REFRESH_FAILED,
         }:
@@ -552,11 +551,21 @@ def _refresh_attempt_status(
 ) -> RefreshAttemptStatus:
     if not datasets:
         return RefreshAttemptStatus.FAILED
-    if provider_failures and not any(health.is_usable for health in datasets.values()):
+    has_attempt_failure = _has_attempt_failure(datasets, provider_failures)
+    if has_attempt_failure and not any(health.is_usable for health in datasets.values()):
         return RefreshAttemptStatus.FAILED
-    if provider_failures:
+    if has_attempt_failure:
         return RefreshAttemptStatus.DEGRADED
     return RefreshAttemptStatus.SUCCESS
+
+
+def _has_attempt_failure(
+    datasets: dict[tuple[str, str], DatasetHealth],
+    provider_failures: tuple[dict[str, str], ...],
+) -> bool:
+    if provider_failures:
+        return True
+    return any(health.primary_reason == HealthReason.CACHE_READ_FAILED for health in datasets.values())
 
 
 def _now_ms(value: int | None, clock: Clock) -> int:

@@ -120,8 +120,9 @@ def run_once(
         data_error = None
         bundle = None
         try:
+            requested_intervals = ("15m", "1h")
             loader_kwargs = {
-                "intervals": ("15m", "1h"),
+                "intervals": requested_intervals,
                 "days": config.days,
                 "data_dir": config.data_dir,
                 "refresh": config.refresh,
@@ -132,7 +133,7 @@ def run_once(
                 if trusted_context is not None:
                     loader_kwargs["context"] = trusted_context
             bundle = candle_loader(ticker.inst_id, **loader_kwargs)
-            bundle = ensure_trusted_candle_bundle(bundle)
+            bundle = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
         except Exception as exc:
             data_error = _market_data_load_error(ticker.inst_id, exc)
             data_errors.append(data_error)
@@ -141,7 +142,11 @@ def run_once(
 
         if bundle is not None:
             cycle_run_id = cycle_run_id or bundle.run_id
-            data_error = _market_data_freshness_error(symbol=ticker.inst_id, bundle=bundle)
+            data_error = _market_data_freshness_error(
+                symbol=ticker.inst_id,
+                bundle=bundle,
+                requested_intervals=requested_intervals,
+            )
             if data_error is not None:
                 data_errors.append(data_error)
                 result = _stale_scan_result(ticker.inst_id, bundle, data_error)
@@ -511,8 +516,9 @@ def _market_data_freshness_error(
     *,
     symbol: str,
     bundle: CandleBundle,
+    requested_intervals: tuple[str, ...],
 ) -> dict[str, Any] | None:
-    trust_error = trust_error_payload(symbol, bundle)
+    trust_error = trust_error_payload(symbol, bundle, requested_intervals=requested_intervals)
     if trust_error is not None:
         return trust_error
     for interval, candles in bundle.candles_by_interval.items():

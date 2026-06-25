@@ -178,12 +178,13 @@ class TrustedStateSeparationTests(unittest.TestCase):
         self.assertEqual([gap], status.validation.timestamp_gaps)
         self.assertEqual([gap], payload["validation"]["timestamp_gaps"])
 
-    def test_demo_custom_loader_is_adapted_without_consumer_freshness_clock(self):
+    def test_demo_custom_loader_missing_legacy_status_is_blocked_without_consumer_freshness_clock(self):
         import mu_strategy.demo_trading as demo_trading
         from mu_strategy.market_data.service import CandleBundle
         from mu_strategy.market_data.symbols import ResolvedSymbol
         from mu_strategy.market_data.universe import OKXSwapTicker
 
+        status = _valid_status("15m")
         legacy_bundle = CandleBundle(
             symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
             candles_by_interval={
@@ -192,6 +193,7 @@ class TrustedStateSeparationTests(unittest.TestCase):
             },
             files_by_interval={},
             days=1,
+            statuses_by_interval={"15m": status},
         )
 
         with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", side_effect=AssertionError("consumer clock")):
@@ -205,7 +207,101 @@ class TrustedStateSeparationTests(unittest.TestCase):
 
         self.assertEqual([], result["orders"])
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
-        self.assertEqual("manifest_blocked", result["data_errors"][0]["status_reason"])
+        self.assertEqual("cache_missing", result["data_errors"][0]["status_reason"])
+
+    def test_legacy_statuses_missing_5m_dependency_are_blocked(self):
+        from mu_strategy.market_data.trusted_data.compat import CandleBundle, ensure_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.symbols import ResolvedSymbol
+
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={"15m": [Candle(0, 1, 1, 1, 1, 1)], "1h": [Candle(0, 1, 1, 1, 1, 1)]},
+            files_by_interval={},
+            days=1,
+            statuses_by_interval={"15m": _valid_status("15m"), "1h": _valid_status("1h")},
+        )
+
+        decision = ensure_trusted_candle_bundle(bundle, requested_intervals=("15m", "1h")).trust_decision
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(HealthReason.CACHE_MISSING, decision.reason)
+        self.assertEqual("legacy trusted status missing for 5m", decision.message)
+
+    def test_legacy_statuses_all_effective_intervals_valid_are_allowed(self):
+        from mu_strategy.market_data.trusted_data.compat import CandleBundle, ensure_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.symbols import ResolvedSymbol
+
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={"15m": [Candle(0, 1, 1, 1, 1, 1)], "1h": [Candle(0, 1, 1, 1, 1, 1)]},
+            files_by_interval={},
+            days=1,
+            statuses_by_interval={interval: _valid_status(interval) for interval in ("5m", "15m", "1h")},
+        )
+
+        decision = ensure_trusted_candle_bundle(bundle, requested_intervals=("15m", "1h")).trust_decision
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(HealthReason.OK, decision.reason)
+
+    def test_legacy_statuses_missing_extra_candle_interval_are_blocked(self):
+        from mu_strategy.market_data.trusted_data.compat import CandleBundle, ensure_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.symbols import ResolvedSymbol
+
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={
+                "15m": [Candle(0, 1, 1, 1, 1, 1)],
+                "1h": [Candle(0, 1, 1, 1, 1, 1)],
+                "4h": [Candle(0, 1, 1, 1, 1, 1)],
+            },
+            files_by_interval={},
+            days=1,
+            statuses_by_interval={interval: _valid_status(interval) for interval in ("5m", "15m", "1h")},
+        )
+
+        decision = ensure_trusted_candle_bundle(bundle, requested_intervals=("15m", "1h")).trust_decision
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(HealthReason.CACHE_MISSING, decision.reason)
+        self.assertEqual("legacy trusted status missing for 4h", decision.message)
+
+    def test_existing_allowed_trust_decision_is_not_rederived_from_legacy_statuses(self):
+        from mu_strategy.market_data.trusted_data.compat import CandleBundle, ensure_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+        from mu_strategy.market_data.symbols import ResolvedSymbol
+
+        decision = TrustDecision(True, HealthReason.OK)
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={"15m": [Candle(0, 1, 1, 1, 1, 1)]},
+            files_by_interval={},
+            days=1,
+            statuses_by_interval={},
+            trust_decision=decision,
+        )
+
+        self.assertIs(decision, ensure_trusted_candle_bundle(bundle, requested_intervals=("15m", "1h")).trust_decision)
+
+    def test_existing_blocked_trust_decision_is_not_overridden_by_legacy_statuses(self):
+        from mu_strategy.market_data.trusted_data.compat import CandleBundle, ensure_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+        from mu_strategy.market_data.symbols import ResolvedSymbol
+
+        decision = TrustDecision(False, HealthReason.MANIFEST_STALE, "official block")
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="BTC-USDT-SWAP", inst_id="BTC-USDT-SWAP", source="okx"),
+            candles_by_interval={"15m": [Candle(0, 1, 1, 1, 1, 1)], "1h": [Candle(0, 1, 1, 1, 1, 1)]},
+            files_by_interval={},
+            days=1,
+            statuses_by_interval={interval: _valid_status(interval) for interval in ("5m", "15m", "1h")},
+            trust_decision=decision,
+        )
+
+        self.assertIs(decision, ensure_trusted_candle_bundle(bundle, requested_intervals=("15m", "1h")).trust_decision)
 
     def test_cli_exit_code_contract_for_attempt_and_snapshot_axes(self):
         from mu_strategy.commands.refresh_market_data import classify_refresh_run
@@ -257,6 +353,20 @@ def _candles(interval: str) -> list[Candle]:
     if interval == "5m":
         return five
     raise AssertionError(f"unexpected interval: {interval}")
+
+
+def _valid_status(interval: str):
+    from mu_strategy.market_data.trusted_data.compat import DataStatus
+
+    return DataStatus(
+        symbol="BTC-USDT-SWAP",
+        interval=interval,
+        rows=1,
+        first_timestamp_ms=0,
+        last_timestamp_ms=0,
+        updated_at_ms=0,
+        source_file=Path(f"data/live/okx/BTC-USDT-SWAP/{interval}.csv"),
+    )
 
 
 class _IncrementalFailureProvider:
