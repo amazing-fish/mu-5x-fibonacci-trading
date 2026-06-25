@@ -517,7 +517,11 @@ def _provider_failures(datasets: dict[tuple[str, str], DatasetHealth]) -> tuple[
         reason = health.primary_reason
         if HealthReason.INCREMENTAL_REFRESH_FAILED.value in health.warnings:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED
-        if reason not in {HealthReason.REFRESH_FAILED, HealthReason.INCREMENTAL_REFRESH_FAILED}:
+        if reason not in {
+            HealthReason.CACHE_READ_FAILED,
+            HealthReason.REFRESH_FAILED,
+            HealthReason.INCREMENTAL_REFRESH_FAILED,
+        }:
             continue
         failures.append(
             {

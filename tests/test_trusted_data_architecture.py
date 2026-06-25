@@ -1145,6 +1145,42 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(0, run_log["symbol_count"])
         self.assertEqual([], csv_paths)
 
+    def test_cache_read_failure_marks_refresh_attempt_failed(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        provider = _Provider(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            store.cache_path("BTC-USDT-SWAP", "5m").parent.mkdir(parents=True, exist_ok=True)
+            store.cache_path("BTC-USDT-SWAP", "5m").write_text(
+                "open_time_ms,open,high,low,close,volume\nnot-an-int,1,1,1,1,1\n",
+                encoding="utf-8",
+            )
+
+            run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+
+        health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        self.assertEqual(HealthReason.CACHE_READ_FAILED, health.primary_reason)
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("failed", run_log["attempt_status"])
+        self.assertEqual("cache_read_failed", run.provider_failures[0]["reason"])
+        self.assertEqual([], provider.history_calls)
+        self.assertEqual([], provider.incremental_calls)
+
     def test_refresh_market_data_command_is_canonical_writer(self):
         from mu_strategy.commands.refresh_market_data import main
 
