@@ -465,7 +465,7 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
     }
     symbols = {"MU-USDT-SWAP": {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.cache_path("MU-USDT-SWAP", interval)
+        path = store.flat_cache_path("MU-USDT-SWAP", interval)
         store.write_csv(candles, path)
         health = _health_payload(freshness=freshness, interval=interval)
         health.update(

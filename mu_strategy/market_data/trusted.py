@@ -27,10 +27,6 @@ from mu_strategy.market_data.trusted_data.validation import (
 from mu_strategy.models import Candle
 
 
-def trusted_cache_path(symbol: str, interval: str, *, data_dir: Path = DEFAULT_LIVE_DATA_DIR) -> Path:
-    return TrustedDataStore(data_dir=Path(data_dir)).cache_path(symbol, interval)
-
-
 def refresh_market_data_once(
     *,
     data_dir: Path = DEFAULT_LIVE_DATA_DIR,

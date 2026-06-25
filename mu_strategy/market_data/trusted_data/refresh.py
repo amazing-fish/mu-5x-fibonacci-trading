@@ -25,7 +25,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     derive_snapshot_usability,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
     normalize_and_validate_candles,
@@ -125,6 +125,7 @@ class RefreshTrustedMarketDataRequest:
 class DatasetRefreshCandidate:
     key: DatasetKey
     path: Path
+    source_file: Path
     candles: list[Candle]
     had_existing: bool = False
     fetch_reason: HealthReason | None = None
@@ -151,7 +152,11 @@ class RefreshTrustedMarketData:
     def execute(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
         started_at_ms = _now_ms(request.now_ms, self.clock)
         plan = self.planner.plan(request.requested_intervals)
-        run_id = request.run_id or uuid.uuid4().hex
+        for interval in plan.effective_intervals:
+            validate_storage_segment(interval, field="interval")
+        run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
+        previous_manifest = self.store.read_manifest(compatibility_mode=True)
+        self.store.prepare_generation(run_id)
         try:
             universe = self._universe(request)
         except Exception as exc:
@@ -181,13 +186,15 @@ class RefreshTrustedMarketData:
         datasets: dict[tuple[str, str], DatasetHealth] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top]):
-            symbol = str(ticker["inst_id"])
+            symbol = validate_storage_segment(str(ticker["inst_id"]), field="symbol")
             candidates: dict[tuple[str, str], DatasetRefreshCandidate] = {}
             for interval in plan.effective_intervals:
                 candidate = self._fetch_dataset_candidate(
                     symbol=symbol,
                     interval=interval,
                     days=request.days,
+                    run_id=run_id,
+                    previous_manifest=previous_manifest,
                 )
                 candidates[(symbol, interval)] = candidate
             symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
@@ -247,13 +254,17 @@ class RefreshTrustedMarketData:
         symbol: str,
         interval: str,
         days: int,
+        run_id: str,
+        previous_manifest,
     ) -> DatasetRefreshCandidate:
-        path = self.store.cache_path(symbol, interval)
+        path = self.store.generation_cache_path(run_id, symbol, interval)
+        source_file = self.store.generation_source_file(symbol, interval)
+        previous_path = self._previous_dataset_path(previous_manifest, symbol, interval)
         existing: list[Candle] = []
         cache_loaded = False
         try:
-            if path.exists():
-                existing = self.store.read_csv(path)
+            if previous_path is not None and previous_path.exists():
+                existing = self.store.read_csv(previous_path)
             cache_loaded = True
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
@@ -263,18 +274,20 @@ class RefreshTrustedMarketData:
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
+                source_file=source_file,
                 candles=dedupe_candles([*existing, *fetched]),
                 had_existing=bool(existing),
             )
         except Exception as exc:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED if existing else HealthReason.REFRESH_FAILED
-            if path.exists() and not cache_loaded:
+            if previous_path is not None and previous_path.exists() and not cache_loaded:
                 reason = HealthReason.CACHE_READ_FAILED
                 existing = []
             failure = _exception_failure(exc)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
+                source_file=source_file,
                 candles=dedupe_candles(existing),
                 had_existing=bool(existing),
                 fetch_reason=reason,
@@ -309,7 +322,7 @@ class RefreshTrustedMarketData:
                 datasets[key] = _health(
                     symbol,
                     interval,
-                    candidate.path,
+                    candidate.source_file,
                     candles,
                     now_ms=now_ms,
                     availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
@@ -329,7 +342,7 @@ class RefreshTrustedMarketData:
                     datasets[key] = _health(
                         symbol,
                         interval,
-                        candidate.path,
+                        candidate.source_file,
                         candles,
                         now_ms=now_ms,
                         availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
@@ -343,6 +356,8 @@ class RefreshTrustedMarketData:
                     )
                     candles_by_key[key] = candles if validation.reason == HealthReason.TIMESTAMP_GAP else []
                     continue
+                if candidate.path.exists():
+                    raise FileExistsError(f"generation dataset already exists: {candidate.path}")
                 self.store.write_csv(candles, candidate.path)
                 freshness = self.freshness_policy.assess(
                     now_ms=now_ms,
@@ -352,7 +367,7 @@ class RefreshTrustedMarketData:
                 datasets[key] = _health(
                     symbol,
                     interval,
-                    candidate.path,
+                    candidate.source_file,
                     candles,
                     now_ms=now_ms,
                     availability=AvailabilityState.AVAILABLE,
@@ -367,12 +382,14 @@ class RefreshTrustedMarketData:
                 )
                 candles_by_key[key] = candles
             except Exception as exc:
+                if isinstance(exc, OSError):
+                    raise
                 reason = HealthReason.INCREMENTAL_REFRESH_FAILED if candidate.had_existing else HealthReason.REFRESH_FAILED
                 failure = _exception_failure(exc)
                 datasets[key] = _health(
                     symbol,
                     interval,
-                    candidate.path,
+                    candidate.source_file,
                     candles,
                     now_ms=now_ms,
                     availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
@@ -419,8 +436,29 @@ class RefreshTrustedMarketData:
             )
 
     def _persist_run(self, run: RefreshRun) -> None:
-        self.store.append_run_log(run.run_log_payload())
-        self.store.write_manifest(run.to_manifest())
+        self.store.write_generation_manifest(run.run_id, run.to_manifest())
+        self.store.replace_current(run.run_id)
+        try:
+            self.store.append_run_log(run.run_log_payload())
+        except Exception as exc:
+            raise RuntimeError(f"audit log append failed: {exc}") from exc
+
+    def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
+        if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:
+            return None
+        health = manifest_result.snapshot.datasets.get((symbol, interval))
+        if health is None:
+            return None
+        if manifest_result.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
+        try:
+            return self.store.resolve_source_file(
+                health.source_file,
+                generation_root=manifest_result.generation_root,
+                generation_id=manifest_result.generation_id,
+            )
+        except Exception:
+            return None
 
 
 def load_stock_token_inst_ids(config_path: Path = DEFAULT_STOCK_TOKEN_CONFIG) -> set[str]:

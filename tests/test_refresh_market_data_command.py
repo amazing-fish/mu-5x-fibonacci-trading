@@ -63,7 +63,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                     stdout=stdout,
                 )
 
-            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -107,7 +107,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                         stdout=stdout,
                     )
 
-            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             csv_paths = list(data_dir.rglob("*.csv"))
             html_exists = html_path.exists()
@@ -172,7 +172,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                             stdout=stdout,
                         )
 
-            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -219,7 +219,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                             stdout=stdout,
                         )
 
-            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -394,6 +394,15 @@ def _candles(interval: str) -> list[Candle]:
 
 def _fetch_history(symbol: str, interval: str, *, days: int) -> list[Candle]:
     return _candles(interval)
+
+
+def _manifest_path(data_dir: Path) -> Path:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    current = data_dir / "current.json"
+    if current.exists():
+        return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
+    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
 
 
 if __name__ == "__main__":

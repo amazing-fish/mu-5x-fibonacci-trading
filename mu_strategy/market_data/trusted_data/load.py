@@ -12,12 +12,11 @@ from mu_strategy.market_data.trusted_data.contracts import (
     FreshnessState,
     HealthReason,
     IntegrityState,
-    PublishedDatasetCatalog,
+    ManifestSchemaError,
     SystemClock,
     TrustDecision,
     TrustedBundle,
     TrustedLoadContext,
-    TrustedManifestSnapshot,
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
@@ -76,13 +75,12 @@ class LoadTrustedBundle:
         now_ms: int | None = None,
         compatibility_mode: bool = False,
     ) -> TrustedLoadContext:
-        observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
-        manifest_result = self.store.read_manifest(compatibility_mode=compatibility_mode)
-        if not manifest_result.ok or manifest_result.snapshot is None:
+        context, manifest_result = self._open_context_result(now_ms=now_ms, compatibility_mode=compatibility_mode)
+        if context is None:
             reason = manifest_result.reason or HealthReason.MANIFEST_BLOCKED
             message = manifest_result.message or reason.value
             raise RuntimeError(f"{reason.value}: {message}")
-        return TrustedLoadContext(manifest=manifest_result.snapshot, observed_at_ms=observed_at_ms)
+        return context
 
     def execute(
         self,
@@ -94,13 +92,12 @@ class LoadTrustedBundle:
         resolved = resolve_okx_swap_symbol(query.symbol)
         plan = self.planner.plan(query.intervals)
         if context is None:
-            observed_at_ms = int(query.now_ms if query.now_ms is not None else self.clock.now_ms())
-            manifest_result = self.store.read_manifest(compatibility_mode=query.compatibility_mode)
-            if not manifest_result.ok or manifest_result.snapshot is None:
+            context, manifest_result = self._open_context_result(now_ms=query.now_ms, compatibility_mode=query.compatibility_mode)
+            if context is None:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={interval: [] for interval in plan.requested_intervals},
-                    files_by_interval={interval: self.store.cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
+                    files_by_interval={interval: self.store.flat_cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(
@@ -109,23 +106,35 @@ class LoadTrustedBundle:
                         manifest_result.message,
                     ),
                 )
-            context = TrustedLoadContext(manifest=manifest_result.snapshot, observed_at_ms=observed_at_ms)
 
         manifest = context.manifest
-        publications = PublishedDatasetCatalog.from_manifest(manifest, data_dir=self.store.data_dir)
         published_health_by_interval: dict[str, DatasetHealth] = {}
         raw_candles_by_interval: dict[str, list[Candle]] = {}
         candles_by_interval: dict[str, list[Candle]] = {}
         health_by_interval: dict[str, DatasetHealth] = {}
+        path_by_interval: dict[str, Path] = {}
         for interval in plan.effective_intervals:
-            path = self.store.cache_path(resolved.inst_id, interval)
-            publication = publications.resolve_dataset(DatasetKey(resolved.inst_id, interval))
-            if not publication.is_published:
+            manifest_health = manifest.datasets.get((resolved.inst_id, interval))
+            try:
+                path = self._dataset_path(resolved.inst_id, interval, manifest_health, context)
+            except ManifestSchemaError as exc:
+                return TrustedBundle(
+                    symbol=resolved.inst_id,
+                    candles_by_interval={requested: [] for requested in plan.requested_intervals},
+                    files_by_interval={requested: self._default_dataset_path(resolved.inst_id, requested, context) for requested in plan.requested_intervals},
+                    days=query.days,
+                    health_by_interval={},
+                    trust_decision=TrustDecision(False, HealthReason.MALFORMED_MANIFEST, str(exc)),
+                    run_id=manifest.run_id,
+                    universe_snapshot=manifest.universe_snapshot,
+                    load_context=context,
+                )
+            path_by_interval[interval] = path
+            if manifest_health is None:
                 health_by_interval[interval] = _not_published_health(resolved.inst_id, interval, path)
                 raw_candles_by_interval[interval] = []
                 continue
-            assert publication.health is not None
-            published_health_by_interval[interval] = publication.health
+            published_health_by_interval[interval] = manifest_health
             try:
                 raw_candles_by_interval[interval] = self.store.read_csv(path) if path.exists() else []
             except Exception as exc:
@@ -145,7 +154,7 @@ class LoadTrustedBundle:
             if interval in health_by_interval:
                 candles_by_interval[interval] = []
                 continue
-            path = self.store.cache_path(resolved.inst_id, interval)
+            path = path_by_interval[interval]
             candles = pruned_candles_by_interval.get(interval) or []
             candles, validation = normalize_and_validate_candles(candles, interval=interval)
             if not validation.ok:
@@ -195,7 +204,7 @@ class LoadTrustedBundle:
             for interval in plan.requested_intervals
         }
         requested_files = {
-            interval: self.store.cache_path(resolved.inst_id, interval)
+            interval: path_by_interval.get(interval, self._default_dataset_path(resolved.inst_id, interval, context))
             for interval in plan.requested_intervals
         }
         return TrustedBundle(
@@ -209,6 +218,47 @@ class LoadTrustedBundle:
             universe_snapshot=manifest.universe_snapshot,
             load_context=context,
         )
+
+    def _open_context_result(
+        self,
+        *,
+        now_ms: int | None = None,
+        compatibility_mode: bool = False,
+    ):
+        observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        manifest_result = self.store.read_manifest(compatibility_mode=compatibility_mode)
+        if not manifest_result.ok or manifest_result.snapshot is None:
+            return None, manifest_result
+        return (
+            TrustedLoadContext(
+                manifest=manifest_result.snapshot,
+                observed_at_ms=observed_at_ms,
+                generation_root=manifest_result.generation_root or self.store.data_dir,
+                generation_id=manifest_result.generation_id,
+            ),
+            manifest_result,
+        )
+
+    def _dataset_path(
+        self,
+        symbol: str,
+        interval: str,
+        manifest_health: DatasetHealth | None,
+        context: TrustedLoadContext,
+    ) -> Path:
+        if manifest_health is None:
+            return self._default_dataset_path(symbol, interval, context)
+        if context.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
+        expected = self.store.generation_source_file(symbol, interval)
+        if manifest_health.source_file.as_posix() != expected.as_posix():
+            raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
+        return self.store.generation_cache_path(context.generation_id, symbol, interval)
+
+    def _default_dataset_path(self, symbol: str, interval: str, context: TrustedLoadContext) -> Path:
+        if context.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
+        return self.store.generation_cache_path(context.generation_id, symbol, interval)
 
     def _attach_built_native_validation(
         self,
@@ -237,22 +287,6 @@ class LoadTrustedBundle:
             )
             if not report.ok:
                 candles_by_interval[interval] = []
-
-
-def _manifest_health_by_interval(
-    manifest: TrustedManifestSnapshot,
-    symbol: str,
-    *,
-    data_dir: Path,
-) -> dict[str, DatasetHealth]:
-    output: dict[str, DatasetHealth] = {}
-    for (health_symbol, interval), health in manifest.datasets.items():
-        if health_symbol != symbol:
-            continue
-        if str(health.source_file) == "":
-            health = replace(health, source_file=data_dir / "okx" / symbol / f"{interval}.csv")
-        output[interval] = health
-    return output
 
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
