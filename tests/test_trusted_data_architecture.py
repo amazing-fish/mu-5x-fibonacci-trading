@@ -226,6 +226,91 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         self.assertTrue(bundle.trust_decision.allowed)
         self.assertLess(len(bundle.candles_by_interval["15m"]), 192)
 
+    def test_strict_load_rejects_generation_with_less_coverage_than_requested_days(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start_ms = 20 * DAY_MS
+            end_ms = start_ms + DAY_MS - 300_000
+            _write_generation_publication(data_dir, symbol="MU-USDT-SWAP", start_ms=start_ms, end_ms=end_ms)
+
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=14, now_ms=end_ms),
+                trading_strict_policy(),
+            )
+
+        health = bundle.health_by_interval["5m"]
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, health.primary_reason)
+        self.assertEqual(IntegrityState.INVALID, health.integrity)
+        self.assertEqual(FreshnessState.FRESH, health.freshness)
+        self.assertIn("requested_days=14", health.message)
+        self.assertIn(f"expected_start_ms={end_ms - 14 * DAY_MS}", health.message)
+        self.assertIn(f"actual_start_ms={start_ms}", health.message)
+
+    def test_strict_load_allows_complete_coverage_with_interval_boundary_alignment(self):
+        from mu_strategy.market_data.trusted_data.contracts import IntegrityState
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start_ms = 20 * DAY_MS + 300_000
+            end_ms = start_ms + 14 * DAY_MS
+            _write_generation_publication(data_dir, symbol="MU-USDT-SWAP", start_ms=start_ms, end_ms=end_ms)
+
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=14, now_ms=end_ms),
+                trading_strict_policy(),
+            )
+
+        expected_start_ms = end_ms - 14 * DAY_MS
+        self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+        self.assertEqual(IntegrityState.VALID, bundle.health_by_interval["5m"].integrity)
+        self.assertLessEqual(bundle.health_by_interval["15m"].first_timestamp_ms - expected_start_ms, 900_000)
+        self.assertLessEqual(bundle.health_by_interval["1h"].first_timestamp_ms - expected_start_ms, 3_600_000)
+
+    def test_strict_load_rejects_when_any_effective_interval_lacks_coverage(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+        from mu_strategy.market_data.utils import DAY_MS
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            start_ms = 20 * DAY_MS
+            end_ms = start_ms + 14 * DAY_MS
+            full_five = _range_candles(start_ms, end_ms)
+            short_five = _range_candles(end_ms - DAY_MS + 300_000, end_ms)
+            _write_generation_publication(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                candles_by_interval={
+                    "5m": short_five,
+                    "15m": aggregate_candles(full_five, interval="15m"),
+                    "1h": aggregate_candles(full_five, interval="1h"),
+                },
+            )
+
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=14, now_ms=end_ms),
+                trading_strict_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, bundle.health_by_interval["5m"].primary_reason)
+
     def test_strict_policies_reject_failed_manifest_even_when_csv_is_valid(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -927,7 +1012,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                 )
             )
             manifest = json.loads(_manifest_path(Path(tmp)).read_text(encoding="utf-8"))
@@ -1491,7 +1576,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 result = run_once(
-                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()),
                     broker=None,
                     scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
                 )
@@ -1515,7 +1600,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                 )
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 result = run_once(
-                    DemoTradingConfig(universe_limit=2, dry_run=False, data_dir=data_dir, watchlist_symbols=()),
+                    DemoTradingConfig(universe_limit=2, dry_run=False, data_dir=data_dir, days=1, watchlist_symbols=()),
                     broker=_EmptyBroker(),
                     scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
                 )
@@ -1546,7 +1631,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
             )
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 run_once(
-                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=("MU-USDT-SWAP",)),
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=("MU-USDT-SWAP",)),
                     broker=None,
                     scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol) or _wait(symbol),
                 )
@@ -1586,20 +1671,20 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                             refresh=False,
                             clock=_FakeClock(86_400_000),
                         )
-                        with patch("sys.argv", ["mu_strategy.cli", "--trusted-data", "--data-dir", str(data_dir), "--report", str(data_dir / "report.md")]):
+                        with patch("sys.argv", ["mu_strategy.cli", "--trusted-data", "--days", "1", "--data-dir", str(data_dir), "--report", str(data_dir / "report.md")]):
                             with patch("mu_strategy.cli.run_backtest", return_value=_empty_backtest()):
                                 with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
                                     with patch("sys.stdout", new_callable=_Sink):
                                         cli.main()
                         with patch(
                             "sys.argv",
-                            ["mu_strategy.visualize", "--trusted-data", "--data-dir", str(data_dir), "--output", str(data_dir / "chart.html")],
+                            ["mu_strategy.visualize", "--trusted-data", "--days", "1", "--data-dir", str(data_dir), "--output", str(data_dir / "chart.html")],
                         ):
                             with patch("mu_strategy.viz.backtest.run_backtest", return_value=_empty_backtest()):
                                 with patch("sys.stdout", new_callable=_Sink):
                                     visualize.main()
                         demo_trading.run_once(
-                            demo_trading.DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                            demo_trading.DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()),
                             broker=None,
                             scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _wait(symbol),
                         )
@@ -1678,6 +1763,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                             universe_limit=0,
                             dry_run=True,
                             data_dir=data_dir,
+                            days=1,
                             max_candle_staleness_bars=1,
                         ),
                         broker=None,
@@ -1706,7 +1792,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 result = run_once(
-                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, watchlist_symbols=()),
+                    DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()),
                     broker=None,
                     scanner=lambda *args, **kwargs: self.fail("scanner must not run for timestamp_gap data"),
                 )
@@ -1819,6 +1905,83 @@ def _write_manifest_and_caches(
     }
     store.write_manifest(manifest)
     return manifest
+
+
+def _write_generation_publication(
+    data_dir: Path,
+    *,
+    symbol: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    candles_by_interval: dict[str, list[Candle]] | None = None,
+    run_id: str = "run-coverage",
+) -> dict:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
+    from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+    store = TrustedDataStore(data_dir=data_dir)
+    if candles_by_interval is None:
+        if start_ms is None or end_ms is None:
+            raise ValueError("start_ms and end_ms are required without explicit candles")
+        five = _range_candles(start_ms, end_ms)
+        candles_by_interval = {
+            "5m": five,
+            "15m": aggregate_candles(five, interval="15m"),
+            "1h": aggregate_candles(five, interval="1h"),
+        }
+
+    store.prepare_generation(run_id)
+    symbols = {symbol: {"intervals": {}}}
+    completed_at_ms = max(candle.open_time_ms for rows in candles_by_interval.values() for candle in rows)
+    for interval, candles in candles_by_interval.items():
+        path = store.generation_cache_path(run_id, symbol, interval)
+        store.write_csv(candles, path)
+        source_file = store.generation_source_file(symbol, interval)
+        symbols[symbol]["intervals"][interval] = {
+            "symbol": symbol,
+            "interval": interval,
+            "availability": "available",
+            "integrity": "valid",
+            "freshness": "fresh",
+            "reasons": ["ok"],
+            "rows": len(candles),
+            "first_timestamp_ms": candles[0].open_time_ms,
+            "last_timestamp_ms": candles[-1].open_time_ms,
+            "updated_at_ms": completed_at_ms,
+            "source_file": source_file.as_posix(),
+            "content_sha256": candles_content_sha256(candles),
+            "validation": {"ok": True, "reason": "ok"},
+        }
+    manifest = {
+        "schema_version": 3,
+        "run_id": run_id,
+        "attempt_status": "success",
+        "snapshot_usability": "usable",
+        "started_at_ms": completed_at_ms,
+        "completed_at_ms": completed_at_ms,
+        "requested_intervals": ["15m", "1h"],
+        "effective_intervals": ["5m", "15m", "1h"],
+        "universes": {"crypto_top": [{"inst_id": symbol, "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}], "stock_token_top": []},
+        "symbols": symbols,
+        "provider_failures": [],
+        "warnings": [],
+        "cycle_error": None,
+    }
+    store.write_generation_manifest(run_id, manifest)
+    store.replace_current(run_id)
+    return manifest
+
+
+def _range_candles(start_ms: int, end_ms: int, *, step_ms: int = 300_000) -> list[Candle]:
+    candles: list[Candle] = []
+    timestamp = start_ms
+    index = 0
+    while timestamp <= end_ms:
+        price = 100.0 + index
+        candles.append(Candle(timestamp, price, price + 1.0, price - 1.0, price, 1000.0))
+        timestamp += step_ms
+        index += 1
+    return candles
 
 
 def _write_orphan_caches(data_dir: Path, *, symbol: str, days: int) -> None:

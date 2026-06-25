@@ -38,12 +38,12 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                     run_id="run-cold",
                 )
             )
             bundle = LoadTrustedBundle(store).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("15m", "1h"), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("15m", "1h"), days=1, now_ms=86_400_000),
                 trading_strict_policy(),
             )
             pointer = read_current(data_dir)
@@ -72,7 +72,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     root = Path(tmp)
                     data_dir = root / "data" / "live"
                     store = TrustedDataStore(data_dir=data_dir)
-                    request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+                    request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
                     RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
                     before = _tree(data_dir)
                     old_current = (data_dir / "current.json").read_bytes()
@@ -80,7 +80,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id=value))
                     old_bundle = LoadTrustedBundle(store).execute(
-                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                         observe_only_policy(),
                     )
 
@@ -101,7 +101,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                 days=1,
                 limit=1,
                 stock_token_inst_ids=set(),
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
             with patch("mu_strategy.market_data.trusted_data.refresh.uuid.uuid4", return_value=_Hex("../escaped")):
@@ -126,7 +126,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     root = Path(tmp)
                     data_dir = root / "data" / "live"
                     store = TrustedDataStore(data_dir=data_dir)
-                    request = dict(days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+                    request = dict(days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
                     RefreshTrustedMarketData(store, StaticProvider()).execute(
                         RefreshTrustedMarketDataRequest(**request, requested_intervals=("5m",), run_id="run-old")
                     )
@@ -138,7 +138,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                             RefreshTrustedMarketDataRequest(**request, requested_intervals=intervals, run_id="run-attack")
                         )
                     old_bundle = LoadTrustedBundle(store).execute(
-                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                         observe_only_policy(),
                     )
 
@@ -157,7 +157,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
             refresher = RefreshTrustedMarketData(store, StaticProvider())
-            request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+            request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             refresher.execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             old_path = data_dir / "generations" / "run-old" / "okx" / SYMBOL / "5m.csv"
             old_bytes = old_path.read_bytes()
@@ -165,7 +165,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-new"))
             new_path = data_dir / "generations" / "run-new" / "okx" / SYMBOL / "5m.csv"
             bundle = LoadTrustedBundle(store).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_900_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_700_000),
                 observe_only_policy(),
             )
 
@@ -184,7 +184,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
-            request = dict(requested_intervals=("15m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+            request = dict(requested_intervals=("15m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             original_write_csv = store.write_csv
             calls = []
@@ -197,11 +197,11 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
 
             with patch.object(store, "write_csv", side_effect=fail_after_first):
                 with self.assertRaisesRegex(OSError, "disk full"):
-                    RefreshTrustedMarketData(store, StaticProvider(offset=10)).execute(
+                    RefreshTrustedMarketData(store, StaticProvider()).execute(
                         RefreshTrustedMarketDataRequest(**request, run_id="run-failed")
                     )
             bundle = LoadTrustedBundle(store).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("15m",), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("15m",), days=1, now_ms=86_400_000),
                 observe_only_policy(),
             )
 
@@ -221,7 +221,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
                     store = TrustedDataStore(data_dir=data_dir)
-                    request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+                    request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
                     RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
                     with patch.object(store, method_name, side_effect=error):
                         with self.assertRaisesRegex(OSError, str(error)):
@@ -238,7 +238,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
-            request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+            request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             old_pointer = (data_dir / "current.json").read_bytes()
             original_replace = os.replace
@@ -298,10 +298,10 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
-            request = dict(requested_intervals=("5m", "15m"), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+            request = dict(requested_intervals=("5m", "15m"), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             loader = LoadTrustedBundle(store)
-            old_context = loader.open_context(now_ms=3_600_000)
+            old_context = loader.open_context(now_ms=86_400_000)
             RefreshTrustedMarketData(store, StaticProvider(offset=10)).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-new"))
 
             old_bundle = loader.execute(
@@ -310,7 +310,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                 context=old_context,
             )
             new_bundle = loader.execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("5m", "15m"), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m", "15m"), days=1, now_ms=86_400_000),
                 observe_only_policy(),
             )
 
@@ -339,7 +339,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     write_flat_v3_publication(data_dir)
                     arrange(data_dir)
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                         observe_only_policy(),
                     )
 
@@ -358,7 +358,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             (data_dir / "manifest.json").unlink()
             write_generation_pointer(data_dir, generation_id="run-a", manifest=manifest)
             bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                 observe_only_policy(),
             )
 
@@ -392,7 +392,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     manifest["symbols"][SYMBOL]["intervals"]["5m"]["source_file"] = source_file
                     write_generation_pointer(data_dir, generation_id="run-source", manifest=manifest)
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                         observe_only_policy(),
                     )
 
@@ -416,7 +416,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     manifest["symbols"][SYMBOL]["intervals"]["5m"]["source_file"] = source_file
                     write_generation_pointer(data_dir, generation_id="bad-source", manifest=manifest)
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                         observe_only_policy(),
                     )
 
@@ -475,7 +475,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                         data_dir = Path("data/live")
                         write_flat_v3_publication(data_dir, source_file=lambda symbol, interval, path: source_form(data_dir, symbol, interval, path))
                         bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                            LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                            LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                             trading_strict_policy(),
                         )
                     finally:
@@ -496,7 +496,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             (data_dir / "manifest.json").unlink()
             write_generation_pointer(data_dir, generation_id="run-v2", manifest=manifest)
             bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000, compatibility_mode=True),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000, compatibility_mode=True),
                 observe_only_policy(),
             )
 
@@ -519,7 +519,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                     run_id="run-next",
                 )
             )
@@ -570,7 +570,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                                     days=1,
                                     limit=1,
                                     stock_token_inst_ids=set(),
-                                    now_ms=3_600_000,
+                                    now_ms=86_400_000,
                                     run_id="run-order",
                                 )
                             )
@@ -593,14 +593,14 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                     run_id="run-good",
                 )
             )
             csv_path = current_generation_dir(data_dir) / "okx" / SYMBOL / "5m.csv"
             csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("100.0", "100.5", 1), encoding="utf-8")
             bundle = LoadTrustedBundle(store).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
                 trading_strict_policy(),
             )
 
@@ -619,7 +619,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             flat_manifest_bytes = (data_dir / "manifest.json").read_bytes()
             store = TrustedDataStore(data_dir=data_dir)
             flat_bundle = LoadTrustedBundle(store).execute(
-                LoadTrustedBundleQuery(SYMBOL, intervals=("15m",), days=1, now_ms=3_600_000),
+                LoadTrustedBundleQuery(SYMBOL, intervals=("15m",), days=1, now_ms=86_400_000),
                 trading_strict_policy(),
             )
             RefreshTrustedMarketData(store, StaticProvider()).execute(
@@ -628,7 +628,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                     run_id="run-migrated",
                 )
             )
@@ -646,9 +646,9 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         cases = (
-            ("run-stale", StaticProvider(), 86_400_000, HealthReason.MANIFEST_STALE),
-            ("run-invalid", HoleyProvider(), 3_600_000, HealthReason.MANIFEST_INVALID),
-            ("run-failed", UniverseFailureProvider(), 3_600_000, HealthReason.RUN_FAILED),
+            ("run-stale", StaticProvider(), 10 * 86_400_000, HealthReason.MANIFEST_STALE),
+            ("run-invalid", HoleyProvider(), 86_400_000, HealthReason.MANIFEST_INVALID),
+            ("run-failed", UniverseFailureProvider(), 86_400_000, HealthReason.RUN_FAILED),
         )
         for run_id, provider, now_ms, expected_reason in cases:
             with self.subTest(run_id=run_id):

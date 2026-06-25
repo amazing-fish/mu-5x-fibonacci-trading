@@ -31,7 +31,7 @@ class TrustedStateSeparationTests(unittest.TestCase):
                     days=1,
                     limit=1,
                     stock_token_inst_ids=set(),
-                    now_ms=3_600_000,
+                    now_ms=86_400_000,
                 )
             )
             command_result = classify_refresh_run(run)

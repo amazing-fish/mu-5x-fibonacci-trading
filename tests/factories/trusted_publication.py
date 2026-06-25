@@ -11,9 +11,9 @@ from mu_strategy.models import Candle
 SYMBOL = "BTC-USDT-SWAP"
 
 
-def candles(*, count: int = 12, offset: int = 0) -> list[Candle]:
+def candles(*, count: int = 288, offset: int = 0) -> list[Candle]:
     return [
-        Candle((offset + index) * 300_000, 100.0 + offset + index, 101.0 + offset + index, 99.0 + offset + index, 100.0 + offset + index, 10.0)
+        Candle(index * 300_000, 100.0 + offset + index, 101.0 + offset + index, 99.0 + offset + index, 100.0 + offset + index, 10.0)
         for index in range(count)
     ]
 
@@ -46,7 +46,8 @@ class StaticProvider:
             raise TimeoutError("blocked")
         step_ms = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}[interval]
         next_time_ms = since_time_ms + (step_ms if interval == "1h" else step_ms * 2)
-        extra = Candle(next_time_ms, 112.0, 113.0, 111.0, 112.0, 20.0)
+        price = 100.0 + self.offset + (next_time_ms // 300_000)
+        extra = Candle(next_time_ms, price, price + 1.0, price - 1.0, price, 20.0)
         return [extra]
 
 

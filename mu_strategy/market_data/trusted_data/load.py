@@ -27,6 +27,7 @@ from mu_strategy.market_data.trusted_data.validation import (
     validate_built_native_candles,
 )
 from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -194,6 +195,13 @@ class LoadTrustedBundle:
             candles_by_interval[interval] = candles if health.integrity == IntegrityState.VALID else []
 
         self._attach_built_native_validation(health_by_interval, candles_by_interval)
+        _apply_coverage_gate(
+            health_by_interval,
+            candles_by_interval,
+            effective_intervals=plan.effective_intervals,
+            requested_days=query.days,
+            window_end_time_ms=window_plan.end_time_ms,
+        )
         decision = policy.decide(
             context=context,
             health_by_interval=health_by_interval,
@@ -287,6 +295,41 @@ class LoadTrustedBundle:
             )
             if not report.ok:
                 candles_by_interval[interval] = []
+
+
+def _apply_coverage_gate(
+    health_by_interval: dict[str, DatasetHealth],
+    candles_by_interval: dict[str, list[Candle]],
+    *,
+    effective_intervals: tuple[str, ...],
+    requested_days: int,
+    window_end_time_ms: int | None,
+) -> None:
+    if window_end_time_ms is None:
+        return
+    expected_start_ms = window_end_time_ms - (requested_days * DAY_MS)
+    for interval in effective_intervals:
+        health = health_by_interval.get(interval)
+        candles = candles_by_interval.get(interval) or []
+        if health is None or not candles:
+            continue
+        if health.availability != AvailabilityState.AVAILABLE or health.integrity != IntegrityState.VALID:
+            continue
+        actual_start_ms = candles[0].open_time_ms
+        if actual_start_ms <= expected_start_ms + interval_to_ms(interval):
+            continue
+        health_by_interval[interval] = replace(
+            health,
+            integrity=IntegrityState.INVALID,
+            reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
+            message=(
+                "insufficient coverage: "
+                f"requested_days={requested_days} "
+                f"expected_start_ms={expected_start_ms} "
+                f"actual_start_ms={actual_start_ms}"
+            ),
+        )
+        candles_by_interval[interval] = []
 
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:

@@ -68,6 +68,7 @@ class HealthReason(Enum):
     OHLCV_INVALID = "ohlcv_invalid"
     CONTINUITY_GAP = "continuity_gap"
     CACHE_CONTENT_MISMATCH = "cache_content_mismatch"
+    INSUFFICIENT_COVERAGE = "insufficient_coverage"
 
 
 class Clock(Protocol):

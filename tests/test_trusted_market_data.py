@@ -405,9 +405,15 @@ class TrustedCandleBundleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             manifest_intervals = {}
+            five_minute = _five_minute_candles(days=1)
             for interval in ("5m", "15m", "1h"):
                 path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
-                candles = _fake_fetcher("MU-USDT-SWAP", interval, days=1)
+                if interval == "5m":
+                    candles = five_minute
+                else:
+                    from mu_strategy.market_data.trusted import aggregate_candles
+
+                    candles = aggregate_candles(five_minute, interval=interval)
                 write_csv(candles, path)
                 manifest_intervals[interval] = {
                     "symbol": "MU-USDT-SWAP",
@@ -442,11 +448,11 @@ class TrustedCandleBundleTests(unittest.TestCase):
                             days=1,
                             data_dir=data_dir,
                             refresh=False,
-                            clock=_FixedClock(3_600_000),
+                            clock=_FixedClock(86_400_000),
                         )
 
-        self.assertEqual(4, len(bundle.candles_by_interval["15m"]))
-        self.assertEqual(1, len(bundle.candles_by_interval["1h"]))
+        self.assertEqual(96, len(bundle.candles_by_interval["15m"]))
+        self.assertEqual(24, len(bundle.candles_by_interval["1h"]))
         self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
 
     def test_refresh_trusted_candle_bundle_prunes_cached_window_and_statuses_to_days(self):
