@@ -155,6 +155,7 @@ class RefreshTrustedMarketData:
         try:
             universe = self._universe(request)
         except Exception as exc:
+            failure = _exception_failure(exc)
             run = RefreshRun(
                 run_id=run_id,
                 attempt_status=RefreshAttemptStatus.FAILED,
@@ -169,11 +170,10 @@ class RefreshTrustedMarketData:
                         "symbol": "*",
                         "interval": "*",
                         "reason": HealthReason.REFRESH_FAILED.value,
-                        "error_type": type(exc).__name__,
-                        "message": str(exc),
+                        **failure,
                     },
                 ),
-                cycle_error={"error_type": type(exc).__name__, "message": str(exc)},
+                cycle_error=failure,
             )
             self._persist_run(run)
             return run
@@ -271,14 +271,15 @@ class RefreshTrustedMarketData:
             if path.exists() and not cache_loaded:
                 reason = HealthReason.CACHE_READ_FAILED
                 existing = []
+            failure = _exception_failure(exc)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
                 candles=dedupe_candles(existing),
                 had_existing=bool(existing),
                 fetch_reason=reason,
-                error_type=type(exc).__name__,
-                message=str(exc),
+                error_type=failure["error_type"],
+                message=failure["message"],
             )
 
     def _materialize_symbol_bundle(
@@ -367,6 +368,7 @@ class RefreshTrustedMarketData:
                 candles_by_key[key] = candles
             except Exception as exc:
                 reason = HealthReason.INCREMENTAL_REFRESH_FAILED if candidate.had_existing else HealthReason.REFRESH_FAILED
+                failure = _exception_failure(exc)
                 datasets[key] = _health(
                     symbol,
                     interval,
@@ -377,8 +379,8 @@ class RefreshTrustedMarketData:
                     integrity=IntegrityState.INVALID,
                     freshness=FreshnessState.STALE,
                     reason=reason,
-                    error_type=type(exc).__name__,
-                    message=str(exc),
+                    error_type=failure["error_type"],
+                    message=failure["message"],
                     warnings=fetch_warnings,
                 )
                 candles_by_key[key] = []
@@ -522,11 +524,22 @@ def _provider_failures(datasets: dict[tuple[str, str], DatasetHealth]) -> tuple[
                 "symbol": symbol,
                 "interval": interval,
                 "reason": reason.value,
-                "error_type": health.error_type or "",
-                "message": health.message or "",
+                **_failure_fields_from_health(health),
             }
         )
     return tuple(failures)
+
+
+def _exception_failure(exc: Exception) -> dict[str, str]:
+    error_type = type(exc).__name__
+    message = str(exc).strip() or error_type
+    return {"error_type": error_type, "message": message}
+
+
+def _failure_fields_from_health(health: DatasetHealth) -> dict[str, str]:
+    error_type = (health.error_type or "").strip() or "Error"
+    message = (health.message or "").strip() or error_type
+    return {"error_type": error_type, "message": message}
 
 
 def _refresh_attempt_status(

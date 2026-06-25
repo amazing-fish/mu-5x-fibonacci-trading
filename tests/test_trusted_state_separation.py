@@ -58,6 +58,88 @@ class TrustedStateSeparationTests(unittest.TestCase):
                     payload["provider_failures"],
                 )
 
+    def test_empty_exception_message_provider_failure_manifest_round_trips(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            run = RefreshTrustedMarketData(store, _HistoryTimeoutProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+
+            manifest_result = store.read_manifest()
+            bundle = LoadTrustedBundle(store).execute(
+                LoadTrustedBundleQuery("BTC-USDT-SWAP", intervals=("5m",), days=1, now_ms=3_600_000),
+                trading_strict_policy(),
+            )
+
+        self.assertEqual(
+            (
+                {
+                    "symbol": "BTC-USDT-SWAP",
+                    "interval": "5m",
+                    "reason": "refresh_failed",
+                    "error_type": "TimeoutError",
+                    "message": "TimeoutError",
+                },
+            ),
+            run.provider_failures,
+        )
+        self.assertTrue(manifest_result.ok, manifest_result.message)
+        self.assertNotEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
+    def test_empty_exception_message_universe_failure_manifest_round_trips(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            run = RefreshTrustedMarketData(store, _UniverseTimeoutProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                )
+            )
+
+            manifest_result = store.read_manifest()
+            bundle = LoadTrustedBundle(store).execute(
+                LoadTrustedBundleQuery("BTC-USDT-SWAP", intervals=("5m",), days=1, now_ms=3_600_000),
+                trading_strict_policy(),
+            )
+
+        self.assertEqual(
+            (
+                {
+                    "symbol": "*",
+                    "interval": "*",
+                    "reason": "refresh_failed",
+                    "error_type": "TimeoutError",
+                    "message": "TimeoutError",
+                },
+            ),
+            run.provider_failures,
+        )
+        self.assertEqual({"error_type": "TimeoutError", "message": "TimeoutError"}, run.cycle_error)
+        self.assertTrue(manifest_result.ok, manifest_result.message)
+        self.assertNotEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
     def test_timestamp_gaps_round_trip_through_single_compat_adapter(self):
         from mu_strategy.market_data.trusted_data.compat import data_status_from_health
         from mu_strategy.market_data.trusted_data.contracts import (
@@ -186,6 +268,28 @@ class _IncrementalFailureProvider:
 
     def fetch_incremental(self, symbol, interval, *, since_time_ms):
         raise TimeoutError("blocked incremental")
+
+
+class _HistoryTimeoutProvider:
+    def fetch_tickers(self):
+        return [{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}]
+
+    def fetch_history(self, symbol, interval, *, days):
+        raise TimeoutError()
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        raise AssertionError("empty cache should force history path")
+
+
+class _UniverseTimeoutProvider:
+    def fetch_tickers(self):
+        raise TimeoutError()
+
+    def fetch_history(self, symbol, interval, *, days):
+        raise AssertionError("universe failure must not fetch history")
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        raise AssertionError("universe failure must not fetch incremental")
 
 
 if __name__ == "__main__":
