@@ -529,7 +529,7 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
     }
     symbols = {symbol: {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.cache_path(symbol, interval)
+        path = store.flat_cache_path(symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,

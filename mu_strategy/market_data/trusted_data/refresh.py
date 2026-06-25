@@ -25,7 +25,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     derive_snapshot_usability,
 )
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
     normalize_and_validate_candles,
@@ -152,7 +152,9 @@ class RefreshTrustedMarketData:
     def execute(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
         started_at_ms = _now_ms(request.now_ms, self.clock)
         plan = self.planner.plan(request.requested_intervals)
-        run_id = request.run_id or uuid.uuid4().hex
+        for interval in plan.effective_intervals:
+            validate_storage_segment(interval, field="interval")
+        run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
         previous_manifest = self.store.read_manifest(compatibility_mode=True)
         self.store.prepare_generation(run_id)
         try:
@@ -184,7 +186,7 @@ class RefreshTrustedMarketData:
         datasets: dict[tuple[str, str], DatasetHealth] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top]):
-            symbol = str(ticker["inst_id"])
+            symbol = validate_storage_segment(str(ticker["inst_id"]), field="symbol")
             candidates: dict[tuple[str, str], DatasetRefreshCandidate] = {}
             for interval in plan.effective_intervals:
                 candidate = self._fetch_dataset_candidate(
@@ -447,6 +449,8 @@ class RefreshTrustedMarketData:
         health = manifest_result.snapshot.datasets.get((symbol, interval))
         if health is None:
             return None
+        if manifest_result.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
         try:
             return self.store.resolve_source_file(
                 health.source_file,

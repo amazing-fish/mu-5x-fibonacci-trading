@@ -399,7 +399,10 @@ def _fetch_history(symbol: str, interval: str, *, days: int) -> list[Candle]:
 def _manifest_path(data_dir: Path) -> Path:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-    return TrustedDataStore(data_dir=data_dir).manifest_path
+    current = data_dir / "current.json"
+    if current.exists():
+        return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
+    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
 
 
 if __name__ == "__main__":

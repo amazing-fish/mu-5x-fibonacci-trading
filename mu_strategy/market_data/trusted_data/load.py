@@ -97,7 +97,7 @@ class LoadTrustedBundle:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={interval: [] for interval in plan.requested_intervals},
-                    files_by_interval={interval: self.store.data_dir / "okx" / resolved.inst_id / f"{interval}.csv" for interval in plan.requested_intervals},
+                    files_by_interval={interval: self.store.flat_cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(
@@ -121,7 +121,7 @@ class LoadTrustedBundle:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={requested: [] for requested in plan.requested_intervals},
-                    files_by_interval={requested: context.generation_root / "okx" / resolved.inst_id / f"{requested}.csv" for requested in plan.requested_intervals},
+                    files_by_interval={requested: self._default_dataset_path(resolved.inst_id, requested, context) for requested in plan.requested_intervals},
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(False, HealthReason.MALFORMED_MANIFEST, str(exc)),
@@ -204,7 +204,7 @@ class LoadTrustedBundle:
             for interval in plan.requested_intervals
         }
         requested_files = {
-            interval: path_by_interval.get(interval, context.generation_root / "okx" / resolved.inst_id / f"{interval}.csv")
+            interval: path_by_interval.get(interval, self._default_dataset_path(resolved.inst_id, interval, context))
             for interval in plan.requested_intervals
         }
         return TrustedBundle(
@@ -247,15 +247,18 @@ class LoadTrustedBundle:
         context: TrustedLoadContext,
     ) -> Path:
         if manifest_health is None:
-            return context.generation_root / "okx" / symbol / f"{interval}.csv"
-        source_file = manifest_health.source_file
-        if str(source_file) == "" and context.generation_id is None:
-            return self.store.data_dir / "okx" / symbol / f"{interval}.csv"
-        return self.store.resolve_source_file(
-            source_file,
-            generation_root=context.generation_root,
-            generation_id=context.generation_id,
-        )
+            return self._default_dataset_path(symbol, interval, context)
+        if context.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
+        expected = self.store.generation_source_file(symbol, interval)
+        if manifest_health.source_file.as_posix() != expected.as_posix():
+            raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
+        return self.store.generation_cache_path(context.generation_id, symbol, interval)
+
+    def _default_dataset_path(self, symbol: str, interval: str, context: TrustedLoadContext) -> Path:
+        if context.generation_id is None:
+            return self.store.flat_cache_path(symbol, interval)
+        return self.store.generation_cache_path(context.generation_id, symbol, interval)
 
     def _attach_built_native_validation(
         self,

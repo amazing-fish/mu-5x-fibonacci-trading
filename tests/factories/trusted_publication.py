@@ -80,12 +80,13 @@ def generation_manifest(data_dir: Path, generation_id: str) -> dict:
     return json.loads((data_dir / "generations" / generation_id / "manifest.json").read_text(encoding="utf-8"))
 
 
-def write_flat_v3_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: str = "flat-run") -> dict:
+def write_flat_v3_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: str = "flat-run", source_file=None) -> dict:
     store = TrustedDataStore(data_dir=data_dir)
     symbols = {symbol: {"intervals": {}}}
     for interval, rows in candles_by_interval().items():
         path = data_dir / "okx" / symbol / f"{interval}.csv"
         store.write_csv(rows, path)
+        source = source_file(symbol, interval, path) if callable(source_file) else source_file
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
             "interval": interval,
@@ -97,7 +98,7 @@ def write_flat_v3_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: s
             "first_timestamp_ms": rows[0].open_time_ms,
             "last_timestamp_ms": rows[-1].open_time_ms,
             "updated_at_ms": 3_600_000,
-            "source_file": str(path),
+            "source_file": str(path if source is None else source),
             "content_sha256": candles_content_sha256(rows),
             "validation": {"ok": True, "reason": "ok"},
         }
@@ -118,6 +119,17 @@ def write_flat_v3_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: s
         "warnings": [],
         "cycle_error": None,
     }
+    (data_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    return manifest
+
+
+def write_flat_v2_publication(data_dir: Path, *, symbol: str = SYMBOL, run_id: str = "flat-v2-run", source_file=None) -> dict:
+    manifest = write_flat_v3_publication(data_dir, symbol=symbol, run_id=run_id, source_file=source_file)
+    manifest.pop("attempt_status")
+    manifest.pop("snapshot_usability")
+    manifest["schema_version"] = 2
+    manifest["outcome"] = "success"
+    manifest["status"] = "ok"
     (data_dir / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     return manifest
 

@@ -327,7 +327,7 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
     }
     symbols = {symbol: {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.cache_path(symbol, interval)
+        path = store.flat_cache_path(symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -376,7 +376,7 @@ def _write_csv_only(data_dir: Path, *, symbol: str) -> None:
         "1h": aggregate_candles(five, interval="1h"),
     }
     for interval, candles in by_interval.items():
-        store.write_csv(candles, store.cache_path(symbol, interval))
+        store.write_csv(candles, store.flat_cache_path(symbol, interval))
 
 
 if __name__ == "__main__":

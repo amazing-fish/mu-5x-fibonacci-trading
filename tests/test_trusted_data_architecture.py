@@ -444,7 +444,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             data_dir = Path(tmp)
             _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             store = TrustedDataStore(data_dir=data_dir)
-            write_csv([Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0)], store.cache_path("MU-USDT-SWAP", "15m"))
+            write_csv([Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0)], store.flat_cache_path("MU-USDT-SWAP", "15m"))
 
             bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
                 LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
@@ -492,7 +492,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             data_dir = Path(tmp)
             _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             store = TrustedDataStore(data_dir=data_dir)
-            write_csv(_constant_candles((0, 1_800_000)), store.cache_path("MU-USDT-SWAP", "15m"))
+            write_csv(_constant_candles((0, 1_800_000)), store.flat_cache_path("MU-USDT-SWAP", "15m"))
 
             bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
                 LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
@@ -515,7 +515,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             data_dir = Path(tmp)
             _write_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             store = TrustedDataStore(data_dir=data_dir)
-            original = store.read_csv(store.cache_path("MU-USDT-SWAP", "5m"))
+            original = store.read_csv(store.flat_cache_path("MU-USDT-SWAP", "5m"))
             replacement = [
                 Candle(
                     candle.open_time_ms,
@@ -527,7 +527,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 )
                 for candle in original
             ]
-            write_csv(replacement, store.cache_path("MU-USDT-SWAP", "5m"))
+            write_csv(replacement, store.flat_cache_path("MU-USDT-SWAP", "5m"))
 
             bundle = LoadTrustedBundle(store, clock=_FakeClock(86_400_000)).execute(
                 LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("5m",), days=1),
@@ -578,7 +578,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             "unknown_attempt_status": lambda manifest: manifest.__setitem__("attempt_status", "unknown"),
             "missing_snapshot_usability": lambda manifest: manifest.pop("snapshot_usability"),
             "unknown_snapshot_usability": lambda manifest: manifest.__setitem__("snapshot_usability", "missing"),
-            "wrong_schema_version": lambda manifest: manifest.__setitem__("schema_version", 2),
+            "wrong_schema_version": lambda manifest: manifest.__setitem__("schema_version", 4),
             "missing_nested_availability": lambda manifest: first_dataset(manifest).pop("availability"),
             "unknown_nested_reason": lambda manifest: first_dataset(manifest).__setitem__("reasons", ["new_reason"]),
             "dataset_key_payload_mismatch": lambda manifest: first_dataset(manifest).__setitem__("symbol", "BTC-USDT-SWAP"),
@@ -1158,7 +1158,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
             write_flat_v3_publication(data_dir, symbol="BTC-USDT-SWAP")
-            store.cache_path("BTC-USDT-SWAP", "5m").write_text(
+            store.flat_cache_path("BTC-USDT-SWAP", "5m").write_text(
                 "open_time_ms,open,high,low,close,volume\nnot-an-int,1,1,1,1,1\n",
                 encoding="utf-8",
             )
@@ -1329,7 +1329,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
             original_read_manifest = TrustedDataStore.read_manifest
 
             def counted_read_manifest(store, *args, **kwargs):
-                read_calls.append(store.manifest_path)
+                read_calls.append(store.flat_manifest_path)
                 return original_read_manifest(store, *args, **kwargs)
 
             with patch.object(TrustedDataStore, "read_manifest", counted_read_manifest):
@@ -1702,7 +1702,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                 universe_symbols=("MU-USDT-SWAP",),
             )
             store = TrustedDataStore(data_dir=data_dir)
-            write_csv(_constant_candles((0, 1_800_000)), store.cache_path("MU-USDT-SWAP", "15m"))
+            write_csv(_constant_candles((0, 1_800_000)), store.flat_cache_path("MU-USDT-SWAP", "15m"))
 
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 result = run_once(
@@ -1755,7 +1755,7 @@ def _write_manifest_and_caches(
     symbols = dict(previous_symbols)
     symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in by_interval.items():
-        path = store.cache_path(symbol, interval)
+        path = store.flat_cache_path(symbol, interval)
         store.write_csv(candles, path)
         reason = "ok"
         if integrity == "invalid":
@@ -1837,7 +1837,7 @@ def _write_orphan_caches(data_dir: Path, *, symbol: str, days: int) -> None:
         "1h": aggregate_candles(five, interval="1h"),
     }
     for interval, candles in by_interval.items():
-        store.write_csv(candles, store.cache_path(symbol, interval))
+        store.write_csv(candles, store.flat_cache_path(symbol, interval))
 
 
 def _constant_candles(timestamps: tuple[int, ...]) -> list[Candle]:
@@ -2080,7 +2080,10 @@ def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
 def _manifest_path(data_dir: Path) -> Path:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-    return TrustedDataStore(data_dir=data_dir).manifest_path
+    current = data_dir / "current.json"
+    if current.exists():
+        return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
+    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
 
 
 if __name__ == "__main__":

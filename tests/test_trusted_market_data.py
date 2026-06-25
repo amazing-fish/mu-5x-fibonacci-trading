@@ -162,7 +162,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             self.assertEqual(["MU-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["stock_token_top"]])
             from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-            self.assertTrue(TrustedDataStore(data_dir=data_dir).cache_path("BTC-USDT-SWAP", "5m").exists())
+            self.assertTrue(TrustedDataStore(data_dir=data_dir).generation_cache_path(manifest["run_id"], "BTC-USDT-SWAP", "5m").exists())
             self.assertTrue(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
 
             html = render_data_health_dashboard(json.loads(manifest_path.read_text(encoding="utf-8")))
@@ -701,7 +701,10 @@ class _FixedClock:
 def _manifest_path(data_dir: Path) -> Path:
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-    return TrustedDataStore(data_dir=data_dir).manifest_path
+    current = data_dir / "current.json"
+    if current.exists():
+        return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
+    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
 
 
 if __name__ == "__main__":

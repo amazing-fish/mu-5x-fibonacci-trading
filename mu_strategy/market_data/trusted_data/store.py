@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from mu_strategy.market_data.trusted_data.contracts import (
     trusted_manifest_snapshot_from_dict,
 )
 from mu_strategy.models import Candle
+
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -39,18 +42,10 @@ class TrustedDataStore:
     def __init__(self, *, data_dir: Path):
         self.data_dir = Path(data_dir)
 
-    def cache_path(self, symbol: str, interval: str) -> Path:
-        generation_id = self._current_generation_id_or_none()
-        if generation_id is not None:
-            return self.generation_cache_path(generation_id, symbol, interval)
+    def flat_cache_path(self, symbol: str, interval: str) -> Path:
+        symbol = validate_storage_segment(symbol, field="symbol")
+        interval = validate_storage_segment(interval, field="interval")
         return self.data_dir / "okx" / symbol / f"{interval}.csv"
-
-    @property
-    def manifest_path(self) -> Path:
-        generation_id = self._current_generation_id_or_none()
-        if generation_id is not None:
-            return self.generation_root(generation_id) / "manifest.json"
-        return self.flat_manifest_path
 
     @property
     def flat_manifest_path(self) -> Path:
@@ -69,10 +64,16 @@ class TrustedDataStore:
         return self.data_dir / "refresh_runs.jsonl"
 
     def generation_root(self, generation_id: str) -> Path:
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
         return self.generations_dir / generation_id
 
     def generation_source_file(self, symbol: str, interval: str) -> Path:
+        symbol = validate_storage_segment(symbol, field="symbol")
+        interval = validate_storage_segment(interval, field="interval")
         return Path("okx") / symbol / f"{interval}.csv"
+
+    def generation_manifest_path(self, generation_id: str) -> Path:
+        return self.generation_root(generation_id) / "manifest.json"
 
     def generation_cache_path(self, generation_id: str, symbol: str, interval: str) -> Path:
         return self.generation_root(generation_id) / self.generation_source_file(symbol, interval)
@@ -82,6 +83,7 @@ class TrustedDataStore:
         if root.exists():
             raise FileExistsError(f"trusted generation already exists: {generation_id}")
         root.mkdir(parents=True)
+        _fsync_directory(self.generations_dir)
         return root
 
     def read_csv(self, path: Path) -> list[Candle]:
@@ -101,6 +103,7 @@ class TrustedDataStore:
                     writer.writerow(candle.to_csv_row())
                 _flush_and_fsync(handle)
             os.replace(tmp_path, path)
+            _fsync_directory(path.parent)
         finally:
             _cleanup_tmp(tmp_path)
 
@@ -121,7 +124,7 @@ class TrustedDataStore:
                 except ManifestSchemaError as exc:
                     return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
             return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
-        return self._read_manifest_file(path, compatibility_mode=compatibility_mode, generation_root=self.data_dir)
+        return self._read_manifest_file(path, compatibility_mode=True, generation_root=self.data_dir)
 
     def _read_current_manifest(self, *, compatibility_mode: bool = False) -> ManifestReadResult:
         try:
@@ -145,7 +148,7 @@ class TrustedDataStore:
             )
         return self._read_manifest_file(
             manifest_path,
-            compatibility_mode=compatibility_mode,
+            compatibility_mode=False,
             generation_root=self.generation_root(generation_id),
             generation_id=generation_id,
         )
@@ -159,21 +162,13 @@ class TrustedDataStore:
         manifest_value = pointer.get("manifest")
         if not isinstance(generation_id, str) or not generation_id:
             raise ManifestSchemaError("current pointer generation_id must be non-empty string")
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
         if not isinstance(manifest_value, str) or not manifest_value:
             raise ManifestSchemaError("current pointer manifest must be non-empty string")
-        manifest_path = Path(manifest_value)
-        if manifest_path.is_absolute():
-            raise ManifestSchemaError("current pointer manifest must be relative")
-        if any(part == ".." for part in manifest_path.parts):
-            raise ManifestSchemaError("current pointer manifest cannot contain '..'")
-        resolved = (self.data_dir / manifest_path).resolve()
-        root = self.data_dir.resolve()
-        if resolved != root and root not in resolved.parents:
-            raise ManifestSchemaError("current pointer manifest must stay inside data_dir")
-        expected = (self.generation_root(generation_id) / "manifest.json").resolve()
-        if resolved != expected:
+        expected_value = f"generations/{generation_id}/manifest.json"
+        if manifest_value != expected_value:
             raise ManifestSchemaError("current pointer manifest must target its generation manifest")
-        return generation_id, resolved
+        return generation_id, self.generation_manifest_path(generation_id)
 
     def _read_manifest_file(
         self,
@@ -192,6 +187,8 @@ class TrustedDataStore:
         try:
             snapshot = trusted_manifest_snapshot_from_dict(payload, compatibility_mode=compatibility_mode)
             if generation_id is not None:
+                if snapshot.run_id != generation_id:
+                    raise ManifestSchemaError("generation manifest run_id must match current generation_id")
                 _validate_generation_source_files(snapshot, generation_root)
         except Exception as exc:
             return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc), generation_root=generation_root, generation_id=generation_id, manifest_path=path)
@@ -204,7 +201,10 @@ class TrustedDataStore:
         return path
 
     def write_generation_manifest(self, generation_id: str, manifest: dict[str, Any]) -> Path:
-        path = self.generation_root(generation_id) / "manifest.json"
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
+        if manifest.get("run_id") != generation_id:
+            raise ManifestSchemaError("generation manifest run_id must match generation_id")
+        path = self.generation_manifest_path(generation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
         result = self._read_manifest_file(path, generation_root=self.generation_root(generation_id), generation_id=generation_id)
@@ -214,6 +214,12 @@ class TrustedDataStore:
         return path
 
     def replace_current(self, generation_id: str) -> Path:
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
+        manifest_path = self.generation_manifest_path(generation_id)
+        result = self._read_manifest_file(manifest_path, generation_root=self.generation_root(generation_id), generation_id=generation_id)
+        if not result.ok:
+            message = result.message or (result.reason.value if result.reason is not None else "generation manifest is malformed")
+            raise ManifestSchemaError(message)
         pointer = {
             "schema_version": 1,
             "generation_id": generation_id,
@@ -240,16 +246,6 @@ class TrustedDataStore:
             _flush_and_fsync(handle)
         return path
 
-    def _current_generation_id_or_none(self) -> str | None:
-        if not self.current_path.exists():
-            return None
-        try:
-            pointer = json.loads(self.current_path.read_text(encoding="utf-8"))
-            generation_id, _ = self._resolve_current_pointer(pointer)
-            return generation_id
-        except Exception:
-            return None
-
 
 def candles_content_sha256(candles: list[Candle]) -> str:
     digest = hashlib.sha256()
@@ -269,6 +265,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
             handle.write(text)
             _flush_and_fsync(handle)
         os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
     finally:
         _cleanup_tmp(tmp_path)
 
@@ -283,6 +280,19 @@ def _flush_and_fsync(handle) -> None:
         os.fsync(handle.fileno())
     except OSError:
         pass
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _cleanup_tmp(path: Path) -> None:
@@ -307,4 +317,21 @@ def _resolve_generation_source_file(source_file: Path, generation_root: Path) ->
 
 def _validate_generation_source_files(snapshot: TrustedManifestSnapshot, generation_root: Path) -> None:
     for health in snapshot.datasets.values():
+        expected = Path("okx") / validate_storage_segment(health.key.symbol, field="symbol") / f"{validate_storage_segment(health.key.interval, field='interval')}.csv"
+        if health.source_file.as_posix() != expected.as_posix():
+            raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
         _resolve_generation_source_file(health.source_file, generation_root)
+
+
+def validate_storage_segment(value: str, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    if value != value.strip():
+        raise ValueError(f"{field} must not have surrounding whitespace")
+    if value in {"", ".", ".."}:
+        raise ValueError(f"{field} must be a storage segment")
+    if any(char in value for char in ("/", "\\", ":", "\0")):
+        raise ValueError(f"{field} must not contain path separators or drive syntax")
+    if not _SEGMENT_RE.fullmatch(value):
+        raise ValueError(f"{field} must match [A-Za-z0-9][A-Za-z0-9._-]{{0,127}}")
+    return value

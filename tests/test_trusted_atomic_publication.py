@@ -15,6 +15,7 @@ from tests.factories.trusted_publication import (
     current_generation_dir,
     generation_manifest,
     read_current,
+    write_flat_v2_publication,
     write_flat_v3_publication,
     write_generation_pointer,
 )
@@ -56,6 +57,94 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         self.assertEqual("run-cold", bundle.run_id)
         self.assertTrue(bundle.trust_decision.allowed)
         self.assertEqual(data_dir / "generations" / "run-cold" / "okx" / SYMBOL / "15m.csv", bundle.files_by_interval["15m"])
+
+    def test_storage_segments_reject_path_attacks_without_changing_current(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        attacks = ("../../escaped", "../escaped", "a/b", "a\\b", "C:\\escaped", "C:escaped", ".", "..", "bad\0id", "a" * 129)
+        for value in attacks:
+            with self.subTest(value=value):
+                with TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    data_dir = root / "data" / "live"
+                    store = TrustedDataStore(data_dir=data_dir)
+                    request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+                    RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
+                    before = _tree(data_dir)
+                    old_current = (data_dir / "current.json").read_bytes()
+
+                    with self.assertRaises(ValueError):
+                        RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id=value))
+                    old_bundle = LoadTrustedBundle(store).execute(
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        observe_only_policy(),
+                    )
+
+                    self.assertEqual(before, _tree(data_dir))
+                    self.assertEqual(old_current, (data_dir / "current.json").read_bytes())
+                    self.assertFalse((root / "escaped").exists())
+                    self.assertEqual("run-old", old_bundle.run_id)
+
+    def test_generated_run_id_segment_is_validated_before_paths(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data" / "live"
+            store = TrustedDataStore(data_dir=data_dir)
+            request = RefreshTrustedMarketDataRequest(
+                requested_intervals=("5m",),
+                days=1,
+                limit=1,
+                stock_token_inst_ids=set(),
+                now_ms=3_600_000,
+            )
+
+            with patch("mu_strategy.market_data.trusted_data.refresh.uuid.uuid4", return_value=_Hex("../escaped")):
+                with self.assertRaises(ValueError):
+                    RefreshTrustedMarketData(store, StaticProvider()).execute(request)
+
+            self.assertFalse(data_dir.exists())
+
+    def test_provider_symbol_and_requested_interval_attacks_do_not_publish_current(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        cases = (
+            ("provider_symbol", StaticProvider(symbol="../escaped-USDT-SWAP"), ("5m",)),
+            ("requested_interval", StaticProvider(), ("../escaped",)),
+        )
+        for name, provider, intervals in cases:
+            with self.subTest(name=name):
+                with TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    data_dir = root / "data" / "live"
+                    store = TrustedDataStore(data_dir=data_dir)
+                    request = dict(days=1, limit=1, stock_token_inst_ids=set(), now_ms=3_600_000)
+                    RefreshTrustedMarketData(store, StaticProvider()).execute(
+                        RefreshTrustedMarketDataRequest(**request, requested_intervals=("5m",), run_id="run-old")
+                    )
+                    before = _tree(data_dir)
+                    current_before = (data_dir / "current.json").read_bytes()
+
+                    with self.assertRaises(ValueError):
+                        RefreshTrustedMarketData(store, provider).execute(
+                            RefreshTrustedMarketDataRequest(**request, requested_intervals=intervals, run_id="run-attack")
+                        )
+                    old_bundle = LoadTrustedBundle(store).execute(
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        observe_only_policy(),
+                    )
+
+                    self.assertEqual(current_before, (data_dir / "current.json").read_bytes())
+                    self.assertFalse((root / "escaped").exists())
+                    self.assertEqual("run-old", old_bundle.run_id)
+                    self.assertTrue(set(before).issubset(set(_tree(data_dir))))
 
     def test_incremental_refresh_reads_current_generation_and_preserves_old_generation(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -256,13 +345,66 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                 self.assertFalse(bundle.trust_decision.allowed)
                 self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
 
+    def test_generation_manifest_identity_must_match_current_pointer(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, ManifestSchemaError
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = write_flat_v3_publication(data_dir, run_id="run-b")
+            (data_dir / "manifest.json").unlink()
+            write_generation_pointer(data_dir, generation_id="run-a", manifest=manifest)
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                observe_only_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            manifest = write_flat_v3_publication(data_dir, run_id="run-b")
+            with self.assertRaises(ManifestSchemaError):
+                store.write_generation_manifest("run-a", manifest)
+
+    def test_generation_source_file_must_match_dataset_key_exactly(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        cases = {
+            "other_symbol": f"okx/ETH-USDT-SWAP/5m.csv",
+            "wrong_interval": f"okx/{SYMBOL}/15m.csv",
+            "nested_relative": f"okx/{SYMBOL}/nested/5m.csv",
+        }
+        for name, source_file in cases.items():
+            with self.subTest(name=name):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp)
+                    manifest = write_flat_v3_publication(data_dir, run_id="run-source")
+                    (data_dir / "manifest.json").unlink()
+                    manifest["symbols"][SYMBOL]["intervals"]["5m"]["source_file"] = source_file
+                    write_generation_pointer(data_dir, generation_id="run-source", manifest=manifest)
+                    bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                        LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                        observe_only_policy(),
+                    )
+
+                self.assertFalse(bundle.trust_decision.allowed)
+                self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
     def test_generation_source_file_must_stay_relative_inside_generation_root(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import observe_only_policy
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-        bad_sources = (str(Path("C:/outside.csv")), "../outside.csv")
+        bad_sources = ("C:\\outside.csv", "C:/outside.csv", "\\\\server\\share\\outside.csv", "/outside.csv", "../outside.csv")
         for source_file in bad_sources:
             with self.subTest(source_file=source_file):
                 with TemporaryDirectory() as tmp:
@@ -279,6 +421,139 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
 
                 self.assertFalse(bundle.trust_decision.allowed)
                 self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
+    def test_store_no_longer_exposes_dynamic_cache_or_manifest_helpers(self):
+        store_source = Path("mu_strategy/market_data/trusted_data/store.py").read_text(encoding="utf-8")
+        load_source = Path("mu_strategy/market_data/trusted_data/load.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("def cache_path(", store_source)
+        self.assertNotIn("def manifest_path(", store_source)
+        self.assertNotIn("_current_generation_id_or_none", store_source)
+        self.assertNotIn(".cache_path(", load_source)
+        self.assertEqual(1, load_source.count("self.store.read_manifest("))
+
+    def test_flat_v2_and_v3_read_from_canonical_dataset_path_with_relative_data_dir(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        source_forms = (
+            lambda data_dir, symbol, interval, path: f"okx/{symbol}/{interval}.csv",
+            lambda data_dir, symbol, interval, path: f"{data_dir.as_posix()}/okx/{symbol}/{interval}.csv",
+            lambda data_dir, symbol, interval, path: str(path.resolve()),
+            lambda data_dir, symbol, interval, path: "",
+        )
+        writers = (write_flat_v2_publication, write_flat_v3_publication)
+        for writer in writers:
+            for source_form in source_forms:
+                with self.subTest(writer=writer.__name__, source_form=source_form):
+                    with TemporaryDirectory() as tmp:
+                        temp_root = Path(tmp)
+                        old_cwd = Path.cwd()
+                        os.chdir(temp_root)
+                        try:
+                            data_dir = Path("data/live")
+                            writer(data_dir, source_file=lambda symbol, interval, path: source_form(data_dir, symbol, interval, path))
+                            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000),
+                                trading_strict_policy(),
+                            )
+                        finally:
+                            os.chdir(old_cwd)
+
+                    self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+                    self.assertEqual(Path("data/live/okx") / SYMBOL / "5m.csv", bundle.files_by_interval["5m"])
+
+    def test_generation_mode_rejects_schema_v2_even_with_compatibility_mode(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = write_flat_v2_publication(data_dir, run_id="run-v2")
+            (data_dir / "manifest.json").unlink()
+            write_generation_pointer(data_dir, generation_id="run-v2", manifest=manifest)
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=3_600_000, compatibility_mode=True),
+                observe_only_policy(),
+            )
+
+        self.assertFalse(bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
+
+    def test_next_refresh_preserves_flat_manifest_and_publishes_generation_pointer(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_flat_v2_publication(data_dir)
+            flat_manifest_before = (data_dir / "manifest.json").read_bytes()
+            flat_csv_before = (data_dir / "okx" / SYMBOL / "5m.csv").read_bytes()
+
+            RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), StaticProvider(offset=10)).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                    run_id="run-next",
+                )
+            )
+
+            self.assertEqual(flat_manifest_before, (data_dir / "manifest.json").read_bytes())
+            self.assertEqual(flat_csv_before, (data_dir / "okx" / SYMBOL / "5m.csv").read_bytes())
+            self.assertEqual("run-next", read_current(data_dir)["generation_id"])
+            self.assertTrue((data_dir / "generations" / "run-next" / "manifest.json").exists())
+
+    def test_publication_order_is_csv_manifest_current_then_audit_log(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            calls = []
+            original_write_csv = store.write_csv
+            original_write_manifest = store.write_generation_manifest
+            original_replace_current = store.replace_current
+            original_append_log = store.append_run_log
+
+            def write_csv(*args, **kwargs):
+                calls.append("generation CSV")
+                return original_write_csv(*args, **kwargs)
+
+            def write_manifest(*args, **kwargs):
+                calls.append("generation manifest")
+                return original_write_manifest(*args, **kwargs)
+
+            def replace_current(*args, **kwargs):
+                calls.append("current pointer")
+                return original_replace_current(*args, **kwargs)
+
+            def append_log(*args, **kwargs):
+                calls.append("audit log")
+                return original_append_log(*args, **kwargs)
+
+            with patch.object(store, "write_csv", side_effect=write_csv):
+                with patch.object(store, "write_generation_manifest", side_effect=write_manifest):
+                    with patch.object(store, "replace_current", side_effect=replace_current):
+                        with patch.object(store, "append_run_log", side_effect=append_log):
+                            RefreshTrustedMarketData(store, StaticProvider()).execute(
+                                RefreshTrustedMarketDataRequest(
+                                    requested_intervals=("5m",),
+                                    days=1,
+                                    limit=1,
+                                    stock_token_inst_ids=set(),
+                                    now_ms=3_600_000,
+                                    run_id="run-order",
+                                )
+                            )
+
+        self.assertEqual(["generation CSV", "generation manifest", "current pointer", "audit log"], calls)
 
     def test_generation_csv_modification_is_detected_by_hash(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -392,6 +667,20 @@ class _Sink:
 class _Hex:
     def __init__(self, value: str):
         self.hex = value
+
+
+class _NullContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _tree(path: Path) -> tuple[str, ...]:
+    if not path.exists():
+        return ()
+    return tuple(sorted(item.relative_to(path).as_posix() for item in path.rglob("*")))
 
 
 if __name__ == "__main__":

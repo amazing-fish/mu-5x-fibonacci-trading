@@ -70,9 +70,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-            persisted_five = store.read_csv(store.cache_path(SYMBOL, "5m"))
-            persisted_15m = store.read_csv(store.cache_path(SYMBOL, "15m"))
-            persisted_1h = store.read_csv(store.cache_path(SYMBOL, "1h"))
+            persisted_five = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "5m"))
+            persisted_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
+            persisted_1h = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "1h"))
 
         self.assertEqual(DAY_MS + ONE_HOUR_MS, persisted_15m[0].open_time_ms)
         self.assertEqual(DAY_MS + ONE_HOUR_MS, persisted_1h[0].open_time_ms)
@@ -107,9 +107,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                     now_ms=five_end,
                 )
             )
-            persisted_five = store.read_csv(store.cache_path(SYMBOL, "5m"))
-            persisted_15m = store.read_csv(store.cache_path(SYMBOL, "15m"))
-            persisted_1h = store.read_csv(store.cache_path(SYMBOL, "1h"))
+            persisted_five = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "5m"))
+            persisted_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
+            persisted_1h = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "1h"))
 
         self.assertTrue(run.datasets[(SYMBOL, "15m")].validation.ok)
         self.assertTrue(run.datasets[(SYMBOL, "1h")].validation.ok)
@@ -301,8 +301,8 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                     now_ms=first_end,
                 )
             )
-            first_15m = store.read_csv(store.cache_path(SYMBOL, "15m"))
-            second_15m = store.read_csv(store.cache_path(SECOND_SYMBOL, "15m"))
+            first_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
+            second_15m = store.read_csv(store.generation_cache_path(run.run_id, SECOND_SYMBOL, "15m"))
 
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
@@ -348,13 +348,13 @@ def _confirmed_bundle(
 def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
     from mu_strategy.market_data.trusted_data.store import candles_content_sha256
 
-    manifest_path = store.manifest_path
+    manifest_path = store.flat_manifest_path
     symbols = {}
     if manifest_path.exists():
         symbols = json.loads(manifest_path.read_text(encoding="utf-8")).get("symbols") or {}
     symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in bundle.items():
-        path = store.cache_path(symbol, interval)
+        path = store.flat_cache_path(symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -391,14 +391,17 @@ def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
 
 
 def _manifest(store) -> dict:
-    return json.loads(store.manifest_path.read_text(encoding="utf-8"))
+    current = store.current_path
+    if current.exists():
+        return json.loads((store.data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]).read_text(encoding="utf-8"))
+    return json.loads(store.flat_manifest_path.read_text(encoding="utf-8"))
 
 
 def _assert_health_matches_csv(self, store, run, symbol: str, intervals: tuple[str, ...]) -> None:
     for interval in intervals:
         with self.subTest(symbol=symbol, interval=interval):
             health = run.datasets[(symbol, interval)]
-            csv_rows = store.read_csv(store.cache_path(symbol, interval))
+            csv_rows = store.read_csv(store.generation_cache_path(run.run_id, symbol, interval))
             self.assertEqual(len(csv_rows), health.rows)
             self.assertEqual(csv_rows[0].open_time_ms, health.first_timestamp_ms)
             self.assertEqual(csv_rows[-1].open_time_ms, health.last_timestamp_ms)
