@@ -152,7 +152,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=3_600_000,
             )
 
-            manifest_path = data_dir / "manifest.json"
+            manifest_path = _manifest_path(data_dir)
             run_log_path = data_dir / "refresh_runs.jsonl"
             self.assertTrue(manifest_path.exists())
             self.assertTrue(run_log_path.exists())
@@ -160,7 +160,9 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             self.assertEqual("usable", manifest["snapshot_usability"])
             self.assertEqual(["BTC-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["crypto_top"]])
             self.assertEqual(["MU-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["stock_token_top"]])
-            self.assertTrue((data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv").exists())
+            from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+            self.assertTrue(TrustedDataStore(data_dir=data_dir).cache_path("BTC-USDT-SWAP", "5m").exists())
             self.assertTrue(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
 
             html = render_data_health_dashboard(json.loads(manifest_path.read_text(encoding="utf-8")))
@@ -202,7 +204,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=3_600_000,
             )
 
-            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         self.assertEqual("degraded", manifest["attempt_status"])
@@ -234,7 +236,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=3_600_000,
             )
 
-            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         self.assertEqual("failed", manifest["attempt_status"])
@@ -259,6 +261,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             corrupt_cache = data_dir / "okx" / "BTC-USDT-SWAP" / "5m.csv"
             corrupt_cache.parent.mkdir(parents=True)
             corrupt_cache.write_text("not,a,valid,candle\n1,2,3,4\n", encoding="utf-8")
+            _write_flat_manifest_for_paths(data_dir, {"BTC-USDT-SWAP": ("5m",)})
 
             manifest = refresh_market_data_once(
                 data_dir=data_dir,
@@ -292,6 +295,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             corrupt_native = data_dir / "okx" / "BTC-USDT-SWAP" / "15m.csv"
             corrupt_native.parent.mkdir(parents=True)
             corrupt_native.write_text("not,a,valid,candle\n1,2,3,4\n", encoding="utf-8")
+            _write_flat_manifest_for_paths(data_dir, {"BTC-USDT-SWAP": ("15m",)})
 
             manifest = refresh_market_data_once(
                 data_dir=data_dir,
@@ -304,7 +308,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=3_600_000,
             )
 
-            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
@@ -354,7 +358,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=3_600_000,
             )
 
-            persisted = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
@@ -390,7 +394,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                                     refresh=True,
                                 )
 
-            self.assertFalse((data_dir / "manifest.json").exists())
+            self.assertFalse(_manifest_path(data_dir).exists())
             self.assertFalse((data_dir / "refresh_runs.jsonl").exists())
 
     def test_refresh_trusted_candle_bundle_honors_refresh_false(self):
@@ -424,7 +428,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "content_sha256": candles_content_sha256(candles),
                     "validation": {"ok": True, "reason": "ok"},
                 }
-            (data_dir / "manifest.json").write_text(
+            _manifest_path(data_dir).write_text(
                 json.dumps(_manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})),
                 encoding="utf-8",
             )
@@ -484,7 +488,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "validation": {"ok": True, "reason": "ok"},
                 }
             manifest = _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})
-            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            _manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
 
             bundle = refresh_trusted_candle_bundle(
                 "MU-USDT-SWAP",
@@ -551,7 +555,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 },
                 cycle_error={"error_type": "TimeoutError", "message": "blocked"},
             )
-            (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            _manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
 
             bundle = refresh_trusted_candle_bundle(
                 "MU-USDT-SWAP",
@@ -576,7 +580,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            manifest_path = data_dir / "manifest.json"
+            manifest_path = _manifest_path(data_dir)
             run_log_path = data_dir / "refresh_runs.jsonl"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(json.dumps(_manifest(symbols={}, outcome="success", status="ok")), encoding="utf-8")
@@ -643,12 +647,61 @@ def _manifest(
     }
 
 
+def _write_flat_manifest_for_paths(data_dir: Path, intervals_by_symbol: dict[str, tuple[str, ...]]) -> None:
+    symbols = {}
+    for symbol, intervals in intervals_by_symbol.items():
+        symbols[symbol] = {"intervals": {}}
+        for interval in intervals:
+            path = data_dir / "okx" / symbol / f"{interval}.csv"
+            symbols[symbol]["intervals"][interval] = {
+                "symbol": symbol,
+                "interval": interval,
+                "availability": "available",
+                "integrity": "valid",
+                "freshness": "fresh",
+                "reasons": ["ok"],
+                "rows": 1,
+                "first_timestamp_ms": 0,
+                "last_timestamp_ms": 0,
+                "updated_at_ms": 0,
+                "source_file": str(path),
+                "content_sha256": "not-checked-during-refresh",
+                "validation": {"ok": True, "reason": "ok"},
+            }
+    _manifest_path(data_dir).write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "flat-corrupt-cache",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
+                "started_at_ms": 0,
+                "completed_at_ms": 0,
+                "requested_intervals": ["5m", "15m", "1h"],
+                "effective_intervals": ["5m", "15m", "1h"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": symbols,
+                "provider_failures": [],
+                "warnings": [],
+                "cycle_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class _FixedClock:
     def __init__(self, now_ms: int):
         self.now = now_ms
 
     def now_ms(self) -> int:
         return self.now
+
+
+def _manifest_path(data_dir: Path) -> Path:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    return TrustedDataStore(data_dir=data_dir).manifest_path
 
 
 if __name__ == "__main__":

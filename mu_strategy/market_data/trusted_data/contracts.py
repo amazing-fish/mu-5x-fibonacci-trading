@@ -38,11 +38,6 @@ class SnapshotUsability(Enum):
     INVALID = "invalid"
 
 
-class PublicationState(Enum):
-    PUBLISHED = "published"
-    NOT_PUBLISHED = "not_published"
-
-
 class HealthReason(Enum):
     OK = "ok"
     NOT_PUBLISHED = "not_published"
@@ -203,7 +198,7 @@ class DatasetHealth:
             "first_timestamp_ms": self.first_timestamp_ms,
             "last_timestamp_ms": self.last_timestamp_ms,
             "updated_at_ms": self.updated_at_ms,
-            "source_file": str(self.source_file),
+            "source_file": self.source_file.as_posix(),
             "is_valid": self.integrity == IntegrityState.VALID and self.availability == AvailabilityState.AVAILABLE,
             "is_stale": self.freshness != FreshnessState.FRESH,
             "reason": reason.value,
@@ -286,57 +281,11 @@ class TrustedManifestSnapshot:
 
 
 @dataclass(frozen=True)
-class DatasetPublication:
-    key: DatasetKey
-    state: PublicationState
-    health: DatasetHealth | None = None
-
-    @property
-    def is_published(self) -> bool:
-        return self.state == PublicationState.PUBLISHED and self.health is not None
-
-
-@dataclass(frozen=True)
-class PublishedDatasetCatalog:
-    datasets: dict[tuple[str, str], DatasetHealth]
-    data_dir: Path
-
-    @classmethod
-    def from_manifest(cls, manifest: TrustedManifestSnapshot, *, data_dir: Path) -> "PublishedDatasetCatalog":
-        datasets: dict[tuple[str, str], DatasetHealth] = {}
-        for key, health in manifest.datasets.items():
-            if str(health.source_file) == "":
-                health = DatasetHealth(
-                    key=health.key,
-                    availability=health.availability,
-                    integrity=health.integrity,
-                    freshness=health.freshness,
-                    reasons=health.reasons,
-                    rows=health.rows,
-                    first_timestamp_ms=health.first_timestamp_ms,
-                    last_timestamp_ms=health.last_timestamp_ms,
-                    source_file=Path(data_dir) / "okx" / health.key.symbol / f"{health.key.interval}.csv",
-                    validation=health.validation,
-                    updated_at_ms=health.updated_at_ms,
-                    error_type=health.error_type,
-                    message=health.message,
-                    warnings=health.warnings,
-                    content_sha256=health.content_sha256,
-                )
-            datasets[key] = health
-        return cls(datasets=datasets, data_dir=Path(data_dir))
-
-    def resolve_dataset(self, key: DatasetKey) -> DatasetPublication:
-        health = self.datasets.get(key.tuple())
-        if health is None:
-            return DatasetPublication(key=key, state=PublicationState.NOT_PUBLISHED)
-        return DatasetPublication(key=key, state=PublicationState.PUBLISHED, health=health)
-
-
-@dataclass(frozen=True)
 class TrustedLoadContext:
     manifest: TrustedManifestSnapshot
     observed_at_ms: int
+    generation_root: Path = Path(".")
+    generation_id: str | None = None
 
 
 def derive_snapshot_usability(

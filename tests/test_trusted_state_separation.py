@@ -21,7 +21,9 @@ class TrustedStateSeparationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
-            store.write_csv(_candles("5m"), store.cache_path("BTC-USDT-SWAP", "5m"))
+            from tests.factories.trusted_publication import write_flat_v3_publication
+
+            write_flat_v3_publication(data_dir, symbol="BTC-USDT-SWAP")
 
             run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(
@@ -33,7 +35,7 @@ class TrustedStateSeparationTests(unittest.TestCase):
                 )
             )
             command_result = classify_refresh_run(run)
-            manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
@@ -400,6 +402,12 @@ class _UniverseTimeoutProvider:
 
     def fetch_incremental(self, symbol, interval, *, since_time_ms):
         raise AssertionError("universe failure must not fetch incremental")
+
+
+def _manifest_path(data_dir: Path) -> Path:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    return TrustedDataStore(data_dir=data_dir).manifest_path
 
 
 if __name__ == "__main__":

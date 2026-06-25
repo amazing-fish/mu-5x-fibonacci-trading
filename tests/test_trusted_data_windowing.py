@@ -346,8 +346,48 @@ def _confirmed_bundle(
 
 
 def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
+    from mu_strategy.market_data.trusted_data.store import candles_content_sha256
+
+    manifest_path = store.manifest_path
+    symbols = {}
+    if manifest_path.exists():
+        symbols = json.loads(manifest_path.read_text(encoding="utf-8")).get("symbols") or {}
+    symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in bundle.items():
-        store.write_csv(candles, store.cache_path(symbol, interval))
+        path = store.cache_path(symbol, interval)
+        store.write_csv(candles, path)
+        symbols[symbol]["intervals"][interval] = {
+            "symbol": symbol,
+            "interval": interval,
+            "availability": "available",
+            "integrity": "valid",
+            "freshness": "fresh",
+            "reasons": ["ok"],
+            "rows": len(candles),
+            "first_timestamp_ms": candles[0].open_time_ms,
+            "last_timestamp_ms": candles[-1].open_time_ms,
+            "updated_at_ms": candles[-1].open_time_ms,
+            "source_file": str(path),
+            "content_sha256": candles_content_sha256(candles),
+            "validation": {"ok": True, "reason": "ok"},
+        }
+    store.write_manifest(
+        {
+            "schema_version": 3,
+            "run_id": "flat-windowing",
+            "attempt_status": "success",
+            "snapshot_usability": "usable",
+            "started_at_ms": 0,
+            "completed_at_ms": 0,
+            "requested_intervals": ["15m", "1h"],
+            "effective_intervals": ["5m", "15m", "1h"],
+            "universes": {"crypto_top": [], "stock_token_top": []},
+            "symbols": symbols,
+            "provider_failures": [],
+            "warnings": [],
+            "cycle_error": None,
+        }
+    )
 
 
 def _manifest(store) -> dict:
