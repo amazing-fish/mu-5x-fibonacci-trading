@@ -1,52 +1,31 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 from mu_strategy.market_data.cache import cached_historical
 from mu_strategy.market_data.symbols import ResolvedSymbol, resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.trusted_data.compat import (
+    CandleBundle,
+    candle_bundle_from_trusted_bundle,
+)
 from mu_strategy.market_data.trusted_data.contracts import (
     Clock,
-    DatasetHealth,
-    TrustDecision,
     TrustedConsumerRefreshError,
     TrustedLoadContext,
-    UniverseSnapshot,
 )
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_LIVE_DATA_DIR,
-    DEFAULT_INTERVALS,
 )
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.models import Candle
 
 
-TRUSTED_REQUIRED_INTERVALS = DEFAULT_INTERVALS
 TRUSTED_CONSUMER_REFRESH_ERROR = (
     "trusted bundle loading is cache-only; run "
     "python -m mu_strategy.commands.refresh_market_data "
     "before loading trusted data"
 )
-OKXHistoryFetcher = Callable[..., list[Candle]]
-OKXIncrementalFetcher = Callable[..., list[Candle]]
-
-
-@dataclass(frozen=True)
-class CandleBundle:
-    symbol: ResolvedSymbol
-    candles_by_interval: dict[str, list[Candle]]
-    files_by_interval: dict[str, Path]
-    days: int
-    statuses_by_interval: dict[str, DataStatus] = field(default_factory=dict)
-    run_id: str | None = None
-    trust_decision: TrustDecision | None = None
-    universe_snapshot: UniverseSnapshot | None = None
-    load_context: TrustedLoadContext | None = None
-    observed_at_ms: int | None = None
 
 
 def refresh_candle_bundle(
@@ -94,10 +73,9 @@ def refresh_trusted_candle_bundle(
     days: int = 28,
     data_dir: Path = DEFAULT_LIVE_DATA_DIR,
     refresh: bool = False,
-    fetcher: OKXHistoryFetcher | None = None,
-    incremental_fetcher: OKXIncrementalFetcher | None = None,
     policy: TrustPolicy | None = None,
     freshness_policy: FreshnessPolicy | None = None,
+    max_staleness_bars: int = 3,
     clock: Clock | None = None,
     context: TrustedLoadContext | None = None,
 ) -> CandleBundle:
@@ -106,7 +84,8 @@ def refresh_trusted_candle_bundle(
     resolved = resolve_okx_swap_symbol(symbol)
     store = TrustedDataStore(data_dir=Path(data_dir))
     requested_intervals = tuple(dict.fromkeys(intervals))
-    bundle = LoadTrustedBundle(store, clock=clock, freshness_policy=freshness_policy).execute(
+    resolved_freshness_policy = freshness_policy or FreshnessPolicy(max_staleness_bars=max_staleness_bars)
+    bundle = LoadTrustedBundle(store, clock=clock, freshness_policy=resolved_freshness_policy).execute(
         LoadTrustedBundleQuery(
             resolved.inst_id,
             intervals=requested_intervals,
@@ -115,82 +94,4 @@ def refresh_trusted_candle_bundle(
         policy or research_strict_policy(),
         context=context,
     )
-    return _compat_bundle(resolved, bundle)
-
-
-def trusted_bundle_error(
-    bundle: CandleBundle,
-    *,
-    required_intervals: tuple[str, ...] = TRUSTED_REQUIRED_INTERVALS,
-) -> str | None:
-    decision = getattr(bundle, "trust_decision", None)
-    if decision is not None and not decision.allowed:
-        return f"trusted data blocked: {decision.reason.value}"
-    return trusted_status_error(bundle.statuses_by_interval, required_intervals=required_intervals)
-
-
-def trusted_status_error(
-    statuses: dict[str, DataStatus],
-    *,
-    required_intervals: tuple[str, ...] = TRUSTED_REQUIRED_INTERVALS,
-) -> str | None:
-    for interval in required_intervals:
-        status = statuses.get(interval)
-        if status is None:
-            return f"trusted data status missing for {interval}"
-        if not status.is_valid:
-            return f"trusted data invalid for {interval}: {status.reason}"
-        if status.is_stale:
-            return f"trusted data stale for {interval}: {status.reason}"
-    return None
-
-
-def _compat_bundle(resolved: ResolvedSymbol, bundle) -> CandleBundle:
-    statuses = {
-        interval: _data_status_from_health(health)
-        for interval, health in bundle.health_by_interval.items()
-    }
-    return CandleBundle(
-        symbol=resolved,
-        candles_by_interval=bundle.candles_by_interval,
-        files_by_interval=bundle.files_by_interval,
-        days=bundle.days,
-        statuses_by_interval=statuses,
-        run_id=bundle.run_id,
-        trust_decision=bundle.trust_decision,
-        universe_snapshot=bundle.universe_snapshot,
-        load_context=bundle.load_context,
-        observed_at_ms=bundle.load_context.observed_at_ms if bundle.load_context else None,
-    )
-
-
-def _data_status_from_health(health: DatasetHealth) -> DataStatus:
-    payload = health.to_dict()
-    validation = payload.get("validation")
-    from mu_strategy.market_data.trusted import CandleValidationResult
-
-    return DataStatus(
-        symbol=health.key.symbol,
-        interval=health.key.interval,
-        rows=health.rows,
-        first_timestamp_ms=health.first_timestamp_ms,
-        last_timestamp_ms=health.last_timestamp_ms,
-        updated_at_ms=health.updated_at_ms,
-        source_file=health.source_file,
-        is_valid=bool(payload["is_valid"]),
-        is_stale=bool(payload["is_stale"]),
-        reason=str(payload["reason"]),
-        error_type=health.error_type,
-        message=health.message,
-        warnings=health.warnings,
-        validation=CandleValidationResult(
-            ok=bool(validation.get("ok")),
-            reason=str(validation.get("reason")),
-            missing_in_built=list(validation.get("missing_in_built") or []),
-            missing_in_native=list(validation.get("missing_in_native") or []),
-            misaligned_timestamps=list(validation.get("misaligned_timestamps") or []),
-            value_mismatches=list(validation.get("value_mismatches") or []),
-        )
-        if isinstance(validation, dict)
-        else None,
-    )
+    return candle_bundle_from_trusted_bundle(resolved, bundle)

@@ -77,7 +77,7 @@ python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report report
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
 
-使用可信 OKX cache-only 数据运行回测或可视化。该路径只读取 `data/live/manifest.json` 和对应 CSV，不访问网络、不写缓存。`--trusted-data --refresh` 不受支持；需要先运行独立刷新命令发布 canonical manifest：
+使用可信 OKX cache-only 数据运行回测或可视化。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存。`--trusted-data --refresh` 不受支持；需要先运行独立刷新命令发布当前 generation：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
@@ -122,13 +122,13 @@ OKX demo 私有交易接口不一定支持 `MU-USDT-SWAP` 下单；demo 模式�
 python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy --size 0.01 --order-type ioc --price 1 --client-order-id DEMO001 --pos-side long --confirm-demo-order
 ```
 
-运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认从 trusted manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist。默认 trusted-manifest 模式下，`--limit N` 表示最多 N 个 crypto universe symbols，加最多 N 个 stock-token universe symbols；`--limit 0` 表示 watchlist-only，不读取动态 universe；`--limit` 必须非负：
+运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认从 current generation manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist。默认 trusted-manifest 模式下，`--limit N` 表示最多 N 个 crypto universe symbols，加最多 N 个 stock-token universe symbols；`--limit 0` 表示 watchlist-only，不读取动态 universe；`--limit` 必须非负：
 
 ```powershell
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
-刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`。这是 `data/live/manifest.json` canonical trusted universe snapshot 的唯一发布流程：
+刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`。这是发布 `data/live/generations/<run_id>/` 并原子替换 `data/live/current.json` 的唯一流程：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
@@ -165,14 +165,15 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
-- 可信数据层 v1 只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
-- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/manifest.json` canonical trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
+- 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
+- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
 - `--trusted-data --refresh` 会被 backtest 和 visualization 拒绝；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli --trusted-data ...`、`python -m mu_strategy.visualize --trusted-data ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
-- 兼容 facade `refresh_trusted_candle_bundle(..., refresh=True)`、`refresh_trusted_interval()` 和 `refresh_trusted_symbol_statuses()` 不会执行 per-symbol canonical refresh；需要刷新时使用独立 refresh command。
-- 可信数据层 v1 固定使用 CSV + `data/live/manifest.json` + `data/live/refresh_runs.jsonl`；manifest schema v2 包含 `run_id`、`outcome`、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
+- 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
+- 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
+- flat `data/live/manifest.json` schema v1/v2 仅供 refresh 显式迁移旧 publication 时读取；默认 trading、visualization、demo 和 `LoadTrustedBundle` consumer 不启用兼容读取。只要存在 `data/live/current.json`，generation consumer 始终按 schema v3 strict 读取，`compatibility_mode=True` 也不会接受 generation v1/v2。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。
 - freshness 按当前 clock、interval 和最后一根已确认 K 线计算；不会因为上次 fetch 成功就默认 fresh。
-- run outcome 表示整个刷新周期是 `success`、`partial` 还是 `failed`；dataset health 表示单个 `symbol/interval` 的 availability、integrity 和 freshness，两者在 manifest 中分开记录。
+- `RefreshAttemptStatus` 表示刷新尝试是否 `success`、`degraded` 或 `failed`；`SnapshotUsability` 表示发布快照是否 `usable`、`stale` 或 `invalid`。dataset health 表示单个 `symbol/interval` 的 availability、integrity 和 freshness，这三类状态在 manifest 中分开记录。
 - malformed manifest 会 fail-closed；trading strict policy 下缺失或损坏 manifest 都会阻断消费。旧 public import 仍保留在 `mu_strategy.market_data.trusted` / `service`，但只是兼容 facade。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。

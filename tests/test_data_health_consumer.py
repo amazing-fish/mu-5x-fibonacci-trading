@@ -25,7 +25,7 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertEqual([], result["orders"])
         self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
         self.assertEqual("native_empty", result["data_errors"][0]["status_reason"])
-        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertIsNone(result["data_errors"][0]["interval"])
         self.assertEqual("skip", result["scans"][0]["action"])
 
 
@@ -40,7 +40,19 @@ class _Broker:
 def _invalid_bundle(symbol: str) -> CandleBundle:
     last_open_time_ms = int(time.time() * 1000) - 900_000
     candles = [Candle(last_open_time_ms, 100, 101, 99, 100, 1000)]
-    status = DataStatus(
+    statuses = {
+        interval: DataStatus(
+            symbol=symbol,
+            interval=interval,
+            rows=1,
+            first_timestamp_ms=last_open_time_ms,
+            last_timestamp_ms=last_open_time_ms,
+            updated_at_ms=last_open_time_ms,
+            source_file=Path(f"data/live/okx/BTC-USDT-SWAP/{interval}.csv"),
+        )
+        for interval in ("5m", "1h")
+    }
+    statuses["15m"] = DataStatus(
         symbol=symbol,
         interval="15m",
         rows=1,
@@ -57,7 +69,7 @@ def _invalid_bundle(symbol: str) -> CandleBundle:
         candles_by_interval={"15m": candles, "1h": candles},
         files_by_interval={},
         days=1,
-        statuses_by_interval={"15m": status},
+        statuses_by_interval=statuses,
     )
 
 

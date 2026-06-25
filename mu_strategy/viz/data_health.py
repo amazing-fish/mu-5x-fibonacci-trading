@@ -38,6 +38,8 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     requested = ", ".join(str(item) for item in manifest.get("requested_intervals") or manifest.get("intervals") or [])
     effective = ", ".join(str(item) for item in manifest.get("effective_intervals") or manifest.get("intervals") or [])
     cycle_error = manifest.get("cycle_error")
+    provider_failures = manifest.get("provider_failures") or []
+    provider_failure_html = "".join(f"<li>{_e(item)}</li>" for item in provider_failures) or "<li>无</li>"
     cycle_error_html = (
         f"<pre>{_e(cycle_error)}</pre>"
         if cycle_error
@@ -73,8 +75,8 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
   <h1>OKX 数据健康看板</h1>
   <div>生成时间：{_e(generated_at)} · 数据源：OKX public market data · 存储：CSV + JSON manifest + JSONL run log</div>
   <div class="summary">
-    {_metric("状态", manifest.get("status"))}
-    {_metric("run outcome", manifest.get("outcome") or manifest.get("status"))}
+    {_metric("attempt", manifest.get("attempt_status"))}
+    {_metric("snapshot", manifest.get("snapshot_usability"))}
     {_metric("run_id", manifest.get("run_id") or "-")}
     {_metric("symbols", len(manifest.get("symbols") or {}))}
     {_metric("crypto_top", crypto_count)}
@@ -85,6 +87,10 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
   <section>
     <h2>Warnings</h2>
     <ul>{warning_html}</ul>
+  </section>
+  <section>
+    <h2>Provider failures</h2>
+    <ul>{provider_failure_html}</ul>
   </section>
   <section>
     <h2>Cycle error</h2>

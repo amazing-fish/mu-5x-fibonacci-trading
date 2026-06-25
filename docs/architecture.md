@@ -27,16 +27,16 @@ Rules:
 - Existing OKX caches are incrementally updated and pruned to the requested `days` window.
 - Adjacent candle continuity is gated by `previous close -> next open`; gaps above 2% raise `DataQualityError`.
 - If an incremental OKX refresh fails, existing cached data is still usable.
-- `data/live/manifest.json` is the canonical complete trusted universe snapshot. The global refresh command/use case is the only writer for that manifest and the matching canonical CSV set.
+- `data/live/current.json` is the atomic pointer to the current trusted generation. Each generation lives under `data/live/generations/<run_id>/` with its schema v3 manifest and matching canonical CSV set. The global refresh command/use case is the only writer for the current pointer and generation directories.
 - Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo are cache-only consumers.
 - Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. `--trusted-data --refresh` is rejected; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli --trusted-data`, `python -m mu_strategy.visualize --trusted-data`, or `python -m mu_strategy.commands.okx_demo_loop`.
-- Compatibility per-symbol refresh APIs are deprecated and fail fast. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical manifest.
-- Trusted storage v1 is CSV + versioned JSON manifest + JSONL run log. It does not use DB, Parquet, or a local web service.
-- Manifest schema v2 records `run_id`, refresh `outcome`, requested/effective intervals, universe snapshot, warnings, cycle-level error, and dataset health for every `symbol/interval`.
-- Run outcome is global cycle health (`success`, `partial`, `failed`). Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, and validation report.
+- The old per-symbol refresh APIs have been removed. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical generation.
+- Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
+- Manifest schema v3 records `run_id`, `attempt_status` (`RefreshAttemptStatus`), `snapshot_usability` (`SnapshotUsability`), requested/effective intervals, universe snapshot, provider failures, warnings, cycle-level error, and dataset health for every `symbol/interval`.
+- `RefreshAttemptStatus` is refresh-attempt health (`success`, `degraded`, `failed`). `SnapshotUsability` is published snapshot health (`usable`, `stale`, `invalid`). Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, and validation report.
 - Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
-- Missing or malformed manifest is fail-closed for trading strict policy. Explicit compatibility behavior is limited to old public wrappers and tests, and cannot overwrite the canonical manifest.
+- Missing or malformed manifest is fail-closed for trading strict policy. Flat `data/live/manifest.json` schema v1/v2 is accepted only when refresh explicitly opts into migration compatibility and no `current.json` exists. Generation consumers always read schema v3 strictly, even if a caller passes `compatibility_mode=True`.
 
 ## Strategies
 
@@ -159,7 +159,7 @@ Package: `mu_strategy.viz`
 
 `viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload.
 
-`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays run outcome, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest; it does not recompute trusted business state.
+`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest; it does not recompute trusted business state.
 
 ## Compatibility Wrappers
 

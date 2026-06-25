@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from mu_strategy.market_data.trusted_data.contracts import ManifestStatus, RefreshRun, RefreshRunOutcome
+from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, RefreshRun, SnapshotUsability
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_INTERVALS,
     RefreshTrustedMarketData,
@@ -19,16 +19,18 @@ from mu_strategy.viz.data_health import write_data_health_dashboard
 
 
 REFRESH_COMMAND_UNUSABLE_EXIT_CODE = 1
+REFRESH_COMMAND_DEGRADED_USABLE_EXIT_CODE = 2
 
 
 @dataclass(frozen=True)
 class RefreshCommandResult:
     run_id: str
-    outcome: str
-    manifest_status: str
+    attempt_status: str
+    snapshot_usability: str
     usable: bool
     exit_code: int
     symbol_count: int
+    provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
     reason: str | None = None
@@ -37,11 +39,13 @@ class RefreshCommandResult:
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "run_id": self.run_id,
-            "outcome": self.outcome,
-            "status": self.manifest_status,
+            "attempt_status": self.attempt_status,
+            "snapshot_usability": self.snapshot_usability,
             "usable": self.usable,
             "symbols": self.symbol_count,
         }
+        if self.provider_failures:
+            payload["provider_failures"] = [dict(value) for value in self.provider_failures]
         if self.warnings:
             payload["warnings"] = list(self.warnings)
         if self.cycle_error is not None:
@@ -114,19 +118,28 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
 
 
 def classify_refresh_run(run: RefreshRun) -> RefreshCommandResult:
-    status = run.manifest_status()
-    usable = run.outcome == RefreshRunOutcome.SUCCESS and status == ManifestStatus.OK.value
-    reason = None if usable else "publication_not_usable"
+    usable = run.snapshot_usability == SnapshotUsability.USABLE
+    if run.attempt_status == RefreshAttemptStatus.SUCCESS and usable:
+        exit_code = 0
+    elif run.attempt_status == RefreshAttemptStatus.DEGRADED and usable:
+        exit_code = REFRESH_COMMAND_DEGRADED_USABLE_EXIT_CODE
+    else:
+        exit_code = REFRESH_COMMAND_UNUSABLE_EXIT_CODE
+    reason = None if exit_code == 0 else "publication_not_fully_healthy"
     message = None
-    if not usable:
-        message = f"trusted publication is not usable: outcome={run.outcome.value}, status={status}"
+    if exit_code != 0:
+        message = (
+            "trusted publication is not fully healthy: "
+            f"attempt_status={run.attempt_status.value}, snapshot_usability={run.snapshot_usability.value}"
+        )
     return RefreshCommandResult(
         run_id=run.run_id,
-        outcome=run.outcome.value,
-        manifest_status=status,
+        attempt_status=run.attempt_status.value,
+        snapshot_usability=run.snapshot_usability.value,
         usable=usable,
-        exit_code=0 if usable else REFRESH_COMMAND_UNUSABLE_EXIT_CODE,
+        exit_code=exit_code,
         symbol_count=len({symbol for symbol, _ in run.datasets}),
+        provider_failures=run.provider_failures,
         warnings=tuple(run.warnings),
         cycle_error=run.cycle_error,
         reason=reason,

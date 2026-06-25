@@ -336,7 +336,7 @@ class VisualizationTests(unittest.TestCase):
             html = output_path.read_text(encoding="utf-8")
 
         self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
-        self.assertEqual(("5m", "15m", "1h"), trusted_calls[0][1]["intervals"])
+        self.assertEqual(("15m", "1h"), trusted_calls[0][1]["intervals"])
         self.assertEqual(7, trusted_calls[0][1]["days"])
         self.assertIn("trusted OKX data layer", html)
 
@@ -529,7 +529,7 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
     }
     symbols = {symbol: {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.cache_path(symbol, interval)
+        path = store.flat_cache_path(symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -548,16 +548,17 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
         }
     store.write_manifest(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "run_id": "failed-run",
-            "outcome": "failed",
-            "status": "invalid",
+            "attempt_status": "failed",
+            "snapshot_usability": "invalid",
             "started_at_ms": 0,
             "completed_at_ms": 86_400_000,
             "requested_intervals": ["5m", "15m", "1h"],
             "effective_intervals": ["5m", "15m", "1h"],
             "universes": {"crypto_top": [], "stock_token_top": []},
             "symbols": symbols,
+            "provider_failures": [],
             "warnings": [],
             "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
         }
