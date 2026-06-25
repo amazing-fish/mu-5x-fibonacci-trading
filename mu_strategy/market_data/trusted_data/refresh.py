@@ -264,7 +264,10 @@ class RefreshTrustedMarketData:
         cache_loaded = False
         try:
             if previous_path is not None and previous_path.exists():
-                existing = self.store.read_csv(previous_path)
+                cached = self.store.read_csv(previous_path)
+                expected_hash = _previous_content_sha256(previous_manifest, symbol, interval)
+                if expected_hash is not None and candles_content_sha256(cached) == expected_hash:
+                    existing = cached
             cache_loaded = True
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
@@ -459,6 +462,13 @@ class RefreshTrustedMarketData:
             )
         except Exception:
             return None
+
+
+def _previous_content_sha256(manifest_result, symbol: str, interval: str) -> str | None:
+    if not manifest_result.ok or manifest_result.snapshot is None:
+        return None
+    health = manifest_result.snapshot.datasets.get((symbol, interval))
+    return health.content_sha256 if health is not None else None
 
 
 def load_stock_token_inst_ids(config_path: Path = DEFAULT_STOCK_TOKEN_CONFIG) -> set[str]:

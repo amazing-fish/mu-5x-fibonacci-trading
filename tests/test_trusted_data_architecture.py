@@ -959,6 +959,91 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
         self.assertEqual([("BTC-USDT-SWAP", "5m", 3_000_000)], provider.incremental_calls)
 
+    def test_refresh_ignores_previous_generation_when_content_hash_mismatches_and_full_fetch_succeeds(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            _write_generation_publication(
+                data_dir,
+                symbol="BTC-USDT-SWAP",
+                start_ms=0,
+                end_ms=3_300_000,
+                run_id="previous",
+            )
+            previous_path = store.generation_cache_path("previous", "BTC-USDT-SWAP", "5m")
+            corrupted = list(store.read_csv(previous_path))
+            corrupted[0] = Candle(0, 999.0, 1000.0, 998.0, 999.0, 99.0)
+            store.write_csv(corrupted, previous_path)
+
+            provider = _Provider(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+            run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                    run_id="next",
+                )
+            )
+            new_candles = store.read_csv(store.generation_cache_path("next", "BTC-USDT-SWAP", "5m"))
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
+        self.assertEqual([], provider.incremental_calls)
+        self.assertEqual(candles_content_sha256(_candles("5m")), candles_content_sha256(new_candles))
+        self.assertNotEqual(candles_content_sha256(corrupted), candles_content_sha256(new_candles))
+
+    def test_refresh_ignores_previous_generation_when_content_hash_mismatches_and_full_fetch_fails(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        class _HistoryFailureProvider(_Provider):
+            def fetch_history(self, symbol, interval, *, days):
+                self.history_calls.append((symbol, interval, days))
+                raise TimeoutError(f"blocked {symbol} {interval}")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            _write_generation_publication(
+                data_dir,
+                symbol="BTC-USDT-SWAP",
+                start_ms=0,
+                end_ms=3_300_000,
+                run_id="previous",
+            )
+            previous_path = store.generation_cache_path("previous", "BTC-USDT-SWAP", "5m")
+            corrupted = list(store.read_csv(previous_path))
+            corrupted[0] = Candle(0, 999.0, 1000.0, 998.0, 999.0, 99.0)
+            store.write_csv(corrupted, previous_path)
+
+            provider = _HistoryFailureProvider(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+            run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=3_600_000,
+                    run_id="next",
+                )
+            )
+            new_path = store.generation_cache_path("next", "BTC-USDT-SWAP", "5m")
+
+        health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
+        self.assertEqual([], provider.incremental_calls)
+        self.assertEqual(HealthReason.REFRESH_FAILED, health.primary_reason)
+        self.assertEqual(0, health.rows)
+        self.assertFalse(new_path.exists())
+
     def test_refresh_freshness_uses_current_clock_after_long_fetch(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
