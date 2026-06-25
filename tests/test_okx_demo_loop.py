@@ -302,26 +302,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_signal_is_no_longer_active(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -344,31 +325,12 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_orders_before_enforcing_capacity(self):
-        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
-
-        class StaleLaterOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "SOL-USDT-SWAP",
-                            "ordId": "OLD-SOL",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
+        broker, stale_client_order_id = _broker_with_open_bot_order("SOL-USDT-SWAP", order_id="OLD-SOL")
 
         def scanner(symbol, candles_15m, candles_1h, **kwargs):
             if symbol == "BTC-USDT-SWAP":
                 return _entry(symbol, trigger_price=100.19)
             return _scan_result(symbol, action="wait", trigger_price=None)
-
-        broker = StaleLaterOrderBroker()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=1, notional_usdt=10.0),
@@ -386,31 +348,12 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_does_not_reenter_off_universe_stale_order_symbol(self):
-        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
-
-        class OffUniverseStaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "SOL-USDT-SWAP",
-                            "ordId": "OLD-SOL",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
+        broker, stale_client_order_id = _broker_with_open_bot_order("SOL-USDT-SWAP", order_id="OLD-SOL")
 
         def scanner(symbol, candles_15m, candles_1h, **kwargs):
             if symbol == "SOL-USDT-SWAP":
                 return _entry(symbol, trigger_price=100.19)
             return _scan_result(symbol, action="wait", trigger_price=None)
-
-        broker = OffUniverseStaleOrderBroker()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, notional_usdt=10.0),
@@ -474,26 +417,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -514,26 +438,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_candle_loader_fails(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         def failing_loader(symbol, **kwargs):
             raise RuntimeError("fetch timeout")
@@ -559,26 +464,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_universe_provider_fails(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         def failing_universe_provider(*, limit):
             raise RuntimeError("ticker timeout")
@@ -1058,6 +944,29 @@ def _scan_result(symbol: str, *, action: str, trigger_price: float = 100.0) -> E
         initial_stop=98.0,
         signal_time_ms=123,
     )
+
+
+def _broker_with_open_bot_order(symbol: str = "BTC-USDT-SWAP", *, order_id: str = "OLD1"):
+    client_order_id = generate_client_order_id(symbol, 1, 100.0)
+
+    class OpenOrderBroker(StubBroker):
+        def get_open_orders(self, *, inst_type=None, inst_id=None):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": symbol,
+                        "ordId": order_id,
+                        "clOrdId": client_order_id,
+                        "ordType": "limit",
+                        "side": "buy",
+                        "state": "live",
+                    }
+                ],
+                "msg": "",
+            }
+
+    return OpenOrderBroker(), client_order_id
 
 
 if __name__ == "__main__":
