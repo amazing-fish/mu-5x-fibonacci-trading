@@ -26,8 +26,7 @@ from mu_strategy.market_data.trusted_data.validation import (
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
-from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
-from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
+from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 from mu_strategy.models import Candle
 
 
@@ -305,9 +304,6 @@ def _apply_coverage_gate(
     requested_days: int,
     window_end_time_ms: int | None,
 ) -> None:
-    if window_end_time_ms is None:
-        return
-    expected_start_ms = window_end_time_ms - (requested_days * DAY_MS)
     for interval in effective_intervals:
         health = health_by_interval.get(interval)
         candles = candles_by_interval.get(interval) or []
@@ -315,19 +311,19 @@ def _apply_coverage_gate(
             continue
         if health.availability != AvailabilityState.AVAILABLE or health.integrity != IntegrityState.VALID:
             continue
-        actual_start_ms = candles[0].open_time_ms
-        if actual_start_ms <= expected_start_ms + interval_to_ms(interval):
+        coverage = assess_requested_coverage(
+            candles,
+            interval=interval,
+            requested_days=requested_days,
+            window_end_time_ms=window_end_time_ms,
+        )
+        if coverage.covered:
             continue
         health_by_interval[interval] = replace(
             health,
             integrity=IntegrityState.INVALID,
             reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
-            message=(
-                "insufficient coverage: "
-                f"requested_days={requested_days} "
-                f"expected_start_ms={expected_start_ms} "
-                f"actual_start_ms={actual_start_ms}"
-            ),
+            message=coverage.message,
         )
         candles_by_interval[interval] = []
 

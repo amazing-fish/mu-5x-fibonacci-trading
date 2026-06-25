@@ -31,7 +31,7 @@ from mu_strategy.market_data.trusted_data.validation import (
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
-from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
+from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
 from mu_strategy.models import Candle
@@ -406,7 +406,49 @@ class RefreshTrustedMarketData:
                 candles_by_key[key] = []
 
         self._attach_built_native_validation(symbol, datasets, candles_by_key)
+        self._apply_requested_coverage_gate(
+            symbol,
+            intervals,
+            datasets,
+            candles_by_key,
+            days=days,
+            window_end_time_ms=window_plan.end_time_ms,
+        )
         return datasets, candles_by_key
+
+    def _apply_requested_coverage_gate(
+        self,
+        symbol: str,
+        intervals: tuple[str, ...],
+        datasets: dict[tuple[str, str], DatasetHealth],
+        candles_by_key: dict[tuple[str, str], list[Candle]],
+        *,
+        days: int,
+        window_end_time_ms: int | None,
+    ) -> None:
+        for interval in intervals:
+            key = (symbol, interval)
+            health = datasets.get(key)
+            candles = candles_by_key.get(key) or []
+            if health is None or not candles:
+                continue
+            if health.availability != AvailabilityState.AVAILABLE or health.integrity != IntegrityState.VALID:
+                continue
+            coverage = assess_requested_coverage(
+                candles,
+                interval=interval,
+                requested_days=days,
+                window_end_time_ms=window_end_time_ms,
+            )
+            if coverage.covered:
+                continue
+            datasets[key] = replace(
+                health,
+                integrity=IntegrityState.INVALID,
+                reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
+                message=coverage.message,
+            )
+            candles_by_key[key] = []
 
     def _attach_built_native_validation(
         self,

@@ -260,7 +260,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
 
     def test_loader_and_refresh_share_window_planner_contract(self):
         from mu_strategy.market_data.trusted_data import load
-        from mu_strategy.market_data.trusted_data.windowing import prune_candle_bundle, resolve_shared_window
+        from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 
         five_end = 2 * DAY_MS + 55 * 60_000
         five = _five_minute_candles(0, five_end)
@@ -277,6 +277,27 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertEqual(DAY_MS + ONE_HOUR_MS, pruned["1h"][0].open_time_ms)
         self.assertNotIn("def _shared_window_end", load_source)
         self.assertIn("resolve_shared_window", load_source)
+        self.assertIn("assess_requested_coverage", load_source)
+
+        expected_start_ms = five_end - DAY_MS
+        covered = assess_requested_coverage(
+            _five_minute_candles(expected_start_ms + FIVE_MINUTES_MS, five_end),
+            interval="5m",
+            requested_days=1,
+            window_end_time_ms=five_end,
+        )
+        short = assess_requested_coverage(
+            _five_minute_candles(expected_start_ms + 2 * FIVE_MINUTES_MS, five_end),
+            interval="5m",
+            requested_days=1,
+            window_end_time_ms=five_end,
+        )
+        missing_anchor = assess_requested_coverage([], interval="5m", requested_days=1, window_end_time_ms=None)
+        self.assertTrue(covered.covered)
+        self.assertFalse(short.covered)
+        self.assertIn("requested_days=1", short.message)
+        self.assertIsNone(missing_anchor.expected_start_ms)
+        self.assertTrue(missing_anchor.covered)
 
     def test_multiple_symbols_resolve_independent_shared_windows(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability

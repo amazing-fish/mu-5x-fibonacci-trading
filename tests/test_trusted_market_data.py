@@ -149,7 +149,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 intervals=("5m", "15m", "1h"),
                 fetcher=_fake_fetcher,
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
             manifest_path = _manifest_path(data_dir)
@@ -201,7 +201,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 intervals=("5m", "15m"),
                 fetcher=fetcher,
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
             persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
@@ -271,7 +271,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 intervals=("5m",),
                 fetcher=_fake_fetcher,
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
         btc_status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
@@ -305,7 +305,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 intervals=("5m", "15m"),
                 fetcher=_fake_fetcher,
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
             persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
@@ -355,7 +355,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 intervals=("5m", "15m"),
                 fetcher=fetcher,
-                now_ms=3_600_000,
+                now_ms=86_400_000,
             )
 
             persisted = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
@@ -612,7 +612,7 @@ def _candle(open_time_ms: int, close: float) -> Candle:
 
 
 def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
-    five_minute = [_candle(index * 300_000, 100 + index) for index in range(12)]
+    five_minute = _five_minute_candles(days=days)
     if interval == "5m":
         return five_minute
     from mu_strategy.market_data.trusted import aggregate_candles

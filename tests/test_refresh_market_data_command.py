@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.models import Candle
+from tests.factories.trusted_publication import manifest_path, range_candles
 
 
 class RefreshMarketDataCommandTests(unittest.TestCase):
@@ -63,7 +64,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                     stdout=stdout,
                 )
 
-            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -107,7 +108,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                         stdout=stdout,
                     )
 
-            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             csv_paths = list(data_dir.rglob("*.csv"))
             html_exists = html_path.exists()
@@ -153,7 +154,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                 ],
             ):
                 with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=fetch_history):
-                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=3_600_000):
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                         exit_code = main(
                             [
                                 "--data-dir",
@@ -172,7 +173,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                             stdout=stdout,
                         )
 
-            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -219,7 +220,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                             stdout=stdout,
                         )
 
-            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
             html_exists = html_path.exists()
 
@@ -231,6 +232,63 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("success", manifest["attempt_status"])
         self.assertEqual("stale", manifest["snapshot_usability"])
         self.assertEqual("stale", run_log[-1]["snapshot_usability"])
+        self.assertTrue(html_exists)
+
+    def test_success_invalid_short_coverage_one_shot_exits_non_zero_after_writing_artifacts(self):
+        from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.utils import DAY_MS
+
+        end_ms = 20 * DAY_MS
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            self.assertEqual("BTC-USDT-SWAP", symbol)
+            self.assertEqual("5m", interval)
+            self.assertEqual(14, days)
+            return range_candles(end_ms - DAY_MS, end_ms)
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            html_path = Path(tmp) / "health.html"
+            stock_config = Path(tmp) / "stock_tokens.json"
+            stock_config.write_text("[]", encoding="utf-8")
+            stdout = io.StringIO()
+            with patch(
+                "mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers",
+                return_value=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            ):
+                with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=fetch_history):
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=end_ms):
+                        exit_code = main(
+                            [
+                                "--data-dir",
+                                str(data_dir),
+                                "--html-output",
+                                str(html_path),
+                                "--stock-token-config",
+                                str(stock_config),
+                                "--limit",
+                                "1",
+                                "--days",
+                                "14",
+                                "--interval",
+                                "5m",
+                            ],
+                            stdout=stdout,
+                        )
+
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+            run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
+            html_exists = html_path.exists()
+
+        output = json.loads(stdout.getvalue())
+        self.assertNotEqual(0, exit_code)
+        self.assertEqual("success", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
+        self.assertFalse(output["usable"])
+        self.assertEqual("publication_not_fully_healthy", output["reason"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("insufficient_coverage", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
+        self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
         self.assertTrue(html_exists)
 
     def test_loop_reports_cycle_failure_and_continues(self):
@@ -386,23 +444,13 @@ def _run(
 
 
 def _candles(interval: str) -> list[Candle]:
-    candles = [Candle(index * 300_000, 100 + index, 101 + index, 99 + index, 100 + index, 10.0) for index in range(12)]
     if interval == "5m":
-        return candles
+        return range_candles(0, 86_400_000)
     raise AssertionError(f"unexpected interval: {interval}")
 
 
 def _fetch_history(symbol: str, interval: str, *, days: int) -> list[Candle]:
     return _candles(interval)
-
-
-def _manifest_path(data_dir: Path) -> Path:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-
-    current = data_dir / "current.json"
-    if current.exists():
-        return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
-    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
 
 
 if __name__ == "__main__":
