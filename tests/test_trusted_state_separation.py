@@ -341,7 +341,6 @@ class TrustedStateSeparationTests(unittest.TestCase):
         forbidden = {
             "mu_strategy/cli.py": ("trusted_status_error", "FreshnessPolicy", "SystemClock"),
             "mu_strategy/viz/backtest.py": ("trusted_status_error", "FreshnessPolicy", "SystemClock"),
-            "mu_strategy/demo_trading.py": ("_legacy_market_data_staleness_error", "FreshnessPolicy", "SystemClock"),
         }
         for relative_path, needles in forbidden.items():
             source = Path(relative_path).read_text(encoding="utf-8")

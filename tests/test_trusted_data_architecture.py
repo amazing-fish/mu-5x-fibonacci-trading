@@ -184,7 +184,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             ("failed", {"outcome": "failed", "status": "ok", "run_id": "run-failed"}, HealthReason.RUN_FAILED),
             ("partial_invalid", {"outcome": "partial", "status": "invalid", "integrity": "invalid"}, HealthReason.MANIFEST_INVALID),
             ("success_invalid", {"outcome": "success", "status": "invalid", "integrity": "invalid"}, HealthReason.MANIFEST_INVALID),
-            ("success_stale", {"outcome": "success", "status": "stale", "freshness": "stale"}, HealthReason.MANIFEST_STALE),
+            ("success_stale", {"outcome": "success", "status": "stale", "freshness": "stale"}, HealthReason.MALFORMED_MANIFEST),
         ]
         for name, kwargs, reason in cases:
             with self.subTest(name=name):
@@ -398,8 +398,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 trading_strict_policy(),
             )
 
-        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
         self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual("failed", manifest["attempt_status"])
         self.assertEqual("invalid", manifest["snapshot_usability"])
         for interval in ("5m", "15m", "1h"):
             with self.subTest(interval=interval):
@@ -488,6 +489,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
     def test_refresh_attempt_and_snapshot_axes_remain_separate(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.evaluate import classify_publication_health
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
@@ -514,6 +516,44 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(SnapshotUsability.USABLE, degraded_fresh.snapshot_usability)
         self.assertEqual(RefreshAttemptStatus.FAILED, all_invalid.attempt_status)
         self.assertEqual(SnapshotUsability.INVALID, all_invalid.snapshot_usability)
+        summary = classify_publication_health(all_invalid.datasets, provider_failures=all_invalid.provider_failures)
+        self.assertTrue(summary.zero_usable)
+        self.assertEqual(0, summary.usable_count)
+        self.assertEqual(len(all_invalid.datasets), summary.unusable_count)
+
+    def test_refresh_validation_only_mixed_usable_publication_is_degraded(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.evaluate import classify_publication_health
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            if symbol == "ETH-USDT-SWAP":
+                return [Candle(0, 100.0, 99.0, 101.0, 100.0, 1.0)]
+            return range_candles(0, DAY_MS)
+
+        provider = RecordingProvider(
+            ticker_rows=[
+                {"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"},
+                {"instId": "ETH-USDT-SWAP", "last": "90", "volCcy24h": "9"},
+            ],
+            history_fetcher=fetch_history,
+        )
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), provider).execute(
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=2, stock_token_inst_ids=set(), now_ms=DAY_MS)
+            )
+
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertTrue(run.datasets[("BTC-USDT-SWAP", "5m")].is_usable)
+        self.assertEqual(HealthReason.OHLCV_INVALID, run.datasets[("ETH-USDT-SWAP", "5m")].primary_reason)
+        summary = classify_publication_health(run.datasets, provider_failures=run.provider_failures)
+        self.assertTrue(summary.partial_usable)
+        self.assertEqual(1, summary.usable_count)
+        self.assertEqual(1, summary.unusable_count)
+        self.assertEqual(1, summary.validation_failure_count)
 
     def test_refresh_insufficient_coverage_preserves_incremental_warning(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState

@@ -116,8 +116,17 @@ def write_data_health_dashboard(manifest: dict[str, Any], output_path: Path) -> 
 
 
 def _state_label(status: dict[str, Any]) -> str:
-    if status.get("freshness"):
-        return str(status.get("freshness"))
+    availability = status.get("availability")
+    integrity = status.get("integrity")
+    freshness = status.get("freshness")
+    if availability or integrity or freshness:
+        if availability == "missing" or integrity == "invalid":
+            return "invalid"
+        if freshness == "stale":
+            return "stale"
+        if freshness == "fresh" and availability == "available" and integrity == "valid":
+            return "fresh"
+        return "invalid"
     if status.get("is_stale"):
         return "stale"
     if not status.get("is_valid"):

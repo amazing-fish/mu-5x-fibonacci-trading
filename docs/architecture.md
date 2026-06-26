@@ -12,6 +12,7 @@ Package: `mu_strategy.market_data`
 - `symbols.py`: OKX swap symbol normalization and aliases.
 - `universe.py`: dynamic OKX Top USDT-SWAP universe selection.
 - `trusted_data/contracts.py`: dataclass/Enum contracts for dataset health, validation reports, refresh runs, trust decisions, trusted bundles, and universe snapshots.
+- `trusted_data/evaluate.py`: shared publication health classification plus refresh/load candle evaluation for windowing, normalization, freshness, built/native validation, and requested-days coverage.
 - `trusted_data/policy.py`: interval dependency planning, freshness policy, and trading/research/observe trust policies.
 - `trusted_data/validation.py`: in-memory candle normalization plus `5m -> 15m/1h` built/native validation.
 - `trusted_data/store.py`: CSV, JSON manifest, and JSONL run-log repository with atomic per-file writes.
@@ -33,10 +34,12 @@ Rules:
 - The old per-symbol refresh APIs have been removed. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical generation.
 - Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
 - Manifest schema v3 records `run_id`, `attempt_status` (`RefreshAttemptStatus`), `snapshot_usability` (`SnapshotUsability`), requested/effective intervals, universe snapshot, provider failures, warnings, cycle-level error, and dataset health for every `symbol/interval`.
-- `RefreshAttemptStatus` is refresh-attempt health (`success`, `degraded`, `failed`). `SnapshotUsability` is published snapshot health (`usable`, `stale`, `invalid`). Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, and validation report.
+- `RefreshAttemptStatus` is refresh-attempt health (`success`, `degraded`, `failed`). Zero usable datasets always classify the attempt as `failed`, regardless of whether the cause was provider failure, cache read failure, validation failure, requested-days coverage, or content hash mismatch.
+- `SnapshotUsability` is published snapshot health (`usable`, `stale`, `invalid`) derived from DatasetHealth availability/integrity/freshness. Zero usable snapshots fail closed to `invalid`; mixed usable/unusable snapshots keep the stricter derived dataset state.
+- Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, content hash, and validation report.
 - Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
-- Missing or malformed manifest is fail-closed for trading strict policy. Flat `data/live/manifest.json` schema v1/v2 is accepted only when refresh explicitly opts into migration compatibility and no `current.json` exists. Generation consumers always read schema v3 strictly, even if a caller passes `compatibility_mode=True`.
+- Missing or malformed manifest is fail-closed for trading strict policy. Legacy flat `data/live/manifest.json` formats are accepted only when refresh explicitly opts into migration compatibility and no `current.json` exists. Generation consumers always read schema v3 strictly, even if a caller passes `compatibility_mode=True`.
 
 ## Strategies
 
@@ -159,7 +162,7 @@ Package: `mu_strategy.viz`
 
 `viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload.
 
-`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest; it does not recompute trusted business state.
+`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest. Row badges are derived from availability/integrity/freshness together: missing or invalid integrity is invalid, stale freshness is stale, and only available+valid+fresh is ok.
 
 ## Compatibility Wrappers
 

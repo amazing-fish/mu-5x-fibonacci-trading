@@ -17,6 +17,7 @@ from .contracts import (
     ValidationReport,
     derive_snapshot_usability,
 )
+from .evaluate import PublicationHealthSummary, classify_publication_health
 
 __all__ = [
     "AvailabilityState",
@@ -33,5 +34,7 @@ __all__ = [
     "TrustedBundle",
     "UniverseSnapshot",
     "ValidationReport",
+    "PublicationHealthSummary",
+    "classify_publication_health",
     "derive_snapshot_usability",
 ]

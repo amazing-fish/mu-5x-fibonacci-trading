@@ -28,6 +28,43 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertIsNone(result["data_errors"][0]["interval"])
         self.assertEqual("skip", result["scans"][0]["action"])
 
+    def test_dashboard_does_not_show_ok_badge_when_integrity_is_invalid_but_freshness_is_fresh(self):
+        from mu_strategy.viz.data_health import render_data_health_dashboard
+
+        html = render_data_health_dashboard(
+            {
+                "schema_version": 3,
+                "run_id": "run-invalid-fresh",
+                "attempt_status": "failed",
+                "snapshot_usability": "invalid",
+                "updated_at_ms": 86_400_000,
+                "requested_intervals": ["5m"],
+                "effective_intervals": ["5m"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": {
+                    "BTC-USDT-SWAP": {
+                        "source": "top",
+                        "intervals": {
+                            "5m": {
+                                "symbol": "BTC-USDT-SWAP",
+                                "interval": "5m",
+                                "availability": "available",
+                                "integrity": "invalid",
+                                "freshness": "fresh",
+                                "reason": "ohlcv_invalid",
+                                "rows": 1,
+                                "last_timestamp_ms": 0,
+                                "source_file": "okx/BTC-USDT-SWAP/5m.csv",
+                            }
+                        },
+                    }
+                },
+            }
+        )
+
+        self.assertIn('<span class="badge bad">invalid</span>', html)
+        self.assertNotIn('<span class="badge ok">fresh</span>', html)
+
 
 class _Broker:
     def get_positions(self, *, inst_type=None, inst_id=None):

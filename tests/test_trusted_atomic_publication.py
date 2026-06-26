@@ -646,8 +646,8 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         cases = (
-            ("run-stale", StaticProvider(), 10 * 86_400_000, HealthReason.MANIFEST_STALE),
-            ("run-invalid", HoleyProvider(), 86_400_000, HealthReason.MANIFEST_INVALID),
+            ("run-stale", StaticProvider(), 10 * 86_400_000, HealthReason.RUN_FAILED),
+            ("run-invalid", HoleyProvider(), 86_400_000, HealthReason.RUN_FAILED),
             ("run-failed", UniverseFailureProvider(), 86_400_000, HealthReason.RUN_FAILED),
         )
         for run_id, provider, now_ms, expected_reason in cases:
@@ -665,12 +665,15 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                             run_id=run_id,
                         )
                     )
+                    manifest = generation_manifest(data_dir, run_id)
                     bundle = LoadTrustedBundle(store).execute(
                         LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=now_ms),
                         trading_strict_policy(),
                     )
 
                     self.assertEqual(run_id, read_current(data_dir)["generation_id"])
+                    self.assertEqual("failed", manifest["attempt_status"])
+                    self.assertEqual("invalid", manifest["snapshot_usability"])
                     self.assertFalse(bundle.trust_decision.allowed)
                     self.assertEqual(expected_reason, bundle.trust_decision.reason)
 

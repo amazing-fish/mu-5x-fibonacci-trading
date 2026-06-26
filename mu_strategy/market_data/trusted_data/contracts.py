@@ -294,6 +294,8 @@ def derive_snapshot_usability(
 ) -> SnapshotUsability:
     if not datasets:
         return SnapshotUsability.INVALID
+    if not any(health.is_usable for health in datasets.values()):
+        return SnapshotUsability.INVALID
     if any(health.availability != AvailabilityState.AVAILABLE for health in datasets.values()):
         return SnapshotUsability.INVALID
     if any(health.integrity != IntegrityState.VALID for health in datasets.values()):

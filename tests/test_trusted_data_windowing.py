@@ -180,7 +180,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
         self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         health = run.datasets[(SYMBOL, "15m")]
         self.assertFalse(health.validation.ok)
@@ -216,7 +216,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
         self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
         health = run.datasets[(SYMBOL, "15m")]
         self.assertFalse(health.validation.ok)
@@ -259,6 +259,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertIn("incremental_refresh_failed", manifest["symbols"][SYMBOL]["intervals"]["5m"]["warnings"])
 
     def test_loader_and_refresh_share_window_planner_contract(self):
+        from mu_strategy.market_data.trusted_data import evaluate
         from mu_strategy.market_data.trusted_data import load
         from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 
@@ -269,6 +270,7 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         plan = resolve_shared_window(raw, days=1)
         pruned = prune_candle_bundle(raw, plan=plan)
         load_source = Path(load.__file__).read_text(encoding="utf-8")
+        evaluate_source = Path(evaluate.__file__).read_text(encoding="utf-8")
 
         self.assertEqual(1, plan.days)
         self.assertEqual(five_end, plan.end_time_ms)
@@ -276,8 +278,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertEqual(DAY_MS + ONE_HOUR_MS, pruned["15m"][0].open_time_ms)
         self.assertEqual(DAY_MS + ONE_HOUR_MS, pruned["1h"][0].open_time_ms)
         self.assertNotIn("def _shared_window_end", load_source)
-        self.assertIn("resolve_shared_window", load_source)
-        self.assertIn("assess_requested_coverage", load_source)
+        self.assertIn("evaluate_candle_bundle", load_source)
+        self.assertIn("resolve_shared_window", evaluate_source)
+        self.assertIn("assess_requested_coverage", evaluate_source)
 
         expected_start_ms = five_end - DAY_MS
         covered = assess_requested_coverage(

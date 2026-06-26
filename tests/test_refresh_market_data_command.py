@@ -226,13 +226,67 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("success", output["attempt_status"])
-        self.assertEqual("stale", output["snapshot_usability"])
+        self.assertEqual("failed", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
         self.assertFalse(output["usable"])
-        self.assertEqual("success", manifest["attempt_status"])
-        self.assertEqual("stale", manifest["snapshot_usability"])
-        self.assertEqual("stale", run_log[-1]["snapshot_usability"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("failed", run_log[-1]["attempt_status"])
+        self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
         self.assertTrue(html_exists)
+
+    def test_validation_only_zero_usable_one_shot_exits_failed_invalid_after_writing_artifacts(self):
+        from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.utils import DAY_MS
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            self.assertEqual("BTC-USDT-SWAP", symbol)
+            self.assertEqual("5m", interval)
+            return [Candle(0, 100.0, 99.0, 101.0, 100.0, 1000.0)]
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            html_path = Path(tmp) / "health.html"
+            stock_config = Path(tmp) / "stock_tokens.json"
+            stock_config.write_text("[]", encoding="utf-8")
+            stdout = io.StringIO()
+            with patch(
+                "mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers",
+                return_value=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            ):
+                with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=fetch_history):
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=DAY_MS):
+                        exit_code = main(
+                            [
+                                "--data-dir",
+                                str(data_dir),
+                                "--html-output",
+                                str(html_path),
+                                "--stock-token-config",
+                                str(stock_config),
+                                "--limit",
+                                "1",
+                                "--days",
+                                "1",
+                                "--interval",
+                                "5m",
+                            ],
+                            stdout=stdout,
+                        )
+
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+            run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(1, exit_code)
+        self.assertEqual("failed", output["attempt_status"])
+        self.assertEqual("invalid", output["snapshot_usability"])
+        self.assertFalse(output["usable"])
+        self.assertEqual("failed", manifest["attempt_status"])
+        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("ohlcv_invalid", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
+        self.assertEqual("failed", run_log[-1]["attempt_status"])
+        self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
 
     def test_success_invalid_short_coverage_one_shot_exits_non_zero_after_writing_artifacts(self):
         from mu_strategy.commands.refresh_market_data import main
@@ -282,12 +336,14 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         output = json.loads(stdout.getvalue())
         self.assertNotEqual(0, exit_code)
-        self.assertEqual("success", output["attempt_status"])
+        self.assertEqual("failed", output["attempt_status"])
         self.assertEqual("invalid", output["snapshot_usability"])
         self.assertFalse(output["usable"])
         self.assertEqual("publication_not_fully_healthy", output["reason"])
+        self.assertEqual("failed", manifest["attempt_status"])
         self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertEqual("insufficient_coverage", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
+        self.assertEqual("failed", run_log[-1]["attempt_status"])
         self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
         self.assertTrue(html_exists)
 
@@ -367,7 +423,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
         self.assertEqual(4, len(calls))
         self.assertEqual(["failed", "degraded", "success", "success"], [row["attempt_status"] for row in rows])
-        self.assertEqual(["invalid", "invalid", "stale", "usable"], [row["snapshot_usability"] for row in rows])
+        self.assertEqual(["invalid", "invalid", "invalid", "usable"], [row["snapshot_usability"] for row in rows])
         self.assertEqual([False, False, False, True], [row["usable"] for row in rows])
         self.assertEqual([1, 1, 1, 1], sleeps)
         self.assertEqual(4, write_dashboard.call_count)

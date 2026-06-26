@@ -2,36 +2,26 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
-    AvailabilityState,
     Clock,
     DatasetHealth,
     DatasetKey,
-    FreshnessState,
     HealthReason,
-    IntegrityState,
     RefreshRun,
     RefreshAttemptStatus,
     SnapshotUsability,
     SystemClock,
     UniverseSnapshot,
-    ValidationReport,
-    derive_snapshot_usability,
 )
+from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
-from mu_strategy.market_data.trusted_data.validation import (
-    aggregate_candles,
-    normalize_and_validate_candles,
-    validate_built_native_candles,
-)
-from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
 from mu_strategy.models import Candle
@@ -160,7 +150,7 @@ class RefreshTrustedMarketData:
         try:
             universe = self._universe(request)
         except Exception as exc:
-            failure = _exception_failure(exc)
+            failure = exception_failure(exc)
             run = RefreshRun(
                 run_id=run_id,
                 attempt_status=RefreshAttemptStatus.FAILED,
@@ -213,15 +203,11 @@ class RefreshTrustedMarketData:
         if len(universe.stock_token_top) < request.limit:
             warnings.append(f"stock_token_top_count_below_limit:{len(universe.stock_token_top)}/{request.limit}")
         provider_failures = _provider_failures(datasets)
-        attempt_status = _refresh_attempt_status(datasets, provider_failures)
-        snapshot_usability = derive_snapshot_usability(datasets)
-        if request.limit > 0 and not datasets:
-            attempt_status = RefreshAttemptStatus.FAILED
-            snapshot_usability = SnapshotUsability.INVALID
+        health_summary = classify_publication_health(datasets, provider_failures=provider_failures)
         run = RefreshRun(
             run_id=run_id,
-            attempt_status=attempt_status,
-            snapshot_usability=snapshot_usability,
+            attempt_status=health_summary.attempt_status,
+            snapshot_usability=health_summary.snapshot_usability,
             started_at_ms=started_at_ms,
             completed_at_ms=_now_ms(request.now_ms, self.clock),
             requested_intervals=plan.requested_intervals,
@@ -286,7 +272,7 @@ class RefreshTrustedMarketData:
             if previous_path is not None and previous_path.exists() and not cache_loaded:
                 reason = HealthReason.CACHE_READ_FAILED
                 existing = []
-            failure = _exception_failure(exc)
+            failure = exception_failure(exc)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
@@ -307,178 +293,49 @@ class RefreshTrustedMarketData:
         days: int,
         now_ms: int,
     ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], list[Candle]]]:
-        raw_candles_by_interval = {
-            interval: candidates[(symbol, interval)].candles
+        seeds_by_interval = {
+            interval: DatasetEvaluationSeed(
+                key=candidates[(symbol, interval)].key,
+                source_file=candidates[(symbol, interval)].source_file,
+                candles=candidates[(symbol, interval)].candles,
+                prefailed_reason=(
+                    candidates[(symbol, interval)].fetch_reason
+                    if candidates[(symbol, interval)].fetch_reason is not None and not candidates[(symbol, interval)].had_existing
+                    else None
+                ),
+                empty_prefailed_reason=candidates[(symbol, interval)].fetch_reason,
+                exception_reason=(
+                    HealthReason.INCREMENTAL_REFRESH_FAILED
+                    if candidates[(symbol, interval)].had_existing
+                    else HealthReason.REFRESH_FAILED
+                ),
+                error_type=candidates[(symbol, interval)].error_type,
+                message=candidates[(symbol, interval)].message,
+                warnings=_fetch_warnings(candidates[(symbol, interval)]),
+            )
             for interval in intervals
         }
-        window_plan = resolve_shared_window(raw_candles_by_interval, days=days)
-        pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
-        datasets: dict[tuple[str, str], DatasetHealth] = {}
-        candles_by_key: dict[tuple[str, str], list[Candle]] = {}
 
-        for interval in intervals:
+        def write_valid_dataset(interval: str, seed: DatasetEvaluationSeed, candles: list[Candle]) -> str:
             candidate = candidates[(symbol, interval)]
-            key = candidate.key.tuple()
-            candles = pruned_candles_by_interval.get(interval) or []
-            fetch_warnings = _fetch_warnings(candidate)
-            if candidate.fetch_reason is not None and (not candidate.had_existing or not candles):
-                datasets[key] = _health(
-                    symbol,
-                    interval,
-                    candidate.source_file,
-                    candles,
-                    now_ms=now_ms,
-                    availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
-                    integrity=IntegrityState.INVALID,
-                    freshness=FreshnessState.STALE,
-                    reason=candidate.fetch_reason,
-                    error_type=candidate.error_type,
-                    message=candidate.message,
-                    warnings=fetch_warnings,
-                )
-                candles_by_key[key] = []
-                continue
+            if candidate.path.exists():
+                raise FileExistsError(f"generation dataset already exists: {candidate.path}")
+            self.store.write_csv(candles, candidate.path)
+            return candles_content_sha256(candles)
 
-            try:
-                candles, validation = normalize_and_validate_candles(candles, interval=interval)
-                if not validation.ok:
-                    datasets[key] = _health(
-                        symbol,
-                        interval,
-                        candidate.source_file,
-                        candles,
-                        now_ms=now_ms,
-                        availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
-                        integrity=IntegrityState.INVALID,
-                        freshness=FreshnessState.STALE,
-                        reason=validation.reason,
-                        validation=validation,
-                        error_type=candidate.error_type,
-                        message=candidate.message,
-                        warnings=fetch_warnings,
-                    )
-                    candles_by_key[key] = candles if validation.reason == HealthReason.TIMESTAMP_GAP else []
-                    continue
-                if candidate.path.exists():
-                    raise FileExistsError(f"generation dataset already exists: {candidate.path}")
-                self.store.write_csv(candles, candidate.path)
-                freshness = self.freshness_policy.assess(
-                    now_ms=now_ms,
-                    interval=interval,
-                    last_confirmed_open_time_ms=candles[-1].open_time_ms if candles else None,
-                )
-                datasets[key] = _health(
-                    symbol,
-                    interval,
-                    candidate.source_file,
-                    candles,
-                    now_ms=now_ms,
-                    availability=AvailabilityState.AVAILABLE,
-                    integrity=IntegrityState.VALID,
-                    freshness=freshness.state,
-                    reason=freshness.reason,
-                    validation=validation,
-                    error_type=candidate.error_type,
-                    message=candidate.message,
-                    content_sha256=candles_content_sha256(candles),
-                    warnings=fetch_warnings,
-                )
-                candles_by_key[key] = candles
-            except Exception as exc:
-                if isinstance(exc, OSError):
-                    raise
-                reason = HealthReason.INCREMENTAL_REFRESH_FAILED if candidate.had_existing else HealthReason.REFRESH_FAILED
-                failure = _exception_failure(exc)
-                datasets[key] = _health(
-                    symbol,
-                    interval,
-                    candidate.source_file,
-                    candles,
-                    now_ms=now_ms,
-                    availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
-                    integrity=IntegrityState.INVALID,
-                    freshness=FreshnessState.STALE,
-                    reason=reason,
-                    error_type=failure["error_type"],
-                    message=failure["message"],
-                    warnings=fetch_warnings,
-                )
-                candles_by_key[key] = []
-
-        self._attach_built_native_validation(symbol, datasets, candles_by_key)
-        self._apply_requested_coverage_gate(
-            symbol,
-            intervals,
-            datasets,
-            candles_by_key,
+        result = evaluate_candle_bundle(
+            symbol=symbol,
+            intervals=intervals,
+            seeds_by_interval=seeds_by_interval,
             days=days,
-            window_end_time_ms=window_plan.end_time_ms,
+            now_ms=now_ms,
+            freshness_policy=self.freshness_policy,
+            on_validated_candles=write_valid_dataset,
+            retain_invalid_candles_for_reasons=(HealthReason.TIMESTAMP_GAP,),
+            allow_timestamp_gap_built_native_inputs=True,
+            raise_os_errors=True,
         )
-        return datasets, candles_by_key
-
-    def _apply_requested_coverage_gate(
-        self,
-        symbol: str,
-        intervals: tuple[str, ...],
-        datasets: dict[tuple[str, str], DatasetHealth],
-        candles_by_key: dict[tuple[str, str], list[Candle]],
-        *,
-        days: int,
-        window_end_time_ms: int | None,
-    ) -> None:
-        for interval in intervals:
-            key = (symbol, interval)
-            health = datasets.get(key)
-            candles = candles_by_key.get(key) or []
-            if health is None or not candles:
-                continue
-            if health.availability != AvailabilityState.AVAILABLE or health.integrity != IntegrityState.VALID:
-                continue
-            coverage = assess_requested_coverage(
-                candles,
-                interval=interval,
-                requested_days=days,
-                window_end_time_ms=window_end_time_ms,
-            )
-            if coverage.covered:
-                continue
-            datasets[key] = replace(
-                health,
-                integrity=IntegrityState.INVALID,
-                reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
-                message=coverage.message,
-            )
-            candles_by_key[key] = []
-
-    def _attach_built_native_validation(
-        self,
-        symbol: str,
-        datasets: dict[tuple[str, str], DatasetHealth],
-        candles_by_key: dict[tuple[str, str], list[Candle]],
-    ) -> None:
-        base_health = datasets.get((symbol, "5m"))
-        if base_health is None or not _has_built_native_validation_inputs(base_health):
-            return
-        five = candles_by_key.get((symbol, "5m")) or []
-        for interval in ("15m", "1h"):
-            key = (symbol, interval)
-            native_health = datasets.get(key)
-            if native_health is None or not _has_built_native_validation_inputs(native_health):
-                continue
-            report = validate_built_native_candles(
-                aggregate_candles(five, interval=interval),
-                candles_by_key.get(key) or [],
-                interval=interval,
-            )
-            if report.ok and native_health.integrity != IntegrityState.VALID:
-                continue
-            datasets[key] = replace(
-                native_health,
-                integrity=IntegrityState.VALID if report.ok else IntegrityState.INVALID,
-                freshness=native_health.freshness if report.ok else FreshnessState.STALE,
-                reasons=(native_health.primary_reason if report.ok else report.reason,),
-                validation=report,
-            )
+        return result.health_by_key, result.candles_by_key
 
     def _persist_run(self, run: RefreshRun) -> None:
         self.store.write_generation_manifest(run.run_id, run.to_manifest())
@@ -559,42 +416,6 @@ def _validate_selection_limit(limit: int) -> None:
         raise ValueError("limit must be non-negative")
 
 
-def _health(
-    symbol: str,
-    interval: str,
-    path: Path,
-    candles: list[Candle],
-    *,
-    now_ms: int,
-    availability: AvailabilityState,
-    integrity: IntegrityState,
-    freshness: FreshnessState,
-    reason: HealthReason,
-    validation: ValidationReport | None = None,
-    error_type: str | None = None,
-    message: str | None = None,
-    warnings: tuple[str, ...] = (),
-    content_sha256: str | None = None,
-) -> DatasetHealth:
-    return DatasetHealth(
-        key=DatasetKey(symbol, interval),
-        availability=availability,
-        integrity=integrity,
-        freshness=freshness,
-        reasons=(reason,),
-        rows=len(candles),
-        first_timestamp_ms=candles[0].open_time_ms if candles else None,
-        last_timestamp_ms=candles[-1].open_time_ms if candles else None,
-        updated_at_ms=now_ms,
-        source_file=path,
-        validation=validation,
-        error_type=error_type,
-        message=message,
-        warnings=warnings,
-        content_sha256=content_sha256,
-    )
-
-
 def _fetch_warnings(candidate: DatasetRefreshCandidate) -> tuple[str, ...]:
     if candidate.fetch_reason is None:
         return ()
@@ -623,39 +444,10 @@ def _provider_failures(datasets: dict[tuple[str, str], DatasetHealth]) -> tuple[
     return tuple(failures)
 
 
-def _exception_failure(exc: Exception) -> dict[str, str]:
-    error_type = type(exc).__name__
-    message = str(exc).strip() or error_type
-    return {"error_type": error_type, "message": message}
-
-
 def _failure_fields_from_health(health: DatasetHealth) -> dict[str, str]:
     error_type = (health.error_type or "").strip() or "Error"
     message = (health.message or "").strip() or error_type
     return {"error_type": error_type, "message": message}
-
-
-def _refresh_attempt_status(
-    datasets: dict[tuple[str, str], DatasetHealth],
-    provider_failures: tuple[dict[str, str], ...],
-) -> RefreshAttemptStatus:
-    if not datasets:
-        return RefreshAttemptStatus.FAILED
-    has_attempt_failure = _has_attempt_failure(datasets, provider_failures)
-    if has_attempt_failure and not any(health.is_usable for health in datasets.values()):
-        return RefreshAttemptStatus.FAILED
-    if has_attempt_failure:
-        return RefreshAttemptStatus.DEGRADED
-    return RefreshAttemptStatus.SUCCESS
-
-
-def _has_attempt_failure(
-    datasets: dict[tuple[str, str], DatasetHealth],
-    provider_failures: tuple[dict[str, str], ...],
-) -> bool:
-    if provider_failures:
-        return True
-    return any(health.primary_reason == HealthReason.CACHE_READ_FAILED for health in datasets.values())
 
 
 def _now_ms(value: int | None, clock: Clock) -> int:
@@ -676,22 +468,3 @@ def _dedupe_tickers(tickers: list[dict]) -> list[dict]:
     for ticker in tickers:
         by_symbol.setdefault(str(ticker["inst_id"]), ticker)
     return list(by_symbol.values())
-
-
-def _has_validation_inputs(health: DatasetHealth) -> bool:
-    return (
-        health.availability == AvailabilityState.AVAILABLE
-        and health.integrity == IntegrityState.VALID
-        and health.rows > 0
-    )
-
-
-def _has_built_native_validation_inputs(health: DatasetHealth) -> bool:
-    if _has_validation_inputs(health):
-        return True
-    return (
-        health.availability == AvailabilityState.AVAILABLE
-        and health.rows > 0
-        and health.validation is not None
-        and health.validation.reason == HealthReason.TIMESTAMP_GAP
-    )

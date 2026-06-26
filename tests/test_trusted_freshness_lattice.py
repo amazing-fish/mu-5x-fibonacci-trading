@@ -42,7 +42,7 @@ class SnapshotUsabilityDerivationTests(unittest.TestCase):
             (
                 "one_stale",
                 {("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m", freshness=FreshnessState.STALE)},
-                SnapshotUsability.STALE,
+                SnapshotUsability.INVALID,
             ),
             (
                 "one_unknown",
@@ -83,6 +83,7 @@ class ManifestSchemaConsistencyTests(unittest.TestCase):
             ("success_usable_invalid", _manifest(snapshot_usability="usable", integrity="invalid")),
             ("success_stale_all_fresh", _manifest(snapshot_usability="stale")),
             ("success_invalid_all_fresh", _manifest(snapshot_usability="invalid")),
+            ("success_stale_zero_usable", _manifest(snapshot_usability="stale", freshness="stale")),
         ]
         for name, payload in invalid_cases:
             with self.subTest(name=name):
@@ -94,7 +95,7 @@ class ManifestSchemaConsistencyTests(unittest.TestCase):
 
         valid_cases = [
             ("success_usable_fresh", _manifest(snapshot_usability="usable")),
-            ("success_stale", _manifest(snapshot_usability="stale", freshness="stale")),
+            ("success_invalid_stale", _manifest(snapshot_usability="invalid", freshness="stale")),
             ("success_invalid_unknown", _manifest(snapshot_usability="invalid", freshness="unknown")),
             ("success_invalid_integrity", _manifest(snapshot_usability="invalid", integrity="invalid")),
             ("success_invalid_missing", _manifest(snapshot_usability="invalid", availability="missing", integrity="invalid", freshness="unknown")),

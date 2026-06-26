@@ -390,9 +390,9 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("market_data_invalid", result["scans"][0]["reason"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
-    def test_run_once_blocks_legacy_bundle_without_trusted_decision(self):
+    def test_run_once_blocks_plain_legacy_bundle_when_candles_are_stale(self):
         broker = StubBroker()
-        stale_bundle = _legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
+        stale_bundle = _plain_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
 
         with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_001):
             result = run_once(
@@ -411,9 +411,9 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
-        self.assertEqual("cache_missing", result["data_errors"][0]["status_reason"])
-        self.assertIsNone(result["data_errors"][0]["interval"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
+        self.assertEqual("15m", result["data_errors"][0]["interval"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
@@ -922,6 +922,25 @@ def _legacy_bundle(symbol: str, *, last_open_time_ms: int) -> CandleBundle:
         files_by_interval={},
         days=28,
     )
+
+
+class _PlainLegacyBundle:
+    def __init__(self, symbol: str, *, last_open_time_ms: int):
+        self.symbol = ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx")
+        self.candles_by_interval = {
+            "15m": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        }
+        self.files_by_interval = {}
+        self.days = 28
+        self.run_id = None
+        self.universe_snapshot = None
+        self.load_context = None
+        self.observed_at_ms = None
+
+
+def _plain_legacy_bundle(symbol: str, *, last_open_time_ms: int) -> _PlainLegacyBundle:
+    return _PlainLegacyBundle(symbol, last_open_time_ms=last_open_time_ms)
 
 
 def _entry(symbol: str, trigger_price: float = 100.0) -> EntryScanResult:

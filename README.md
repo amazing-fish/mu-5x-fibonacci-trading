@@ -170,10 +170,12 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `--trusted-data --refresh` 会被 backtest 和 visualization 拒绝；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli --trusted-data ...`、`python -m mu_strategy.visualize --trusted-data ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
 - 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
-- flat `data/live/manifest.json` schema v1/v2 仅供 refresh 显式迁移旧 publication 时读取；默认 trading、visualization、demo 和 `LoadTrustedBundle` consumer 不启用兼容读取。只要存在 `data/live/current.json`，generation consumer 始终按 schema v3 strict 读取，`compatibility_mode=True` 也不会接受 generation v1/v2。
+- legacy flat `data/live/manifest.json` 仅供 refresh 显式迁移旧 publication 时读取；默认 trading、visualization、demo 和 `LoadTrustedBundle` consumer 不启用兼容读取。只要存在 `data/live/current.json`，generation consumer 始终按 schema v3 strict 读取，`compatibility_mode=True` 也不会接受 legacy generation manifest。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。
 - freshness 按当前 clock、interval 和最后一根已确认 K 线计算；不会因为上次 fetch 成功就默认 fresh。
-- `RefreshAttemptStatus` 表示刷新尝试是否 `success`、`degraded` 或 `failed`；`SnapshotUsability` 表示发布快照是否 `usable`、`stale` 或 `invalid`。dataset health 表示单个 `symbol/interval` 的 availability、integrity 和 freshness，这三类状态在 manifest 中分开记录。
+- `RefreshAttemptStatus` 表示 refresh attempt 健康：只有全量 usable 且无 provider/cache/validation failure 才是 `success`；mixed usable/unusable 是 `degraded`；zero usable 不论来自 provider failure、cache read failure、validation failure、coverage failure 或 content hash mismatch 都是 `failed`。
+- `SnapshotUsability` 表示 publication 是否可被消费者使用，由所有 `DatasetHealth` 的 availability/integrity/freshness 三轴推导；zero usable fail-closed 为 `invalid`，mixed usable/unusable 会按最严格 dataset 轴推导为 `stale` 或 `invalid`。
+- `DatasetHealth` 表示单个 `symbol/interval` 的 availability、integrity、freshness、reason、validation 和 `content_sha256`，refresh/load/dashboard 不各自重新定义全局状态。
 - malformed manifest 会 fail-closed；trading strict policy 下缺失或损坏 manifest 都会阻断消费。旧 public import 仍保留在 `mu_strategy.market_data.trusted` / `service`，但只是兼容 facade。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。

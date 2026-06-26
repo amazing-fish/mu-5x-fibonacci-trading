@@ -362,11 +362,11 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
-        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("degraded", manifest["attempt_status"])
         self.assertEqual("invalid", manifest["snapshot_usability"])
-        self.assertEqual("success", persisted["attempt_status"])
+        self.assertEqual("degraded", persisted["attempt_status"])
         self.assertEqual("invalid", persisted["snapshot_usability"])
-        self.assertEqual("success", run_log["attempt_status"])
+        self.assertEqual("degraded", run_log["attempt_status"])
         self.assertEqual("invalid", run_log["snapshot_usability"])
         self.assertFalse(status["is_valid"])
         self.assertEqual("ohlcv_mismatch", status["reason"])

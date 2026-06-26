@@ -19,31 +19,10 @@ from mu_strategy.market_data.trusted_data.contracts import (
     TrustedLoadContext,
     ValidationReport,
 )
+from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, VALIDATION_FAILURE_REASONS, evaluate_candle_bundle
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
-from mu_strategy.market_data.trusted_data.validation import (
-    aggregate_candles,
-    normalize_and_validate_candles,
-    validate_built_native_candles,
-)
-from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage, prune_candle_bundle, resolve_shared_window
 from mu_strategy.models import Candle
-
-
-_VALIDATION_FAILURE_REASONS = {
-    HealthReason.EMPTY,
-    HealthReason.BUILT_EMPTY,
-    HealthReason.NATIVE_EMPTY,
-    HealthReason.BUILT_SAMPLE_COUNT_BELOW_MINIMUM,
-    HealthReason.NATIVE_SAMPLE_COUNT_BELOW_MINIMUM,
-    HealthReason.TIMESTAMP_MISALIGNED,
-    HealthReason.TIMESTAMP_GAP,
-    HealthReason.MISSING_IN_BUILT,
-    HealthReason.MISSING_IN_NATIVE,
-    HealthReason.OHLCV_MISMATCH,
-    HealthReason.OHLCV_INVALID,
-    HealthReason.CONTINUITY_GAP,
-}
 
 
 @dataclass(frozen=True)
@@ -109,10 +88,8 @@ class LoadTrustedBundle:
 
         manifest = context.manifest
         published_health_by_interval: dict[str, DatasetHealth] = {}
-        raw_candles_by_interval: dict[str, list[Candle]] = {}
-        candles_by_interval: dict[str, list[Candle]] = {}
-        health_by_interval: dict[str, DatasetHealth] = {}
         path_by_interval: dict[str, Path] = {}
+        seeds_by_interval: dict[str, DatasetEvaluationSeed] = {}
         for interval in plan.effective_intervals:
             manifest_health = manifest.datasets.get((resolved.inst_id, interval))
             try:
@@ -131,76 +108,59 @@ class LoadTrustedBundle:
                 )
             path_by_interval[interval] = path
             if manifest_health is None:
-                health_by_interval[interval] = _not_published_health(resolved.inst_id, interval, path)
-                raw_candles_by_interval[interval] = []
+                seeds_by_interval[interval] = DatasetEvaluationSeed(
+                    key=DatasetKey(resolved.inst_id, interval),
+                    source_file=path,
+                    candles=[],
+                    prefailed_reason=HealthReason.NOT_PUBLISHED,
+                    prefailed_availability=AvailabilityState.MISSING,
+                    prefailed_freshness=FreshnessState.UNKNOWN,
+                )
                 continue
             published_health_by_interval[interval] = manifest_health
             try:
-                raw_candles_by_interval[interval] = self.store.read_csv(path) if path.exists() else []
+                candles = self.store.read_csv(path) if path.exists() else []
             except Exception as exc:
-                health_by_interval[interval] = _failed_health(
-                    resolved.inst_id,
-                    interval,
-                    path,
-                    reason=HealthReason.CACHE_READ_FAILED,
+                seeds_by_interval[interval] = DatasetEvaluationSeed(
+                    key=DatasetKey(resolved.inst_id, interval),
+                    source_file=path,
+                    candles=[],
+                    prefailed_reason=HealthReason.CACHE_READ_FAILED,
+                    prefailed_availability=AvailabilityState.MISSING,
+                    prefailed_freshness=FreshnessState.STALE,
                     error_type=type(exc).__name__,
                     message=str(exc),
                 )
-                raw_candles_by_interval[interval] = []
-
-        window_plan = resolve_shared_window(raw_candles_by_interval, days=query.days)
-        pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
-        for interval in plan.effective_intervals:
-            if interval in health_by_interval:
-                candles_by_interval[interval] = []
                 continue
-            path = path_by_interval[interval]
-            candles = pruned_candles_by_interval.get(interval) or []
-            candles, validation = normalize_and_validate_candles(candles, interval=interval)
-            if not validation.ok:
-                health = _health_from_candles(
-                    resolved.inst_id,
-                    interval,
-                    path,
-                    candles,
-                    reason=validation.reason,
-                    integrity=IntegrityState.INVALID,
-                    freshness=FreshnessState.STALE,
-                    validation=validation,
-                    updated_at_ms=context.observed_at_ms,
-                )
-            else:
-                freshness = self.freshness_policy.assess(
-                    now_ms=context.observed_at_ms,
-                    interval=interval,
-                    last_confirmed_open_time_ms=candles[-1].open_time_ms if candles else None,
-                )
-                health = _health_from_candles(
-                    resolved.inst_id,
-                    interval,
-                    path,
-                    candles,
-                    reason=freshness.reason,
-                    integrity=IntegrityState.VALID,
-                    freshness=freshness.state,
-                    validation=validation,
-                    updated_at_ms=context.observed_at_ms,
-                )
-            manifest_health = published_health_by_interval.get(interval)
-            cached_candles = raw_candles_by_interval.get(interval) or []
-            health = _verify_manifest_bound_content(health, manifest_health, cached_candles)
-            health = _merge_manifest_health(health, manifest_health)
-            health_by_interval[interval] = health
-            candles_by_interval[interval] = candles if health.integrity == IntegrityState.VALID else []
+            seeds_by_interval[interval] = DatasetEvaluationSeed(
+                key=DatasetKey(resolved.inst_id, interval),
+                source_file=path,
+                candles=candles,
+                empty_validation_reason=HealthReason.CACHE_MISSING,
+            )
 
-        self._attach_built_native_validation(health_by_interval, candles_by_interval)
-        _apply_coverage_gate(
-            health_by_interval,
-            candles_by_interval,
-            effective_intervals=plan.effective_intervals,
-            requested_days=query.days,
-            window_end_time_ms=window_plan.end_time_ms,
+        def merge_published_health(interval: str, health: DatasetHealth, candles: list[Candle], raw_candles: list[Candle]) -> DatasetHealth:
+            manifest_health = published_health_by_interval.get(interval)
+            health = _verify_manifest_bound_content(health, manifest_health, raw_candles)
+            return _merge_manifest_health(health, manifest_health)
+
+        evaluation = evaluate_candle_bundle(
+            symbol=resolved.inst_id,
+            intervals=plan.effective_intervals,
+            seeds_by_interval=seeds_by_interval,
+            days=query.days,
+            now_ms=context.observed_at_ms,
+            freshness_policy=self.freshness_policy,
+            post_process_health=merge_published_health,
         )
+        health_by_interval = {
+            interval: evaluation.health_by_key[(resolved.inst_id, interval)]
+            for interval in plan.effective_intervals
+        }
+        candles_by_interval = {
+            interval: evaluation.candles_by_key.get((resolved.inst_id, interval), [])
+            for interval in plan.effective_intervals
+        }
         decision = policy.decide(
             context=context,
             health_by_interval=health_by_interval,
@@ -266,67 +226,6 @@ class LoadTrustedBundle:
         if context.generation_id is None:
             return self.store.flat_cache_path(symbol, interval)
         return self.store.generation_cache_path(context.generation_id, symbol, interval)
-
-    def _attach_built_native_validation(
-        self,
-        health_by_interval: dict[str, DatasetHealth],
-        candles_by_interval: dict[str, list[Candle]],
-    ) -> None:
-        base_health = health_by_interval.get("5m")
-        if base_health is None or not _has_validation_inputs(base_health):
-            return
-        five = candles_by_interval.get("5m") or []
-        for interval in ("15m", "1h"):
-            native_health = health_by_interval.get(interval)
-            if native_health is None or not _has_validation_inputs(native_health):
-                continue
-            report = validate_built_native_candles(
-                aggregate_candles(five, interval=interval),
-                candles_by_interval.get(interval) or [],
-                interval=interval,
-            )
-            health_by_interval[interval] = replace(
-                native_health,
-                integrity=IntegrityState.VALID if report.ok else IntegrityState.INVALID,
-                freshness=native_health.freshness if report.ok else FreshnessState.STALE,
-                reasons=(native_health.primary_reason if report.ok else report.reason,),
-                validation=report,
-            )
-            if not report.ok:
-                candles_by_interval[interval] = []
-
-
-def _apply_coverage_gate(
-    health_by_interval: dict[str, DatasetHealth],
-    candles_by_interval: dict[str, list[Candle]],
-    *,
-    effective_intervals: tuple[str, ...],
-    requested_days: int,
-    window_end_time_ms: int | None,
-) -> None:
-    for interval in effective_intervals:
-        health = health_by_interval.get(interval)
-        candles = candles_by_interval.get(interval) or []
-        if health is None or not candles:
-            continue
-        if health.availability != AvailabilityState.AVAILABLE or health.integrity != IntegrityState.VALID:
-            continue
-        coverage = assess_requested_coverage(
-            candles,
-            interval=interval,
-            requested_days=requested_days,
-            window_end_time_ms=window_end_time_ms,
-        )
-        if coverage.covered:
-            continue
-        health_by_interval[interval] = replace(
-            health,
-            integrity=IntegrityState.INVALID,
-            reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
-            message=coverage.message,
-        )
-        candles_by_interval[interval] = []
-
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:
@@ -394,78 +293,12 @@ def _merge_validation_report(
 
 def _ensure_validation_report_consistency(health: DatasetHealth) -> DatasetHealth:
     reason = health.primary_reason
-    if reason not in _VALIDATION_FAILURE_REASONS:
+    if reason not in VALIDATION_FAILURE_REASONS:
         return health
     validation = health.validation
     if validation is not None and not validation.ok and validation.reason == reason:
         return health
     return replace(health, validation=ValidationReport(False, reason))
-
-
-def _not_published_health(symbol: str, interval: str, path: Path) -> DatasetHealth:
-    return DatasetHealth(
-        key=DatasetKey(symbol, interval),
-        availability=AvailabilityState.MISSING,
-        integrity=IntegrityState.INVALID,
-        freshness=FreshnessState.UNKNOWN,
-        reasons=(HealthReason.NOT_PUBLISHED,),
-        rows=0,
-        first_timestamp_ms=None,
-        last_timestamp_ms=None,
-        source_file=path,
-    )
-
-
-def _health_from_candles(
-    symbol: str,
-    interval: str,
-    path: Path,
-    candles: list[Candle],
-    *,
-    reason: HealthReason,
-    integrity: IntegrityState,
-    freshness: FreshnessState,
-    validation,
-    updated_at_ms: int = 0,
-) -> DatasetHealth:
-    return DatasetHealth(
-        key=DatasetKey(symbol, interval),
-        availability=AvailabilityState.AVAILABLE if candles else AvailabilityState.MISSING,
-        integrity=integrity if candles else IntegrityState.INVALID,
-        freshness=freshness,
-        reasons=(reason if candles else HealthReason.CACHE_MISSING,),
-        rows=len(candles),
-        first_timestamp_ms=candles[0].open_time_ms if candles else None,
-        last_timestamp_ms=candles[-1].open_time_ms if candles else None,
-        source_file=path,
-        validation=validation,
-        updated_at_ms=updated_at_ms,
-        content_sha256=candles_content_sha256(candles) if candles and integrity == IntegrityState.VALID else None,
-    )
-
-
-def _failed_health(
-    symbol: str,
-    interval: str,
-    path: Path,
-    *,
-    reason: HealthReason,
-    error_type: str,
-    message: str,
-) -> DatasetHealth:
-    return DatasetHealth(
-        key=DatasetKey(symbol, interval),
-        availability=AvailabilityState.MISSING,
-        integrity=IntegrityState.INVALID,
-        freshness=FreshnessState.STALE,
-        reasons=(reason,),
-        rows=0,
-        first_timestamp_ms=None,
-        last_timestamp_ms=None,
-        source_file=path,
-        error_type=error_type,
-        message=message,
-    )
 
 
 def _worst_availability(left: AvailabilityState, right: AvailabilityState) -> AvailabilityState:
@@ -509,11 +342,3 @@ def _merge_warnings(*groups: tuple[str, ...]) -> tuple[str, ...]:
             if warning not in values:
                 values.append(warning)
     return tuple(values)
-
-
-def _has_validation_inputs(health: DatasetHealth) -> bool:
-    return (
-        health.availability == AvailabilityState.AVAILABLE
-        and health.integrity == IntegrityState.VALID
-        and health.rows > 0
-    )
