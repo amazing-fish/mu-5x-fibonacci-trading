@@ -123,6 +123,10 @@ class DatasetRefreshCandidate:
     message: str | None = None
 
 
+class ReusablePriorDatasetReadError(Exception):
+    pass
+
+
 class RefreshTrustedMarketData:
     def __init__(
         self,
@@ -245,16 +249,9 @@ class RefreshTrustedMarketData:
     ) -> DatasetRefreshCandidate:
         path = self.store.generation_cache_path(run_id, symbol, interval)
         source_file = self.store.generation_source_file(symbol, interval)
-        previous_path = self._previous_dataset_path(previous_manifest, symbol, interval)
         existing: list[Candle] = []
-        cache_loaded = False
         try:
-            if previous_path is not None and previous_path.exists():
-                cached = self.store.read_csv(previous_path)
-                expected_hash = _previous_content_sha256(previous_manifest, symbol, interval)
-                if expected_hash is not None and candles_content_sha256(cached) == expected_hash:
-                    existing = cached
-            cache_loaded = True
+            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval) or []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -267,11 +264,19 @@ class RefreshTrustedMarketData:
                 candles=dedupe_candles([*existing, *fetched]),
                 had_existing=bool(existing),
             )
+        except ReusablePriorDatasetReadError as exc:
+            failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
+            return DatasetRefreshCandidate(
+                key=DatasetKey(symbol, interval),
+                path=path,
+                source_file=source_file,
+                candles=[],
+                fetch_reason=HealthReason.CACHE_READ_FAILED,
+                error_type=failure["error_type"],
+                message=failure["message"],
+            )
         except Exception as exc:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED if existing else HealthReason.REFRESH_FAILED
-            if previous_path is not None and previous_path.exists() and not cache_loaded:
-                reason = HealthReason.CACHE_READ_FAILED
-                existing = []
             failure = exception_failure(exc)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
@@ -362,12 +367,22 @@ class RefreshTrustedMarketData:
         except Exception:
             return None
 
-
-def _previous_content_sha256(manifest_result, symbol: str, interval: str) -> str | None:
-    if not manifest_result.ok or manifest_result.snapshot is None:
-        return None
-    health = manifest_result.snapshot.datasets.get((symbol, interval))
-    return health.content_sha256 if health is not None else None
+    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str) -> list[Candle] | None:
+        if not manifest_result.ok or manifest_result.snapshot is None:
+            return None
+        health = manifest_result.snapshot.datasets.get((symbol, interval))
+        if health is None or not health.is_usable or not health.content_sha256:
+            return None
+        previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
+        if previous_path is None or not previous_path.exists():
+            return None
+        try:
+            cached = self.store.read_csv(previous_path)
+        except Exception as exc:
+            raise ReusablePriorDatasetReadError from exc
+        if candles_content_sha256(cached) != health.content_sha256:
+            return None
+        return cached
 
 
 def load_stock_token_inst_ids(config_path: Path = DEFAULT_STOCK_TOKEN_CONFIG) -> set[str]:
