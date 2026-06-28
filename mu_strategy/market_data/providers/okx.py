@@ -82,21 +82,30 @@ def fetch_okx_historical(
     end_time_ms: int | None = None,
 ) -> list[Candle]:
     end_time_ms = end_time_ms or int(time.time() * 1000)
-    start_time_ms = end_time_ms - (days * DAY_MS)
     output: list[Candle] = []
     after: int | None = end_time_ms
+    latest_confirmed_time_ms: int | None = None
+    required_start_time_ms: int | None = None
     while True:
         batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:
             break
         output.extend(batch)
-        oldest = min(bar.open_time_ms for bar in batch)
-        if oldest <= start_time_ms:
+        confirmed = [bar for bar in output if bar.open_time_ms <= end_time_ms]
+        if not confirmed:
             break
-        if after == oldest:
+        latest_confirmed_time_ms = max(bar.open_time_ms for bar in confirmed)
+        required_start_time_ms = latest_confirmed_time_ms - (days * DAY_MS)
+        oldest_confirmed = min(bar.open_time_ms for bar in confirmed)
+        if oldest_confirmed <= required_start_time_ms:
             break
-        after = oldest
-    return dedupe_candles([bar for bar in output if start_time_ms <= bar.open_time_ms <= end_time_ms])
+        batch_oldest = min(bar.open_time_ms for bar in batch)
+        if after == batch_oldest:
+            break
+        after = batch_oldest
+    if latest_confirmed_time_ms is None or required_start_time_ms is None:
+        return []
+    return dedupe_candles([bar for bar in output if required_start_time_ms <= bar.open_time_ms <= latest_confirmed_time_ms])
 
 
 def fetch_okx_incremental(

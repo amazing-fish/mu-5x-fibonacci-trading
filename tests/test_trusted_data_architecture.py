@@ -456,6 +456,80 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 self.assertEqual("ok", health.primary_reason.value)
                 self.assertEqual(interval_to_ms(interval), health.first_timestamp_ms)
 
+    def test_refresh_accepts_okx_history_when_confirmed_candles_lag_wall_clock(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import OKXMarketDataProvider, RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+        from mu_strategy.market_data.utils import DAY_MS
+
+        days = 14
+        wall_end_ms = (days * DAY_MS) + (120 * 60_000)
+        wall_start_ms = wall_end_ms - (days * DAY_MS)
+        confirmed_lags_ms = {
+            "5m": 15 * 60_000,
+            "15m": 30 * 60_000,
+            "1h": 120 * 60_000,
+        }
+        five = range_candles(0, wall_end_ms - confirmed_lags_ms["5m"])
+        history = {
+            "5m": five,
+            "15m": aggregate_candles(five, interval="15m"),
+            "1h": aggregate_candles(five, interval="1h"),
+        }
+        pages: dict[str, tuple[list[Candle], list[Candle]]] = {}
+        for interval, rows in history.items():
+            latest_confirmed_ms = wall_end_ms - confirmed_lags_ms[interval]
+            required_start_ms = latest_confirmed_ms - (days * DAY_MS)
+            interval_rows = [bar for bar in rows if bar.open_time_ms <= latest_confirmed_ms]
+            pages[interval] = (
+                [bar for bar in interval_rows if wall_start_ms <= bar.open_time_ms <= latest_confirmed_ms],
+                [bar for bar in interval_rows if required_start_ms <= bar.open_time_ms < wall_start_ms],
+            )
+            self.assertTrue(pages[interval][0], interval)
+            self.assertTrue(pages[interval][1], interval)
+        requested_pages: list[tuple[str, int | None]] = []
+
+        def fake_fetch(symbol, interval, *, after=None):
+            self.assertEqual("MU-USDT-SWAP", symbol)
+            requested_pages.append((interval, after))
+            first_page, older_page = pages[interval]
+            if after == wall_end_ms:
+                return first_page
+            if after == wall_start_ms:
+                return older_page
+            return []
+
+        provider = OKXMarketDataProvider(
+            ticker_rows=[{"instId": "MU-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+        )
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            with patch("mu_strategy.market_data.providers.okx.time.time", return_value=wall_end_ms / 1000):
+                with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
+                    run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("15m", "1h"),
+                            days=days,
+                            limit=1,
+                            stock_token_inst_ids=set(),
+                            now_ms=wall_end_ms,
+                        )
+                    )
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual("usable", manifest["snapshot_usability"])
+        self.assertNotIn(HealthReason.INSUFFICIENT_COVERAGE, [health.primary_reason for health in run.datasets.values()])
+        for interval in ("5m", "15m", "1h"):
+            with self.subTest(interval=interval):
+                self.assertIn((interval, wall_end_ms), requested_pages)
+                self.assertIn((interval, wall_start_ms), requested_pages)
+                health = run.datasets[("MU-USDT-SWAP", interval)]
+                self.assertEqual(HealthReason.OK, health.primary_reason)
+
     def test_refresh_records_effective_intervals_and_uses_incremental_after_history(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest

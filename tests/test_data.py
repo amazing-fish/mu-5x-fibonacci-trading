@@ -13,6 +13,8 @@ from mu_strategy.market_data.cache import (
     validate_close_to_next_open_gaps,
 )
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, okx_row_to_candle
+from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -205,12 +207,93 @@ class DataTests(unittest.TestCase):
         with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
             candles = fetch_okx_historical("MU-USDT-SWAP", "15m", days=1, end_time_ms=end_time_ms)
 
-        self.assertEqual([end_time_ms], requested_after_values)
+        self.assertEqual(end_time_ms, requested_after_values[0])
         self.assertEqual([86_400_000], [candle.open_time_ms for candle in candles])
+
+    def test_okx_historical_paginates_to_latest_confirmed_requested_window(self):
+        days = 14
+        cases = (
+            ("5m", 15 * 60_000),
+            ("15m", 30 * 60_000),
+            ("1h", 120 * 60_000),
+        )
+        for interval, confirmed_lag_ms in cases:
+            with self.subTest(interval=interval):
+                step_ms = interval_to_ms(interval)
+                latest_confirmed_ms = days * DAY_MS
+                end_time_ms = latest_confirmed_ms + confirmed_lag_ms
+                wall_clock_start_ms = end_time_ms - (days * DAY_MS)
+                required_start_ms = latest_confirmed_ms - (days * DAY_MS)
+                first_page = _range_interval_candles(wall_clock_start_ms, latest_confirmed_ms, step_ms)
+                older_page = _range_interval_candles(required_start_ms, wall_clock_start_ms - step_ms, step_ms)
+                requested_after_values = []
+
+                def fake_fetch(symbol, candidate_interval, *, after=None):
+                    self.assertEqual("MU-USDT-SWAP", symbol)
+                    self.assertEqual(interval, candidate_interval)
+                    requested_after_values.append(after)
+                    if after == end_time_ms:
+                        return first_page
+                    if after == wall_clock_start_ms:
+                        return older_page
+                    return []
+
+                with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
+                    candles = fetch_okx_historical("MU-USDT-SWAP", interval, days=days, end_time_ms=end_time_ms)
+
+                coverage = assess_requested_coverage(
+                    candles,
+                    interval=interval,
+                    requested_days=days,
+                    window_end_time_ms=candles[-1].open_time_ms if candles else None,
+                )
+                self.assertEqual([end_time_ms, wall_clock_start_ms], requested_after_values)
+                self.assertTrue(coverage.covered, coverage.message)
+                self.assertLessEqual(candles[0].open_time_ms, required_start_ms + step_ms)
+
+    def test_okx_historical_does_not_hide_short_history(self):
+        days = 14
+        interval = "15m"
+        step_ms = interval_to_ms(interval)
+        latest_confirmed_ms = days * DAY_MS
+        end_time_ms = latest_confirmed_ms + (30 * 60_000)
+        short_start_ms = DAY_MS
+        first_page = _range_interval_candles(short_start_ms, latest_confirmed_ms, step_ms)
+        requested_after_values = []
+
+        def fake_fetch(symbol, candidate_interval, *, after=None):
+            self.assertEqual("MU-USDT-SWAP", symbol)
+            self.assertEqual(interval, candidate_interval)
+            requested_after_values.append(after)
+            if after == end_time_ms:
+                return first_page
+            return []
+
+        with patch("mu_strategy.market_data.providers.okx.fetch_okx_candles", side_effect=fake_fetch):
+            candles = fetch_okx_historical("MU-USDT-SWAP", interval, days=days, end_time_ms=end_time_ms)
+
+        coverage = assess_requested_coverage(
+            candles,
+            interval=interval,
+            requested_days=days,
+            window_end_time_ms=candles[-1].open_time_ms if candles else None,
+        )
+        self.assertEqual([end_time_ms, short_start_ms], requested_after_values)
+        self.assertFalse(coverage.covered)
+        self.assertIn("insufficient coverage", coverage.message)
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
+
+
+def _range_interval_candles(start_ms: int, end_ms: int, step_ms: int) -> list[Candle]:
+    rows: list[Candle] = []
+    timestamp = start_ms
+    while timestamp <= end_ms:
+        rows.append(_candle(timestamp, 100 + len(rows)))
+        timestamp += step_ms
+    return rows
 
 
 if __name__ == "__main__":
