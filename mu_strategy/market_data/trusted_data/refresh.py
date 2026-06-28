@@ -343,12 +343,11 @@ class RefreshTrustedMarketData:
         return result.health_by_key, result.candles_by_key
 
     def _persist_run(self, run: RefreshRun) -> None:
-        self.store.write_generation_manifest(run.run_id, run.to_manifest())
-        self.store.replace_current(run.run_id)
-        try:
-            self.store.append_run_log(run.run_log_payload())
-        except Exception as exc:
-            raise RuntimeError(f"audit log append failed: {exc}") from exc
+        self.store.commit_generation_publication(
+            run.run_id,
+            run.to_manifest(),
+            run.run_log_payload(),
+        )
 
     def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
         if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:

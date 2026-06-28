@@ -577,6 +577,14 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
 
         self.assertEqual(["generation CSV", "generation manifest", "current pointer", "audit log"], calls)
 
+    def test_refresh_uses_store_owned_publication_seam(self):
+        refresh_source = Path("mu_strategy/market_data/trusted_data/refresh.py").read_text(encoding="utf-8")
+
+        self.assertIn("self.store.commit_generation_publication(", refresh_source)
+        self.assertNotIn("self.store.write_generation_manifest(", refresh_source)
+        self.assertNotIn("self.store.replace_current(", refresh_source)
+        self.assertNotIn("self.store.append_run_log(", refresh_source)
+
     def test_generation_csv_modification_is_detected_by_hash(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery

@@ -229,6 +229,19 @@ class TrustedDataStore:
         _atomic_write_text(self.current_path, json.dumps(pointer, ensure_ascii=False, indent=2, sort_keys=True))
         return self.current_path
 
+    def commit_generation_publication(
+        self,
+        generation_id: str,
+        manifest: dict[str, Any],
+        run_log_payload: dict[str, Any],
+    ) -> None:
+        self.write_generation_manifest(generation_id, manifest)
+        self.replace_current(generation_id)
+        try:
+            self.append_run_log(run_log_payload)
+        except Exception as exc:
+            raise RuntimeError(f"audit log append failed: {exc}") from exc
+
     def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str | None) -> Path:
         source_file = Path(source_file)
         if generation_id is None:
