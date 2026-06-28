@@ -127,6 +127,58 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual("ok", result.reason)
 
+    def test_normalize_rejects_nan_ohlc_prices(self):
+        for field in ("open", "high", "low", "close"):
+            with self.subTest(field=field):
+                report = _normalize_report([_ohlcv_candle(**{field: float("nan")})])
+
+                self.assertFalse(report.ok)
+                self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_rejects_infinite_ohlc_prices(self):
+        for field in ("open", "high", "low", "close"):
+            with self.subTest(field=field):
+                report = _normalize_report([_ohlcv_candle(**{field: float("inf")})])
+
+                self.assertFalse(report.ok)
+                self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_rejects_zero_ohlc_prices(self):
+        for field in ("open", "high", "low", "close"):
+            with self.subTest(field=field):
+                report = _normalize_report([_ohlcv_candle(**{field: 0.0})])
+
+                self.assertFalse(report.ok)
+                self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_rejects_negative_ohlc_prices(self):
+        for field in ("open", "high", "low", "close"):
+            with self.subTest(field=field):
+                report = _normalize_report([_ohlcv_candle(**{field: -1.0})])
+
+                self.assertFalse(report.ok)
+                self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_rejects_nan_or_infinite_volume(self):
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                report = _normalize_report([_ohlcv_candle(volume=value)])
+
+                self.assertFalse(report.ok)
+                self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_rejects_negative_volume(self):
+        report = _normalize_report([_ohlcv_candle(volume=-1.0)])
+
+        self.assertFalse(report.ok)
+        self.assertEqual("ohlcv_invalid", report.reason.value)
+
+    def test_normalize_accepts_zero_volume_with_valid_prices(self):
+        report = _normalize_report([_ohlcv_candle(volume=0.0)])
+
+        self.assertTrue(report.ok)
+        self.assertEqual("ok", report.reason.value)
+
 
 class TrustedRefreshStoreTests(unittest.TestCase):
     def test_refresh_once_writes_manifest_run_log_and_health_dashboard(self):
@@ -609,6 +661,24 @@ class TrustedCandleBundleTests(unittest.TestCase):
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
+
+
+def _ohlcv_candle(
+    *,
+    open: float = 100.0,
+    high: float = 101.0,
+    low: float = 99.0,
+    close: float = 100.0,
+    volume: float = 1000.0,
+) -> Candle:
+    return Candle(0, open, high, low, close, volume)
+
+
+def _normalize_report(candles: list[Candle]):
+    from mu_strategy.market_data.trusted_data.validation import normalize_and_validate_candles
+
+    _, report = normalize_and_validate_candles(candles, interval="5m")
+    return report
 
 
 def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:

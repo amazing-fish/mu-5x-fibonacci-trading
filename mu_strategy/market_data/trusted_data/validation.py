@@ -40,6 +40,10 @@ def normalize_and_validate_candles(
     if timestamp_gaps:
         return ordered, ValidationReport(False, HealthReason.TIMESTAMP_GAP, timestamp_gaps=tuple(timestamp_gaps))
     for candle in ordered:
+        if not all(_is_finite_positive(value) for value in (candle.open, candle.high, candle.low, candle.close)):
+            return ordered, ValidationReport(False, HealthReason.OHLCV_INVALID)
+        if not _is_finite_non_negative(candle.volume):
+            return ordered, ValidationReport(False, HealthReason.OHLCV_INVALID)
         if (
             candle.high < max(candle.open, candle.close)
             or candle.low > min(candle.open, candle.close)
@@ -53,6 +57,14 @@ def normalize_and_validate_candles(
         if gap_pct > max_gap_pct:
             return ordered, ValidationReport(False, HealthReason.CONTINUITY_GAP)
     return ordered, ValidationReport(True, HealthReason.OK)
+
+
+def _is_finite_positive(value: float) -> bool:
+    return math.isfinite(value) and value > 0
+
+
+def _is_finite_non_negative(value: float) -> bool:
+    return math.isfinite(value) and value >= 0
 
 
 def aggregate_candles(candles: list[Candle], *, interval: str, base_interval: str = "5m") -> list[Candle]:
