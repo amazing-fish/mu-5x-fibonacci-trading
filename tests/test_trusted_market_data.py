@@ -248,7 +248,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual({}, manifest["symbols"])
         self.assertIn("empty_universe", manifest["warnings"])
 
-    def test_refresh_once_marks_bad_cache_invalid_without_aborting_other_symbols(self):
+    def test_refresh_once_rebuilds_bad_cache_without_aborting_other_symbols(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
 
         rows = [
@@ -276,14 +276,14 @@ class TrustedRefreshStoreTests(unittest.TestCase):
 
         btc_status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
         eth_status = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]
-        self.assertEqual("degraded", manifest["attempt_status"])
-        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("usable", manifest["snapshot_usability"])
         self.assertEqual([], manifest["provider_failures"])
-        self.assertFalse(btc_status["is_valid"])
-        self.assertEqual("cache_read_failed", btc_status["reason"])
+        self.assertTrue(btc_status["is_valid"])
+        self.assertEqual("ok", btc_status["reason"])
         self.assertTrue(eth_status["is_valid"])
 
-    def test_refresh_once_skips_invalid_native_cache_during_validation(self):
+    def test_refresh_once_rebuilds_invalid_native_cache_during_validation(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once
 
         rows = [
@@ -312,17 +312,17 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
 
         status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]
-        self.assertEqual("degraded", manifest["attempt_status"])
-        self.assertEqual("invalid", manifest["snapshot_usability"])
-        self.assertEqual("degraded", persisted["attempt_status"])
-        self.assertEqual("invalid", persisted["snapshot_usability"])
-        self.assertEqual("degraded", run_log["attempt_status"])
-        self.assertEqual("invalid", run_log["snapshot_usability"])
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("usable", manifest["snapshot_usability"])
+        self.assertEqual("success", persisted["attempt_status"])
+        self.assertEqual("usable", persisted["snapshot_usability"])
+        self.assertEqual("success", run_log["attempt_status"])
+        self.assertEqual("usable", run_log["snapshot_usability"])
         self.assertEqual([], manifest["provider_failures"])
         self.assertEqual([], persisted["provider_failures"])
         self.assertEqual([], run_log["provider_failures"])
-        self.assertFalse(status["is_valid"])
-        self.assertEqual("cache_read_failed", status["reason"])
+        self.assertTrue(status["is_valid"])
+        self.assertEqual("ok", status["reason"])
 
     def test_refresh_once_marks_native_ohlcv_mismatch_invalid(self):
         from mu_strategy.market_data.trusted import refresh_market_data_once

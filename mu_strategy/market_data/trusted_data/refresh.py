@@ -266,7 +266,16 @@ class RefreshTrustedMarketData:
                 had_existing=bool(existing),
             )
         except ReusablePriorDatasetReadError as exc:
-            failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
+            try:
+                fetched = self.provider.fetch_history(symbol, interval, days=days)
+                return DatasetRefreshCandidate(
+                    key=DatasetKey(symbol, interval),
+                    path=path,
+                    source_file=source_file,
+                    candles=dedupe_candles(fetched),
+                )
+            except Exception:
+                failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,

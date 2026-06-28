@@ -757,10 +757,11 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(FreshnessState.FRESH, health.freshness)
         self.assertIn("incremental_refresh_failed", health.warnings)
 
-    def test_limit_zero_and_cache_read_failure_do_not_escape_canonical_publication(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
+    def test_limit_zero_and_unreadable_prior_cache_falls_back_to_history(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
@@ -778,14 +779,30 @@ class TrustedDataRefreshTests(unittest.TestCase):
             def read_csv(self, path):
                 raise OSError("disk offline")
 
+        class FullHistoryProvider(RecordingProvider):
+            def __init__(self):
+                super().__init__(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+
+            def fetch_history(self, symbol, interval, *, days):
+                self.history_calls.append((symbol, interval, days))
+                return range_candles(0, DAY_MS)
+
+            def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((symbol, interval, since_time_ms))
+                raise AssertionError("unreadable prior cache must fall back to history")
+
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             write_flat_v3_publication(data_dir, symbol="BTC-USDT-SWAP")
-            run = RefreshTrustedMarketData(FailingReadStore(data_dir=data_dir), RecordingProvider(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])).execute(
+            provider = FullHistoryProvider()
+            run = RefreshTrustedMarketData(FailingReadStore(data_dir=data_dir), provider).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             )
-        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
-        self.assertEqual("cache_read_failed", run.datasets[("BTC-USDT-SWAP", "5m")].primary_reason.value)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual("ok", run.datasets[("BTC-USDT-SWAP", "5m")].primary_reason.value)
+        self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
+        self.assertEqual([], provider.incremental_calls)
 
 
 class TrustedDemoConsumerTests(unittest.TestCase):
