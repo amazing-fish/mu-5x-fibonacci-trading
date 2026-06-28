@@ -22,6 +22,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
+from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
 from mu_strategy.models import Candle
@@ -251,7 +252,7 @@ class RefreshTrustedMarketData:
         source_file = self.store.generation_source_file(symbol, interval)
         existing: list[Candle] = []
         try:
-            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval) or []
+            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval, days=days) or []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -366,7 +367,7 @@ class RefreshTrustedMarketData:
         except Exception:
             return None
 
-    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str) -> list[Candle] | None:
+    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str, *, days: int) -> list[Candle] | None:
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None
         health = manifest_result.snapshot.datasets.get((symbol, interval))
@@ -380,6 +381,14 @@ class RefreshTrustedMarketData:
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
         if candles_content_sha256(cached) != health.content_sha256:
+            return None
+        coverage = assess_requested_coverage(
+            cached,
+            interval=interval,
+            requested_days=days,
+            window_end_time_ms=cached[-1].open_time_ms if cached else None,
+        )
+        if not coverage.covered:
             return None
         return cached
 

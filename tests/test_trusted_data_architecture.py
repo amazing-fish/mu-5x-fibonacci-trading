@@ -534,6 +534,62 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual([], provider.incremental_calls)
         self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
 
+    def test_refresh_falls_back_to_history_when_requested_retention_expands(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+        from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
+
+        one_day_end_ms = 20 * DAY_MS
+        one_day_five = range_candles(one_day_end_ms - DAY_MS, one_day_end_ms)
+        one_day_history = {
+            "5m": one_day_five,
+            "15m": aggregate_candles(one_day_five, interval="15m"),
+            "1h": aggregate_candles(one_day_five, interval="1h"),
+        }
+        full_end_ms = 34 * DAY_MS
+        full_five = range_candles(full_end_ms - (14 * DAY_MS) + interval_to_ms("5m"), full_end_ms)
+        full_history = {
+            "5m": full_five,
+            "15m": aggregate_candles(full_five, interval="15m"),
+            "1h": aggregate_candles(full_five, interval="1h"),
+        }
+        first_provider = RecordingProvider(
+            ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+            history_fetcher=lambda symbol, interval, *, days: one_day_history[interval],
+        )
+
+        class FullHistoryProvider(RecordingProvider):
+            def __init__(self):
+                super().__init__(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+
+            def fetch_history(self, symbol, interval, *, days):
+                self.history_calls.append((symbol, interval, days))
+                return full_history[interval]
+
+            def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((symbol, interval, since_time_ms))
+                raise AssertionError("expanded retention must fetch full history")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            first = RefreshTrustedMarketData(store, first_provider).execute(
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=one_day_end_ms)
+            )
+            provider = FullHistoryProvider()
+            second = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=14, limit=1, stock_token_inst_ids=set(), now_ms=full_end_ms)
+            )
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, first.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, first.snapshot_usability)
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
+        self.assertEqual([], provider.incremental_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
+
     def test_refresh_attempt_and_snapshot_axes_remain_separate(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.evaluate import classify_publication_health
@@ -602,8 +658,8 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(1, summary.unusable_count)
         self.assertEqual(1, summary.validation_failure_count)
 
-    def test_refresh_insufficient_coverage_preserves_incremental_warning(self):
-        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState
+    def test_refresh_covering_prior_preserves_incremental_warning(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
         from mu_strategy.market_data.trusted_data.validation import aggregate_candles
@@ -616,12 +672,14 @@ class TrustedDataRefreshTests(unittest.TestCase):
             data_dir = Path(tmp)
             write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", candles_by_interval=candles_by_interval)
             run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), _IncrementalFailureProvider()).execute(
-                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=14, limit=1, stock_token_inst_ids=set(), now_ms=end_ms)
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=end_ms)
             )
 
         health = run.datasets[("BTC-USDT-SWAP", "5m")]
-        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, health.primary_reason)
-        self.assertEqual(IntegrityState.INVALID, health.integrity)
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual(HealthReason.OK, health.primary_reason)
+        self.assertEqual(IntegrityState.VALID, health.integrity)
         self.assertEqual(FreshnessState.FRESH, health.freshness)
         self.assertIn("incremental_refresh_failed", health.warnings)
 
