@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -71,12 +71,6 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
         exit_code = 0
         try:
             run = _refresh_once(args, intervals=intervals)
-            manifest = run.to_manifest()
-            if args.html_output is not None:
-                write_data_health_dashboard(manifest, args.html_output)
-            command_result = classify_refresh_run(run)
-            output = command_result.to_dict()
-            exit_code = command_result.exit_code
         except Exception as exc:
             output = {
                 "status": "error",
@@ -85,6 +79,16 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
                 "symbols": 0,
             }
             exit_code = REFRESH_COMMAND_UNUSABLE_EXIT_CODE
+        else:
+            command_result = classify_refresh_run(run)
+            dashboard_warnings = _write_dashboard_or_warning(run.to_manifest(), args.html_output)
+            if dashboard_warnings:
+                command_result = replace(
+                    command_result,
+                    warnings=(*command_result.warnings, *dashboard_warnings),
+                )
+            output = command_result.to_dict()
+            exit_code = command_result.exit_code
         stdout.write(json.dumps(output, sort_keys=True))
         stdout.write("\n")
         stdout.flush()
@@ -115,6 +119,16 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
             stock_token_config=args.stock_token_config,
         )
     )
+
+
+def _write_dashboard_or_warning(manifest: dict[str, Any], html_output: Path | None) -> tuple[str, ...]:
+    if html_output is None:
+        return ()
+    try:
+        write_data_health_dashboard(manifest, html_output)
+    except Exception as exc:
+        return (f"dashboard_write_failed: {exc}",)
+    return ()
 
 
 def classify_refresh_run(run: RefreshRun) -> RefreshCommandResult:

@@ -42,6 +42,63 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         )
         write_dashboard.assert_called_once()
 
+    def test_dashboard_failure_after_successful_refresh_warns_without_cycle_error(self):
+        from mu_strategy.commands.refresh_market_data import main
+
+        run = _run("run-ok")
+
+        with TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            html_path = Path(tmp) / "health.html"
+            with patch("mu_strategy.commands.refresh_market_data._refresh_once", return_value=run):
+                with patch(
+                    "mu_strategy.commands.refresh_market_data.write_data_health_dashboard",
+                    side_effect=OSError("dashboard offline"),
+                ):
+                    exit_code = main(["--interval", "5m", "--html-output", str(html_path)], stdout=stdout)
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(0, exit_code)
+        self.assertEqual("run-ok", output["run_id"])
+        self.assertEqual("success", output["attempt_status"])
+        self.assertEqual("usable", output["snapshot_usability"])
+        self.assertTrue(output["usable"])
+        self.assertEqual(1, output["symbols"])
+        self.assertIn("dashboard_write_failed: dashboard offline", output["warnings"])
+        self.assertNotIn("status", output)
+        self.assertNotIn("cycle_error", output)
+
+    def test_dashboard_failure_after_degraded_usable_refresh_preserves_exit_code(self):
+        from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        run = _run(
+            "run-degraded-usable",
+            attempt_status=RefreshAttemptStatus.DEGRADED,
+            snapshot_usability=SnapshotUsability.USABLE,
+        )
+
+        with TemporaryDirectory() as tmp:
+            stdout = io.StringIO()
+            html_path = Path(tmp) / "health.html"
+            with patch("mu_strategy.commands.refresh_market_data._refresh_once", return_value=run):
+                with patch(
+                    "mu_strategy.commands.refresh_market_data.write_data_health_dashboard",
+                    side_effect=OSError("dashboard offline"),
+                ):
+                    exit_code = main(["--interval", "5m", "--html-output", str(html_path)], stdout=stdout)
+
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(2, exit_code)
+        self.assertEqual("run-degraded-usable", output["run_id"])
+        self.assertEqual("degraded", output["attempt_status"])
+        self.assertEqual("usable", output["snapshot_usability"])
+        self.assertTrue(output["usable"])
+        self.assertEqual(1, output["symbols"])
+        self.assertIn("dashboard_write_failed: dashboard offline", output["warnings"])
+        self.assertNotIn("status", output)
+        self.assertNotIn("cycle_error", output)
+
     def test_failed_one_shot_exits_non_zero_after_writing_artifacts(self):
         from mu_strategy.commands.refresh_market_data import main
 
@@ -448,6 +505,7 @@ def _run(
     attempt_status=None,
     freshness=None,
     cycle_error=None,
+    snapshot_usability=None,
 ):
     from mu_strategy.market_data.trusted_data.contracts import (
         AvailabilityState,
@@ -486,7 +544,7 @@ def _run(
     return RefreshRun(
         run_id=run_id,
         attempt_status=attempt_status,
-        snapshot_usability=derive_snapshot_usability(datasets),
+        snapshot_usability=snapshot_usability or derive_snapshot_usability(datasets),
         started_at_ms=0,
         completed_at_ms=0,
         requested_intervals=("5m",),
