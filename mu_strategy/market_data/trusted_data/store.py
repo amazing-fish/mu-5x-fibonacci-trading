@@ -234,13 +234,14 @@ class TrustedDataStore:
         generation_id: str,
         manifest: dict[str, Any],
         run_log_payload: dict[str, Any],
-    ) -> None:
+    ) -> tuple[str, ...]:
         self.write_generation_manifest(generation_id, manifest)
         self.replace_current(generation_id)
         try:
             self.append_run_log(run_log_payload)
         except Exception as exc:
-            raise RuntimeError(f"audit log append failed: {exc}") from exc
+            return (f"audit_log_append_failed: {exc}",)
+        return ()
 
     def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str | None) -> Path:
         source_file = Path(source_file)

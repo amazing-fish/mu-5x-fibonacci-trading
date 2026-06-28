@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -175,7 +175,7 @@ class RefreshTrustedMarketData:
                 ),
                 cycle_error=failure,
             )
-            self._persist_run(run)
+            run = self._persist_run(run)
             return run
 
         datasets: dict[tuple[str, str], DatasetHealth] = {}
@@ -222,7 +222,7 @@ class RefreshTrustedMarketData:
             provider_failures=provider_failures,
             warnings=tuple(warnings),
         )
-        self._persist_run(run)
+        run = self._persist_run(run)
         return run
 
     def _universe(self, request: RefreshTrustedMarketDataRequest) -> UniverseSnapshot:
@@ -352,12 +352,15 @@ class RefreshTrustedMarketData:
         )
         return result.health_by_key, result.candles_by_key
 
-    def _persist_run(self, run: RefreshRun) -> None:
-        self.store.commit_generation_publication(
+    def _persist_run(self, run: RefreshRun) -> RefreshRun:
+        publication_warnings = self.store.commit_generation_publication(
             run.run_id,
             run.to_manifest(),
             run.run_log_payload(),
         )
+        if not publication_warnings:
+            return run
+        return replace(run, warnings=(*run.warnings, *publication_warnings))
 
     def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
         if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:

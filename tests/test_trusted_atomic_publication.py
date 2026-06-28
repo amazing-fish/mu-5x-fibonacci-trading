@@ -256,38 +256,51 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
 
             self.assertEqual(old_pointer, (data_dir / "current.json").read_bytes())
 
-    def test_run_log_failure_after_pointer_reports_audit_failure_without_rollback(self):
+    def test_run_log_failure_after_pointer_warns_without_failing_refresh(self):
         from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             stock_config = Path(tmp) / "stock.json"
             stock_config.write_text("[]", encoding="utf-8")
+            html_path = Path(tmp) / "health.html"
             stdout = _Sink()
             with patch("mu_strategy.market_data.trusted_data.refresh.uuid.uuid4", return_value=_Hex("run-audit")):
-                with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers", return_value=[{"instId": SYMBOL, "last": "100", "volCcy24h": "10"}]):
-                    with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=lambda symbol, interval, *, days: candles_by_interval()[interval]):
-                        with patch.object(TrustedDataStore, "append_run_log", side_effect=OSError("audit offline")):
-                            exit_code = main(
-                                [
-                                    "--data-dir",
-                                    str(data_dir),
-                                    "--stock-token-config",
-                                    str(stock_config),
-                                    "--limit",
-                                    "1",
-                                    "--days",
-                                    "1",
-                                    "--html-output",
-                                    str(Path(tmp) / "health.html"),
-                                ],
-                                stdout=stdout,
-                            )
+                with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                    with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers", return_value=[{"instId": SYMBOL, "last": "100", "volCcy24h": "10"}]):
+                        with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=lambda symbol, interval, *, days: candles_by_interval()[interval]):
+                            with patch.object(TrustedDataStore, "append_run_log", side_effect=OSError("audit offline")):
+                                exit_code = main(
+                                    [
+                                        "--data-dir",
+                                        str(data_dir),
+                                        "--stock-token-config",
+                                        str(stock_config),
+                                        "--limit",
+                                        "1",
+                                        "--days",
+                                        "1",
+                                        "--html-output",
+                                        str(html_path),
+                                    ],
+                                    stdout=stdout,
+                                )
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
+                trading_strict_policy(),
+            )
 
-            self.assertNotEqual(0, exit_code)
+            output = json.loads(stdout.text)
+            self.assertEqual(0, exit_code)
             self.assertEqual("run-audit", read_current(data_dir)["generation_id"])
-            self.assertIn("audit log append failed", json.loads(stdout.text)["message"])
+            self.assertEqual("run-audit", bundle.run_id)
+            self.assertTrue(bundle.trust_decision.allowed)
+            self.assertTrue(html_path.exists())
+            self.assertTrue(output["usable"])
+            self.assertIn("audit_log_append_failed: audit offline", output["warnings"])
 
     def test_context_pins_generation_while_new_refresh_publishes(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
