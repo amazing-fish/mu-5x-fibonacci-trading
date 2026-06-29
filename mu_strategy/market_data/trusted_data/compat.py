@@ -49,6 +49,9 @@ class DataStatus:
     message: str | None = None
     warnings: tuple[str, ...] = ()
     validation: CandleValidationResult | None = None
+    requested_days: int | None = None
+    effective_days: float | None = None
+    coverage_state: str | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -168,6 +171,9 @@ def data_status_from_health(health: DatasetHealth) -> DataStatus:
         message=health.message,
         warnings=health.warnings,
         validation=validation_result_from_report(health.validation) if health.validation else None,
+        requested_days=health.requested_days,
+        effective_days=health.effective_days,
+        coverage_state=health.coverage_state,
     )
 
 

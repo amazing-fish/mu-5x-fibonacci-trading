@@ -145,7 +145,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             self.assertTrue(bundle.trust_decision.allowed)
             self.assertEqual(("5m", "15m", "1h"), tuple(bundle.health_by_interval))
 
-    def test_requested_days_coverage_gate_accepts_only_complete_generation_windows(self):
+    def test_requested_days_coverage_gate_marks_short_generation_as_partial_usable(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
@@ -153,10 +153,10 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS
 
         cases = (
-            ("short", 20 * DAY_MS, 20 * DAY_MS + DAY_MS - 300_000, False),
-            ("complete", 20 * DAY_MS + 300_000, 20 * DAY_MS + 300_000 + 14 * DAY_MS, True),
+            ("short", 20 * DAY_MS, 20 * DAY_MS + DAY_MS - 300_000, "partial_available_history"),
+            ("complete", 20 * DAY_MS + 300_000, 20 * DAY_MS + 300_000 + 14 * DAY_MS, "complete"),
         )
-        for name, start_ms, end_ms, allowed in cases:
+        for name, start_ms, end_ms, coverage_state in cases:
             with self.subTest(name=name):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
@@ -166,13 +166,50 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                         trading_strict_policy(),
                     )
 
-                self.assertEqual(allowed, bundle.trust_decision.allowed, bundle.trust_decision)
-                if not allowed:
-                    health = bundle.health_by_interval["5m"]
-                    self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, health.primary_reason)
-                    self.assertEqual(IntegrityState.INVALID, health.integrity)
-                    self.assertEqual(FreshnessState.FRESH, health.freshness)
-                    self.assertIn("requested_days=14", health.message)
+                self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+                health = bundle.health_by_interval["5m"]
+                self.assertEqual(HealthReason.OK, health.primary_reason)
+                self.assertEqual(IntegrityState.VALID, health.integrity)
+                self.assertEqual(FreshnessState.FRESH, health.freshness)
+                self.assertEqual(14, health.requested_days)
+                self.assertEqual(coverage_state, health.coverage_state)
+                if coverage_state == "partial_available_history":
+                    self.assertTrue(any(item.startswith("partial_available_history:requested_days=14") for item in health.warnings))
+
+    def test_loader_allows_base_only_stale_manifest_when_requested_intervals_are_fresh(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        end_ms = 20 * DAY_MS
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = write_generation_publication(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                start_ms=end_ms - DAY_MS,
+                end_ms=end_ms,
+            )
+            manifest["attempt_status"] = "degraded"
+            manifest["snapshot_usability"] = "stale"
+            base_status = manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"]
+            base_status["freshness"] = "stale"
+            base_status["reason"] = "stale_by_clock"
+            base_status["reasons"] = ["stale_by_clock"]
+            generation_manifest = data_dir / "generations" / manifest["run_id"] / "manifest.json"
+            generation_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=14, now_ms=end_ms),
+                research_strict_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+        self.assertEqual(FreshnessState.STALE, bundle.health_by_interval["5m"].freshness)
+        self.assertEqual(FreshnessState.FRESH, bundle.health_by_interval["15m"].freshness)
+        self.assertEqual(FreshnessState.FRESH, bundle.health_by_interval["1h"].freshness)
 
     def test_strict_policy_rejects_manifest_run_and_dataset_states(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -363,7 +400,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
 
 class TrustedDataRefreshTests(unittest.TestCase):
-    def test_refresh_rejects_short_requested_coverage_for_all_effective_intervals_and_load_agrees(self):
+    def test_refresh_publishes_usable_partial_history_for_short_requested_coverage_and_load_agrees(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
@@ -398,26 +435,32 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 trading_strict_policy(),
             )
 
-        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
-        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
-        self.assertEqual("failed", manifest["attempt_status"])
-        self.assertEqual("invalid", manifest["snapshot_usability"])
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("usable", manifest["snapshot_usability"])
         for interval in ("5m", "15m", "1h"):
             with self.subTest(interval=interval):
                 health = run.datasets[("BTC-USDT-SWAP", interval)]
-                self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, health.primary_reason)
-                self.assertEqual(IntegrityState.INVALID, health.integrity)
+                self.assertEqual(HealthReason.OK, health.primary_reason)
+                self.assertEqual(IntegrityState.VALID, health.integrity)
                 self.assertEqual(FreshnessState.FRESH, health.freshness)
-                self.assertIn("requested_days=14", health.message)
-                self.assertIn("expected_start_ms=", health.message)
-                self.assertIn("actual_start_ms=", health.message)
+                self.assertEqual(14, health.requested_days)
+                self.assertEqual("partial_available_history", health.coverage_state)
+                self.assertTrue(any(item.startswith("partial_available_history:requested_days=14") for item in health.warnings))
                 persisted = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"][interval]
-                self.assertEqual("invalid", persisted["integrity"])
-                self.assertEqual("insufficient_coverage", persisted["reason"])
-                self.assertEqual("insufficient_coverage", bundle.health_by_interval[interval].primary_reason.value)
-        self.assertFalse(bundle.trust_decision.allowed)
-        self.assertEqual([], bundle.candles_by_interval["15m"])
-        self.assertEqual([], bundle.candles_by_interval["1h"])
+                expected_effective_days = (persisted["last_timestamp_ms"] - persisted["first_timestamp_ms"]) / DAY_MS
+                self.assertAlmostEqual(expected_effective_days, health.effective_days)
+                self.assertEqual("valid", persisted["integrity"])
+                self.assertEqual("ok", persisted["reason"])
+                self.assertEqual(14, persisted["requested_days"])
+                self.assertAlmostEqual(expected_effective_days, persisted["effective_days"])
+                self.assertEqual("partial_available_history", persisted["coverage_state"])
+                self.assertEqual("ok", bundle.health_by_interval[interval].primary_reason.value)
+                self.assertEqual("partial_available_history", bundle.health_by_interval[interval].coverage_state)
+        self.assertTrue(bundle.trust_decision.allowed)
+        self.assertTrue(bundle.candles_by_interval["15m"])
+        self.assertTrue(bundle.candles_by_interval["1h"])
 
     def test_refresh_accepts_requested_coverage_left_boundary_one_interval_tolerance(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -570,7 +613,8 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         short_end_ms = 20 * DAY_MS
         short_five = range_candles(short_end_ms - DAY_MS, short_end_ms)
-        short_history = {"5m": short_five, "15m": aggregate_candles(short_five, interval="15m"), "1h": aggregate_candles(short_five, interval="1h")}
+        gap_five = short_five[:50] + short_five[51:]
+        short_history = {"5m": gap_five, "15m": aggregate_candles(short_five, interval="15m"), "1h": aggregate_candles(short_five, interval="1h")}
         short_provider = RecordingProvider(
             ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             history_fetcher=lambda symbol, interval, *, days: short_history[interval],
@@ -602,7 +646,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
             )
 
         self.assertEqual(RefreshAttemptStatus.FAILED, first.attempt_status)
-        self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, first.datasets[("BTC-USDT-SWAP", "5m")].primary_reason)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, first.datasets[("BTC-USDT-SWAP", "5m")].primary_reason)
         self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
         self.assertEqual([], provider.incremental_calls)

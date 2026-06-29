@@ -110,6 +110,37 @@ class ManifestSchemaConsistencyTests(unittest.TestCase):
 
 
 class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
+    def test_strict_policy_uses_requested_intervals_for_freshness_when_base_is_validation_only(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy
+
+        context = _context_with_status("stale", attempt_status="degraded")
+        health_by_interval = {
+            "5m": _health("MU-USDT-SWAP", "5m", freshness=FreshnessState.STALE),
+            "15m": _health("MU-USDT-SWAP", "15m"),
+            "1h": _health("MU-USDT-SWAP", "1h"),
+        }
+
+        decision = research_strict_policy().decide(
+            context=context,
+            health_by_interval=health_by_interval,
+            required_intervals=("5m", "15m", "1h"),
+            freshness_intervals=("15m", "1h"),
+        )
+
+        self.assertTrue(decision.allowed)
+
+        requested_stale = dict(health_by_interval)
+        requested_stale["15m"] = _health("MU-USDT-SWAP", "15m", freshness=FreshnessState.STALE)
+        blocked = research_strict_policy().decide(
+            context=context,
+            health_by_interval=requested_stale,
+            required_intervals=("5m", "15m", "1h"),
+            freshness_intervals=("15m", "1h"),
+        )
+        self.assertFalse(blocked.allowed)
+        self.assertEqual(HealthReason.STALE_BY_CLOCK, blocked.reason)
+
     def test_strict_policies_block_unknown_freshness_with_non_ok_reason(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
         from mu_strategy.market_data.trusted_data.policy import (
@@ -346,7 +377,7 @@ def _health(symbol, interval, *, availability=None, integrity=None, freshness=No
     )
 
 
-def _context_with_status(status: str):
+def _context_with_status(status: str, *, attempt_status: str = "success"):
     from mu_strategy.market_data.trusted_data.contracts import (
         RefreshAttemptStatus,
         SnapshotUsability,
@@ -360,7 +391,7 @@ def _context_with_status(status: str):
         manifest=TrustedManifestSnapshot(
             schema_version=3,
             run_id=f"run-{status}",
-            attempt_status=RefreshAttemptStatus.SUCCESS,
+            attempt_status=RefreshAttemptStatus(attempt_status),
             snapshot_usability=SnapshotUsability(snapshot_usability),
             started_at_ms=0,
             completed_at_ms=0,

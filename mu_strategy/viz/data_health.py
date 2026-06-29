@@ -8,6 +8,8 @@ from typing import Any
 
 def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     rows = []
+    blocking = _blocking_issue_summary(manifest)
+    partial = _partial_coverage_summary(manifest)
     for symbol, payload in sorted((manifest.get("symbols") or {}).items()):
         source = payload.get("source")
         for interval, status in sorted((payload.get("intervals") or {}).items()):
@@ -67,6 +69,9 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     .badge {{ display: inline-flex; padding: 2px 8px; border-radius: 999px; font-weight: 650; }}
     .badge.ok {{ color: #0b7a5a; background: #dff3ea; }}
     .badge.bad {{ color: #b42318; background: #ffe2de; }}
+    .issue-list {{ margin: 0; padding-left: 18px; }}
+    .issue-list li {{ margin: 4px 0; }}
+    .hint {{ color: #63707a; font-size: 12px; }}
     section {{ overflow-x: auto; margin-top: 14px; }}
   </style>
 </head>
@@ -84,6 +89,14 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     {_metric("requested", requested or "-")}
     {_metric("effective", effective or "-")}
   </div>
+  <section>
+    <h2>Blocking issues</h2>
+    {blocking}
+  </section>
+  <section>
+    <h2>Partial coverage</h2>
+    {partial}
+  </section>
   <section>
     <h2>Warnings</h2>
     <ul>{warning_html}</ul>
@@ -132,6 +145,74 @@ def _state_label(status: dict[str, Any]) -> str:
     if not status.get("is_valid"):
         return "invalid"
     return "fresh"
+
+
+def _blocking_issue_summary(manifest: dict[str, Any]) -> str:
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for symbol, payload in sorted((manifest.get("symbols") or {}).items()):
+        for interval, status in sorted((payload.get("intervals") or {}).items()):
+            if not _is_blocking_status(status):
+                continue
+            reason = str(status.get("reason") or _reasons_text(status))
+            grouped.setdefault(symbol, {}).setdefault(reason, []).append(str(interval))
+    if not grouped:
+        return "<p>无</p>"
+    summary = f"<p>{len(grouped)} blocking symbol{'s' if len(grouped) != 1 else ''}</p>"
+    items: list[str] = []
+    for symbol, reasons in grouped.items():
+        reason_text = "; ".join(
+            f"{'/'.join(intervals)}: {reason}"
+            for reason, intervals in sorted(reasons.items())
+        )
+        hint = _blocking_hint(reasons)
+        hint_html = f'<div class="hint">{_e(hint)}</div>' if hint else ""
+        items.append(f"<li><strong>{_e(symbol)}</strong> {_e(reason_text)}{hint_html}</li>")
+    return summary + '<ul class="issue-list">' + "".join(items) + "</ul>"
+
+
+def _partial_coverage_summary(manifest: dict[str, Any]) -> str:
+    items: list[str] = []
+    for symbol, payload in sorted((manifest.get("symbols") or {}).items()):
+        for interval, status in sorted((payload.get("intervals") or {}).items()):
+            if status.get("coverage_state") != "partial_available_history":
+                continue
+            requested = _format_days(status.get("requested_days"))
+            effective = _format_days(status.get("effective_days"))
+            first = _format_time_ms(status.get("first_timestamp_ms"))
+            latest = _format_time_ms(status.get("last_timestamp_ms"))
+            items.append(
+                f"<li><strong>{_e(symbol)}</strong> {_e(interval)}: "
+                f"requested {_e(requested)}, effective {_e(effective)}, "
+                f"{_e(first)} to {_e(latest)}</li>"
+            )
+    if not items:
+        return "<p>无</p>"
+    return '<ul class="issue-list">' + "".join(items) + "</ul>"
+
+
+def _is_blocking_status(status: dict[str, Any]) -> bool:
+    availability = status.get("availability")
+    integrity = status.get("integrity")
+    freshness = status.get("freshness")
+    return availability == "missing" or integrity == "invalid" or freshness in {"stale", "unknown"}
+
+
+def _blocking_hint(reasons: dict[str, list[str]]) -> str | None:
+    if "ohlcv_mismatch" in reasons:
+        return "likely cause: zero-volume child candle OHLC policy mismatch"
+    return None
+
+
+def _format_days(value: Any) -> str:
+    try:
+        if value is None:
+            return "-"
+        number = float(value)
+        if number.is_integer():
+            return f"{int(number)}d"
+        return f"{number:.2f}d"
+    except Exception:
+        return str(value)
 
 
 def _reasons_text(status: dict[str, Any]) -> str:

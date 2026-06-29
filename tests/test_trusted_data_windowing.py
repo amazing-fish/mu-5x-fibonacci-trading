@@ -187,6 +187,70 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertEqual(HealthReason.MISSING_IN_BUILT, health.validation.reason)
         self.assertIn(DAY_MS + 2 * ONE_HOUR_MS, health.validation.missing_in_built)
 
+    def test_left_edge_incomplete_native_parent_is_clipped_before_validation(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        start_ms = ONE_HOUR_MS
+        base_start_ms = ONE_HOUR_MS + 15 * 60_000
+        five_end = DAY_MS + 55 * 60_000
+        complete_five = _five_minute_candles(start_ms, five_end)
+        base_five = [candle for candle in complete_five if candle.open_time_ms >= base_start_ms]
+        native_1h = aggregate_candles(complete_five, interval="1h")
+        history = {
+            (SYMBOL, "5m"): base_five,
+            (SYMBOL, "1h"): native_1h,
+        }
+
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), _Provider(_ticker_rows(SYMBOL), history=history)).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("1h",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=five_end,
+                )
+            )
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        health = run.datasets[(SYMBOL, "1h")]
+        self.assertTrue(health.validation.ok)
+        self.assertEqual((), health.validation.missing_in_built)
+
+    def test_right_edge_incomplete_native_parent_is_clipped_before_validation(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five_end = ONE_HOUR_MS + 35 * 60_000
+        complete_five = _five_minute_candles(0, ONE_HOUR_MS + 40 * 60_000)
+        base_five = [candle for candle in complete_five if candle.open_time_ms <= five_end]
+        native_15m = aggregate_candles(complete_five, interval="15m")
+        history = {
+            (SYMBOL, "5m"): base_five,
+            (SYMBOL, "15m"): native_15m,
+        }
+
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), _Provider(_ticker_rows(SYMBOL), history=history)).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=five_end,
+                )
+            )
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        health = run.datasets[(SYMBOL, "15m")]
+        self.assertTrue(health.validation.ok)
+        self.assertEqual((), health.validation.missing_in_built)
+
     def test_internal_missing_native_candle_still_fails_exact_validation(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest

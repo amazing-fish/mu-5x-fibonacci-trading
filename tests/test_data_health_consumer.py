@@ -65,6 +65,77 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertIn('<span class="badge bad">invalid</span>', html)
         self.assertNotIn('<span class="badge ok">fresh</span>', html)
 
+    def test_dashboard_shows_blocking_summary_before_interval_table(self):
+        from mu_strategy.viz.data_health import render_data_health_dashboard
+
+        html = render_data_health_dashboard(
+            {
+                "schema_version": 3,
+                "run_id": "run-blocking",
+                "attempt_status": "degraded",
+                "snapshot_usability": "invalid",
+                "updated_at_ms": 86_400_000,
+                "requested_intervals": ["15m", "1h"],
+                "effective_intervals": ["5m", "15m", "1h"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": {
+                    "META-USDT-SWAP": {
+                        "source": "stock_token",
+                        "intervals": {
+                            "15m": _status("META-USDT-SWAP", "15m", integrity="invalid", reason="ohlcv_mismatch"),
+                            "1h": _status("META-USDT-SWAP", "1h", integrity="invalid", reason="ohlcv_mismatch"),
+                        },
+                    }
+                },
+            }
+        )
+
+        self.assertIn("Blocking issues", html)
+        self.assertIn("1 blocking symbol", html)
+        self.assertIn("META-USDT-SWAP", html)
+        self.assertIn("15m/1h: ohlcv_mismatch", html)
+        self.assertIn("likely cause: zero-volume child candle OHLC policy mismatch", html)
+        self.assertLess(html.index("Blocking issues"), html.index("Intervals"))
+
+    def test_dashboard_shows_partial_coverage_summary_before_interval_table(self):
+        from mu_strategy.viz.data_health import render_data_health_dashboard
+
+        status = _status("MU-USDT-SWAP", "5m")
+        status.update(
+            {
+                "requested_days": 180,
+                "effective_days": 117.25,
+                "coverage_state": "partial_available_history",
+                "first_timestamp_ms": 1772608500000,
+                "last_timestamp_ms": 1782738600000,
+                "warnings": ["partial_available_history:requested_days=180:effective_days=117.25"],
+            }
+        )
+        html = render_data_health_dashboard(
+            {
+                "schema_version": 3,
+                "run_id": "run-partial",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
+                "updated_at_ms": 86_400_000,
+                "requested_intervals": ["5m"],
+                "effective_intervals": ["5m"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": {
+                    "MU-USDT-SWAP": {
+                        "source": "stock_token",
+                        "intervals": {"5m": status},
+                    }
+                },
+            }
+        )
+
+        self.assertIn("Partial coverage", html)
+        self.assertIn("MU-USDT-SWAP", html)
+        self.assertIn("requested 180d", html)
+        self.assertIn("effective 117.25d", html)
+        self.assertLess(html.index("Partial coverage"), html.index("Intervals"))
+
 
 class _Broker:
     def get_positions(self, *, inst_type=None, inst_id=None):
@@ -108,6 +179,31 @@ def _invalid_bundle(symbol: str) -> CandleBundle:
         days=1,
         statuses_by_interval=statuses,
     )
+
+
+def _status(
+    symbol: str,
+    interval: str,
+    *,
+    integrity: str = "valid",
+    freshness: str = "fresh",
+    reason: str = "ok",
+) -> dict:
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "availability": "available",
+        "integrity": integrity,
+        "freshness": freshness,
+        "reason": reason,
+        "reasons": [reason],
+        "rows": 1,
+        "first_timestamp_ms": 0,
+        "last_timestamp_ms": 0,
+        "updated_at_ms": 0,
+        "source_file": f"okx/{symbol}/{interval}.csv",
+        "warnings": [],
+    }
 
 
 def _entry(symbol: str) -> EntryScanResult:

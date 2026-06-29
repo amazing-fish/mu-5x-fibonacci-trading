@@ -19,6 +19,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
+    clip_parent_candles_to_complete_base_window,
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
@@ -279,11 +280,18 @@ def apply_built_native_validation(
         native_health = health_by_key.get(key)
         if native_health is None or not _has_validation_inputs(native_health, allow_timestamp_gap_inputs=allow_timestamp_gap_inputs):
             continue
-        report = validate_built_native_candles(
-            aggregate_candles(five, interval=interval),
-            candles_by_key.get(key) or [],
-            interval=interval,
-        )
+        try:
+            built = aggregate_candles(five, interval=interval, ohlc_policy="okx_native")
+        except ValueError as exc:
+            report = ValidationReport(False, HealthReason.OHLCV_INVALID, warnings=(str(exc),))
+        else:
+            built = clip_parent_candles_to_complete_base_window(built, base_candles=five, interval=interval)
+            native = clip_parent_candles_to_complete_base_window(candles_by_key.get(key) or [], base_candles=five, interval=interval)
+            report = validate_built_native_candles(
+                built,
+                native,
+                interval=interval,
+            )
         if report.ok and native_health.integrity != IntegrityState.VALID:
             continue
         health_by_key[key] = replace(
@@ -320,15 +328,14 @@ def apply_requested_coverage_gate(
             requested_days=days,
             window_end_time_ms=window_end_time_ms,
         )
-        if coverage.covered:
-            continue
+        warning = _coverage_warning(coverage)
         health_by_key[key] = replace(
             health,
-            integrity=IntegrityState.INVALID,
-            reasons=(HealthReason.INSUFFICIENT_COVERAGE,),
-            message=coverage.message,
+            requested_days=coverage.requested_days,
+            effective_days=coverage.effective_days,
+            coverage_state=coverage.coverage_state,
+            warnings=(*health.warnings, warning) if warning and warning not in health.warnings else health.warnings,
         )
-        candles_by_key[key] = []
 
 
 def make_dataset_health(
@@ -365,6 +372,12 @@ def make_dataset_health(
         warnings=warnings,
         content_sha256=content_sha256,
     )
+
+
+def _coverage_warning(coverage) -> str | None:
+    if coverage.coverage_state != "partial_available_history" or coverage.effective_days is None:
+        return None
+    return f"partial_available_history:requested_days={coverage.requested_days}:effective_days={coverage.effective_days:.2f}"
 
 
 def exception_failure(exc: Exception) -> dict[str, str]:

@@ -8,7 +8,7 @@ from mu_strategy.indicators import ema, macd, rsi
 from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import Candle
-from mu_strategy.reporting import render_markdown_report
+from mu_strategy.reporting import candle_sample_summary, render_markdown_report
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, one_hour_regime, selected_strategy_groups, with_fee_profile
 
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
@@ -81,7 +81,13 @@ def main() -> None:
     file_1h = bundle.files_by_interval["1h"]
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)
-    report = render_markdown_report(result, config=config, symbol=args.symbol, data_files=[file_15m, file_1h])
+    report = render_markdown_report(
+        result,
+        config=config,
+        symbol=args.symbol,
+        data_files=[file_15m, file_1h],
+        sample_summary=candle_sample_summary({"15m": candles_15m, "1h": candles_1h}),
+    )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")
     print(report)

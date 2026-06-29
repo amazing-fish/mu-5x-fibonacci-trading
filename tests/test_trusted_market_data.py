@@ -127,6 +127,50 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual("ok", result.reason)
 
+    def test_okx_native_parent_ignores_zero_volume_child_ohlc_but_preserves_volume(self):
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+        five = [
+            Candle(0, 555.33, 555.33, 555.33, 555.33, 0.0),
+            Candle(300_000, 555.00, 555.00, 555.00, 555.00, 0.16),
+            Candle(600_000, 555.00, 555.00, 555.00, 555.00, 0.28),
+        ]
+
+        standard = aggregate_candles(five, interval="15m")
+        okx_native = aggregate_candles(five, interval="15m", ohlc_policy="okx_native")
+
+        self.assertEqual(555.33, standard[0].open)
+        self.assertEqual(555.00, okx_native[0].open)
+        self.assertEqual(555.00, okx_native[0].high)
+        self.assertEqual(555.00, okx_native[0].low)
+        self.assertEqual(555.00, okx_native[0].close)
+        self.assertAlmostEqual(0.44, okx_native[0].volume)
+
+    def test_okx_native_parent_preserves_consistent_all_zero_no_trade_bucket(self):
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+        five = [
+            Candle(0, 100.0, 100.0, 100.0, 100.0, 0.0),
+            Candle(300_000, 100.0, 100.0, 100.0, 100.0, 0.0),
+            Candle(600_000, 100.0, 100.0, 100.0, 100.0, 0.0),
+        ]
+
+        result = aggregate_candles(five, interval="15m", ohlc_policy="okx_native")
+
+        self.assertEqual([Candle(0, 100.0, 100.0, 100.0, 100.0, 0.0)], result)
+
+    def test_okx_native_parent_rejects_inconsistent_all_zero_no_trade_bucket(self):
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+        five = [
+            Candle(0, 100.0, 100.0, 100.0, 100.0, 0.0),
+            Candle(300_000, 101.0, 101.0, 101.0, 101.0, 0.0),
+            Candle(600_000, 100.0, 100.0, 100.0, 100.0, 0.0),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "inconsistent all-zero"):
+            aggregate_candles(five, interval="15m", ohlc_policy="okx_native")
+
     def test_normalize_rejects_nan_ohlc_prices(self):
         for field in ("open", "high", "low", "close"):
             with self.subTest(field=field):

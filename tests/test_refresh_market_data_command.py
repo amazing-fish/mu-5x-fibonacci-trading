@@ -345,7 +345,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("failed", run_log[-1]["attempt_status"])
         self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
 
-    def test_success_invalid_short_coverage_one_shot_exits_non_zero_after_writing_artifacts(self):
+    def test_success_partial_history_one_shot_exits_zero_after_writing_artifacts(self):
         from mu_strategy.commands.refresh_market_data import main
         from mu_strategy.market_data.utils import DAY_MS
 
@@ -392,16 +392,20 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
             html_exists = html_path.exists()
 
         output = json.loads(stdout.getvalue())
-        self.assertNotEqual(0, exit_code)
-        self.assertEqual("failed", output["attempt_status"])
-        self.assertEqual("invalid", output["snapshot_usability"])
-        self.assertFalse(output["usable"])
-        self.assertEqual("publication_not_fully_healthy", output["reason"])
-        self.assertEqual("failed", manifest["attempt_status"])
-        self.assertEqual("invalid", manifest["snapshot_usability"])
-        self.assertEqual("insufficient_coverage", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
-        self.assertEqual("failed", run_log[-1]["attempt_status"])
-        self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
+        self.assertEqual(0, exit_code)
+        self.assertEqual("success", output["attempt_status"])
+        self.assertEqual("usable", output["snapshot_usability"])
+        self.assertTrue(output["usable"])
+        self.assertNotIn("reason", output)
+        self.assertEqual("success", manifest["attempt_status"])
+        self.assertEqual("usable", manifest["snapshot_usability"])
+        status = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
+        self.assertEqual("ok", status["reason"])
+        self.assertEqual("valid", status["integrity"])
+        self.assertEqual(14, status["requested_days"])
+        self.assertEqual("partial_available_history", status["coverage_state"])
+        self.assertEqual("success", run_log[-1]["attempt_status"])
+        self.assertEqual("usable", run_log[-1]["snapshot_usability"])
         self.assertTrue(html_exists)
 
     def test_loop_reports_cycle_failure_and_continues(self):

@@ -165,6 +165,7 @@ class LoadTrustedBundle:
             context=context,
             health_by_interval=health_by_interval,
             required_intervals=plan.effective_intervals,
+            freshness_intervals=plan.requested_intervals,
         )
         requested_candles = {
             interval: candles_by_interval.get(interval, [])

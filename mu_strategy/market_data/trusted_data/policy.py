@@ -66,13 +66,15 @@ class TrustPolicy:
         context: TrustedLoadContext,
         health_by_interval: dict[str, DatasetHealth],
         required_intervals: tuple[str, ...],
+        freshness_intervals: tuple[str, ...] | None = None,
     ) -> TrustDecision:
+        required_freshness_intervals = freshness_intervals or required_intervals
         if self.require_manifest_success:
             if context.manifest.attempt_status == RefreshAttemptStatus.FAILED:
                 return TrustDecision(False, HealthReason.RUN_FAILED)
             if context.manifest.snapshot_usability == SnapshotUsability.INVALID:
                 return TrustDecision(False, HealthReason.MANIFEST_INVALID)
-            if context.manifest.snapshot_usability == SnapshotUsability.STALE:
+            if context.manifest.snapshot_usability == SnapshotUsability.STALE and freshness_intervals is None:
                 return TrustDecision(False, HealthReason.MANIFEST_STALE)
         for interval in required_intervals:
             health = health_by_interval.get(interval)
@@ -82,6 +84,10 @@ class TrustPolicy:
                 return TrustDecision(False, health.primary_reason)
             if health.integrity != IntegrityState.VALID and not self.allow_invalid:
                 return TrustDecision(False, health.primary_reason)
+        for interval in required_freshness_intervals:
+            health = health_by_interval.get(interval)
+            if health is None:
+                return TrustDecision(False, HealthReason.CACHE_MISSING)
             if health.freshness != FreshnessState.FRESH and self.require_fresh:
                 return TrustDecision(False, _freshness_block_reason(health))
         return TrustDecision(True, HealthReason.OK)

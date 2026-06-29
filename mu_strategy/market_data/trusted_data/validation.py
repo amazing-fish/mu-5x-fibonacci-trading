@@ -67,12 +67,20 @@ def _is_finite_non_negative(value: float) -> bool:
     return math.isfinite(value) and value >= 0
 
 
-def aggregate_candles(candles: list[Candle], *, interval: str, base_interval: str = "5m") -> list[Candle]:
+def aggregate_candles(
+    candles: list[Candle],
+    *,
+    interval: str,
+    base_interval: str = "5m",
+    ohlc_policy: str = "standard",
+) -> list[Candle]:
     target_ms = interval_to_ms(interval)
     base_ms = interval_to_ms(base_interval)
     expected = target_ms // base_ms
     if expected <= 0 or target_ms % base_ms != 0:
         raise ValueError(f"{base_interval} cannot build {interval}")
+    if ohlc_policy not in {"standard", "okx_native"}:
+        raise ValueError(f"unsupported ohlc_policy: {ohlc_policy}")
     groups: dict[int, list[Candle]] = {}
     for candle in dedupe_candles(candles):
         bucket = candle.open_time_ms - (candle.open_time_ms % target_ms)
@@ -82,17 +90,71 @@ def aggregate_candles(candles: list[Candle], *, interval: str, base_interval: st
         rows = dedupe_candles(rows)
         if len(rows) != expected:
             continue
-        output.append(
-            Candle(
-                timestamp,
-                rows[0].open,
-                max(row.high for row in rows),
-                min(row.low for row in rows),
-                rows[-1].close,
-                sum(row.volume for row in rows),
-            )
-        )
+        output.append(_aggregate_parent(timestamp, rows, ohlc_policy=ohlc_policy))
     return output
+
+
+def _aggregate_parent(timestamp: int, rows: list[Candle], *, ohlc_policy: str) -> Candle:
+    volume = sum(row.volume for row in rows)
+    if ohlc_policy == "standard":
+        ohlc_rows = rows
+    else:
+        ohlc_rows = [row for row in rows if row.volume > 0]
+        if not ohlc_rows:
+            ohlc_values = {(row.open, row.high, row.low, row.close) for row in rows}
+            if len(ohlc_values) != 1:
+                raise ValueError(f"inconsistent all-zero no-trade bucket at {timestamp}")
+            ohlc_rows = rows
+    return Candle(
+        timestamp,
+        ohlc_rows[0].open,
+        max(row.high for row in ohlc_rows),
+        min(row.low for row in ohlc_rows),
+        ohlc_rows[-1].close,
+        volume,
+    )
+
+
+def complete_parent_window(
+    base_candles: list[Candle],
+    *,
+    interval: str,
+    base_interval: str = "5m",
+) -> tuple[int, int] | None:
+    ordered = dedupe_candles(base_candles)
+    if not ordered:
+        return None
+    target_ms = interval_to_ms(interval)
+    base_ms = interval_to_ms(base_interval)
+    if target_ms % base_ms != 0 or target_ms < base_ms:
+        raise ValueError(f"{base_interval} cannot build {interval}")
+    first = _ceil_to_interval(ordered[0].open_time_ms, target_ms)
+    last = _floor_to_interval(ordered[-1].open_time_ms - (target_ms - base_ms), target_ms)
+    if first > last:
+        return None
+    return first, last
+
+
+def clip_parent_candles_to_complete_base_window(
+    candles: list[Candle],
+    *,
+    base_candles: list[Candle],
+    interval: str,
+    base_interval: str = "5m",
+) -> list[Candle]:
+    window = complete_parent_window(base_candles, interval=interval, base_interval=base_interval)
+    if window is None:
+        return []
+    start_ms, end_ms = window
+    return [candle for candle in dedupe_candles(candles) if start_ms <= candle.open_time_ms <= end_ms]
+
+
+def _ceil_to_interval(timestamp_ms: int, interval_ms: int) -> int:
+    return timestamp_ms if timestamp_ms % interval_ms == 0 else timestamp_ms + (interval_ms - (timestamp_ms % interval_ms))
+
+
+def _floor_to_interval(timestamp_ms: int, interval_ms: int) -> int:
+    return timestamp_ms - (timestamp_ms % interval_ms)
 
 
 def validate_built_native_candles(

@@ -280,7 +280,7 @@ class DataTests(unittest.TestCase):
         )
         self.assertEqual([end_time_ms, short_start_ms], requested_after_values)
         self.assertFalse(coverage.covered)
-        self.assertIn("insufficient coverage", coverage.message)
+        self.assertIn("partial_available_history", coverage.message)
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:

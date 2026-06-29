@@ -19,6 +19,10 @@ class CoverageAssessment:
     covered: bool
     expected_start_ms: int | None
     actual_start_ms: int | None
+    actual_end_ms: int | None
+    requested_days: int
+    effective_days: float | None
+    coverage_state: str
     message: str | None
 
 
@@ -64,22 +68,35 @@ def assess_requested_coverage(
             covered=True,
             expected_start_ms=None,
             actual_start_ms=candles[0].open_time_ms if candles else None,
+            actual_end_ms=candles[-1].open_time_ms if candles else None,
+            requested_days=requested_days,
+            effective_days=None,
+            coverage_state="complete",
             message=None,
         )
     expected_start_ms = window_end_time_ms - (requested_days * DAY_MS)
     actual_start_ms = candles[0].open_time_ms
+    actual_end_ms = candles[-1].open_time_ms
     covered = actual_start_ms <= expected_start_ms + interval_to_ms(interval)
+    effective_days = max(0.0, (actual_end_ms - actual_start_ms) / DAY_MS)
+    coverage_state = "complete" if covered else "partial_available_history"
     message = None
     if not covered:
         message = (
-            "insufficient coverage: "
+            "partial_available_history:"
             f"requested_days={requested_days} "
+            f"effective_days={effective_days:.2f} "
             f"expected_start_ms={expected_start_ms} "
-            f"actual_start_ms={actual_start_ms}"
+            f"actual_start_ms={actual_start_ms} "
+            f"actual_end_ms={actual_end_ms}"
         )
     return CoverageAssessment(
         covered=covered,
         expected_start_ms=expected_start_ms,
         actual_start_ms=actual_start_ms,
+        actual_end_ms=actual_end_ms,
+        requested_days=requested_days,
+        effective_days=effective_days,
+        coverage_state=coverage_state,
         message=message,
     )

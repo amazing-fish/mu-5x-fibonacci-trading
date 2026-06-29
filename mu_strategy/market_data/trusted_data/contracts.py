@@ -168,6 +168,9 @@ class DatasetHealth:
     message: str | None = None
     warnings: tuple[str, ...] = ()
     content_sha256: str | None = None
+    requested_days: int | None = None
+    effective_days: float | None = None
+    coverage_state: str | None = None
 
     @property
     def is_usable(self) -> bool:
@@ -208,6 +211,9 @@ class DatasetHealth:
             "warnings": list(self.warnings),
             "content_sha256": self.content_sha256,
             "validation": self.validation.to_dict() if self.validation else None,
+            "requested_days": self.requested_days,
+            "effective_days": self.effective_days,
+            "coverage_state": self.coverage_state,
         }
 
     @classmethod
@@ -246,6 +252,9 @@ class DatasetHealth:
             message=payload.get("message"),
             warnings=tuple(str(value) for value in payload.get("warnings") or ()),
             content_sha256=str(payload["content_sha256"]) if payload.get("content_sha256") is not None else None,
+            requested_days=_optional_int(payload.get("requested_days")),
+            effective_days=_optional_float(payload.get("effective_days")),
+            coverage_state=str(payload["coverage_state"]) if payload.get("coverage_state") is not None else None,
         )
         if strict:
             _validate_dataset_health(health)
@@ -465,6 +474,12 @@ def _optional_int(value: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapshot:
