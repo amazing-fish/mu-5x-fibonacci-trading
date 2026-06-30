@@ -547,9 +547,10 @@ def _market_data_freshness_error(
 
 
 def _is_plain_legacy_bundle(bundle: Any) -> bool:
+    statuses = getattr(bundle, "statuses_by_interval", None)
     return (
         getattr(bundle, "trust_decision", None) is None
-        and not hasattr(bundle, "statuses_by_interval")
+        and not statuses
         and isinstance(getattr(bundle, "candles_by_interval", None), dict)
     )
 

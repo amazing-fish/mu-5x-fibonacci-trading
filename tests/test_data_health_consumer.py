@@ -1,6 +1,7 @@
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mu_strategy.demo_trading import DemoTradingConfig, run_once
 from mu_strategy.entry.scanner import EntryScanResult
@@ -12,6 +13,58 @@ from mu_strategy.models import Candle
 
 
 class DataHealthConsumerTests(unittest.TestCase):
+    def test_live_demo_scans_fresh_shared_bundle_with_empty_statuses_as_legacy(self):
+        scanned = []
+        bundle = _empty_status_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=900_000)
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_000):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=True,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=None,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(
+                    (symbol, len(candles_15m), len(candles_1h))
+                )
+                or _entry(symbol),
+            )
+
+        self.assertEqual([("BTC-USDT-SWAP", 1, 1)], scanned)
+        self.assertEqual([], result["data_errors"])
+        self.assertEqual("enter", result["scans"][0]["action"])
+        self.assertEqual("planned", result["orders"][0]["status"])
+
+    def test_live_demo_blocks_stale_shared_bundle_with_empty_statuses_by_legacy_age_fallback(self):
+        bundle = _empty_status_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_001):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=True,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=None,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail(
+                    "stale legacy data must not be scanned"
+                ),
+            )
+
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
+        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+        self.assertEqual("market_data_stale", result["scans"][0]["reason"])
+
     def test_live_demo_blocks_when_trusted_status_is_invalid(self):
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -178,6 +231,18 @@ def _invalid_bundle(symbol: str) -> CandleBundle:
         files_by_interval={},
         days=1,
         statuses_by_interval=statuses,
+    )
+
+
+def _empty_status_legacy_bundle(symbol: str, *, last_open_time_ms: int) -> CandleBundle:
+    return CandleBundle(
+        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
+        candles_by_interval={
+            "15m": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        },
+        files_by_interval={},
+        days=28,
     )
 
 
