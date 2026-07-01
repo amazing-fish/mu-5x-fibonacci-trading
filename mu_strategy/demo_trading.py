@@ -534,7 +534,8 @@ def _market_data_freshness_error(
         trust_error = trust_error_payload(symbol, bundle, requested_intervals=requested_intervals)
         if trust_error is not None:
             return trust_error
-    for interval, candles in bundle.candles_by_interval.items():
+    for interval in requested_intervals:
+        candles = bundle.candles_by_interval.get(interval) or []
         if not candles:
             return {
                 "symbol": symbol,

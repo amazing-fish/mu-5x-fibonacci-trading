@@ -65,6 +65,94 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertEqual("skip", result["scans"][0]["action"])
         self.assertEqual("market_data_stale", result["scans"][0]["reason"])
 
+    def test_live_demo_blocks_legacy_bundle_missing_requested_1h_before_scanning(self):
+        bundle = _legacy_bundle_with_intervals(
+            "BTC-USDT-SWAP",
+            candles_by_interval={
+                "15m": [_fresh_candle()],
+            },
+        )
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_000):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=True,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=None,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail(
+                    "missing requested 1h data must not be scanned"
+                ),
+            )
+
+        self.assertEqual("market_data_missing", result["data_errors"][0]["reason"])
+        self.assertEqual("1h", result["data_errors"][0]["interval"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+
+    def test_live_demo_blocks_legacy_bundle_missing_requested_15m_before_scanning(self):
+        bundle = _legacy_bundle_with_intervals(
+            "BTC-USDT-SWAP",
+            candles_by_interval={
+                "1h": [_fresh_candle()],
+            },
+        )
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_000):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=True,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=None,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail(
+                    "missing requested 15m data must not be scanned"
+                ),
+            )
+
+        self.assertEqual("market_data_missing", result["data_errors"][0]["reason"])
+        self.assertEqual("15m", result["data_errors"][0]["interval"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+
+    def test_live_demo_blocks_empty_requested_interval_before_scanning(self):
+        bundle = _legacy_bundle_with_intervals(
+            "BTC-USDT-SWAP",
+            candles_by_interval={
+                "15m": [_fresh_candle()],
+                "1h": [],
+            },
+        )
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_000):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=True,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=None,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail(
+                    "empty requested 1h data must not be scanned"
+                ),
+            )
+
+        self.assertEqual("market_data_missing", result["data_errors"][0]["reason"])
+        self.assertEqual("1h", result["data_errors"][0]["interval"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+
     def test_live_demo_blocks_when_trusted_status_is_invalid(self):
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -244,6 +332,21 @@ def _empty_status_legacy_bundle(symbol: str, *, last_open_time_ms: int) -> Candl
         files_by_interval={},
         days=28,
     )
+
+
+def _legacy_bundle_with_intervals(symbol: str, *, candles_by_interval: dict[str, list[Candle]]) -> CandleBundle:
+    return CandleBundle(
+        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
+        candles_by_interval=candles_by_interval,
+        files_by_interval={},
+        days=28,
+        statuses_by_interval={},
+        trust_decision=None,
+    )
+
+
+def _fresh_candle() -> Candle:
+    return Candle(900_000, 100.0, 101.0, 99.0, 100.0, 1000.0)
 
 
 def _status(
