@@ -37,6 +37,20 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("- stop transition bars: 8", report)
         self.assertIn("- stop transition curve: slow_start", report)
 
+    def test_markdown_report_discloses_actual_sample_length_when_provided(self):
+        config = with_fee_profile(StrategyConfig(), "market")
+
+        report = render_markdown_report(
+            BacktestResult(10_000, 10_000, [], []),
+            config=config,
+            symbol="MU-USDT-SWAP",
+            data_files=[],
+            sample_summary=["15m actual sample: 117d 1h", "1h actual sample: 117d 1h"],
+        )
+
+        self.assertIn("- 15m actual sample: 117d 1h", report)
+        self.assertIn("- 1h actual sample: 117d 1h", report)
+
 
 if __name__ == "__main__":
     unittest.main()

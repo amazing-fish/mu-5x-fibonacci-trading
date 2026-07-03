@@ -150,6 +150,88 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual([], output["watchlist_symbols"])
         self.assertEqual(1, output["limit"])
 
+    def test_run_once_limit_zero_skips_universe_provider_and_scans_watchlist_only(self):
+        scanned = []
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=("MU-USDT-SWAP", "MU-USDT-SWAP")),
+            broker=None,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol)
+            or _scan_result(symbol, action="wait", trigger_price=None),
+        )
+
+        self.assertEqual(["MU-USDT-SWAP"], scanned)
+        self.assertEqual(["MU-USDT-SWAP"], [row["inst_id"] for row in result["universe"]])
+        self.assertEqual(["watchlist"], [row["source"] for row in result["universe"]])
+        self.assertEqual([], result["orders"])
+
+    def test_run_once_limit_zero_without_watchlist_skips_loader_scanner_and_orders(self):
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=()),
+            broker=None,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: self.fail("empty universe must not load candles"),
+            scanner=lambda *args, **kwargs: self.fail("empty universe must not scan"),
+        )
+
+        self.assertEqual("dry_run", result["mode"])
+        self.assertEqual([], result["universe"])
+        self.assertEqual([], result["scans"])
+        self.assertEqual([], result["orders"])
+
+    def test_run_once_confirmed_limit_zero_orders_only_watchlist(self):
+        broker = StubBroker()
+        scanned = []
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=False, notional_usdt=10.0, watchlist_symbols=("MU-USDT-SWAP",)),
+            broker=broker,
+            universe_provider=lambda limit: self.fail("limit=0 must not call universe provider"),
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: scanned.append(symbol)
+            or _entry(symbol, trigger_price=100.19),
+        )
+
+        self.assertEqual(["MU-USDT-SWAP"], scanned)
+        self.assertEqual(["MU-USDT-SWAP"], [row["inst_id"] for row in result["universe"]])
+        self.assertEqual(["MU-USDT-SWAP"], [row["symbol"] for row in result["orders"]])
+        self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
+
+    def test_run_once_rejects_negative_universe_limit(self):
+        with self.assertRaisesRegex(ValueError, "universe_limit must be non-negative"):
+            DemoTradingConfig(universe_limit=-1)
+
+    def test_cli_rejects_negative_limit_before_runner(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                main(
+                    ["--once", "--dry-run", "--limit", "-1"],
+                    stdout=io.StringIO(),
+                    runner=lambda config, broker: self.fail("runner must not run"),
+                )
+
+        self.assertNotEqual(0, raised.exception.code)
+        self.assertIn("non-negative", stderr.getvalue())
+
+    def test_cli_rejects_refresh_before_runner_or_broker(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        with patch("mu_strategy.commands.okx_demo_loop.OKXRestClient", side_effect=AssertionError("broker")):
+            with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    main(
+                        ["--once", "--dry-run", "--refresh"],
+                        stdout=io.StringIO(),
+                        runner=lambda config, broker: self.fail("runner must not run"),
+                    )
+
+        self.assertNotEqual(0, raised.exception.code)
+        self.assertIn("refresh_market_data", stderr.getvalue())
+
     def test_run_once_blocks_when_open_exposure_limit_is_reached(self):
         class FullBroker(StubBroker):
             def get_positions(self, *, inst_type=None, inst_id=None):
@@ -220,26 +302,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_signal_is_no_longer_active(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -262,31 +325,12 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_orders_before_enforcing_capacity(self):
-        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
-
-        class StaleLaterOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "SOL-USDT-SWAP",
-                            "ordId": "OLD-SOL",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
+        broker, stale_client_order_id = _broker_with_open_bot_order("SOL-USDT-SWAP", order_id="OLD-SOL")
 
         def scanner(symbol, candles_15m, candles_1h, **kwargs):
             if symbol == "BTC-USDT-SWAP":
                 return _entry(symbol, trigger_price=100.19)
             return _scan_result(symbol, action="wait", trigger_price=None)
-
-        broker = StaleLaterOrderBroker()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=1, notional_usdt=10.0),
@@ -304,31 +348,12 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_does_not_reenter_off_universe_stale_order_symbol(self):
-        stale_client_order_id = generate_client_order_id("SOL-USDT-SWAP", 1, 100.0)
-
-        class OffUniverseStaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "SOL-USDT-SWAP",
-                            "ordId": "OLD-SOL",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
+        broker, stale_client_order_id = _broker_with_open_bot_order("SOL-USDT-SWAP", order_id="OLD-SOL")
 
         def scanner(symbol, candles_15m, candles_1h, **kwargs):
             if symbol == "SOL-USDT-SWAP":
                 return _entry(symbol, trigger_price=100.19)
             return _scan_result(symbol, action="wait", trigger_price=None)
-
-        broker = OffUniverseStaleOrderBroker()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3, notional_usdt=10.0),
@@ -358,33 +383,41 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
         self.assertEqual("BTC-USDT-SWAP", result["data_errors"][0]["symbol"])
         self.assertEqual("skip", result["scans"][0]["action"])
-        self.assertEqual("market_data_stale", result["scans"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["scans"][0]["reason"])
+        self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
+
+    def test_run_once_blocks_plain_legacy_bundle_when_candles_are_stale(self):
+        broker = StubBroker()
+        stale_bundle = _plain_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)
+
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_001):
+            result = run_once(
+                DemoTradingConfig(
+                    universe_limit=1,
+                    dry_run=False,
+                    max_open_positions=3,
+                    max_candle_staleness_bars=1,
+                    watchlist_symbols=(),
+                ),
+                broker=broker,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                candle_loader=lambda symbol, **kwargs: stale_bundle,
+                scanner=lambda symbol, candles_15m, candles_1h, **kwargs: self.fail("stale legacy data must not be scanned"),
+            )
+
+        self.assertEqual("live_demo", result["mode"])
+        self.assertEqual([], result["orders"])
+        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
+        self.assertEqual("15m", result["data_errors"][0]["interval"])
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_market_data_is_stale(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         result = run_once(
             DemoTradingConfig(universe_limit=1, dry_run=False, max_open_positions=3),
@@ -396,34 +429,16 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual("live_demo", result["mode"])
         self.assertEqual([], result["orders"])
-        self.assertEqual("market_data_stale", result["data_errors"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["data_errors"][0]["reason"])
+        self.assertEqual("stale_by_clock", result["data_errors"][0]["status_reason"])
         self.assertEqual("expired", result["expired_orders"][0]["status"])
-        self.assertEqual("market_data_stale", result["expired_orders"][0]["reason"])
+        self.assertEqual("market_data_invalid", result["expired_orders"][0]["reason"])
         self.assertEqual(stale_client_order_id, result["expired_orders"][0]["client_order_id"])
         self.assertIn(("cancel_order", "BTC-USDT-SWAP", "OLD1", stale_client_order_id, True), broker.calls)
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_candle_loader_fails(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         def failing_loader(symbol, **kwargs):
             raise RuntimeError("fetch timeout")
@@ -449,26 +464,7 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertNotIn("place_limit_buy", [call[0] for call in broker.calls])
 
     def test_run_once_expires_stale_bot_limit_order_when_universe_provider_fails(self):
-        stale_client_order_id = generate_client_order_id("BTC-USDT-SWAP", 1, 100.0)
-
-        class StaleOrderBroker(StubBroker):
-            def get_open_orders(self, *, inst_type=None, inst_id=None):
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "instId": "BTC-USDT-SWAP",
-                            "ordId": "OLD1",
-                            "clOrdId": stale_client_order_id,
-                            "ordType": "limit",
-                            "side": "buy",
-                            "state": "live",
-                        }
-                    ],
-                    "msg": "",
-                }
-
-        broker = StaleOrderBroker()
+        broker, stale_client_order_id = _broker_with_open_bot_order()
 
         def failing_universe_provider(*, limit):
             raise RuntimeError("ticker timeout")
@@ -869,6 +865,8 @@ class OKXDemoLoopTests(unittest.TestCase):
 
 
 def _bundle(symbol: str) -> CandleBundle:
+    from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
     last_open_time_ms = int(time.time() * 1000) - 900_000
     first_open_time_ms = last_open_time_ms - (39 * 900_000)
     candles = [
@@ -880,10 +878,28 @@ def _bundle(symbol: str) -> CandleBundle:
         candles_by_interval={"15m": candles, "1h": candles},
         files_by_interval={},
         days=28,
+        trust_decision=TrustDecision(True, HealthReason.OK),
     )
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:
+    from mu_strategy.market_data.trusted import DataStatus
+
+    statuses = {
+        interval: DataStatus(
+            symbol=symbol,
+            interval=interval,
+            rows=1,
+            first_timestamp_ms=0,
+            last_timestamp_ms=0,
+            updated_at_ms=0,
+            source_file=Path(f"{interval}.csv"),
+            is_valid=True,
+            is_stale=True,
+            reason="stale_by_clock",
+        )
+        for interval in ("5m", "15m", "1h")
+    }
     return CandleBundle(
         symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
         candles_by_interval={
@@ -892,7 +908,39 @@ def _stale_bundle(symbol: str) -> CandleBundle:
         },
         files_by_interval={},
         days=28,
+        statuses_by_interval=statuses,
     )
+
+
+def _legacy_bundle(symbol: str, *, last_open_time_ms: int) -> CandleBundle:
+    return CandleBundle(
+        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
+        candles_by_interval={
+            "15m": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        },
+        files_by_interval={},
+        days=28,
+    )
+
+
+class _PlainLegacyBundle:
+    def __init__(self, symbol: str, *, last_open_time_ms: int):
+        self.symbol = ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx")
+        self.candles_by_interval = {
+            "15m": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+            "1h": [Candle(last_open_time_ms, 100.0, 101.0, 99.0, 100.0, 1000.0)],
+        }
+        self.files_by_interval = {}
+        self.days = 28
+        self.run_id = None
+        self.universe_snapshot = None
+        self.load_context = None
+        self.observed_at_ms = None
+
+
+def _plain_legacy_bundle(symbol: str, *, last_open_time_ms: int) -> _PlainLegacyBundle:
+    return _PlainLegacyBundle(symbol, last_open_time_ms=last_open_time_ms)
 
 
 def _entry(symbol: str, trigger_price: float = 100.0) -> EntryScanResult:
@@ -915,6 +963,29 @@ def _scan_result(symbol: str, *, action: str, trigger_price: float = 100.0) -> E
         initial_stop=98.0,
         signal_time_ms=123,
     )
+
+
+def _broker_with_open_bot_order(symbol: str = "BTC-USDT-SWAP", *, order_id: str = "OLD1"):
+    client_order_id = generate_client_order_id(symbol, 1, 100.0)
+
+    class OpenOrderBroker(StubBroker):
+        def get_open_orders(self, *, inst_type=None, inst_id=None):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": symbol,
+                        "ordId": order_id,
+                        "clOrdId": client_order_id,
+                        "ordType": "limit",
+                        "side": "buy",
+                        "state": "live",
+                    }
+                ],
+                "msg": "",
+            }
+
+    return OpenOrderBroker(), client_order_id
 
 
 if __name__ == "__main__":

@@ -8,12 +8,15 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
-from mu_strategy.data import cached_historical
+from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import selected_strategy_groups
+
+TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 def main() -> None:
@@ -21,8 +24,17 @@ def main() -> None:
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
     parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh legacy cached_historical data. Not supported with --trusted-data; run python -m mu_strategy.commands.refresh_market_data first.",
+    )
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument(
+        "--trusted-data",
+        action="store_true",
+        help="Use the trusted OKX cache-only data layer instead of legacy cached_historical.",
+    )
     parser.add_argument("--output", type=Path, default=Path("reports/mu_okx_baseline_backtest.html"))
     parser.add_argument("--chart-interval", choices=("15m", "1h"), default="1h")
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to visualize.")
@@ -33,6 +45,11 @@ def main() -> None:
         help="Backtest cost assumption: market/taker=0.0500%%, limit/maker=0.0200%%.",
     )
     args = parser.parse_args()
+    if args.trusted_data and args.refresh:
+        parser.error(
+            "--trusted-data --refresh is not supported; run "
+            "python -m mu_strategy.commands.refresh_market_data before loading trusted data"
+        )
 
     try:
         groups = selected_strategy_groups(args.symbol, [args.strategy])
@@ -42,22 +59,35 @@ def main() -> None:
         parser.error("--strategy must resolve to exactly one strategy group")
     group = groups[0]
     config = with_fee_profile(group.config, args.fee_profile)
-    candles_15m, _ = cached_historical(
-        args.symbol,
-        "15m",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
-    candles_1h, _ = cached_historical(
-        args.symbol,
-        "1h",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
+    data_dir = args.data_dir
+    if data_dir is None:
+        data_dir = Path("data/live") if args.trusted_data else Path("data")
+    data_source_note = None
+    if args.trusted_data:
+        bundle = refresh_trusted_candle_bundle(
+            args.symbol,
+            intervals=TRUSTED_REQUESTED_INTERVALS,
+            days=args.days,
+            data_dir=data_dir,
+            refresh=False,
+        )
+        status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+        if status_error:
+            parser.error(status_error)
+        candles_15m = bundle.candles_by_interval["15m"]
+        candles_1h = bundle.candles_by_interval["1h"]
+        data_source_note = "trusted OKX data layer (CSV + TrustDecision gate)"
+    else:
+        bundle = refresh_candle_bundle(
+            args.symbol,
+            intervals=("15m", "1h"),
+            days=args.days,
+            data_dir=data_dir,
+            refresh=args.refresh,
+            source=args.source,
+        )
+        candles_15m = bundle.candles_by_interval["15m"]
+        candles_1h = bundle.candles_by_interval["1h"]
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)
     chart_candles = candles_1h if args.chart_interval == "1h" else candles_15m
@@ -70,6 +100,7 @@ def main() -> None:
         strategy_name=group.name,
         strategy_label=group.label,
         strategy_components=group.components,
+        data_source_note=data_source_note,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_text, encoding="utf-8")
@@ -86,6 +117,7 @@ def render_html_visualization(
     strategy_name: str | None = None,
     strategy_label: str | None = None,
     strategy_components: StrategyComponents | None = None,
+    data_source_note: str | None = None,
 ) -> str:
     interval_label = "1h" if chart_interval == "1h" else "15m"
     strategy_title = f" {html.escape(strategy_name)}" if strategy_name else ""
@@ -98,6 +130,7 @@ def render_html_visualization(
         if escaped_label:
             strategy_note += f"（{escaped_label}）"
         strategy_note += "。"
+    source_note = f"数据来源：{html.escape(data_source_note)}。" if data_source_note else ""
     chart_data = _plotly_data(candles, result)
     trade_table = _trade_table(result.trades)
     detail_section = _strategy_detail_section(
@@ -295,7 +328,7 @@ def render_html_visualization(
 <body>
 <main>
   <h1>{title}</h1>
-  <div class="subtitle">{strategy_note}当前规则：1h 结构过滤、15m Fibonacci 回踩确认、5x 金字塔加仓、美股现金盘窗口。K线展示周期：{interval_label}。</div>
+  <div class="subtitle">{strategy_note}{source_note}当前规则：1h 结构过滤、15m Fibonacci 回踩确认、5x 金字塔加仓、美股现金盘窗口。K线展示周期：{interval_label}。</div>
   <div class="cards">
     {_metric_card("总收益", f"{result.total_return_pct:.2%}")}
     {_metric_card("最大回撤", f"{result.max_drawdown_pct:.2%}")}

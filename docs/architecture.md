@@ -11,7 +11,15 @@ Package: `mu_strategy.market_data`
 - `cache.py`: CSV cache paths, reads/writes, incremental merge, and lookback pruning.
 - `symbols.py`: OKX swap symbol normalization and aliases.
 - `universe.py`: dynamic OKX Top USDT-SWAP universe selection.
-- `service.py`: callable `15m/1h` candle bundle refresh for scanners and applications.
+- `trusted_data/contracts.py`: dataclass/Enum contracts for dataset health, validation reports, refresh runs, trust decisions, trusted bundles, and universe snapshots.
+- `trusted_data/evaluate.py`: shared publication health classification plus refresh/load candle evaluation for windowing, normalization, freshness, built/native validation, and requested-days coverage.
+- `trusted_data/policy.py`: interval dependency planning, freshness policy, and trading/research/observe trust policies.
+- `trusted_data/validation.py`: in-memory candle normalization plus `5m -> 15m/1h` built/native validation.
+- `trusted_data/store.py`: CSV, JSON manifest, and JSONL run-log repository with atomic per-file writes.
+- `trusted_data/refresh.py`: the canonical trusted refresh use case; it owns OKX provider calls, ticker universe fetch, CSV writes, manifest writes, and run-log appends.
+- `trusted_data/load.py`: the only trusted cache-only load use case; it never accesses the network and never writes CSV, manifest, or run-log files.
+- `trusted.py`: compatibility facade for old public imports; implementation delegates to `trusted_data`.
+- `service.py`: thin application facade that adapts legacy `CandleBundle` callers to `trusted_data` refresh/load use cases.
 
 Rules:
 
@@ -20,6 +28,18 @@ Rules:
 - Existing OKX caches are incrementally updated and pruned to the requested `days` window.
 - Adjacent candle continuity is gated by `previous close -> next open`; gaps above 2% raise `DataQualityError`.
 - If an incremental OKX refresh fails, existing cached data is still usable.
+- `data/live/current.json` is the atomic pointer to the current trusted generation. Each generation lives under `data/live/generations/<run_id>/` with its schema v3 manifest and matching canonical CSV set. The global refresh command/use case is the only writer for the current pointer and generation directories.
+- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo are cache-only consumers.
+- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. `--trusted-data --refresh` is rejected; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli --trusted-data`, `python -m mu_strategy.visualize --trusted-data`, or `python -m mu_strategy.commands.okx_demo_loop`.
+- The old per-symbol refresh APIs have been removed. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical generation.
+- Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
+- Manifest schema v3 records `run_id`, `attempt_status` (`RefreshAttemptStatus`), `snapshot_usability` (`SnapshotUsability`), requested/effective intervals, universe snapshot, provider failures, warnings, cycle-level error, and dataset health for every `symbol/interval`.
+- `RefreshAttemptStatus` is refresh-attempt health (`success`, `degraded`, `failed`). Zero usable datasets always classify the attempt as `failed`, regardless of whether the cause was provider failure, cache read failure, validation failure, requested-days coverage, or content hash mismatch.
+- `SnapshotUsability` is published snapshot health (`usable`, `stale`, `invalid`) derived from DatasetHealth availability/integrity/freshness. Zero usable snapshots fail closed to `invalid`; mixed usable/unusable snapshots keep the stricter derived dataset state.
+- Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, content hash, and validation report.
+- Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
+- Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
+- Missing or malformed manifest is fail-closed for trading strict policy. Legacy flat `data/live/manifest.json` formats are accepted only when refresh explicitly opts into migration compatibility and no `current.json` exists. Generation consumers always read schema v3 strictly, even if a caller passes `compatibility_mode=True`.
 
 ## Strategies
 
@@ -107,8 +127,8 @@ Package: `mu_strategy.demo_trading`
 
 This is the five-minute demo automation layer. It consumes the fixed research baseline and application services:
 
-1. Dynamic OKX Top USDT-SWAP universe plus fixed watchlist symbols; `MU-USDT-SWAP` is included by default.
-2. `15m/1h` candle bundle refresh.
+1. Trusted manifest universe snapshot plus fixed watchlist symbols; `MU-USDT-SWAP` is included by default.
+2. Cache-only trusted `15m/1h` candle bundle load with `5m` dependency validation.
 3. `entry.scan_entry` result.
 4. Open exposure risk cap.
 5. Stable alphanumeric `clOrdId` for idempotency.
@@ -119,6 +139,7 @@ Defaults:
 - `10 USDT` notional per order.
 - Maximum `3` open orders/positions.
 - Dry-run unless `--confirm-demo-orders` is supplied.
+- `data/live` trusted data directory.
 - `300` second loop interval in `python -m mu_strategy.commands.okx_demo_loop`.
 - Optional `--dashboard-output` writes an auto-refreshing local HTML dashboard after each scan cycle.
 
@@ -127,6 +148,9 @@ Boundaries:
 - The demo layer cannot tune strategy parameters during execution.
 - The broker adapter only executes the fixed plan; it does not own signal logic.
 - Missing credentials are acceptable in dry-run and fail before order submission in confirmed mode.
+- Dry-run and confirmed demo use the same trusted gate. Invalid, stale, missing, malformed, or failed-run trusted data blocks scanner calls and order generation.
+- A scan cycle carries the trusted `run_id` from the loaded manifest into scan payloads when available.
+- Dynamic universe limit semantics are explicit: in the default trusted-manifest mode, `limit > 0` returns up to that many crypto universe symbols plus up to that many stock-token universe symbols, `limit == 0` means watchlist-only, and `limit < 0` is rejected.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, or risk kill-switches.
 - If no `planned` order exists, the dashboard explicitly reports no order suggestion and no cancel target.
 
@@ -137,6 +161,8 @@ Package: `mu_strategy.viz`
 `viz.backtest` renders the interactive Plotly backtest dashboard. The top-level `mu_strategy.visualize` module remains a compatibility wrapper.
 
 `viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload.
+
+`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest. Row badges are derived from availability/integrity/freshness together: missing or invalid integrity is invalid, stale freshness is stale, and only available+valid+fresh is ok.
 
 ## Compatibility Wrappers
 
