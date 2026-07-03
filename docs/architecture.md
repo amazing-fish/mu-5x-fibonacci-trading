@@ -30,7 +30,7 @@ Rules:
 - If an incremental OKX refresh fails, existing cached data is still usable.
 - `data/live/current.json` is the atomic pointer to the current trusted generation. Each generation lives under `data/live/generations/<run_id>/` with its schema v3 manifest and matching canonical CSV set. The global refresh command/use case is the only writer for the current pointer and generation directories.
 - Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo are cache-only consumers.
-- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. `--trusted-data --refresh` is rejected; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli --trusted-data`, `python -m mu_strategy.visualize --trusted-data`, or `python -m mu_strategy.commands.okx_demo_loop`.
+- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest and visualization default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, or `python -m mu_strategy.commands.okx_demo_loop`.
 - The old per-symbol refresh APIs have been removed. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical generation.
 - Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
 - Manifest schema v3 records `run_id`, `attempt_status` (`RefreshAttemptStatus`), `snapshot_usability` (`SnapshotUsability`), requested/effective intervals, universe snapshot, provider failures, warnings, cycle-level error, and dataset health for every `symbol/interval`.
@@ -166,11 +166,13 @@ Package: `mu_strategy.viz`
 
 ## Compatibility Wrappers
 
-These old entry points remain valid during migration:
+These compatibility entry points remain valid during migration:
 
 - `mu_strategy.data`
 - `mu_strategy.strategy`
 - `mu_strategy.walk_forward`
 - `mu_strategy.visualize`
 - `mu_strategy.cli`
+
+`mu_strategy.cli` and `mu_strategy.visualize` are compatibility entry points by import path only; their market-data behavior is the current trusted cache-only contract.
 
