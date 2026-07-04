@@ -5,19 +5,24 @@
 - leverage: 5.0x
 - margin steps: 20%, 20%, 20%, 40%
 - initial stop: 2.00%
+- stop tightening: baseline
+- stop transition bars: 8
+- stop transition curve: linear
 - fee profile: market/taker (市价/吃单)
 - fee rate: 0.0500%
-- data files: data\OKX_MU-USDT-SWAP_15m_180d.csv, data\OKX_MU-USDT-SWAP_1h_180d.csv
+- data files: data\live\generations\eba2ee5416a84070a1d7faf6eb68d698\okx\MU-USDT-SWAP\15m.csv, data\live\generations\eba2ee5416a84070a1d7faf6eb68d698\okx\MU-USDT-SWAP\1h.csv
+- 15m actual sample: 122d 8h (11744 rows)
+- 1h actual sample: 122d 8h (2936 rows)
 
 ## Metrics
 
 - starting equity: 10000.00
-- ending equity: 47401.19
-- total return: 374.01%
+- ending equity: 47681.19
+- total return: 376.81%
 - max drawdown: -19.48%
-- trades: 32
-- win rate: 37.50%
-- profit factor: 5.42
+- trades: 37
+- win rate: 37.84%
+- profit factor: 4.25
 
 ## Trades
 
@@ -54,6 +59,11 @@
 | 2026-06-09T19:45:00+00:00 | 2026-06-10T14:45:00+00:00 | 925.24 | 925.24 | 3 | -0.85% | stop |
 | 2026-06-11T14:15:00+00:00 | 2026-06-12T01:15:00+00:00 | 951.78 | 995.26 | 4 | 62.94% | stop |
 | 2026-06-12T14:45:00+00:00 | 2026-06-15T19:45:00+00:00 | 1031.47 | 1079.59 | 4 | 78.68% | stop |
-| 2026-06-17T19:30:00+00:00 | 2026-06-18T14:45:00+00:00 | 1101.94 | 1129.33 | 4 | 50.49% | end_of_data |
+| 2026-06-17T19:30:00+00:00 | 2026-06-18T19:45:00+00:00 | 1101.94 | 1138.82 | 4 | 68.72% | stop |
+| 2026-06-19T14:00:00+00:00 | 2026-06-22T15:30:00+00:00 | 1171.23 | 1178.64 | 4 | 13.10% | stop |
+| 2026-06-25T18:45:00+00:00 | 2026-06-25T19:15:00+00:00 | 1224.56 | 1200.07 | 1 | -10.61% | stop |
+| 2026-06-30T14:00:00+00:00 | 2026-07-01T06:30:00+00:00 | 1150.63 | 1127.62 | 1 | -10.38% | stop |
+| 2026-07-02T14:00:00+00:00 | 2026-07-02T14:15:00+00:00 | 1054.04 | 1032.96 | 1 | -10.17% | stop |
+| 2026-07-03T14:30:00+00:00 | 2026-07-04T15:00:00+00:00 | 1023.60 | 1030.31 | 1 | 2.63% | end_of_data |
 
 This report is a research artifact, not financial advice.

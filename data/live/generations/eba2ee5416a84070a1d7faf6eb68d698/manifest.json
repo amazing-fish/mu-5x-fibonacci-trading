@@ -1,0 +1,157 @@
+{
+  "attempt_status": "success",
+  "completed_at_ms": 1783178385768,
+  "cycle_error": null,
+  "effective_intervals": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "intervals": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "provider_failures": [],
+  "requested_intervals": [
+    "15m",
+    "1h"
+  ],
+  "run_id": "eba2ee5416a84070a1d7faf6eb68d698",
+  "schema_version": 3,
+  "snapshot_usability": "usable",
+  "started_at_ms": 1783178382034,
+  "symbols": {
+    "MU-USDT-SWAP": {
+      "intervals": {
+        "15m": {
+          "availability": "available",
+          "content_sha256": "4023dcab6cfdb036387f2fded278274b34a7939a082faba20f9b530fdbba0c56",
+          "coverage_state": "partial_available_history",
+          "effective_days": 122.32291666666667,
+          "error_type": null,
+          "first_timestamp_ms": 1772608500000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "15m",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1783177200000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 11744,
+          "source_file": "okx/MU-USDT-SWAP/15m.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1783178385168,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=122.32"
+          ]
+        },
+        "1h": {
+          "availability": "available",
+          "content_sha256": "cc3f7c3cf5954bdee248ca32feeb5c9e28769b4879d19f478e91a5552173ce21",
+          "coverage_state": "partial_available_history",
+          "effective_days": 122.29166666666667,
+          "error_type": null,
+          "first_timestamp_ms": 1772607600000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "1h",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1783173600000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 2936,
+          "source_file": "okx/MU-USDT-SWAP/1h.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1783178385168,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=122.29"
+          ]
+        },
+        "5m": {
+          "availability": "available",
+          "content_sha256": "e26cb4db2146e2658357566fd814a389279e2ac8e1227dd866ac6536441f4206",
+          "coverage_state": "partial_available_history",
+          "effective_days": 122.32986111111111,
+          "error_type": null,
+          "first_timestamp_ms": 1772608500000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "5m",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1783177800000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 35232,
+          "source_file": "okx/MU-USDT-SWAP/5m.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1783178385168,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=122.33"
+          ]
+        }
+      },
+      "last": 1029.64,
+      "source": "stock_token",
+      "volume_ccy_24h": 62300.18
+    }
+  },
+  "universes": {
+    "crypto_top": [],
+    "stock_token_top": [
+      {
+        "inst_id": "MU-USDT-SWAP",
+        "last": 1029.64,
+        "source": "stock_token",
+        "volume_ccy_24h": 62300.18
+      }
+    ]
+  },
+  "updated_at_ms": 1783178385768,
+  "warnings": []
+}

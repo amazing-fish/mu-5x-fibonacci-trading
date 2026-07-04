@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OKX 数据健康看板</title>
+  <style>
+    body { margin: 0; background: #f6f7f4; color: #17202a; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+    main { max-width: 1280px; margin: 0 auto; padding: 22px; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 10px; margin: 14px 0; }
+    .metric, section { background: #fff; border: 1px solid #d8ddd7; border-radius: 8px; padding: 12px; }
+    .metric span { display: block; color: #63707a; font-size: 13px; }
+    .metric strong { display: block; font-size: 22px; }
+    table { width: 100%; min-width: 980px; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 9px; border-bottom: 1px solid #d8ddd7; text-align: left; vertical-align: top; }
+    th { background: #edf0e8; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .badge { display: inline-flex; padding: 2px 8px; border-radius: 999px; font-weight: 650; }
+    .badge.ok { color: #0b7a5a; background: #dff3ea; }
+    .badge.bad { color: #b42318; background: #ffe2de; }
+    .issue-list { margin: 0; padding-left: 18px; }
+    .issue-list li { margin: 4px 0; }
+    .hint { color: #63707a; font-size: 12px; }
+    section { overflow-x: auto; margin-top: 14px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OKX 数据健康看板</h1>
+  <div>生成时间：2026-07-04 15:19 UTC · 数据源：OKX public market data · 存储：CSV + JSON manifest + JSONL run log</div>
+  <div class="summary">
+    <div class="metric"><span>attempt</span><strong>success</strong></div>
+    <div class="metric"><span>snapshot</span><strong>usable</strong></div>
+    <div class="metric"><span>run_id</span><strong>eba2ee5416a84070a1d7faf6eb68d698</strong></div>
+    <div class="metric"><span>symbols</span><strong>1</strong></div>
+    <div class="metric"><span>crypto_top</span><strong>0</strong></div>
+    <div class="metric"><span>stock_token_top</span><strong>1</strong></div>
+    <div class="metric"><span>requested</span><strong>15m, 1h</strong></div>
+    <div class="metric"><span>effective</span><strong>5m, 15m, 1h</strong></div>
+  </div>
+  <section>
+    <h2>Blocking issues</h2>
+    <p>无</p>
+  </section>
+  <section>
+    <h2>Partial coverage</h2>
+    <ul class="issue-list"><li><strong>MU-USDT-SWAP</strong> 15m: requested 180d, effective 122.32d, 2026-03-04 07:15 UTC to 2026-07-04 15:00 UTC</li><li><strong>MU-USDT-SWAP</strong> 1h: requested 180d, effective 122.29d, 2026-03-04 07:00 UTC to 2026-07-04 14:00 UTC</li><li><strong>MU-USDT-SWAP</strong> 5m: requested 180d, effective 122.33d, 2026-03-04 07:15 UTC to 2026-07-04 15:10 UTC</li></ul>
+  </section>
+  <section>
+    <h2>Warnings</h2>
+    <ul><li>无</li></ul>
+  </section>
+  <section>
+    <h2>Provider failures</h2>
+    <ul><li>无</li></ul>
+  </section>
+  <section>
+    <h2>Cycle error</h2>
+    <p>无</p>
+  </section>
+  <section>
+    <h2>Intervals</h2>
+    <table>
+      <thead><tr><th>symbol</th><th>universe</th><th>interval</th><th>freshness</th><th>availability</th><th>integrity</th><th>rows</th><th>latest</th><th>reason</th><th>source_file</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>MU-USDT-SWAP</td>
+          <td>stock_token</td>
+          <td>15m</td>
+          <td><span class="badge ok">fresh</span></td>
+          <td>available</td>
+          <td>valid</td>
+          <td class="num">11744</td>
+          <td>2026-07-04 15:00 UTC</td>
+          <td>ok</td>
+          <td class="mono">okx/MU-USDT-SWAP/15m.csv</td>
+        </tr>
+
+        <tr>
+          <td>MU-USDT-SWAP</td>
+          <td>stock_token</td>
+          <td>1h</td>
+          <td><span class="badge ok">fresh</span></td>
+          <td>available</td>
+          <td>valid</td>
+          <td class="num">2936</td>
+          <td>2026-07-04 14:00 UTC</td>
+          <td>ok</td>
+          <td class="mono">okx/MU-USDT-SWAP/1h.csv</td>
+        </tr>
+
+        <tr>
+          <td>MU-USDT-SWAP</td>
+          <td>stock_token</td>
+          <td>5m</td>
+          <td><span class="badge ok">fresh</span></td>
+          <td>available</td>
+          <td>valid</td>
+          <td class="num">35232</td>
+          <td>2026-07-04 15:10 UTC</td>
+          <td>ok</td>
+          <td class="mono">okx/MU-USDT-SWAP/5m.csv</td>
+        </tr></tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>
