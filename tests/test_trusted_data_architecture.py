@@ -400,6 +400,71 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
 
 class TrustedDataRefreshTests(unittest.TestCase):
+    def test_refresh_reuses_stale_partial_but_valid_prior_generation_for_incremental_fetch(self):
+        from mu_strategy.market_data.trusted_data.contracts import FreshnessState
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+        from mu_strategy.market_data.utils import DAY_MS
+
+        symbol = "BTC-USDT-SWAP"
+        end_ms = DAY_MS
+        five = range_candles(0, end_ms)
+        history = {
+            "5m": five,
+            "15m": aggregate_candles(five, interval="15m"),
+            "1h": aggregate_candles(five, interval="1h"),
+        }
+        request = RefreshTrustedMarketDataRequest(
+            requested_intervals=("15m", "1h"),
+            days=14,
+            limit=1,
+            stock_token_inst_ids=set(),
+        )
+        first_provider = RecordingProvider(
+            ticker_rows=[{"instId": symbol, "last": "100", "volCcy24h": "10"}],
+            history_fetcher=lambda requested_symbol, interval, *, days: history[interval],
+        )
+
+        class IncrementalOnlyProvider:
+            def __init__(self):
+                self.history_calls = []
+                self.incremental_calls = []
+
+            def fetch_tickers(self):
+                return [{"instId": symbol, "last": "100", "volCcy24h": "10"}]
+
+            def fetch_history(self, requested_symbol, interval, *, days):
+                self.history_calls.append((requested_symbol, interval, days))
+                raise AssertionError("stale valid prior generation should use incremental fetch")
+
+            def fetch_incremental(self, requested_symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((requested_symbol, interval, since_time_ms))
+                return []
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            first = RefreshTrustedMarketData(
+                store,
+                first_provider,
+                clock=FixedClock(end_ms + 16 * 60_000),
+            ).execute(request)
+            self.assertEqual(FreshnessState.STALE, first.datasets[(symbol, "5m")].freshness)
+
+            second_provider = IncrementalOnlyProvider()
+            RefreshTrustedMarketData(
+                store,
+                second_provider,
+                clock=FixedClock(end_ms + 17 * 60_000),
+            ).execute(request)
+
+        self.assertEqual([], second_provider.history_calls)
+        self.assertEqual(
+            {"5m", "15m", "1h"},
+            {interval for _, interval, _ in second_provider.incremental_calls},
+        )
+
     def test_refresh_publishes_usable_partial_history_for_short_requested_coverage_and_load_agrees(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason, IntegrityState, RefreshAttemptStatus, SnapshotUsability
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
