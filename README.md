@@ -154,7 +154,6 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `reports/live/data_health.html`：OKX 数据健康静态看板，展示 Top universe、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
 - `reports/mu_fibonacci_pullback_1h_12h_7d.md`：MU 最新一周 `1h-12h` Fibonacci 窗口回测，用于确认 2h baseline。
 - `reports/fibonacci_pullback_multi_asset_1h_12h_180d.md`：MU/SPACEX/META/BTC 的优选窗口对照。
-- `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
 - `docs/fibonacci-preferred-parameters.md`：当前标的优选 Fibonacci 参数记录。
 
 ## 数据注意事项
