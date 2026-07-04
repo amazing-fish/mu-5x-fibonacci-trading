@@ -9,10 +9,13 @@ from typing import Callable, Protocol
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
+    AvailabilityState,
     Clock,
     DatasetHealth,
     DatasetKey,
+    FreshnessState,
     HealthReason,
+    IntegrityState,
     RefreshRun,
     RefreshAttemptStatus,
     SnapshotUsability,
@@ -383,7 +386,7 @@ class RefreshTrustedMarketData:
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None
         health = manifest_result.snapshot.datasets.get((symbol, interval))
-        if health is None or not health.is_usable or not health.content_sha256:
+        if health is None or not _is_reusable_prior_health(health):
             return None
         previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
         if previous_path is None or not previous_path.exists():
@@ -400,9 +403,26 @@ class RefreshTrustedMarketData:
             requested_days=days,
             window_end_time_ms=cached[-1].open_time_ms if cached else None,
         )
-        if not coverage.covered:
+        if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None
         return cached
+
+
+def _is_reusable_prior_health(health: DatasetHealth) -> bool:
+    return (
+        health.availability == AvailabilityState.AVAILABLE
+        and health.integrity == IntegrityState.VALID
+        and health.freshness in {FreshnessState.FRESH, FreshnessState.STALE}
+        and bool(health.content_sha256)
+    )
+
+
+def _is_reusable_partial_history(health: DatasetHealth, *, requested_days: int) -> bool:
+    return (
+        health.coverage_state == "partial_available_history"
+        and health.requested_days is not None
+        and health.requested_days >= requested_days
+    )
 
 
 def load_stock_token_inst_ids(config_path: Path = DEFAULT_STOCK_TOKEN_CONFIG) -> set[str]:

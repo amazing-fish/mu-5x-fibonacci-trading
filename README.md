@@ -31,7 +31,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
 - `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、风险上限、`clOrdId` 幂等和小额限价单。
 
-兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`。
+兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`；其中 backtest 和 visualization 主入口默认只消费可信 OKX cache-only 数据。
 
 ## 常用命令
 
@@ -44,6 +44,7 @@ python -m unittest discover -s tests
 运行当前 OKX baseline 回测：
 
 ```powershell
+python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
 ```
 
@@ -74,21 +75,16 @@ python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report report
 生成 Plotly 可视化回测：
 
 ```powershell
+python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
 ```
 
-使用可信 OKX cache-only 数据运行回测或可视化。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存。`--trusted-data --refresh` 不受支持；需要先运行独立刷新命令发布当前 generation：
+主回测和可视化默认使用可信 OKX cache-only 数据。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存；需要先运行独立刷新命令发布当前 generation：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
-python -m mu_strategy.cli --trusted-data --days 14 --report reports\mu_okx_trusted_backtest.md
-python -m mu_strategy.visualize --trusted-data --days 14 --output reports\mu_okx_trusted_backtest.html
-```
-
-显式使用 Binance 做对照：
-
-```powershell
-python -m mu_strategy.cli --source binance --symbol MUUSDT --days 180 --strategy baseline --report reports\mu_binance_backtest.md
+python -m mu_strategy.cli --days 14 --report reports\mu_okx_trusted_backtest.md
+python -m mu_strategy.visualize --days 14 --output reports\mu_okx_trusted_backtest.html
 ```
 
 OKX API 只读检查：
@@ -158,7 +154,6 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `reports/live/data_health.html`：OKX 数据健康静态看板，展示 Top universe、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
 - `reports/mu_fibonacci_pullback_1h_12h_7d.md`：MU 最新一周 `1h-12h` Fibonacci 窗口回测，用于确认 2h baseline。
 - `reports/fibonacci_pullback_multi_asset_1h_12h_180d.md`：MU/SPACEX/META/BTC 的优选窗口对照。
-- `data/OKX_MU-USDT-SWAP_*_180d.csv`：OKX 已确认 K 线缓存，用于本地复现实验。
 - `docs/fibonacci-preferred-parameters.md`：当前标的优选 Fibonacci 参数记录。
 
 ## 数据注意事项
@@ -167,7 +162,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - 每次刷新会在已有缓存基础上增量补充后续已确认数据。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
-- `--trusted-data --refresh` 会被 backtest 和 visualization 拒绝；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli --trusted-data ...`、`python -m mu_strategy.visualize --trusted-data ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
+- backtest 和 visualization 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
 - 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
 - legacy flat `data/live/manifest.json` 仅供 refresh 显式迁移旧 publication 时读取；默认 trading、visualization、demo 和 `LoadTrustedBundle` consumer 不启用兼容读取。只要存在 `data/live/current.json`，generation consumer 始终按 schema v3 strict 读取，`compatibility_mode=True` 也不会接受 legacy generation manifest。

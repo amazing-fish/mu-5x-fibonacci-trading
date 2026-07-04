@@ -34,43 +34,7 @@ class CliTests(unittest.TestCase):
                 self.assertIn("0.0500%", stdout.getvalue())
                 self.assertIn("0.0200%", stdout.getvalue())
 
-    def test_cli_defaults_to_okx_mu_source_and_accepts_strategy(self):
-        from mu_strategy import cli
-
-        bundle_calls = []
-        configs = []
-
-        def fake_refresh_candle_bundle(symbol, **kwargs):
-            bundle_calls.append((symbol, kwargs))
-            return SimpleNamespace(
-                candles_by_interval={"15m": [], "1h": []},
-                files_by_interval={"15m": Path("data/15m.csv"), "1h": Path("data/1h.csv")},
-            )
-
-        def fake_run_backtest(candles_15m, context, *, config):
-            configs.append(config)
-            return BacktestResult(10_000, 10_000, [], [])
-
-        with TemporaryDirectory() as tmp:
-            report_path = Path(tmp) / "report.md"
-            argv = ["mu_strategy.cli", "--days", "180", "--strategy", "baseline", "--report", str(report_path)]
-            with patch("sys.argv", argv):
-                with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=fake_refresh_candle_bundle):
-                    with patch("mu_strategy.cli.cached_historical", side_effect=AssertionError("CLI must use market_data.service"), create=True):
-                        with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
-                            with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
-                                with patch("sys.stdout", new_callable=io.StringIO):
-                                    cli.main()
-
-        self.assertEqual("MU-USDT-SWAP", bundle_calls[0][0])
-        self.assertEqual(("15m", "1h"), bundle_calls[0][1]["intervals"])
-        self.assertEqual("okx", bundle_calls[0][1]["source"])
-        self.assertEqual(180, bundle_calls[0][1]["days"])
-        self.assertFalse(bundle_calls[0][1]["refresh"])
-        self.assertEqual("market", configs[0].fee_profile)
-        self.assertAlmostEqual(0.0005, configs[0].fee_rate)
-
-    def test_cli_trusted_data_uses_trusted_bundle_and_status_gate(self):
+    def test_cli_defaults_to_trusted_live_store_and_accepts_strategy(self):
         from mu_strategy import cli
 
         trusted_calls = []
@@ -94,7 +58,49 @@ class CliTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "report.md"
-            argv = ["mu_strategy.cli", "--trusted-data", "--report", str(report_path)]
+            argv = ["mu_strategy.cli", "--days", "180", "--strategy", "baseline", "--report", str(report_path)]
+            with patch("sys.argv", argv):
+                with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=AssertionError("legacy bundle must not be used"), create=True):
+                        with patch("mu_strategy.cli.cached_historical", side_effect=AssertionError("legacy cache must not be used"), create=True):
+                            with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
+                                with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
+                                    with patch("sys.stdout", new_callable=io.StringIO):
+                                        cli.main()
+
+        self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
+        self.assertEqual(("15m", "1h"), trusted_calls[0][1]["intervals"])
+        self.assertEqual(Path("data/live"), trusted_calls[0][1]["data_dir"])
+        self.assertEqual(180, trusted_calls[0][1]["days"])
+        self.assertFalse(trusted_calls[0][1]["refresh"])
+        self.assertEqual("market", configs[0].fee_profile)
+        self.assertAlmostEqual(0.0005, configs[0].fee_rate)
+
+    def test_cli_uses_trusted_bundle_and_status_gate(self):
+        from mu_strategy import cli
+
+        trusted_calls = []
+        configs = []
+
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
+            trusted_calls.append((symbol, kwargs))
+            return SimpleNamespace(
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                files_by_interval={"15m": Path("data/live/15m.csv"), "1h": Path("data/live/1h.csv")},
+                statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", Path("data/live/5m.csv")),
+                    "15m": _status("MU-USDT-SWAP", "15m", Path("data/live/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", Path("data/live/1h.csv")),
+                },
+            )
+
+        def fake_run_backtest(candles_15m, context, *, config):
+            configs.append(config)
+            return BacktestResult(10_000, 10_000, [], [])
+
+        with TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "report.md"
+            argv = ["mu_strategy.cli", "--report", str(report_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
                     with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
@@ -107,36 +113,38 @@ class CliTests(unittest.TestCase):
         self.assertFalse(trusted_calls[0][1]["refresh"])
         self.assertEqual("market", configs[0].fee_profile)
 
-    def test_cli_rejects_trusted_refresh_before_loading_or_backtesting(self):
+    def test_cli_rejects_removed_data_flags_before_loading_or_backtesting(self):
         from mu_strategy import cli
 
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp) / "live"
-            report_path = Path(tmp) / "report.md"
-            manifest_path = data_dir / "manifest.json"
-            manifest_path.parent.mkdir(parents=True)
-            manifest_path.write_text("canonical manifest", encoding="utf-8")
-            manifest_before = manifest_path.read_bytes()
-            argv = [
-                "mu_strategy.cli",
-                "--trusted-data",
-                "--refresh",
-                "--data-dir",
-                str(data_dir),
-                "--report",
-                str(report_path),
-            ]
-            with patch("sys.argv", argv):
-                with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=AssertionError("trusted loader")):
-                    with patch("mu_strategy.cli.run_backtest", side_effect=AssertionError("backtest")):
-                        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
-                            with self.assertRaises(SystemExit) as raised:
-                                cli.main()
+        for removed_args in (["--refresh"], ["--source", "okx"], ["--trusted-data"]):
+            with self.subTest(removed_args=removed_args):
+                with TemporaryDirectory() as tmp:
+                    data_dir = Path(tmp) / "live"
+                    report_path = Path(tmp) / "report.md"
+                    manifest_path = data_dir / "manifest.json"
+                    manifest_path.parent.mkdir(parents=True)
+                    manifest_path.write_text("canonical manifest", encoding="utf-8")
+                    manifest_before = manifest_path.read_bytes()
+                    argv = [
+                        "mu_strategy.cli",
+                        *removed_args,
+                        "--data-dir",
+                        str(data_dir),
+                        "--report",
+                        str(report_path),
+                    ]
+                    with patch("sys.argv", argv):
+                        with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=AssertionError("trusted loader")):
+                            with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=AssertionError("legacy loader"), create=True):
+                                with patch("mu_strategy.cli.run_backtest", side_effect=AssertionError("backtest")):
+                                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                                        with self.assertRaises(SystemExit) as raised:
+                                            cli.main()
 
-            self.assertNotEqual(0, raised.exception.code)
-            self.assertIn("refresh_market_data", stderr.getvalue())
-            self.assertEqual(manifest_before, manifest_path.read_bytes())
-            self.assertFalse(report_path.exists())
+                    self.assertNotEqual(0, raised.exception.code)
+                    self.assertIn("unrecognized arguments", stderr.getvalue())
+                    self.assertEqual(manifest_before, manifest_path.read_bytes())
+                    self.assertFalse(report_path.exists())
 
     def test_cli_trusted_data_rejects_invalid_base_5m_status(self):
         from mu_strategy import cli
@@ -160,7 +168,7 @@ class CliTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "report.md"
-            argv = ["mu_strategy.cli", "--trusted-data", "--report", str(report_path)]
+            argv = ["mu_strategy.cli", "--report", str(report_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
                     with patch("sys.stderr", new_callable=io.StringIO):
@@ -187,7 +195,7 @@ class CliTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "report.md"
-            argv = ["mu_strategy.cli", "--trusted-data", "--report", str(report_path)]
+            argv = ["mu_strategy.cli", "--report", str(report_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
                     with patch("sys.stderr", new_callable=io.StringIO):
@@ -205,7 +213,6 @@ class CliTests(unittest.TestCase):
             _write_failed_manifest_with_valid_csv(data_dir)
             argv = [
                 "mu_strategy.cli",
-                "--trusted-data",
                 "--data-dir",
                 str(data_dir),
                 "--report",
@@ -232,7 +239,6 @@ class CliTests(unittest.TestCase):
             _write_csv_only(data_dir, symbol="MU-USDT-SWAP")
             argv = [
                 "mu_strategy.cli",
-                "--trusted-data",
                 "--data-dir",
                 str(data_dir),
                 "--report",
@@ -254,10 +260,15 @@ class CliTests(unittest.TestCase):
 
         configs = []
 
-        def fake_refresh_candle_bundle(symbol, **kwargs):
+        def fake_refresh_trusted_candle_bundle(symbol, **kwargs):
             return SimpleNamespace(
-                candles_by_interval={"15m": [], "1h": []},
-                files_by_interval={"15m": Path("data/15m.csv"), "1h": Path("data/1h.csv")},
+                candles_by_interval={"15m": [_candle(0, 100)], "1h": [_candle(0, 100)]},
+                files_by_interval={"15m": Path("data/live/15m.csv"), "1h": Path("data/live/1h.csv")},
+                statuses_by_interval={
+                    "5m": _status("MU-USDT-SWAP", "5m", Path("data/live/5m.csv")),
+                    "15m": _status("MU-USDT-SWAP", "15m", Path("data/live/15m.csv")),
+                    "1h": _status("MU-USDT-SWAP", "1h", Path("data/live/1h.csv")),
+                },
             )
 
         def fake_run_backtest(candles_15m, context, *, config):
@@ -278,11 +289,12 @@ class CliTests(unittest.TestCase):
                 str(report_path),
             ]
             with patch("sys.argv", argv):
-                with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=fake_refresh_candle_bundle):
-                    with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
-                        with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
-                            with patch("sys.stdout", new_callable=io.StringIO):
-                                cli.main()
+                with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=fake_refresh_trusted_candle_bundle):
+                    with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=AssertionError("legacy bundle must not be used"), create=True):
+                        with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
+                            with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
+                                with patch("sys.stdout", new_callable=io.StringIO):
+                                    cli.main()
 
         self.assertEqual("limit", configs[0].fee_profile)
         self.assertAlmostEqual(0.0002, configs[0].fee_rate)

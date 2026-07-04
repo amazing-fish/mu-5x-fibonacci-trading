@@ -5,7 +5,7 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.indicators import ema, macd, rsi
-from mu_strategy.market_data.service import refresh_candle_bundle, refresh_trusted_candle_bundle
+from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import Candle
 from mu_strategy.reporting import candle_sample_summary, render_markdown_report
@@ -15,21 +15,10 @@ TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Backtest the MU 5x Fibonacci strategy.")
+    parser = argparse.ArgumentParser(description="Backtest the MU 5x Fibonacci strategy from trusted cached market data.")
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
-    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=14)
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help="Refresh legacy cached_historical data. Not supported with --trusted-data; run python -m mu_strategy.commands.refresh_market_data first.",
-    )
-    parser.add_argument("--data-dir", type=Path)
-    parser.add_argument(
-        "--trusted-data",
-        action="store_true",
-        help="Use the trusted OKX cache-only data layer instead of legacy cached_historical.",
-    )
+    parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
     parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_backtest.md"))
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
     parser.add_argument(
@@ -39,11 +28,6 @@ def main() -> None:
         help="Backtest cost assumption: market/taker=0.0500%%, limit/maker=0.0200%%.",
     )
     args = parser.parse_args()
-    if args.trusted_data and args.refresh:
-        parser.error(
-            "--trusted-data --refresh is not supported; run "
-            "python -m mu_strategy.commands.refresh_market_data before loading trusted data"
-        )
 
     try:
         groups = selected_strategy_groups(args.symbol, [args.strategy])
@@ -52,29 +36,17 @@ def main() -> None:
     if len(groups) != 1:
         parser.error("--strategy must resolve to exactly one strategy group")
     config = with_fee_profile(groups[0].config, args.fee_profile)
-    data_dir = args.data_dir
-    if data_dir is None:
-        data_dir = Path("data/live") if args.trusted_data else Path("data")
-    if args.trusted_data:
-        bundle = refresh_trusted_candle_bundle(
-            args.symbol,
-            intervals=TRUSTED_REQUESTED_INTERVALS,
-            days=args.days,
-            data_dir=data_dir,
-            refresh=False,
-        )
-        status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
-        if status_error:
-            parser.error(status_error)
-    else:
-        bundle = refresh_candle_bundle(
-            args.symbol,
-            intervals=("15m", "1h"),
-            days=args.days,
-            data_dir=data_dir,
-            refresh=args.refresh,
-            source=args.source,
-        )
+    data_dir = args.data_dir or Path("data/live")
+    bundle = refresh_trusted_candle_bundle(
+        args.symbol,
+        intervals=TRUSTED_REQUESTED_INTERVALS,
+        days=args.days,
+        data_dir=data_dir,
+        refresh=False,
+    )
+    status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+    if status_error:
+        parser.error(status_error)
     candles_15m = bundle.candles_by_interval["15m"]
     candles_1h = bundle.candles_by_interval["1h"]
     file_15m = bundle.files_by_interval["15m"]

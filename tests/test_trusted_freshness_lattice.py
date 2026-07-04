@@ -225,7 +225,7 @@ class MalformedUnknownManifestIntegrationTests(unittest.TestCase):
             data_dir = Path(tmp) / "live"
             report_path = Path(tmp) / "report.md"
             _write_manifest_and_caches(data_dir, status="ok", freshness="unknown")
-            argv = ["mu_strategy.cli", "--trusted-data", "--data-dir", str(data_dir), "--report", str(report_path)]
+            argv = ["mu_strategy.cli", "--data-dir", str(data_dir), "--report", str(report_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.cli.run_backtest", side_effect=AssertionError("backtest must not run")):
                     with patch("sys.stderr", new_callable=io.StringIO):
@@ -243,7 +243,7 @@ class MalformedUnknownManifestIntegrationTests(unittest.TestCase):
             data_dir = Path(tmp) / "live"
             output_path = Path(tmp) / "chart.html"
             _write_manifest_and_caches(data_dir, status="ok", freshness="unknown")
-            argv = ["mu_strategy.visualize", "--trusted-data", "--data-dir", str(data_dir), "--output", str(output_path)]
+            argv = ["mu_strategy.visualize", "--data-dir", str(data_dir), "--output", str(output_path)]
             with patch("sys.argv", argv):
                 with patch("mu_strategy.viz.backtest.run_backtest", side_effect=AssertionError("backtest must not run")):
                     with patch("sys.stderr", new_callable=io.StringIO):
