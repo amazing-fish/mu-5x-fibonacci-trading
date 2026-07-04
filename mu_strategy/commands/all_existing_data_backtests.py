@@ -59,7 +59,7 @@ class DataQualityAudit:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run baseline backtests for every existing local MU dataset.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--report-dir", type=Path, default=Path("reports"))
+    parser.add_argument("--report-dir", type=Path, default=Path("reports/live"))
     parser.add_argument("--strategy", default="baseline")
     parser.add_argument(
         "--fee-profile",

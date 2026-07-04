@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
-    parser.add_argument("--output", type=Path, default=Path("reports/mu_okx_baseline_backtest.html"))
+    parser.add_argument("--output", type=Path, default=Path("reports/live/mu_okx_baseline_backtest.html"))
     parser.add_argument("--chart-interval", choices=("15m", "1h"), default="1h")
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to visualize.")
     parser.add_argument(

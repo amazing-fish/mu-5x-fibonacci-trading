@@ -1,5 +1,7 @@
 # MU Strategy Research Architecture Refactor Design
 
+> Deprecated legacy plan: this document is archived for historical context only. It predates the trusted-data generation contract and may reference deleted tracked reports or flat CSV caches. Do not use it as a current implementation checklist.
+
 ## Background
 
 The project has grown from a single MU backtest workflow into a broader research platform:

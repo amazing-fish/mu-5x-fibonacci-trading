@@ -1,5 +1,7 @@
 # Architecture Refactor Implementation Plan
 
+> Deprecated legacy plan: this document is archived for historical context only. It predates the trusted-data generation contract and may reference deleted tracked reports or flat CSV caches. Do not use it as a current implementation checklist.
+
 > **For AI:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Refactor the project into clear data, strategy, research, experiment, selection, execution, and visualization areas while preserving current CLI and report behavior.

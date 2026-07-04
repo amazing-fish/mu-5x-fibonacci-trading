@@ -10,8 +10,9 @@ env/
 .env.*
 *.log
 data/live/
-reports/live/*.pid
-reports/live/*.jsonl
-reports/live/*.html
+data/*.csv
+reports/live/
+reports/*.html
+reports/*.md
 Thumbs.db
 .DS_Store
