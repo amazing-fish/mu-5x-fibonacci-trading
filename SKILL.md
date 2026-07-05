@@ -85,7 +85,7 @@ python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-o
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\live\mu_okx_backtest.md
 python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\live\mu_okx_backtest_limit.md
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\live\mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html
-python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 1 --days 1 --data-dir data\live --no-default-watchlist --dashboard-output reports\live\okx_entry_dashboard.html
+python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 1 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
 Refresh trusted data before running cache-only backtest, visualization, or demo dry-run commands. Review the generated Markdown and HTML reports from `reports/live/`; they are local artifacts, not source-controlled evidence. Do not infer future validity from one backtest window; extend the data window and compare with a buy-and-hold baseline before using capital.
