@@ -9,7 +9,15 @@ env/
 .env
 .env.*
 *.log
-data/live/
+data/live/*
+!data/live/current.json
+!data/live/generations/
+data/live/generations/**
+!data/live/generations/*/
+!data/live/generations/*/manifest.json
+!data/live/generations/*/okx/
+!data/live/generations/*/okx/*/
+!data/live/generations/*/okx/*/*.csv
 data/*.csv
 reports/live/
 reports/*.html
