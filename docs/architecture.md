@@ -33,6 +33,7 @@ Rules:
 - Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest and visualization default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, or `python -m mu_strategy.commands.okx_demo_loop`.
 - The old per-symbol refresh APIs have been removed. Temporary symbol refreshes need a separate store/manifest namespace in a future issue, not the shared canonical generation.
 - Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
+- Generated backtest, visualization, data-health, and scanner reports are local artifacts. Write them under ignored paths such as `reports/live/`; do not treat tracked report files as the authoritative baseline.
 - Manifest schema v3 records `run_id`, `attempt_status` (`RefreshAttemptStatus`), `snapshot_usability` (`SnapshotUsability`), requested/effective intervals, universe snapshot, provider failures, warnings, cycle-level error, and dataset health for every `symbol/interval`.
 - `RefreshAttemptStatus` is refresh-attempt health (`success`, `degraded`, `failed`). Zero usable datasets always classify the attempt as `failed`, regardless of whether the cause was provider failure, cache read failure, validation failure, requested-days coverage, or content hash mismatch.
 - `SnapshotUsability` is published snapshot health (`usable`, `stale`, `invalid`) derived from DatasetHealth availability/integrity/freshness. Zero usable snapshots fail closed to `invalid`; mixed usable/unusable snapshots keep the stricter derived dataset state.
@@ -158,11 +159,11 @@ Boundaries:
 
 Package: `mu_strategy.viz`
 
-`viz.backtest` renders the interactive Plotly backtest dashboard. The top-level `mu_strategy.visualize` module remains a compatibility wrapper.
+`viz.backtest` renders the interactive Plotly backtest dashboard. The top-level `mu_strategy.visualize` module remains a compatibility wrapper. The recommended output location is a local ignored file such as `reports/live/mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html`.
 
-`viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload.
+`viz.entry_dashboard` renders the latest OKX scan payload as a compact manual-order review dashboard. It shows concrete planned limit details, cancel targets bound to each planned order, scan blockers, and data errors from the already-produced JSON payload. Its HTML output is also a local artifact, normally under `reports/live/`.
 
-`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest. Row badges are derived from availability/integrity/freshness together: missing or invalid integrity is invalid, stale freshness is stale, and only available+valid+fresh is ok.
+`viz.data_health` renders the trusted manifest as a static HTML dashboard. It displays `RefreshAttemptStatus`, `SnapshotUsability`, run_id, requested/effective intervals, warnings, cycle-level error, and dataset health fields from the manifest. Row badges are derived from availability/integrity/freshness together: missing or invalid integrity is invalid, stale freshness is stale, and only available+valid+fresh is ok. The dashboard is review evidence, not a source-controlled baseline.
 
 ## Compatibility Wrappers
 

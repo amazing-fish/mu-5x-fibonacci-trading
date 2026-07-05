@@ -32,10 +32,10 @@ This is a research workflow, not financial advice. Use it to turn discretionary 
 
 ## Project Boundaries
 
-- Data lives in `mu_strategy.market_data`; OKX candles must ignore unconfirmed rows and keep cache windows bounded by `days`.
+- Data lives in `mu_strategy.market_data`; OKX trusted data is the default market source, refresh must ignore unconfirmed rows, and consumers must read only the published cache generation.
 - Strategy groups live in `mu_strategy.strategies`; keep entry, position, exit, and filter components inspectable.
 - Experiments live in `mu_strategy.experiments`; walk-forward windows are independent and must not concatenate reset equity curves for drawdown.
-- Visualization lives in `mu_strategy.viz`; return local report paths instead of pasting generated HTML.
+- Visualization lives in `mu_strategy.viz`; write generated reports under local ignored paths such as `reports/live/` and return paths instead of pasting generated HTML.
 - Execution planning lives in `mu_strategy.execution`; it may return `allow`, `wait`, or `block`, margin steps, and initial stop, but it must not place broker orders.
 
 ## 1h Regime Filter
@@ -81,13 +81,14 @@ Before treating this as usable, run:
 
 ```powershell
 python -m unittest discover -s tests
-python -m mu_strategy.cli --days 180 --strategy baseline --report reports\mu_okx_backtest.md
-python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\mu_okx_backtest_limit.md
-python -m mu_strategy.walk_forward --window-days 180 --windows 1 --report reports\mu_okx_strategy_group_review.md --html-report reports\mu_okx_strategy_components.html
-python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\mu_okx_baseline_backtest.html
+python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
+python -m mu_strategy.cli --days 180 --strategy baseline --report reports\live\mu_okx_backtest.md
+python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\live\mu_okx_backtest_limit.md
+python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\live\mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html
+python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 1 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
-Review the generated Markdown and HTML reports. Do not infer future validity from one backtest window; extend the data window and compare with a buy-and-hold baseline before using capital.
+Refresh trusted data before running cache-only backtest, visualization, or demo dry-run commands. Review the generated Markdown and HTML reports from `reports/live/`; they are local artifacts, not source-controlled evidence. Do not infer future validity from one backtest window; extend the data window and compare with a buy-and-hold baseline before using capital.
 
 ## Common Mistakes
 
