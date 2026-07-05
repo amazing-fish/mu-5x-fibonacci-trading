@@ -365,8 +365,8 @@ def main() -> None:
     parser.add_argument("--windows", type=int, default=2)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_strategy_group_review.md"))
-    parser.add_argument("--html-report", type=Path, default=Path("reports/mu_okx_strategy_components.html"))
+    parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_strategy_group_review.md"))
+    parser.add_argument("--html-report", type=Path, default=Path("reports/live/mu_okx_strategy_components.html"))
     parser.add_argument(
         "--fee-profile",
         choices=FEE_PROFILE_CHOICES,

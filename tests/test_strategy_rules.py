@@ -142,6 +142,7 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertIsNotNone(meta)
         self.assertEqual(9, meta.horizon_hours)
+        self.assertTrue(meta.evidence_report.startswith("reports/live/"))
         self.assertIn("fibonacci_pullback_multi_asset", meta.evidence_report)
 
     def test_baseline_uses_preferred_fibonacci_lookback_for_known_assets(self):

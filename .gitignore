@@ -18,9 +18,9 @@ data/live/generations/**
 !data/live/generations/*/okx/
 !data/live/generations/*/okx/*/
 !data/live/generations/*/okx/*/*.csv
-reports/live/*.pid
-reports/live/*.jsonl
-reports/live/*.html
-reports/live/*.md
+data/*.csv
+reports/live/
+reports/*.html
+reports/*.md
 Thumbs.db
 .DS_Store

@@ -438,8 +438,8 @@ def main() -> None:
     parser.add_argument("--max-hour", type=int, default=12)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--report", type=Path, default=Path("reports/mu_okx_fibonacci_pullback_1h_12h_180d.md"))
-    parser.add_argument("--multi-report", type=Path, default=Path("reports/fibonacci_pullback_multi_asset_1h_12h_180d.md"))
+    parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_fibonacci_pullback_1h_12h_180d.md"))
+    parser.add_argument("--multi-report", type=Path, default=Path("reports/live/fibonacci_pullback_multi_asset_1h_12h_180d.md"))
     parser.add_argument("--asset", action="append", help="Asset alias for batch mode. Repeat or pass comma-separated values.")
     parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
     parser.add_argument(

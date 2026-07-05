@@ -24,7 +24,7 @@ PREFERRED_FIBONACCI_PARAMETERS: tuple[PreferredFibonacciParameter, ...] = (
         source="okx",
         horizon_hours=2,
         fib_lookback_bars=8,
-        evidence_report="reports/mu_fibonacci_pullback_1h_12h_7d.md",
+        evidence_report="reports/live/mu_fibonacci_pullback_1h_12h_7d.md",
         note="Promoted to MU baseline after the latest-week sweep; also ranked #2 in the multi-asset 180d request.",
     ),
     PreferredFibonacciParameter(
@@ -33,7 +33,7 @@ PREFERRED_FIBONACCI_PARAMETERS: tuple[PreferredFibonacciParameter, ...] = (
         source="okx",
         horizon_hours=2,
         fib_lookback_bars=8,
-        evidence_report="reports/fibonacci_pullback_multi_asset_1h_12h_180d.md",
+        evidence_report="reports/live/fibonacci_pullback_multi_asset_1h_12h_180d.md",
         note="Best available full-sample rank in the OKX SPCX-USDT-SWAP sweep.",
     ),
     PreferredFibonacciParameter(
@@ -42,7 +42,7 @@ PREFERRED_FIBONACCI_PARAMETERS: tuple[PreferredFibonacciParameter, ...] = (
         source="okx",
         horizon_hours=9,
         fib_lookback_bars=36,
-        evidence_report="reports/fibonacci_pullback_multi_asset_1h_12h_180d.md",
+        evidence_report="reports/live/fibonacci_pullback_multi_asset_1h_12h_180d.md",
         note="Best available full-sample rank in the OKX META-USDT-SWAP sweep.",
     ),
     PreferredFibonacciParameter(
@@ -51,7 +51,7 @@ PREFERRED_FIBONACCI_PARAMETERS: tuple[PreferredFibonacciParameter, ...] = (
         source="okx",
         horizon_hours=3,
         fib_lookback_bars=12,
-        evidence_report="reports/fibonacci_pullback_multi_asset_1h_12h_180d.md",
+        evidence_report="reports/live/fibonacci_pullback_multi_asset_1h_12h_180d.md",
         note="Best full-180d OKX BTC-USDT-SWAP rank; 4h remained a close #2.",
     ),
 )

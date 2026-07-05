@@ -34,7 +34,6 @@ class RepositoryArtifactPolicyTests(unittest.TestCase):
                     pins_mu_watchlist = "--watchlist-symbol MU-USDT-SWAP" in command
                     self.assertFalse(disables_default_watchlist and not pins_mu_watchlist, command)
 
-
 def _is_git_ignored(path: str) -> bool:
     result = subprocess.run(
         ["git", "check-ignore", "--quiet", path],
