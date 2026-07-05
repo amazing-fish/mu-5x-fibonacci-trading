@@ -13,5 +13,6 @@ data/live/
 reports/live/*.pid
 reports/live/*.jsonl
 reports/live/*.html
+reports/live/*.md
 Thumbs.db
 .DS_Store
