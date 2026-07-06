@@ -21,9 +21,9 @@ class TrustedStateSeparationTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
-            from tests.factories.trusted_publication import write_flat_v3_publication
+            from tests.factories.trusted_publication import write_generation_publication
 
-            write_flat_v3_publication(data_dir, symbol="BTC-USDT-SWAP")
+            write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
 
             run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(
@@ -404,12 +404,10 @@ class _UniverseTimeoutProvider:
 
 
 def _manifest_path(data_dir: Path) -> Path:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-
     current = data_dir / "current.json"
     if current.exists():
         return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
-    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
+    return data_dir / "manifest.json"
 
 
 if __name__ == "__main__":

@@ -436,13 +436,17 @@ def _confirmed_bundle(
 def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
     from mu_strategy.market_data.trusted_data.store import candles_content_sha256
 
-    manifest_path = store.flat_manifest_path
+    run_id = "windowing-seed"
+    generation_dir = store.generation_root(run_id)
+    if not generation_dir.exists():
+        store.prepare_generation(run_id)
+    manifest_path = store.generation_manifest_path(run_id)
     symbols = {}
     if manifest_path.exists():
         symbols = json.loads(manifest_path.read_text(encoding="utf-8")).get("symbols") or {}
     symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in bundle.items():
-        path = store.flat_cache_path(symbol, interval)
+        path = store.generation_cache_path(run_id, symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -455,14 +459,15 @@ def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
             "first_timestamp_ms": candles[0].open_time_ms,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": candles[-1].open_time_ms,
-            "source_file": str(path),
+            "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(candles),
             "validation": {"ok": True, "reason": "ok"},
         }
-    store.write_manifest(
+    store.write_generation_manifest(
+        run_id,
         {
             "schema_version": 3,
-            "run_id": "flat-windowing",
+            "run_id": run_id,
             "attempt_status": "success",
             "snapshot_usability": "usable",
             "started_at_ms": 0,
@@ -476,13 +481,12 @@ def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
             "cycle_error": None,
         }
     )
+    store.replace_current(run_id)
 
 
 def _manifest(store) -> dict:
     current = store.current_path
-    if current.exists():
-        return json.loads((store.data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]).read_text(encoding="utf-8"))
-    return json.loads(store.flat_manifest_path.read_text(encoding="utf-8"))
+    return json.loads((store.data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]).read_text(encoding="utf-8"))
 
 
 def _assert_health_matches_csv(self, store, run, symbol: str, intervals: tuple[str, ...]) -> None:

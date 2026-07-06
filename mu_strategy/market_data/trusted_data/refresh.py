@@ -153,7 +153,7 @@ class RefreshTrustedMarketData:
         for interval in plan.effective_intervals:
             validate_storage_segment(interval, field="interval")
         run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
-        previous_manifest = self.store.read_manifest(compatibility_mode=True)
+        previous_manifest = self.store.read_manifest()
         self.store.prepare_generation(run_id)
         try:
             universe = self._universe(request)
@@ -371,8 +371,6 @@ class RefreshTrustedMarketData:
         health = manifest_result.snapshot.datasets.get((symbol, interval))
         if health is None:
             return None
-        if manifest_result.generation_id is None:
-            return self.store.flat_cache_path(symbol, interval)
         try:
             return self.store.resolve_source_file(
                 health.source_file,

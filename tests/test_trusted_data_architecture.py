@@ -14,7 +14,7 @@ from tests.factories.trusted_publication import (
     constant_candles,
     manifest_path,
     range_candles,
-    write_flat_manifest_and_caches,
+    write_generation_manifest_and_caches,
     write_flat_v3_publication,
     write_generation_publication,
     write_orphan_flat_caches,
@@ -123,20 +123,20 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             self.assertFalse(missing.trust_decision.allowed)
             self.assertEqual(HealthReason.MANIFEST_MISSING, missing.trust_decision.reason)
 
-            manifest_path(data_dir).write_text("{not-json", encoding="utf-8")
+            (data_dir / "current.json").write_text("{not-json", encoding="utf-8")
             malformed = loader.execute(LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1, now_ms=0), trading_strict_policy())
             self.assertFalse(malformed.trust_decision.allowed)
             self.assertEqual(HealthReason.MALFORMED_MANIFEST, malformed.trust_decision.reason)
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=2)
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=2)
             store = TrustedDataStore(data_dir=data_dir)
             loader = LoadTrustedBundle(store)
             with patch("mu_strategy.market_data.providers.okx.fetch_okx_historical", side_effect=AssertionError("network")):
                 with patch("mu_strategy.market_data.providers.okx.fetch_okx_incremental", side_effect=AssertionError("network")):
                     with patch.object(store, "write_csv", side_effect=AssertionError("write_csv")):
-                        with patch.object(store, "write_manifest", side_effect=AssertionError("write_manifest")):
+                        with patch.object(store, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
                             with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
                                 bundle = loader.execute(
                                     LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=86_400_000),
@@ -221,13 +221,13 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             ("failed", {"outcome": "failed", "status": "ok", "run_id": "run-failed"}, HealthReason.RUN_FAILED),
             ("partial_invalid", {"outcome": "partial", "status": "invalid", "integrity": "invalid"}, HealthReason.MANIFEST_INVALID),
             ("success_invalid", {"outcome": "success", "status": "invalid", "integrity": "invalid"}, HealthReason.MANIFEST_INVALID),
-            ("success_stale", {"outcome": "success", "status": "stale", "freshness": "stale"}, HealthReason.MALFORMED_MANIFEST),
+            ("success_stale", {"outcome": "success", "status": "invalid", "freshness": "stale"}, HealthReason.MANIFEST_INVALID),
         ]
         for name, kwargs, reason in cases:
             with self.subTest(name=name):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
-                    write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, **kwargs)
+                    write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, **kwargs)
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=FixedClock(86_400_000)).execute(
                         LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1),
                         trading_strict_policy(),
@@ -244,7 +244,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            manifest = write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, outcome="failed", status="invalid")
+            manifest = write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, outcome="failed", status="invalid", integrity="invalid")
             manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["15m"].update(
                 {
                     "integrity": "invalid",
@@ -264,9 +264,9 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             store = TrustedDataStore(data_dir=data_dir)
-            write_csv([Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0)], store.flat_cache_path("MU-USDT-SWAP", "15m"))
+            write_csv([Candle(60_000, 100.0, 101.0, 99.0, 100.0, 1.0)], store.generation_cache_path("run-1", "MU-USDT-SWAP", "15m"))
             bundle = LoadTrustedBundle(store, clock=FixedClock(86_400_000)).execute(
                 LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
                 observe_only_policy(),
@@ -285,14 +285,15 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             with self.subTest(case=case):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
-                    manifest = write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+                    manifest = write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
                     store = TrustedDataStore(data_dir=data_dir)
                     if case == "missing_hash":
                         manifest["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"].pop("content_sha256")
-                        store.write_manifest(manifest)
+                        manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
                     else:
-                        original = store.read_csv(store.flat_cache_path("MU-USDT-SWAP", "5m"))
-                        write_csv([Candle(c.open_time_ms, c.open + 10_000, c.high + 10_000, c.low + 10_000, c.close + 10_000, c.volume) for c in original], store.flat_cache_path("MU-USDT-SWAP", "5m"))
+                        path = store.generation_cache_path("run-1", "MU-USDT-SWAP", "5m")
+                        original = store.read_csv(path)
+                        write_csv([Candle(c.open_time_ms, c.open + 10_000, c.high + 10_000, c.low + 10_000, c.close + 10_000, c.volume) for c in original], path)
                     bundle = LoadTrustedBundle(store, clock=FixedClock(86_400_000)).execute(
                         LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("5m",), days=1),
                         trading_strict_policy(),
@@ -330,7 +331,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             with self.subTest(name=name):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
-                    manifest = write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+                    manifest = write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
                     mutate(manifest)
                     manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=FixedClock(86_400_000)).execute(
@@ -348,7 +349,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="BTC-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",))
+            write_generation_manifest_and_caches(data_dir, symbol="BTC-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",))
             write_orphan_flat_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             store = TrustedDataStore(data_dir=data_dir)
             with patch.object(store, "read_csv", side_effect=AssertionError("orphan CSV must not be read")):
@@ -363,7 +364,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             with self.subTest(missing_interval=missing_interval):
                 with TemporaryDirectory() as tmp:
                     data_dir = Path(tmp)
-                    manifest = write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+                    manifest = write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
                     manifest["symbols"]["MU-USDT-SWAP"]["intervals"].pop(missing_interval)
                     manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
                     bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=FixedClock(86_400_000)).execute(
@@ -379,7 +380,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
             clock = FixedClock(10 * 86_400_000)
             stale = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=clock).execute(
                 LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m",), days=1),
@@ -781,7 +782,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
-            write_flat_v3_publication(Path(tmp), symbol="BTC-USDT-SWAP")
+            write_generation_publication(Path(tmp), symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
             degraded_fresh = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             )
@@ -902,7 +903,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_v3_publication(data_dir, symbol="BTC-USDT-SWAP")
+            write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
             provider = FullHistoryProvider()
             run = RefreshTrustedMarketData(FailingReadStore(data_dir=data_dir), provider).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
@@ -920,8 +921,8 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="BTC-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",), stock_token_symbols=("MU-USDT-SWAP",))
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",), stock_token_symbols=("MU-USDT-SWAP",))
+            write_generation_manifest_and_caches(data_dir, symbol="BTC-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",), stock_token_symbols=())
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("BTC-USDT-SWAP",), stock_token_symbols=("MU-USDT-SWAP",))
             scanned = []
             with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
                 result = run_once(
@@ -934,7 +935,7 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("MU-USDT-SWAP",), integrity="invalid", status="invalid")
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("MU-USDT-SWAP",), integrity="invalid", status="invalid")
             result = run_once(
                 DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()),
                 broker=None,
@@ -949,9 +950,9 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_flat_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("MU-USDT-SWAP",))
+            write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1, universe_symbols=("MU-USDT-SWAP",))
             manifest_before = manifest_path(data_dir).read_bytes()
-            with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("writer")):
+            with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("writer")):
                 with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("writer")):
                     with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("writer")):
                         result = run_once(DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()), broker=None, scanner=lambda symbol, *_args, **_kwargs: _wait(symbol))

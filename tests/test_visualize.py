@@ -526,6 +526,8 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
 
     symbol = "MU-USDT-SWAP"
     store = TrustedDataStore(data_dir=data_dir)
+    run_id = "failed-run"
+    store.prepare_generation(run_id)
     five = [_candle(index * 300_000, 100 + index) for index in range(DAY_MS // 300_000)]
     by_interval = {
         "5m": five,
@@ -534,7 +536,7 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
     }
     symbols = {symbol: {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.flat_cache_path(symbol, interval)
+        path = store.generation_cache_path(run_id, symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -547,16 +549,17 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
             "first_timestamp_ms": candles[0].open_time_ms,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
-            "source_file": str(path),
+            "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(candles),
             "validation": {"ok": True, "reason": "ok"},
         }
-    store.write_manifest(
+    store.write_generation_manifest(
+        run_id,
         {
             "schema_version": 3,
-            "run_id": "failed-run",
+            "run_id": run_id,
             "attempt_status": "failed",
-            "snapshot_usability": "invalid",
+            "snapshot_usability": "usable",
             "started_at_ms": 0,
             "completed_at_ms": 86_400_000,
             "requested_intervals": ["5m", "15m", "1h"],
@@ -568,6 +571,7 @@ def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
             "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
         }
     )
+    store.replace_current(run_id)
 
 
 if __name__ == "__main__":

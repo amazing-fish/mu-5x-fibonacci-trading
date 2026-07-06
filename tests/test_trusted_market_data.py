@@ -478,7 +478,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
-                with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("write_manifest")):
+                with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
                     with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
                         with patch("mu_strategy.market_data.service.refresh_with_okx_provider", side_effect=AssertionError("provider"), create=True):
                             with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
@@ -503,7 +503,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
             manifest_intervals = {}
             five_minute = _five_minute_candles(days=1)
             for interval in ("5m", "15m", "1h"):
-                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                path = _generation_cache_path(data_dir, "test-run", "MU-USDT-SWAP", interval)
                 if interval == "5m":
                     candles = five_minute
                 else:
@@ -522,7 +522,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "first_timestamp_ms": candles[0].open_time_ms,
                     "last_timestamp_ms": candles[-1].open_time_ms,
                     "updated_at_ms": 3_600_000,
-                    "source_file": str(path),
+                    "source_file": f"okx/MU-USDT-SWAP/{interval}.csv",
                     "is_valid": True,
                     "is_stale": False,
                     "reason": "ok",
@@ -530,12 +530,9 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "content_sha256": candles_content_sha256(candles),
                     "validation": {"ok": True, "reason": "ok"},
                 }
-            _manifest_path(data_dir).write_text(
-                json.dumps(_manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})),
-                encoding="utf-8",
-            )
+            _write_generation_manifest(data_dir, _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}}))
 
-            with patch.object(TrustedDataStore, "write_manifest", side_effect=AssertionError("write_manifest")):
+            with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
                 with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
                     with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
                         bundle = refresh_trusted_candle_bundle(
@@ -568,7 +565,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
             }
             manifest_intervals = {}
             for interval, candles in candles_by_interval.items():
-                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                path = _generation_cache_path(data_dir, "test-run", "MU-USDT-SWAP", interval)
                 write_csv(candles, path)
                 manifest_intervals[interval] = {
                     "symbol": "MU-USDT-SWAP",
@@ -581,7 +578,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "first_timestamp_ms": candles[0].open_time_ms,
                     "last_timestamp_ms": candles[-1].open_time_ms,
                     "updated_at_ms": 3 * DAY_MS,
-                    "source_file": str(path),
+                    "source_file": f"okx/MU-USDT-SWAP/{interval}.csv",
                     "is_valid": True,
                     "is_stale": False,
                     "reason": "ok",
@@ -590,7 +587,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "validation": {"ok": True, "reason": "ok"},
                 }
             manifest = _manifest(symbols={"MU-USDT-SWAP": {"intervals": manifest_intervals}})
-            _manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
+            _write_generation_manifest(data_dir, manifest)
 
             bundle = refresh_trusted_candle_bundle(
                 "MU-USDT-SWAP",
@@ -624,7 +621,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             for interval in ("5m", "15m"):
-                path = data_dir / "okx" / "MU-USDT-SWAP" / f"{interval}.csv"
+                path = _generation_cache_path(data_dir, "test-run", "MU-USDT-SWAP", interval)
                 write_csv(_fake_fetcher("MU-USDT-SWAP", interval, days=1), path)
             manifest = _manifest(
                 outcome="failed",
@@ -643,7 +640,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                                 "first_timestamp_ms": 0,
                                 "last_timestamp_ms": 2_700_000,
                                 "updated_at_ms": 3_600_000,
-                                "source_file": str(data_dir / "okx" / "MU-USDT-SWAP" / "15m.csv"),
+                                "source_file": "okx/MU-USDT-SWAP/15m.csv",
                                 "is_valid": False,
                                 "is_stale": True,
                                 "reason": "incremental_refresh_failed",
@@ -657,7 +654,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 },
                 cycle_error={"error_type": "TimeoutError", "message": "blocked"},
             )
-            _manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
+            _write_generation_manifest(data_dir, manifest)
 
             bundle = refresh_trusted_candle_bundle(
                 "MU-USDT-SWAP",
@@ -768,11 +765,11 @@ def _manifest(
 
 
 def _write_flat_manifest_for_paths(data_dir: Path, intervals_by_symbol: dict[str, tuple[str, ...]]) -> None:
+    run_id = "generation-corrupt-cache"
     symbols = {}
     for symbol, intervals in intervals_by_symbol.items():
         symbols[symbol] = {"intervals": {}}
         for interval in intervals:
-            path = data_dir / "okx" / symbol / f"{interval}.csv"
             symbols[symbol]["intervals"][interval] = {
                 "symbol": symbol,
                 "interval": interval,
@@ -784,28 +781,41 @@ def _write_flat_manifest_for_paths(data_dir: Path, intervals_by_symbol: dict[str
                 "first_timestamp_ms": 0,
                 "last_timestamp_ms": 0,
                 "updated_at_ms": 0,
-                "source_file": str(path),
+                "source_file": f"okx/{symbol}/{interval}.csv",
                 "content_sha256": "not-checked-during-refresh",
                 "validation": {"ok": True, "reason": "ok"},
             }
-    _manifest_path(data_dir).write_text(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "run_id": "flat-corrupt-cache",
-                "attempt_status": "success",
-                "snapshot_usability": "usable",
-                "started_at_ms": 0,
-                "completed_at_ms": 0,
-                "requested_intervals": ["5m", "15m", "1h"],
-                "effective_intervals": ["5m", "15m", "1h"],
-                "universes": {"crypto_top": [], "stock_token_top": []},
-                "symbols": symbols,
-                "provider_failures": [],
-                "warnings": [],
-                "cycle_error": None,
-            }
-        ),
+    _write_generation_manifest(
+        data_dir,
+        {
+            "schema_version": 3,
+            "run_id": run_id,
+            "attempt_status": "success",
+            "snapshot_usability": "usable",
+            "started_at_ms": 0,
+            "completed_at_ms": 0,
+            "requested_intervals": ["5m", "15m", "1h"],
+            "effective_intervals": ["5m", "15m", "1h"],
+            "universes": {"crypto_top": [], "stock_token_top": []},
+            "symbols": symbols,
+            "provider_failures": [],
+            "warnings": [],
+            "cycle_error": None,
+        },
+    )
+
+
+def _generation_cache_path(data_dir: Path, run_id: str, symbol: str, interval: str) -> Path:
+    return data_dir / "generations" / run_id / "okx" / symbol / f"{interval}.csv"
+
+
+def _write_generation_manifest(data_dir: Path, manifest: dict) -> None:
+    run_id = manifest["run_id"]
+    manifest_path = data_dir / "generations" / run_id / "manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    (data_dir / "current.json").write_text(
+        json.dumps({"schema_version": 1, "generation_id": run_id, "manifest": f"generations/{run_id}/manifest.json"}),
         encoding="utf-8",
     )
 
@@ -819,12 +829,10 @@ class _FixedClock:
 
 
 def _manifest_path(data_dir: Path) -> Path:
-    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-
     current = data_dir / "current.json"
     if current.exists():
         return data_dir / json.loads(current.read_text(encoding="utf-8"))["manifest"]
-    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
+    return data_dir / "manifest.json"
 
 
 if __name__ == "__main__":

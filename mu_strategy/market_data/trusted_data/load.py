@@ -31,7 +31,6 @@ class LoadTrustedBundleQuery:
     intervals: tuple[str, ...]
     days: int
     now_ms: int | None = None
-    compatibility_mode: bool = False
 
 
 class LoadTrustedBundle:
@@ -52,9 +51,8 @@ class LoadTrustedBundle:
         self,
         *,
         now_ms: int | None = None,
-        compatibility_mode: bool = False,
     ) -> TrustedLoadContext:
-        context, manifest_result = self._open_context_result(now_ms=now_ms, compatibility_mode=compatibility_mode)
+        context, manifest_result = self._open_context_result(now_ms=now_ms)
         if context is None:
             reason = manifest_result.reason or HealthReason.MANIFEST_BLOCKED
             message = manifest_result.message or reason.value
@@ -71,12 +69,12 @@ class LoadTrustedBundle:
         resolved = resolve_okx_swap_symbol(query.symbol)
         plan = self.planner.plan(query.intervals)
         if context is None:
-            context, manifest_result = self._open_context_result(now_ms=query.now_ms, compatibility_mode=query.compatibility_mode)
+            context, manifest_result = self._open_context_result(now_ms=query.now_ms)
             if context is None:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={interval: [] for interval in plan.requested_intervals},
-                    files_by_interval={interval: self.store.flat_cache_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
+                    files_by_interval={interval: self._unpublished_dataset_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(
@@ -191,12 +189,18 @@ class LoadTrustedBundle:
         self,
         *,
         now_ms: int | None = None,
-        compatibility_mode: bool = False,
     ):
         observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
-        manifest_result = self.store.read_manifest(compatibility_mode=compatibility_mode)
+        manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None, manifest_result
+        if manifest_result.generation_id is None:
+            return None, replace(
+                manifest_result,
+                reason=HealthReason.MALFORMED_MANIFEST,
+                error_type="ManifestSchemaError",
+                message="trusted manifest must be pinned to a generation",
+            )
         return (
             TrustedLoadContext(
                 manifest=manifest_result.snapshot,
@@ -216,17 +220,16 @@ class LoadTrustedBundle:
     ) -> Path:
         if manifest_health is None:
             return self._default_dataset_path(symbol, interval, context)
-        if context.generation_id is None:
-            return self.store.flat_cache_path(symbol, interval)
         expected = self.store.generation_source_file(symbol, interval)
         if manifest_health.source_file.as_posix() != expected.as_posix():
             raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
         return self.store.generation_cache_path(context.generation_id, symbol, interval)
 
     def _default_dataset_path(self, symbol: str, interval: str, context: TrustedLoadContext) -> Path:
-        if context.generation_id is None:
-            return self.store.flat_cache_path(symbol, interval)
         return self.store.generation_cache_path(context.generation_id, symbol, interval)
+
+    def _unpublished_dataset_path(self, symbol: str, interval: str) -> Path:
+        return self.store.generations_dir / "unpublished" / self.store.generation_source_file(symbol, interval)
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:
