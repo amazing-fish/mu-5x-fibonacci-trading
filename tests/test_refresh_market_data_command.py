@@ -37,10 +37,83 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                 "snapshot_usability": "usable",
                 "usable": True,
                 "symbols": 1,
+                "fetch_mode": "top_universe",
             },
             json.loads(stdout.getvalue()),
         )
         write_dashboard.assert_called_once()
+
+    def test_explicit_symbol_subset_skips_universe_fetch_and_reports_mode(self):
+        from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+        fetch_calls = []
+
+        def fetch_history(symbol: str, interval: str, *, days: int):
+            fetch_calls.append((symbol, interval, days))
+            five = range_candles(0, 86_100_000)
+            if interval == "5m":
+                return five
+            return aggregate_candles(five, interval=interval)
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            html_path = Path(tmp) / "health.html"
+            stdout = io.StringIO()
+            with patch(
+                "mu_strategy.market_data.trusted_data.refresh.fetch_okx_swap_tickers",
+                side_effect=AssertionError("explicit refresh must not fetch ticker universe"),
+            ) as fetch_tickers:
+                with patch(
+                    "mu_strategy.market_data.trusted_data.refresh.load_stock_token_inst_ids",
+                    side_effect=AssertionError("explicit refresh must not load stock token config"),
+                ) as load_config:
+                    with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical", side_effect=fetch_history):
+                        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=86_400_000):
+                            exit_code = main(
+                                [
+                                    "--symbol",
+                                    "MU",
+                                    "--symbol",
+                                    "MU-USDT-SWAP",
+                                    "--limit",
+                                    "99",
+                                    "--days",
+                                    "1",
+                                    "--interval",
+                                    "15m",
+                                    "--data-dir",
+                                    str(data_dir),
+                                    "--html-output",
+                                    str(html_path),
+                                ],
+                                stdout=stdout,
+                            )
+
+            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+            html = html_path.read_text(encoding="utf-8")
+            output = json.loads(stdout.getvalue())
+
+        fetch_tickers.assert_not_called()
+        load_config.assert_not_called()
+        self.assertEqual(0, exit_code)
+        self.assertEqual(
+            [("MU-USDT-SWAP", "5m", 1), ("MU-USDT-SWAP", "15m", 1)],
+            fetch_calls,
+        )
+        self.assertEqual("explicit_symbols", output["fetch_mode"])
+        self.assertEqual(["MU-USDT-SWAP"], output["requested_symbols"])
+        self.assertEqual(1, output["symbols"])
+        self.assertEqual(["5m", "15m"], manifest["effective_intervals"])
+        self.assertEqual(["MU-USDT-SWAP"], list(manifest["symbols"]))
+        self.assertEqual(
+            [{"inst_id": "MU-USDT-SWAP", "last": 0.0, "volume_ccy_24h": 0.0, "source": "explicit"}],
+            manifest["universes"]["crypto_top"],
+        )
+        self.assertEqual([], manifest["universes"]["stock_token_top"])
+        self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
+        self.assertNotIn("stock_token_top_count_below_limit", ",".join(manifest["warnings"]))
+        self.assertIn("explicit", html)
 
     def test_dashboard_failure_after_successful_refresh_warns_without_cycle_error(self):
         from mu_strategy.commands.refresh_market_data import main
@@ -444,7 +517,14 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
             rows[0],
         )
         self.assertEqual(
-            {"run_id": "run-ok", "attempt_status": "success", "snapshot_usability": "usable", "usable": True, "symbols": 1},
+            {
+                "run_id": "run-ok",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
+                "usable": True,
+                "symbols": 1,
+                "fetch_mode": "top_universe",
+            },
             rows[1],
         )
         write_dashboard.assert_called_once()

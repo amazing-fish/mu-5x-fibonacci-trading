@@ -45,6 +45,19 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "limit"):
             RefreshTrustedMarketDataRequest(limit=-1)
 
+    def test_request_normalizes_and_dedupes_explicit_symbols(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
+
+        request = RefreshTrustedMarketDataRequest(symbols=("MU", "MU-USDT-SWAP", "mu_usdt_swap"))
+
+        self.assertEqual(("MU-USDT-SWAP",), request.symbols)
+
+    def test_request_rejects_invalid_explicit_symbol(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
+
+        with self.assertRaisesRegex(ValueError, "symbol"):
+            RefreshTrustedMarketDataRequest(symbols=("!!!",))
+
 
 class TrustedCandleValidationTests(unittest.TestCase):
     def test_validate_built_native_rejects_empty_built(self):
@@ -468,6 +481,64 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("ohlcv_mismatch", status["reason"])
         self.assertEqual("ohlcv_mismatch", status["validation"]["reason"])
 
+    def test_explicit_symbol_refresh_publishes_generation_consumable_by_loader(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        provider = _NoTickerRecordingProvider()
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    symbols=("MU", "MU-USDT-SWAP"),
+                    requested_intervals=("15m",),
+                    limit=99,
+                    days=1,
+                    now_ms=86_400_000,
+                    run_id="run-explicit",
+                )
+            )
+            bundle = LoadTrustedBundle(store).execute(
+                LoadTrustedBundleQuery("MU", intervals=("15m",), days=1, now_ms=86_400_000),
+                trading_strict_policy(),
+            )
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+
+        self.assertEqual("success", run.attempt_status.value)
+        self.assertEqual(("5m", "15m"), run.effective_intervals)
+        self.assertEqual([("MU-USDT-SWAP", "5m", 1), ("MU-USDT-SWAP", "15m", 1)], provider.history_calls)
+        self.assertEqual([], provider.incremental_calls)
+        self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+        self.assertEqual("run-explicit", bundle.run_id)
+        self.assertEqual(["MU-USDT-SWAP"], list(manifest["symbols"]))
+        self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
+        self.assertEqual("explicit", manifest["universes"]["crypto_top"][0]["source"])
+
+    def test_explicit_symbol_refresh_reuses_current_generation_incrementally(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            first_provider = _NoTickerRecordingProvider()
+            request = dict(symbols=("MU",), requested_intervals=("5m",), days=1, limit=10, now_ms=86_400_000)
+            RefreshTrustedMarketData(store, first_provider).execute(
+                RefreshTrustedMarketDataRequest(**request, run_id="run-old")
+            )
+            second_provider = _NoTickerRecordingProvider()
+            RefreshTrustedMarketData(store, second_provider).execute(
+                RefreshTrustedMarketDataRequest(**request, run_id="run-new")
+            )
+
+        self.assertEqual([("MU-USDT-SWAP", "5m", 1)], first_provider.history_calls)
+        self.assertEqual([], first_provider.incremental_calls)
+        self.assertEqual([], second_provider.history_calls)
+        self.assertEqual([("MU-USDT-SWAP", "5m", 85_800_000)], second_provider.incremental_calls)
+
 
 class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_refresh_true_fails_before_provider_or_writes(self):
@@ -698,6 +769,23 @@ class TrustedCandleBundleTests(unittest.TestCase):
 
             self.assertEqual(manifest_before, manifest_path.read_bytes())
             self.assertEqual(run_log_before, run_log_path.read_bytes())
+
+
+class _NoTickerRecordingProvider:
+    def __init__(self):
+        self.history_calls = []
+        self.incremental_calls = []
+
+    def fetch_tickers(self):
+        raise AssertionError("explicit symbol refresh must not fetch ticker universe")
+
+    def fetch_history(self, symbol, interval, *, days):
+        self.history_calls.append((symbol, interval, days))
+        return _fake_fetcher(symbol, interval, days=days)
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        self.incremental_calls.append((symbol, interval, since_time_ms))
+        return []
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:

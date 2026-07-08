@@ -114,6 +114,12 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 ```
 
+只刷新显式 symbol 子集（例如 MU-only）时，可重复传入 `--symbol`。传入后刷新范围只由这些 symbol 决定，不会拉取 Top universe ticker list，也不会因 `--limit` 扩大范围：
+
+```powershell
+python -m mu_strategy.commands.refresh_market_data --symbol MU-USDT-SWAP --data-dir data\live --html-output reports\live\data_health.html
+```
+
 持续刷新模式：
 
 ```powershell
@@ -142,6 +148,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
+- 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。
 - backtest 和 visualization 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
 - 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。

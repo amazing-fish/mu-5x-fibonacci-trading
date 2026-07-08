@@ -105,6 +105,7 @@ class RefreshTrustedMarketDataRequest:
     requested_intervals: tuple[str, ...] = DEFAULT_INTERVALS
     days: int = 180
     limit: int = 10
+    symbols: tuple[str, ...] = ()
     stock_token_config: Path = DEFAULT_STOCK_TOKEN_CONFIG
     stock_token_inst_ids: set[str] | None = None
     now_ms: int | None = None
@@ -113,6 +114,7 @@ class RefreshTrustedMarketDataRequest:
     def __post_init__(self) -> None:
         if self.limit < 0:
             raise ValueError("limit must be non-negative")
+        object.__setattr__(self, "symbols", _normalize_explicit_symbols(self.symbols))
 
 
 @dataclass(frozen=True)
@@ -206,10 +208,11 @@ class RefreshTrustedMarketData:
             candles_by_key.update(symbol_candles)
 
         warnings: list[str] = []
-        if request.limit > 0 and not datasets:
-            warnings.append("empty_universe")
-        if len(universe.stock_token_top) < request.limit:
-            warnings.append(f"stock_token_top_count_below_limit:{len(universe.stock_token_top)}/{request.limit}")
+        if not request.symbols:
+            if request.limit > 0 and not datasets:
+                warnings.append("empty_universe")
+            if len(universe.stock_token_top) < request.limit:
+                warnings.append(f"stock_token_top_count_below_limit:{len(universe.stock_token_top)}/{request.limit}")
         provider_failures = _provider_failures(datasets)
         health_summary = classify_publication_health(datasets, provider_failures=provider_failures)
         run = RefreshRun(
@@ -229,6 +232,10 @@ class RefreshTrustedMarketData:
         return run
 
     def _universe(self, request: RefreshTrustedMarketDataRequest) -> UniverseSnapshot:
+        if request.symbols:
+            return UniverseSnapshot(
+                crypto_top=tuple(_explicit_ticker_dict(symbol) for symbol in request.symbols),
+            )
         if request.limit == 0:
             return UniverseSnapshot()
         rows = self.provider.fetch_tickers()
@@ -505,6 +512,34 @@ def _failure_fields_from_health(health: DatasetHealth) -> dict[str, str]:
 
 def _now_ms(value: int | None, clock: Clock) -> int:
     return int(value if value is not None else clock.now_ms())
+
+
+def _normalize_explicit_symbols(values) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        iterable = (values,)
+    else:
+        iterable = tuple(values)
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for value in iterable:
+        resolved = resolve_okx_swap_symbol(str(value))
+        inst_id = validate_storage_segment(resolved.inst_id, field="symbol")
+        if inst_id in seen:
+            continue
+        seen.add(inst_id)
+        symbols.append(inst_id)
+    return tuple(symbols)
+
+
+def _explicit_ticker_dict(symbol: str) -> dict:
+    return {
+        "inst_id": symbol,
+        "last": 0.0,
+        "volume_ccy_24h": 0.0,
+        "source": "explicit",
+    }
 
 
 def _ticker_dict(ticker: OKXSwapTicker) -> dict:
