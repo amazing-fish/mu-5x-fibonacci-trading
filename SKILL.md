@@ -81,7 +81,7 @@ Before treating this as usable, run:
 
 ```powershell
 python -m unittest discover -s tests
-python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
+python -m mu_strategy.commands.refresh_market_data --symbol MU-USDT-SWAP --data-dir data\live --html-output reports\live\data_health.html
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\live\mu_okx_backtest.md
 python -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit --report reports\live\mu_okx_backtest_limit.md
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\live\mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html
