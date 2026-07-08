@@ -137,7 +137,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 当前产物约定
 
 - `data/live/current.json` 和其指向的 `data/live/generations/<run_id>/` 是当前可信数据 baseline；只有明确发布 baseline 时才应入库。
-- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
+- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、blocking symbols、segment diagnostics、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
 - `reports/live/mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html`：推荐的本地 MU 180d 交互式回测报告路径。
 - `reports/live/*.md` / `reports/live/*.html` 是可再生成的本地 artifact，默认不入库；如果需要审阅，给出本地链接或重新生成。
 - `docs/fibonacci-preferred-parameters.md` 是历史参数记录，不等同于当前可信市场数据 baseline。
@@ -151,7 +151,8 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。
 - backtest 和 visualization 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
-- 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。
+- 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。manifest 可以附带 backward-compatible optional `diagnostics.refresh_segments`，用于审计每个 symbol/interval 的 fetch mode、耗时、rows、reuse 和失败原因；trusted consumers 不依赖该字段，缺失时仍按 dataset health fail-closed。
+- `refresh_runs.jsonl` 和 `refresh_market_data` JSON 输出会暴露 per-symbol/per-interval diagnostics，包括 `refresh_segments`、最多 5 条 `slowest_segments`、失败/非 ok 的 `failed_segments`，以及按 symbol 汇总的 `blocking_symbols`。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。
 - freshness 按当前 clock、interval 和最后一根已确认 K 线计算；不会因为上次 fetch 成功就默认 fresh。
 - `RefreshAttemptStatus` 表示 refresh attempt 健康：只有全量 usable 且无 provider/cache/validation failure 才是 `success`；mixed usable/unusable 是 `degraded`；zero usable 不论来自 provider failure、cache read failure、validation failure、coverage failure 或 content hash mismatch 都是 `failed`。

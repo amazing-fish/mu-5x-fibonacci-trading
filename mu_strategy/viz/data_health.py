@@ -10,6 +10,7 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     rows = []
     blocking = _blocking_issue_summary(manifest)
     partial = _partial_coverage_summary(manifest)
+    segments = _segment_diagnostics_table(manifest)
     for symbol, payload in sorted((manifest.get("symbols") or {}).items()):
         source = payload.get("source")
         for interval, status in sorted((payload.get("intervals") or {}).items()):
@@ -98,6 +99,10 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
     {partial}
   </section>
   <section>
+    <h2>Segment diagnostics</h2>
+    {segments}
+  </section>
+  <section>
     <h2>Warnings</h2>
     <ul>{warning_html}</ul>
   </section>
@@ -156,7 +161,7 @@ def _blocking_issue_summary(manifest: dict[str, Any]) -> str:
             reason = str(status.get("reason") or _reasons_text(status))
             grouped.setdefault(symbol, {}).setdefault(reason, []).append(str(interval))
     if not grouped:
-        return "<p>无</p>"
+        return "<p>无 blocking symbols</p>"
     summary = f"<p>{len(grouped)} blocking symbol{'s' if len(grouped) != 1 else ''}</p>"
     items: list[str] = []
     for symbol, reasons in grouped.items():
@@ -168,6 +173,41 @@ def _blocking_issue_summary(manifest: dict[str, Any]) -> str:
         hint_html = f'<div class="hint">{_e(hint)}</div>' if hint else ""
         items.append(f"<li><strong>{_e(symbol)}</strong> {_e(reason_text)}{hint_html}</li>")
     return summary + '<ul class="issue-list">' + "".join(items) + "</ul>"
+
+
+def _segment_diagnostics_table(manifest: dict[str, Any]) -> str:
+    diagnostics = manifest.get("diagnostics") or {}
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    segments = diagnostics.get("refresh_segments") or manifest.get("refresh_segments") or []
+    if not isinstance(segments, list) or not segments:
+        return "<p>No segment diagnostics</p>"
+    rows: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        reason = segment.get("fetch_reason") or segment.get("health_reason") or "-"
+        rows.append(
+            f"""
+        <tr>
+          <td>{_e(segment.get("symbol"))}</td>
+          <td>{_e(segment.get("interval"))}</td>
+          <td>{_e(segment.get("fetch_mode"))}</td>
+          <td class="num">{_e(segment.get("elapsed_ms"))}</td>
+          <td class="num">{_e(segment.get("existing_rows"))}</td>
+          <td class="num">{_e(segment.get("fetched_rows"))}</td>
+          <td class="num">{_e(segment.get("output_rows"))}</td>
+          <td>{_e(reason)}</td>
+          <td>{_e(segment.get("error_type"))}</td>
+          <td class="mono">{_e(segment.get("message"))}</td>
+        </tr>"""
+        )
+    body = "\n".join(rows) if rows else '<tr><td colspan="10">No segment diagnostics</td></tr>'
+    return f"""
+    <table>
+      <thead><tr><th>symbol</th><th>interval</th><th>fetch_mode</th><th>elapsed_ms</th><th>existing_rows</th><th>fetched_rows</th><th>output_rows</th><th>reason</th><th>error_type</th><th>message</th></tr></thead>
+      <tbody>{body}</tbody>
+    </table>"""
 
 
 def _partial_coverage_summary(manifest: dict[str, Any]) -> str:

@@ -8,7 +8,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TextIO
 
-from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, RefreshRun, SnapshotUsability
+from mu_strategy.market_data.trusted_data.contracts import (
+    RefreshAttemptStatus,
+    RefreshRun,
+    SnapshotUsability,
+    refresh_run_diagnostics_payload,
+)
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_INTERVALS,
     RefreshTrustedMarketData,
@@ -37,6 +42,10 @@ class RefreshCommandResult:
     cycle_error: dict[str, str] | None = None
     reason: str | None = None
     message: str | None = None
+    refresh_segments: tuple[dict[str, Any], ...] = ()
+    slowest_segments: tuple[dict[str, Any], ...] = ()
+    failed_segments: tuple[dict[str, Any], ...] = ()
+    blocking_symbols: dict[str, list[dict[str, str]]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -59,6 +68,17 @@ class RefreshCommandResult:
             payload["reason"] = self.reason
         if self.message is not None:
             payload["message"] = self.message
+        if self.refresh_segments:
+            payload["refresh_segments"] = [dict(value) for value in self.refresh_segments]
+        if self.slowest_segments:
+            payload["slowest_segments"] = [dict(value) for value in self.slowest_segments]
+        if self.failed_segments:
+            payload["failed_segments"] = [dict(value) for value in self.failed_segments]
+        if self.blocking_symbols:
+            payload["blocking_symbols"] = {
+                symbol: [dict(value) for value in values]
+                for symbol, values in self.blocking_symbols.items()
+            }
         return payload
 
 
@@ -163,6 +183,7 @@ def classify_refresh_run(run: RefreshRun) -> RefreshCommandResult:
             "trusted publication is not fully healthy: "
             f"attempt_status={run.attempt_status.value}, snapshot_usability={run.snapshot_usability.value}"
         )
+    diagnostics = refresh_run_diagnostics_payload(run)
     return RefreshCommandResult(
         run_id=run.run_id,
         attempt_status=run.attempt_status.value,
@@ -177,6 +198,10 @@ def classify_refresh_run(run: RefreshRun) -> RefreshCommandResult:
         cycle_error=run.cycle_error,
         reason=reason,
         message=message,
+        refresh_segments=tuple(diagnostics.get("refresh_segments") or ()),
+        slowest_segments=tuple(diagnostics.get("slowest_segments") or ()),
+        failed_segments=tuple(diagnostics.get("failed_segments") or ()),
+        blocking_symbols=diagnostics.get("blocking_symbols"),
     )
 
 

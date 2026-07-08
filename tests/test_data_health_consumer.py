@@ -277,6 +277,81 @@ class DataHealthConsumerTests(unittest.TestCase):
         self.assertIn("effective 117.25d", html)
         self.assertLess(html.index("Partial coverage"), html.index("Intervals"))
 
+    def test_dashboard_renders_without_diagnostics_and_says_no_blocking_symbols(self):
+        from mu_strategy.viz.data_health import render_data_health_dashboard
+
+        html = render_data_health_dashboard(
+            {
+                "schema_version": 3,
+                "run_id": "run-old-manifest",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
+                "updated_at_ms": 86_400_000,
+                "requested_intervals": ["5m"],
+                "effective_intervals": ["5m"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": {
+                    "MU-USDT-SWAP": {
+                        "source": "explicit",
+                        "intervals": {"5m": _status("MU-USDT-SWAP", "5m")},
+                    }
+                },
+            }
+        )
+
+        self.assertIn("无 blocking symbols", html)
+        self.assertIn("Segment diagnostics", html)
+        self.assertIn("No segment diagnostics", html)
+
+    def test_dashboard_shows_refresh_segment_diagnostics(self):
+        from mu_strategy.viz.data_health import render_data_health_dashboard
+
+        html = render_data_health_dashboard(
+            {
+                "schema_version": 3,
+                "run_id": "run-segments",
+                "attempt_status": "success",
+                "snapshot_usability": "usable",
+                "updated_at_ms": 86_400_000,
+                "requested_intervals": ["5m"],
+                "effective_intervals": ["5m"],
+                "universes": {"crypto_top": [], "stock_token_top": []},
+                "symbols": {
+                    "MU-USDT-SWAP": {
+                        "source": "explicit",
+                        "intervals": {"5m": _status("MU-USDT-SWAP", "5m")},
+                    }
+                },
+                "diagnostics": {
+                    "refresh_segments": [
+                        {
+                            "symbol": "MU-USDT-SWAP",
+                            "interval": "5m",
+                            "fetch_mode": "incremental_reuse",
+                            "started_at_ms": 1,
+                            "completed_at_ms": 26,
+                            "elapsed_ms": 25,
+                            "existing_rows": 288,
+                            "fetched_rows": 2,
+                            "output_rows": 290,
+                            "had_existing": True,
+                            "reused_prior_generation": True,
+                            "fetch_reason": None,
+                            "health_reason": "ok",
+                            "error_type": None,
+                            "message": None,
+                        }
+                    ]
+                },
+            }
+        )
+
+        self.assertIn("Segment diagnostics", html)
+        self.assertIn("incremental_reuse", html)
+        self.assertIn("25", html)
+        self.assertIn("288", html)
+        self.assertIn("290", html)
+
 
 class _Broker:
     def get_positions(self, *, inst_type=None, inst_id=None):

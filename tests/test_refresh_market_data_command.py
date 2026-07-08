@@ -104,7 +104,22 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("explicit_symbols", output["fetch_mode"])
         self.assertEqual(["MU-USDT-SWAP"], output["requested_symbols"])
         self.assertEqual(1, output["symbols"])
+        self.assertIn("refresh_segments", output)
+        self.assertEqual(2, len(output["refresh_segments"]))
+        self.assertEqual(["15m", "5m"], [segment["interval"] for segment in output["slowest_segments"]])
+        for segment in output["refresh_segments"]:
+            self.assertEqual("MU-USDT-SWAP", segment["symbol"])
+            self.assertEqual("full_history", segment["fetch_mode"])
+            self.assertEqual(0, segment["existing_rows"])
+            self.assertGreater(segment["fetched_rows"], 0)
+            self.assertEqual(segment["fetched_rows"], segment["output_rows"])
+            self.assertFalse(segment["had_existing"])
+            self.assertFalse(segment["reused_prior_generation"])
+            self.assertEqual("ok", segment["health_reason"])
+        self.assertNotIn("failed_segments", output)
+        self.assertNotIn("blocking_symbols", output)
         self.assertEqual(["5m", "15m"], manifest["effective_intervals"])
+        self.assertEqual(output["refresh_segments"], manifest["diagnostics"]["refresh_segments"])
         self.assertEqual(["MU-USDT-SWAP"], list(manifest["symbols"]))
         self.assertEqual(
             [{"inst_id": "MU-USDT-SWAP", "last": 0.0, "volume_ccy_24h": 0.0, "source": "explicit"}],
@@ -314,6 +329,15 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertFalse(output["usable"])
         self.assertEqual("degraded", manifest["attempt_status"])
         self.assertEqual("degraded", run_log[-1]["attempt_status"])
+        self.assertEqual("refresh_failed", output["failed_segments"][0]["fetch_mode"])
+        self.assertEqual("BTC-USDT-SWAP", output["failed_segments"][0]["symbol"])
+        self.assertEqual(
+            [{"interval": "5m", "reason": "refresh_failed"}],
+            [
+                {"interval": item["interval"], "reason": item["reason"]}
+                for item in output["blocking_symbols"]["BTC-USDT-SWAP"]
+            ],
+        )
         self.assertTrue(html_exists)
 
     def test_success_stale_one_shot_exits_non_zero_after_writing_artifacts(self):
@@ -415,6 +439,13 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("failed", manifest["attempt_status"])
         self.assertEqual("invalid", manifest["snapshot_usability"])
         self.assertEqual("ohlcv_invalid", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["reason"])
+        self.assertEqual(
+            [{"interval": "5m", "reason": "ohlcv_invalid"}],
+            [
+                {"interval": item["interval"], "reason": item["reason"]}
+                for item in output["blocking_symbols"]["BTC-USDT-SWAP"]
+            ],
+        )
         self.assertEqual("failed", run_log[-1]["attempt_status"])
         self.assertEqual("invalid", run_log[-1]["snapshot_usability"])
 
