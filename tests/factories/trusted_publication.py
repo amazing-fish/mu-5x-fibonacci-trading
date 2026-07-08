@@ -184,7 +184,7 @@ def manifest_path(data_dir: Path) -> Path:
     current = data_dir / "current.json"
     if current.exists():
         return data_dir / read_current(data_dir)["manifest"]
-    return TrustedDataStore(data_dir=data_dir).flat_manifest_path
+    return data_dir / "manifest.json"
 
 
 def current_generation_dir(data_dir: Path) -> Path:
@@ -268,7 +268,7 @@ def write_generation_pointer(data_dir: Path, *, generation_id: str, manifest: di
     return generation_dir
 
 
-def write_flat_manifest_and_caches(
+def write_generation_manifest_and_caches(
     data_dir: Path,
     *,
     symbol: str,
@@ -285,6 +285,9 @@ def write_flat_manifest_and_caches(
     from mu_strategy.market_data.utils import DAY_MS
 
     store = TrustedDataStore(data_dir=data_dir)
+    generation_dir = store.generation_root(run_id)
+    if not generation_dir.exists():
+        store.prepare_generation(run_id)
     five = [
         Candle(index * 300_000, 100.0 + index, 101.0 + index, 99.0 + index, 100.0 + index, 1000.0)
         for index in range(days * DAY_MS // 300_000)
@@ -303,7 +306,7 @@ def write_flat_manifest_and_caches(
     elif freshness == "unknown":
         reason = "freshness_unknown"
     for interval, rows in rows_by_interval.items():
-        path = store.flat_cache_path(symbol, interval)
+        path = store.generation_cache_path(run_id, symbol, interval)
         store.write_csv(rows, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -316,7 +319,7 @@ def write_flat_manifest_and_caches(
             "first_timestamp_ms": rows[0].open_time_ms,
             "last_timestamp_ms": rows[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
-            "source_file": str(path),
+            "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(rows) if integrity == "valid" else None,
             "validation": {"ok": integrity == "valid", "reason": "ok" if integrity == "valid" else reason},
         }
@@ -350,7 +353,8 @@ def write_flat_manifest_and_caches(
         "warnings": [],
         "cycle_error": {"error_type": "TimeoutError", "message": "blocked"} if outcome == "failed" else None,
     }
-    store.write_manifest(manifest)
+    store.write_generation_manifest(run_id, manifest)
+    store.replace_current(run_id)
     return manifest
 
 
@@ -419,4 +423,4 @@ def write_orphan_flat_caches(data_dir: Path, *, symbol: str, days: int) -> None:
         for index in range(days * DAY_MS // 300_000)
     ]
     for interval, rows in {"5m": five, "15m": aggregate_candles(five, interval="15m"), "1h": aggregate_candles(five, interval="1h")}.items():
-        store.write_csv(rows, store.flat_cache_path(symbol, interval))
+        store.write_csv(rows, data_dir / "okx" / symbol / f"{interval}.csv")

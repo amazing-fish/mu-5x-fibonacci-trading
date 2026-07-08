@@ -294,8 +294,8 @@ class TrustedManifestSnapshot:
 class TrustedLoadContext:
     manifest: TrustedManifestSnapshot
     observed_at_ms: int
-    generation_root: Path = Path(".")
-    generation_id: str | None = None
+    generation_root: Path
+    generation_id: str
 
 
 def derive_snapshot_usability(
@@ -398,21 +398,11 @@ class TrustedBundle:
     load_context: TrustedLoadContext | None = None
 
 
-def trusted_manifest_snapshot_from_dict(
-    payload: dict[str, Any],
-    *,
-    compatibility_mode: bool = False,
-) -> TrustedManifestSnapshot:
+def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManifestSnapshot:
     schema_version = payload.get("schema_version")
     if not _is_int(schema_version):
-        if compatibility_mode and (schema_version is None or schema_version == 1):
-            return _legacy_manifest_snapshot(payload)
         raise ManifestSchemaError("manifest schema_version must be integer v3")
     if int(schema_version) != 3:
-        if compatibility_mode and int(schema_version) == 1:
-            return _legacy_manifest_snapshot(payload)
-        if compatibility_mode and int(schema_version) == 2:
-            return _legacy_manifest_snapshot(payload)
         raise ManifestSchemaError(f"unsupported manifest schema_version: {schema_version}")
 
     run_id = _required_str(payload, "run_id")
@@ -480,45 +470,6 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
-
-
-def _legacy_manifest_snapshot(payload: dict[str, Any]) -> TrustedManifestSnapshot:
-    symbols = payload.get("symbols") if isinstance(payload.get("symbols"), dict) else {}
-    status_value = str(payload.get("status") or "invalid")
-    snapshot_usability = (
-        SnapshotUsability.USABLE
-        if status_value == "ok"
-        else SnapshotUsability.STALE
-        if status_value == "stale"
-        else SnapshotUsability.INVALID
-    )
-    outcome_value = str(payload.get("outcome") or "")
-    attempt_status = (
-        RefreshAttemptStatus.FAILED
-        if outcome_value == "failed" or snapshot_usability == SnapshotUsability.INVALID
-        else RefreshAttemptStatus.DEGRADED
-        if outcome_value == "partial"
-        else RefreshAttemptStatus.SUCCESS
-    )
-    intervals = tuple(str(item) for item in payload.get("intervals") or ())
-    if not intervals:
-        intervals = tuple(dict.fromkeys(interval for _, interval in _datasets_from_symbols(symbols)))
-    universe_payload = payload.get("universes") if isinstance(payload.get("universes"), dict) else {}
-    return TrustedManifestSnapshot(
-        schema_version=1,
-        run_id=str(payload.get("run_id") or "legacy-manifest"),
-        attempt_status=attempt_status,
-        snapshot_usability=snapshot_usability,
-        started_at_ms=int(payload.get("started_at_ms") or 0),
-        completed_at_ms=int(payload.get("completed_at_ms") or payload.get("updated_at_ms") or 0),
-        requested_intervals=intervals,
-        effective_intervals=intervals,
-        universe_snapshot=_universe_snapshot_from_dict(universe_payload),
-        datasets=_datasets_from_symbols(symbols, strict=False),
-        provider_failures=_provider_failures(payload.get("provider_failures") or ()),
-        warnings=tuple(str(value) for value in payload.get("warnings") or ()),
-        cycle_error=_optional_str_dict(payload.get("cycle_error")),
-    )
 
 
 def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> dict[tuple[str, str], DatasetHealth]:

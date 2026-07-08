@@ -322,7 +322,7 @@ def _status(symbol: str, interval: str, path: Path, *, is_valid: bool = True, is
 
 
 def _write_failed_manifest_with_valid_csv(data_dir: Path) -> None:
-    _write_manifest_with_valid_csv(data_dir, symbol="MU-USDT-SWAP", outcome="failed", status="invalid")
+    _write_manifest_with_valid_csv(data_dir, symbol="MU-USDT-SWAP", outcome="failed", status="ok")
 
 
 def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str, status: str) -> None:
@@ -331,6 +331,8 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
     from mu_strategy.market_data.utils import DAY_MS
 
     store = TrustedDataStore(data_dir=data_dir)
+    run_id = f"{outcome}-run"
+    store.prepare_generation(run_id)
     five = [_candle(index * 300_000, 100 + index) for index in range(DAY_MS // 300_000)]
     by_interval = {
         "5m": five,
@@ -339,7 +341,7 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
     }
     symbols = {symbol: {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.flat_cache_path(symbol, interval)
+        path = store.generation_cache_path(run_id, symbol, interval)
         store.write_csv(candles, path)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
@@ -352,14 +354,15 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
             "first_timestamp_ms": candles[0].open_time_ms,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": 86_400_000,
-            "source_file": str(path),
+            "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(candles),
             "validation": {"ok": True, "reason": "ok"},
         }
-    store.write_manifest(
+    store.write_generation_manifest(
+        run_id,
         {
             "schema_version": 3,
-            "run_id": f"{outcome}-run",
+            "run_id": run_id,
             "attempt_status": "failed" if outcome == "failed" else "degraded" if outcome == "partial" else "success",
             "snapshot_usability": "usable" if status == "ok" else status,
             "started_at_ms": 0,
@@ -373,6 +376,7 @@ def _write_manifest_with_valid_csv(data_dir: Path, *, symbol: str, outcome: str,
             "cycle_error": {"error_type": "TimeoutError", "message": "blocked"},
         }
     )
+    store.replace_current(run_id)
 
 
 def _write_csv_only(data_dir: Path, *, symbol: str) -> None:
@@ -388,7 +392,7 @@ def _write_csv_only(data_dir: Path, *, symbol: str) -> None:
         "1h": aggregate_candles(five, interval="1h"),
     }
     for interval, candles in by_interval.items():
-        store.write_csv(candles, store.flat_cache_path(symbol, interval))
+        store.write_csv(candles, data_dir / "okx" / symbol / f"{interval}.csv")
 
 
 if __name__ == "__main__":

@@ -40,7 +40,7 @@ Rules:
 - Dataset health is per-cache health: availability, integrity, freshness, reasons, row count, time range, source file, content hash, and validation report.
 - Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
-- Missing or malformed manifest is fail-closed for trading strict policy. Legacy flat `data/live/manifest.json` formats are accepted only when refresh explicitly opts into migration compatibility and no `current.json` exists. Generation consumers always read schema v3 strictly, even if a caller passes `compatibility_mode=True`.
+- Missing or malformed manifest is fail-closed for trading strict policy. Legacy flat `data/live/manifest.json` formats are no longer trusted input for consumers or incremental refresh reuse; without `current.json`, consumers fail closed and the next refresh performs a full-history publication into a new schema v3 generation.
 
 ## Strategies
 

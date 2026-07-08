@@ -42,15 +42,6 @@ class TrustedDataStore:
     def __init__(self, *, data_dir: Path):
         self.data_dir = Path(data_dir)
 
-    def flat_cache_path(self, symbol: str, interval: str) -> Path:
-        symbol = validate_storage_segment(symbol, field="symbol")
-        interval = validate_storage_segment(interval, field="interval")
-        return self.data_dir / "okx" / symbol / f"{interval}.csv"
-
-    @property
-    def flat_manifest_path(self) -> Path:
-        return self.data_dir / "manifest.json"
-
     @property
     def current_path(self) -> Path:
         return self.data_dir / "current.json"
@@ -107,24 +98,10 @@ class TrustedDataStore:
         finally:
             _cleanup_tmp(tmp_path)
 
-    def read_manifest(self, *, compatibility_mode: bool = False) -> ManifestReadResult:
-        if self.current_path.exists():
-            return self._read_current_manifest()
-        path = self.flat_manifest_path
-        if not path.exists():
-            if compatibility_mode:
-                payload = {"schema_version": 1, "symbols": {}, "status": "missing"}
-                try:
-                    return ManifestReadResult(
-                        trusted_manifest_snapshot_from_dict(payload, compatibility_mode=True),
-                        payload,
-                        generation_root=self.data_dir,
-                        manifest_path=path,
-                    )
-                except ManifestSchemaError as exc:
-                    return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc))
+    def read_manifest(self) -> ManifestReadResult:
+        if not self.current_path.exists():
             return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
-        return self._read_manifest_file(path, compatibility_mode=compatibility_mode, generation_root=self.data_dir)
+        return self._read_current_manifest()
 
     def _read_current_manifest(self) -> ManifestReadResult:
         try:
@@ -148,7 +125,6 @@ class TrustedDataStore:
             )
         return self._read_manifest_file(
             manifest_path,
-            compatibility_mode=False,
             generation_root=self.generation_root(generation_id),
             generation_id=generation_id,
         )
@@ -174,7 +150,6 @@ class TrustedDataStore:
         self,
         path: Path,
         *,
-        compatibility_mode: bool = False,
         generation_root: Path,
         generation_id: str | None = None,
     ) -> ManifestReadResult:
@@ -185,7 +160,7 @@ class TrustedDataStore:
         if not isinstance(payload, dict):
             return ManifestReadResult(None, None, HealthReason.MALFORMED_MANIFEST, "TypeError", "manifest root must be object", generation_root=generation_root, generation_id=generation_id, manifest_path=path)
         try:
-            snapshot = trusted_manifest_snapshot_from_dict(payload, compatibility_mode=compatibility_mode)
+            snapshot = trusted_manifest_snapshot_from_dict(payload)
             if generation_id is not None:
                 if snapshot.run_id != generation_id:
                     raise ManifestSchemaError("generation manifest run_id must match current generation_id")
@@ -193,12 +168,6 @@ class TrustedDataStore:
         except Exception as exc:
             return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc), generation_root=generation_root, generation_id=generation_id, manifest_path=path)
         return ManifestReadResult(snapshot, payload, generation_root=generation_root, generation_id=generation_id, manifest_path=path)
-
-    def write_manifest(self, manifest: dict[str, Any]) -> Path:
-        path = self.flat_manifest_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
-        return path
 
     def write_generation_manifest(self, generation_id: str, manifest: dict[str, Any]) -> Path:
         generation_id = validate_storage_segment(generation_id, field="generation_id")
@@ -243,12 +212,8 @@ class TrustedDataStore:
             return (f"audit_log_append_failed: {exc}",)
         return ()
 
-    def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str | None) -> Path:
+    def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str) -> Path:
         source_file = Path(source_file)
-        if generation_id is None:
-            if str(source_file) == "":
-                raise ManifestSchemaError("manifest dataset source_file must be non-empty")
-            return source_file if source_file.is_absolute() else self.data_dir / source_file
         return _resolve_generation_source_file(source_file, generation_root)
 
     def append_run_log(self, payload: dict[str, Any]) -> Path:

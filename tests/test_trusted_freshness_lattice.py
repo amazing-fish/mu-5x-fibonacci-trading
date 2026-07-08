@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -401,6 +402,8 @@ def _context_with_status(status: str, *, attempt_status: str = "success"):
             datasets={("MU-USDT-SWAP", "5m"): _health("MU-USDT-SWAP", "5m")},
         ),
         observed_at_ms=0,
+        generation_root=Path("data/live/generations/run-1"),
+        generation_id="run-1",
     )
 
 
@@ -478,7 +481,7 @@ def _health_payload(*, availability: str = "available", integrity: str = "valid"
         "first_timestamp_ms": 0 if rows else None,
         "last_timestamp_ms": 0 if rows else None,
         "updated_at_ms": 86_400_000,
-        "source_file": f"data/live/okx/MU-USDT-SWAP/{interval}.csv",
+        "source_file": f"okx/MU-USDT-SWAP/{interval}.csv",
         "validation": {"ok": integrity == "valid", "reason": "ok" if integrity == "valid" else reason},
     }
 
@@ -489,6 +492,8 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
     from mu_strategy.market_data.utils import DAY_MS
 
     store = TrustedDataStore(data_dir=data_dir)
+    run_id = f"run-{status}-{freshness}"
+    store.prepare_generation(run_id)
     five = [Candle(index * 300_000, 100 + index, 101 + index, 99 + index, 100 + index, 10.0) for index in range(DAY_MS // 300_000)]
     by_interval = {
         "5m": five,
@@ -497,7 +502,7 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
     }
     symbols = {"MU-USDT-SWAP": {"intervals": {}}}
     for interval, candles in by_interval.items():
-        path = store.flat_cache_path("MU-USDT-SWAP", interval)
+        path = store.generation_cache_path(run_id, "MU-USDT-SWAP", interval)
         store.write_csv(candles, path)
         health = _health_payload(freshness=freshness, interval=interval)
         health.update(
@@ -505,31 +510,38 @@ def _write_manifest_and_caches(data_dir: Path, *, status: str, freshness: str) -
                 "rows": len(candles),
                 "first_timestamp_ms": candles[0].open_time_ms,
                 "last_timestamp_ms": candles[-1].open_time_ms,
-                "source_file": str(path),
+                "source_file": store.generation_source_file("MU-USDT-SWAP", interval).as_posix(),
                 "content_sha256": candles_content_sha256(candles),
             }
         )
         symbols["MU-USDT-SWAP"]["intervals"][interval] = health
-    store.write_manifest(
-        {
-            "schema_version": 3,
-            "run_id": f"run-{status}-{freshness}",
-            "attempt_status": "success",
-            "snapshot_usability": "usable" if status == "ok" else status,
-            "started_at_ms": 0,
-            "completed_at_ms": 86_400_000,
-            "requested_intervals": ["5m", "15m", "1h"],
-            "effective_intervals": ["5m", "15m", "1h"],
-            "universes": {
-                "crypto_top": [{"inst_id": "MU-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}],
-                "stock_token_top": [],
-            },
-            "symbols": symbols,
-            "provider_failures": [],
-            "warnings": [],
-            "cycle_error": None,
-        }
-    )
+    manifest = {
+        "schema_version": 3,
+        "run_id": run_id,
+        "attempt_status": "success",
+        "snapshot_usability": "usable" if status == "ok" else status,
+        "started_at_ms": 0,
+        "completed_at_ms": 86_400_000,
+        "requested_intervals": ["5m", "15m", "1h"],
+        "effective_intervals": ["5m", "15m", "1h"],
+        "universes": {
+            "crypto_top": [{"inst_id": "MU-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"}],
+            "stock_token_top": [],
+        },
+        "symbols": symbols,
+        "provider_failures": [],
+        "warnings": [],
+        "cycle_error": None,
+    }
+    if status == "ok" and freshness == "unknown":
+        store.generation_manifest_path(run_id).write_text(json.dumps(manifest), encoding="utf-8")
+        store.current_path.write_text(
+            json.dumps({"schema_version": 1, "generation_id": run_id, "manifest": f"generations/{run_id}/manifest.json"}),
+            encoding="utf-8",
+        )
+        return
+    store.write_generation_manifest(run_id, manifest)
+    store.replace_current(run_id)
 
 
 class _Broker:
