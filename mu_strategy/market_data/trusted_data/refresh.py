@@ -198,7 +198,6 @@ class RefreshTrustedMarketData:
                     days=request.days,
                     run_id=run_id,
                     previous_manifest=previous_manifest,
-                    timing_now_ms=request.now_ms,
                 )
                 candidates[(symbol, interval)] = candidate
                 refresh_segments_by_key[(symbol, interval)] = candidate.diagnostics
@@ -266,9 +265,8 @@ class RefreshTrustedMarketData:
         days: int,
         run_id: str,
         previous_manifest,
-        timing_now_ms: int | None,
     ) -> DatasetRefreshCandidate:
-        started_at_ms = _now_ms(timing_now_ms, self.clock)
+        started_at_ms = self.clock.now_ms()
         path = self.store.generation_cache_path(run_id, symbol, interval)
         source_file = self.store.generation_source_file(symbol, interval)
         existing: list[Candle] = []
@@ -292,7 +290,7 @@ class RefreshTrustedMarketData:
                     interval=interval,
                     fetch_mode=fetch_mode,
                     started_at_ms=started_at_ms,
-                    completed_at_ms=_now_ms(timing_now_ms, self.clock),
+                    completed_at_ms=self.clock.now_ms(),
                     existing_rows=len(existing),
                     fetched_rows=len(fetched),
                     output_rows=len(candles),
@@ -316,7 +314,7 @@ class RefreshTrustedMarketData:
                         interval=interval,
                         fetch_mode="prior_read_failed_full_history",
                         started_at_ms=started_at_ms,
-                        completed_at_ms=_now_ms(timing_now_ms, self.clock),
+                        completed_at_ms=self.clock.now_ms(),
                         existing_rows=0,
                         fetched_rows=len(fetched),
                         output_rows=len(candles),
@@ -339,7 +337,7 @@ class RefreshTrustedMarketData:
                     interval=interval,
                     fetch_mode="cache_read_failed",
                     started_at_ms=started_at_ms,
-                    completed_at_ms=_now_ms(timing_now_ms, self.clock),
+                    completed_at_ms=self.clock.now_ms(),
                     existing_rows=0,
                     fetched_rows=0,
                     output_rows=0,
@@ -367,7 +365,7 @@ class RefreshTrustedMarketData:
                     interval=interval,
                     fetch_mode="incremental_failed_reused_cache" if existing else "refresh_failed",
                     started_at_ms=started_at_ms,
-                    completed_at_ms=_now_ms(timing_now_ms, self.clock),
+                    completed_at_ms=self.clock.now_ms(),
                     existing_rows=len(existing),
                     fetched_rows=0,
                     output_rows=len(candles),

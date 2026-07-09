@@ -551,6 +551,30 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("incremental_reuse", manifest["diagnostics"]["refresh_segments"][0]["fetch_mode"])
         self.assertEqual("incremental_reuse", run_log[-1]["refresh_segments"][0]["fetch_mode"])
 
+    def test_segment_timing_uses_clock_when_health_now_is_pinned(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=Path(tmp)),
+                _NoTickerRecordingProvider(),
+                clock=_SequenceClock(100, 350),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    symbols=("MU",),
+                    requested_intervals=("5m",),
+                    days=1,
+                    now_ms=86_400_000,
+                    run_id="run-wall-clock-timing",
+                )
+            )
+
+        segment = run.refresh_segments[0]
+        self.assertEqual(100, segment.started_at_ms)
+        self.assertEqual(350, segment.completed_at_ms)
+        self.assertEqual(250, segment.elapsed_ms)
+
 
 class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_refresh_true_fails_before_provider_or_writes(self):
@@ -926,6 +950,14 @@ class _FixedClock:
 
     def now_ms(self) -> int:
         return self.now
+
+
+class _SequenceClock:
+    def __init__(self, *values: int):
+        self.values = iter(values)
+
+    def now_ms(self) -> int:
+        return next(self.values)
 
 
 def _manifest_path(data_dir: Path) -> Path:
