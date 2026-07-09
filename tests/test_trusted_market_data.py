@@ -514,6 +514,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                     requested_intervals=("15m",),
                     limit=99,
                     days=1,
+                    max_concurrency=1,
                     now_ms=86_400_000,
                     run_id="run-explicit",
                 )
