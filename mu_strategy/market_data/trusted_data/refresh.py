@@ -35,6 +35,7 @@ from mu_strategy.models import Candle
 
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_MAX_CONCURRENCY = 2
+DEFAULT_REQUEST_MAX_CONCURRENCY = 1
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
@@ -108,7 +109,7 @@ class RefreshTrustedMarketDataRequest:
     requested_intervals: tuple[str, ...] = DEFAULT_INTERVALS
     days: int = 180
     limit: int = 10
-    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    max_concurrency: int = DEFAULT_REQUEST_MAX_CONCURRENCY
     symbols: tuple[str, ...] = ()
     stock_token_config: Path = DEFAULT_STOCK_TOKEN_CONFIG
     stock_token_inst_ids: set[str] | None = None

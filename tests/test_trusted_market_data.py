@@ -60,12 +60,17 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symbol"):
             RefreshTrustedMarketDataRequest(symbols=("!!!",))
 
-    def test_request_defaults_to_conservative_concurrency_and_accepts_serial_mode(self):
-        from mu_strategy.market_data.trusted_data.refresh import DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest
+    def test_request_defaults_to_serial_compatibility_and_accepts_concurrency(self):
+        from mu_strategy.market_data.trusted_data.refresh import (
+            DEFAULT_MAX_CONCURRENCY,
+            DEFAULT_REQUEST_MAX_CONCURRENCY,
+            RefreshTrustedMarketDataRequest,
+        )
 
         self.assertEqual(2, DEFAULT_MAX_CONCURRENCY)
-        self.assertEqual(DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest().max_concurrency)
-        self.assertEqual(1, RefreshTrustedMarketDataRequest(max_concurrency=1).max_concurrency)
+        self.assertEqual(1, DEFAULT_REQUEST_MAX_CONCURRENCY)
+        self.assertEqual(DEFAULT_REQUEST_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest().max_concurrency)
+        self.assertEqual(DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest(max_concurrency=2).max_concurrency)
 
     def test_request_rejects_non_positive_concurrency(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
@@ -534,6 +539,46 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual(["MU-USDT-SWAP"], list(manifest["symbols"]))
         self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
         self.assertEqual("explicit", manifest["universes"]["crypto_top"][0]["source"])
+
+    def test_compatibility_refresh_custom_fetcher_remains_serial_by_default(self):
+        from mu_strategy.market_data.trusted import refresh_market_data_once
+
+        lock = threading.Lock()
+        first_started = threading.Event()
+        second_started = threading.Event()
+        active = 0
+        max_active = 0
+
+        def stateful_fetcher(symbol, interval, *, days):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if symbol == "BTC-USDT-SWAP":
+                    first_started.set()
+                    second_started.wait(timeout=0.2)
+                else:
+                    second_started.set()
+                return _fake_fetcher(symbol, interval, days=days)
+            finally:
+                with lock:
+                    active -= 1
+
+        with TemporaryDirectory() as tmp:
+            manifest = refresh_market_data_once(
+                data_dir=Path(tmp),
+                symbols=("BTC", "ETH"),
+                intervals=("5m",),
+                days=1,
+                fetcher=stateful_fetcher,
+                now_ms=86_400_000,
+            )
+
+        self.assertTrue(first_started.is_set())
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(1, max_active)
+        self.assertEqual("success", manifest["attempt_status"])
 
     def test_explicit_symbol_refresh_reuses_current_generation_incrementally(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
