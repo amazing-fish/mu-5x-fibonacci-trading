@@ -109,12 +109,12 @@ class RefreshTrustedMarketDataRequest:
     requested_intervals: tuple[str, ...] = DEFAULT_INTERVALS
     days: int = 180
     limit: int = 10
-    max_concurrency: int = DEFAULT_REQUEST_MAX_CONCURRENCY
     symbols: tuple[str, ...] = ()
     stock_token_config: Path = DEFAULT_STOCK_TOKEN_CONFIG
     stock_token_inst_ids: set[str] | None = None
     now_ms: int | None = None
     run_id: str | None = None
+    max_concurrency: int = DEFAULT_REQUEST_MAX_CONCURRENCY
 
     def __post_init__(self) -> None:
         if self.limit < 0:

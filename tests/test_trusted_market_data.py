@@ -80,6 +80,17 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "max_concurrency must be positive"):
                     RefreshTrustedMarketDataRequest(max_concurrency=value)
 
+    def test_request_preserves_existing_positional_symbol_argument(self):
+        from mu_strategy.market_data.trusted_data.refresh import (
+            DEFAULT_REQUEST_MAX_CONCURRENCY,
+            RefreshTrustedMarketDataRequest,
+        )
+
+        request = RefreshTrustedMarketDataRequest(("5m",), 1, 10, ("MU",))
+
+        self.assertEqual(("MU-USDT-SWAP",), request.symbols)
+        self.assertEqual(DEFAULT_REQUEST_MAX_CONCURRENCY, request.max_concurrency)
+
 
 class TrustedCandleValidationTests(unittest.TestCase):
     def test_validate_built_native_rejects_empty_built(self):
