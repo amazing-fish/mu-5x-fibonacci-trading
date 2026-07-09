@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Protocol
@@ -33,6 +34,7 @@ from mu_strategy.models import Candle
 
 
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
+DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
@@ -106,6 +108,7 @@ class RefreshTrustedMarketDataRequest:
     requested_intervals: tuple[str, ...] = DEFAULT_INTERVALS
     days: int = 180
     limit: int = 10
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     symbols: tuple[str, ...] = ()
     stock_token_config: Path = DEFAULT_STOCK_TOKEN_CONFIG
     stock_token_inst_ids: set[str] | None = None
@@ -115,6 +118,8 @@ class RefreshTrustedMarketDataRequest:
     def __post_init__(self) -> None:
         if self.limit < 0:
             raise ValueError("limit must be non-negative")
+        if not isinstance(self.max_concurrency, int) or isinstance(self.max_concurrency, bool) or self.max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
         object.__setattr__(self, "symbols", _normalize_explicit_symbols(self.symbols))
 
 
@@ -188,19 +193,25 @@ class RefreshTrustedMarketData:
         datasets: dict[tuple[str, str], DatasetHealth] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         refresh_segments_by_key: dict[tuple[str, str], RefreshSegmentDiagnostics] = {}
-        for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top]):
-            symbol = validate_storage_segment(str(ticker["inst_id"]), field="symbol")
-            candidates: dict[tuple[str, str], DatasetRefreshCandidate] = {}
-            for interval in plan.effective_intervals:
-                candidate = self._fetch_dataset_candidate(
-                    symbol=symbol,
-                    interval=interval,
-                    days=request.days,
-                    run_id=run_id,
-                    previous_manifest=previous_manifest,
-                )
-                candidates[(symbol, interval)] = candidate
-                refresh_segments_by_key[(symbol, interval)] = candidate.diagnostics
+        symbols = tuple(
+            validate_storage_segment(str(ticker["inst_id"]), field="symbol")
+            for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top])
+        )
+        candidates_by_key = self._fetch_dataset_candidates(
+            symbols=symbols,
+            intervals=plan.effective_intervals,
+            days=request.days,
+            run_id=run_id,
+            previous_manifest=previous_manifest,
+            max_concurrency=request.max_concurrency,
+        )
+        for symbol in symbols:
+            candidates = {
+                (symbol, interval): candidates_by_key[(symbol, interval)]
+                for interval in plan.effective_intervals
+            }
+            for key, candidate in candidates.items():
+                refresh_segments_by_key[key] = candidate.diagnostics
             symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
                 symbol=symbol,
                 intervals=plan.effective_intervals,
@@ -238,6 +249,34 @@ class RefreshTrustedMarketData:
         )
         run = self._persist_run(run)
         return run
+
+    def _fetch_dataset_candidates(
+        self,
+        *,
+        symbols: tuple[str, ...],
+        intervals: tuple[str, ...],
+        days: int,
+        run_id: str,
+        previous_manifest,
+        max_concurrency: int,
+    ) -> dict[tuple[str, str], DatasetRefreshCandidate]:
+        tasks = tuple((symbol, interval) for symbol in symbols for interval in intervals)
+
+        def fetch(symbol: str, interval: str) -> DatasetRefreshCandidate:
+            return self._fetch_dataset_candidate(
+                symbol=symbol,
+                interval=interval,
+                days=days,
+                run_id=run_id,
+                previous_manifest=previous_manifest,
+            )
+
+        if max_concurrency == 1:
+            return {key: fetch(*key) for key in tasks}
+
+        with ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix="trusted-refresh") as executor:
+            futures = [executor.submit(fetch, *key) for key in tasks]
+            return {key: future.result() for key, future in zip(tasks, futures)}
 
     def _universe(self, request: RefreshTrustedMarketDataRequest) -> UniverseSnapshot:
         if request.symbols:

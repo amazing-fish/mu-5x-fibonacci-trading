@@ -1,10 +1,12 @@
 import json
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.models import Candle
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
 
 class TrustedMarketDataUniverseTests(unittest.TestCase):
@@ -57,6 +59,21 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "symbol"):
             RefreshTrustedMarketDataRequest(symbols=("!!!",))
+
+    def test_request_defaults_to_conservative_concurrency_and_accepts_serial_mode(self):
+        from mu_strategy.market_data.trusted_data.refresh import DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest
+
+        self.assertEqual(2, DEFAULT_MAX_CONCURRENCY)
+        self.assertEqual(DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest().max_concurrency)
+        self.assertEqual(1, RefreshTrustedMarketDataRequest(max_concurrency=1).max_concurrency)
+
+    def test_request_rejects_non_positive_concurrency(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
+
+        for value in (0, -1):
+            with self.subTest(max_concurrency=value):
+                with self.assertRaisesRegex(ValueError, "max_concurrency must be positive"):
+                    RefreshTrustedMarketDataRequest(max_concurrency=value)
 
 
 class TrustedCandleValidationTests(unittest.TestCase):
@@ -575,6 +592,101 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual(350, segment.completed_at_ms)
         self.assertEqual(250, segment.elapsed_ms)
 
+    def test_concurrent_partial_symbol_failure_publishes_unrelated_usable_dataset(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+
+        provider = _ConcurrentHistoryProvider(fail_symbol="BTC-USDT-SWAP")
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = _ThreadRecordingStore(data_dir=data_dir)
+            publisher_thread = threading.get_ident()
+            run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    symbols=("BTC", "ETH"),
+                    requested_intervals=("5m",),
+                    days=1,
+                    now_ms=86_400_000,
+                    run_id="run-concurrent-partial",
+                    max_concurrency=2,
+                )
+            )
+            current = json.loads((data_dir / "current.json").read_text(encoding="utf-8"))
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            healthy_exists = _generation_cache_path(data_dir, run.run_id, "ETH-USDT-SWAP", "5m").exists()
+            failed_exists = _generation_cache_path(data_dir, run.run_id, "BTC-USDT-SWAP", "5m").exists()
+
+        self.assertGreaterEqual(provider.max_active, 2)
+        self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual("run-concurrent-partial", current["generation_id"])
+        self.assertTrue(healthy_exists)
+        self.assertFalse(failed_exists)
+        healthy = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]
+        failed = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]
+        self.assertEqual(("available", "valid", "fresh", "ok"), (
+            healthy["availability"],
+            healthy["integrity"],
+            healthy["freshness"],
+            healthy["reason"],
+        ))
+        self.assertEqual(("missing", "invalid", "refresh_failed"), (
+            failed["availability"],
+            failed["integrity"],
+            failed["reason"],
+        ))
+        segments = manifest["diagnostics"]["refresh_segments"]
+        self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"], [segment["symbol"] for segment in segments])
+        self.assertEqual("refresh_failed", segments[0]["fetch_mode"])
+        self.assertEqual("ok", segments[1]["health_reason"])
+        self.assertEqual([publisher_thread], store.write_thread_ids)
+        self.assertEqual([publisher_thread], store.replace_current_thread_ids)
+
+    def test_parallel_and_serial_fetch_paths_preserve_diagnostics_semantics(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        runs = []
+        manifests = []
+        for max_concurrency in (1, 2):
+            with TemporaryDirectory() as tmp:
+                data_dir = Path(tmp)
+                run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), _NoTickerRecordingProvider()).execute(
+                    RefreshTrustedMarketDataRequest(
+                        symbols=("BTC", "ETH"),
+                        requested_intervals=("5m",),
+                        days=1,
+                        now_ms=86_400_000,
+                        run_id=f"run-concurrency-{max_concurrency}",
+                        max_concurrency=max_concurrency,
+                    )
+                )
+                runs.append(run)
+                manifests.append(json.loads(_manifest_path(data_dir).read_text(encoding="utf-8")))
+
+        def stable_fields(segment):
+            payload = segment.to_dict()
+            for key in ("started_at_ms", "completed_at_ms", "elapsed_ms"):
+                payload.pop(key)
+            return payload
+
+        self.assertEqual(
+            [stable_fields(segment) for segment in runs[0].refresh_segments],
+            [stable_fields(segment) for segment in runs[1].refresh_segments],
+        )
+        self.assertEqual(
+            ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            [segment.symbol for segment in runs[1].refresh_segments],
+        )
+        for run, manifest in zip(runs, manifests):
+            for segment in run.refresh_segments:
+                self.assertGreaterEqual(segment.completed_at_ms, segment.started_at_ms)
+                self.assertEqual(segment.completed_at_ms - segment.started_at_ms, segment.elapsed_ms)
+            self.assertEqual(
+                [segment.to_dict() for segment in run.refresh_segments],
+                manifest["diagnostics"]["refresh_segments"],
+            )
+
 
 class TrustedCandleBundleTests(unittest.TestCase):
     def test_refresh_trusted_candle_bundle_refresh_true_fails_before_provider_or_writes(self):
@@ -822,6 +934,49 @@ class _NoTickerRecordingProvider:
     def fetch_incremental(self, symbol, interval, *, since_time_ms):
         self.incremental_calls.append((symbol, interval, since_time_ms))
         return []
+
+
+class _ConcurrentHistoryProvider:
+    def __init__(self, *, fail_symbol: str | None = None):
+        self.fail_symbol = fail_symbol
+        self.barrier = threading.Barrier(2)
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def fetch_tickers(self):
+        raise AssertionError("explicit symbol refresh must not fetch ticker universe")
+
+    def fetch_history(self, symbol, interval, *, days):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            self.barrier.wait(timeout=2)
+            if symbol == self.fail_symbol:
+                raise TimeoutError(f"{symbol} blocked")
+            return _fake_fetcher(symbol, interval, days=days)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        raise AssertionError("first refresh must use full history")
+
+
+class _ThreadRecordingStore(TrustedDataStore):
+    def __init__(self, *, data_dir: Path):
+        super().__init__(data_dir=data_dir)
+        self.write_thread_ids = []
+        self.replace_current_thread_ids = []
+
+    def write_csv(self, candles, path):
+        self.write_thread_ids.append(threading.get_ident())
+        return super().write_csv(candles, path)
+
+    def replace_current(self, generation_id):
+        self.replace_current_thread_ids.append(threading.get_ident())
+        return super().replace_current(generation_id)
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:
