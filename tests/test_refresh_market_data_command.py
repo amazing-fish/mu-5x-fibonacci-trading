@@ -1,3 +1,4 @@
+from contextlib import redirect_stderr
 import io
 import json
 import unittest
@@ -30,6 +31,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(("5m",), captured["intervals"])
+        self.assertEqual(2, captured["args"].max_concurrency)
         self.assertEqual(
             {
                 "run_id": "run-ok",
@@ -80,6 +82,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
                                     "99",
                                     "--days",
                                     "1",
+                                    "--max-concurrency",
+                                    "1",
                                     "--interval",
                                     "15m",
                                     "--data-dir",
@@ -129,6 +133,16 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
         self.assertNotIn("stock_token_top_count_below_limit", ",".join(manifest["warnings"]))
         self.assertIn("explicit", html)
+
+    def test_max_concurrency_cli_rejects_zero_and_negative_values(self):
+        from mu_strategy.commands.refresh_market_data import main
+
+        for value in (0, -1):
+            with self.subTest(max_concurrency=value):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        main(["--max-concurrency", str(value)], stdout=io.StringIO())
+                self.assertEqual(2, raised.exception.code)
 
     def test_dashboard_failure_after_successful_refresh_warns_without_cycle_error(self):
         from mu_strategy.commands.refresh_market_data import main
