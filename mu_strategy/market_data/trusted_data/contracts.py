@@ -317,6 +317,63 @@ def derive_snapshot_usability(
 
 
 @dataclass(frozen=True)
+class RefreshSegmentDiagnostics:
+    symbol: str
+    interval: str
+    fetch_mode: str
+    started_at_ms: int
+    completed_at_ms: int
+    elapsed_ms: int
+    existing_rows: int
+    fetched_rows: int
+    output_rows: int
+    had_existing: bool
+    reused_prior_generation: bool
+    fetch_reason: HealthReason | None = None
+    health_reason: HealthReason | None = None
+    error_type: str | None = None
+    message: str | None = None
+
+    def with_health(self, health: DatasetHealth) -> "RefreshSegmentDiagnostics":
+        return RefreshSegmentDiagnostics(
+            symbol=self.symbol,
+            interval=self.interval,
+            fetch_mode=self.fetch_mode,
+            started_at_ms=self.started_at_ms,
+            completed_at_ms=self.completed_at_ms,
+            elapsed_ms=self.elapsed_ms,
+            existing_rows=self.existing_rows,
+            fetched_rows=self.fetched_rows,
+            output_rows=health.rows,
+            had_existing=self.had_existing,
+            reused_prior_generation=self.reused_prior_generation,
+            fetch_reason=self.fetch_reason,
+            health_reason=health.primary_reason,
+            error_type=self.error_type or health.error_type,
+            message=self.message or health.message,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "fetch_mode": self.fetch_mode,
+            "started_at_ms": self.started_at_ms,
+            "completed_at_ms": self.completed_at_ms,
+            "elapsed_ms": self.elapsed_ms,
+            "existing_rows": self.existing_rows,
+            "fetched_rows": self.fetched_rows,
+            "output_rows": self.output_rows,
+            "had_existing": self.had_existing,
+            "reused_prior_generation": self.reused_prior_generation,
+            "fetch_reason": self.fetch_reason.value if self.fetch_reason is not None else None,
+            "health_reason": self.health_reason.value if self.health_reason is not None else None,
+            "error_type": self.error_type,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
 class RefreshRun:
     run_id: str
     attempt_status: RefreshAttemptStatus
@@ -330,6 +387,7 @@ class RefreshRun:
     provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
+    refresh_segments: tuple[RefreshSegmentDiagnostics, ...] = ()
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -344,7 +402,7 @@ class RefreshRun:
             symbols[str(inst_id)]["source"] = item.get("source")
             symbols[str(inst_id)]["last"] = item.get("last")
             symbols[str(inst_id)]["volume_ccy_24h"] = item.get("volume_ccy_24h")
-        return {
+        payload = {
             "schema_version": 3,
             "run_id": self.run_id,
             "attempt_status": self.attempt_status.value,
@@ -361,10 +419,14 @@ class RefreshRun:
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
+        diagnostics = refresh_run_diagnostics_payload(self)
+        if diagnostics:
+            payload["diagnostics"] = diagnostics
+        return payload
 
     def run_log_payload(self) -> dict[str, Any]:
         invalid_count = sum(1 for health in self.datasets.values() if not health.is_usable)
-        return {
+        payload = {
             "run_id": self.run_id,
             "attempt_status": self.attempt_status.value,
             "snapshot_usability": self.snapshot_usability.value,
@@ -376,6 +438,79 @@ class RefreshRun:
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
+        payload.update(refresh_run_diagnostics_payload(self))
+        return payload
+
+
+def refresh_run_diagnostics_payload(run: RefreshRun) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if run.refresh_segments:
+        segments = [segment.to_dict() for segment in run.refresh_segments]
+        payload["refresh_segments"] = segments
+        payload["slowest_segments"] = _slowest_segments(run.refresh_segments)
+        failed_segments = _failed_segments(run.refresh_segments)
+        if failed_segments:
+            payload["failed_segments"] = failed_segments
+    blocking_symbols = blocking_symbols_from_datasets(run.datasets)
+    if blocking_symbols:
+        payload["blocking_symbols"] = blocking_symbols
+    return payload
+
+
+def blocking_symbols_from_datasets(datasets: dict[tuple[str, str], DatasetHealth]) -> dict[str, list[dict[str, str]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for (symbol, interval), health in sorted(datasets.items()):
+        if _is_usable_dataset_health(health):
+            continue
+        grouped.setdefault(symbol, []).append(
+            {
+                "interval": interval,
+                "reason": _blocking_reason(health).value,
+                "availability": health.availability.value,
+                "integrity": health.integrity.value,
+                "freshness": health.freshness.value,
+            }
+        )
+    return grouped
+
+
+def _slowest_segments(segments: tuple[RefreshSegmentDiagnostics, ...], *, limit: int = 5) -> list[dict[str, Any]]:
+    ordered = sorted(
+        segments,
+        key=lambda segment: (-segment.elapsed_ms, segment.symbol, segment.interval),
+    )
+    return [segment.to_dict() for segment in ordered[:limit]]
+
+
+def _failed_segments(segments: tuple[RefreshSegmentDiagnostics, ...]) -> list[dict[str, Any]]:
+    return [
+        segment.to_dict()
+        for segment in segments
+        if segment.fetch_reason is not None or (segment.health_reason is not None and segment.health_reason != HealthReason.OK)
+    ]
+
+
+def _is_usable_dataset_health(health: DatasetHealth) -> bool:
+    return (
+        health.availability == AvailabilityState.AVAILABLE
+        and health.integrity == IntegrityState.VALID
+        and health.freshness == FreshnessState.FRESH
+        and health.rows > 0
+    )
+
+
+def _blocking_reason(health: DatasetHealth) -> HealthReason:
+    if health.primary_reason != HealthReason.OK:
+        return health.primary_reason
+    if health.availability == AvailabilityState.MISSING:
+        return HealthReason.CACHE_MISSING
+    if health.freshness == FreshnessState.STALE:
+        return HealthReason.STALE_BY_CLOCK
+    if health.freshness == FreshnessState.UNKNOWN:
+        return HealthReason.FRESHNESS_UNKNOWN
+    if health.integrity != IntegrityState.VALID:
+        return HealthReason.MANIFEST_INVALID
+    return HealthReason.REFRESH_FAILED
 
 
 @dataclass(frozen=True)

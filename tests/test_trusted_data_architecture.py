@@ -341,6 +341,43 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 self.assertFalse(bundle.trust_decision.allowed)
                 self.assertEqual(HealthReason.MALFORMED_MANIFEST, bundle.trust_decision.reason)
 
+    def test_schema_v3_optional_refresh_diagnostics_do_not_affect_strict_load(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = write_generation_manifest_and_caches(data_dir, symbol="MU-USDT-SWAP", days=1)
+            manifest["diagnostics"] = {
+                "refresh_segments": [
+                    {
+                        "symbol": "MU-USDT-SWAP",
+                        "interval": "5m",
+                        "fetch_mode": "full_history",
+                        "started_at_ms": 1,
+                        "completed_at_ms": 2,
+                        "elapsed_ms": 1,
+                        "existing_rows": 0,
+                        "fetched_rows": 288,
+                        "output_rows": 288,
+                        "had_existing": False,
+                        "reused_prior_generation": False,
+                        "fetch_reason": None,
+                        "health_reason": "ok",
+                        "error_type": None,
+                        "message": None,
+                    }
+                ]
+            }
+            manifest_path(data_dir).write_text(json.dumps(manifest), encoding="utf-8")
+            bundle = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir), clock=FixedClock(86_400_000)).execute(
+                LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("5m",), days=1),
+                trading_strict_policy(),
+            )
+
+        self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
+
     def test_unpublished_and_missing_intervals_do_not_read_orphan_caches(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -866,6 +903,15 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(IntegrityState.VALID, health.integrity)
         self.assertEqual(FreshnessState.FRESH, health.freshness)
         self.assertIn("incremental_refresh_failed", health.warnings)
+        segment = run.refresh_segments[0]
+        self.assertEqual("incremental_failed_reused_cache", segment.fetch_mode)
+        self.assertEqual("incremental_refresh_failed", segment.fetch_reason.value)
+        self.assertEqual("ok", segment.health_reason.value)
+        self.assertTrue(segment.had_existing)
+        self.assertTrue(segment.reused_prior_generation)
+        self.assertGreater(segment.existing_rows, 0)
+        self.assertEqual(0, segment.fetched_rows)
+        self.assertEqual(health.rows, segment.output_rows)
 
     def test_limit_zero_and_unreadable_prior_cache_falls_back_to_history(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -913,6 +959,49 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual("ok", run.datasets[("BTC-USDT-SWAP", "5m")].primary_reason.value)
         self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
         self.assertEqual([], provider.incremental_calls)
+        self.assertEqual("prior_read_failed_full_history", run.refresh_segments[0].fetch_mode)
+        self.assertEqual("cache_read_failed", run.refresh_segments[0].fetch_reason.value)
+        self.assertEqual("ok", run.refresh_segments[0].health_reason.value)
+
+    def test_unreadable_prior_cache_and_failed_history_reports_cache_read_failed_segment(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        class FailingReadStore(TrustedDataStore):
+            def read_csv(self, path):
+                raise OSError("disk offline")
+
+        class FailingHistoryProvider(RecordingProvider):
+            def __init__(self):
+                super().__init__(ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}])
+
+            def fetch_history(self, symbol, interval, *, days):
+                self.history_calls.append((symbol, interval, days))
+                raise TimeoutError("history offline")
+
+            def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((symbol, interval, since_time_ms))
+                raise AssertionError("unreadable prior cache must not try incremental")
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
+            provider = FailingHistoryProvider()
+            run = RefreshTrustedMarketData(FailingReadStore(data_dir=data_dir), provider).execute(
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=DAY_MS)
+            )
+
+        health = run.datasets[("BTC-USDT-SWAP", "5m")]
+        segment = run.refresh_segments[0]
+        self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual(HealthReason.CACHE_READ_FAILED, health.primary_reason)
+        self.assertEqual("cache_read_failed", segment.fetch_mode)
+        self.assertEqual("cache_read_failed", segment.fetch_reason.value)
+        self.assertEqual("cache_read_failed", segment.health_reason.value)
+        self.assertEqual(0, segment.output_rows)
 
 
 class TrustedDemoConsumerTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     FreshnessState,
     HealthReason,
     IntegrityState,
+    RefreshSegmentDiagnostics,
     RefreshRun,
     RefreshAttemptStatus,
     SnapshotUsability,
@@ -123,6 +124,7 @@ class DatasetRefreshCandidate:
     path: Path
     source_file: Path
     candles: list[Candle]
+    diagnostics: RefreshSegmentDiagnostics
     had_existing: bool = False
     fetch_reason: HealthReason | None = None
     error_type: str | None = None
@@ -185,6 +187,7 @@ class RefreshTrustedMarketData:
 
         datasets: dict[tuple[str, str], DatasetHealth] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
+        refresh_segments_by_key: dict[tuple[str, str], RefreshSegmentDiagnostics] = {}
         for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top]):
             symbol = validate_storage_segment(str(ticker["inst_id"]), field="symbol")
             candidates: dict[tuple[str, str], DatasetRefreshCandidate] = {}
@@ -197,6 +200,7 @@ class RefreshTrustedMarketData:
                     previous_manifest=previous_manifest,
                 )
                 candidates[(symbol, interval)] = candidate
+                refresh_segments_by_key[(symbol, interval)] = candidate.diagnostics
             symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
                 symbol=symbol,
                 intervals=plan.effective_intervals,
@@ -204,6 +208,9 @@ class RefreshTrustedMarketData:
                 days=request.days,
                 now_ms=_now_ms(request.now_ms, self.clock),
             )
+            for key, health in symbol_datasets.items():
+                if key in refresh_segments_by_key:
+                    refresh_segments_by_key[key] = refresh_segments_by_key[key].with_health(health)
             datasets.update(symbol_datasets)
             candles_by_key.update(symbol_candles)
 
@@ -227,6 +234,7 @@ class RefreshTrustedMarketData:
             datasets=datasets,
             provider_failures=provider_failures,
             warnings=tuple(warnings),
+            refresh_segments=tuple(refresh_segments_by_key.values()),
         )
         run = self._persist_run(run)
         return run
@@ -258,6 +266,7 @@ class RefreshTrustedMarketData:
         run_id: str,
         previous_manifest,
     ) -> DatasetRefreshCandidate:
+        started_at_ms = self.clock.now_ms()
         path = self.store.generation_cache_path(run_id, symbol, interval)
         source_file = self.store.generation_source_file(symbol, interval)
         existing: list[Candle] = []
@@ -266,31 +275,78 @@ class RefreshTrustedMarketData:
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
+                fetch_mode = "incremental_reuse"
             else:
                 fetched = self.provider.fetch_history(symbol, interval, days=days)
+                fetch_mode = "full_history"
+            candles = dedupe_candles([*existing, *fetched])
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
                 source_file=source_file,
-                candles=dedupe_candles([*existing, *fetched]),
+                candles=candles,
+                diagnostics=_segment_diagnostics(
+                    symbol=symbol,
+                    interval=interval,
+                    fetch_mode=fetch_mode,
+                    started_at_ms=started_at_ms,
+                    completed_at_ms=self.clock.now_ms(),
+                    existing_rows=len(existing),
+                    fetched_rows=len(fetched),
+                    output_rows=len(candles),
+                    had_existing=bool(existing),
+                    reused_prior_generation=bool(existing),
+                ),
                 had_existing=bool(existing),
             )
         except ReusablePriorDatasetReadError as exc:
+            prior_failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
             try:
                 fetched = self.provider.fetch_history(symbol, interval, days=days)
+                candles = dedupe_candles(fetched)
                 return DatasetRefreshCandidate(
                     key=DatasetKey(symbol, interval),
                     path=path,
                     source_file=source_file,
-                    candles=dedupe_candles(fetched),
+                    candles=candles,
+                    diagnostics=_segment_diagnostics(
+                        symbol=symbol,
+                        interval=interval,
+                        fetch_mode="prior_read_failed_full_history",
+                        started_at_ms=started_at_ms,
+                        completed_at_ms=self.clock.now_ms(),
+                        existing_rows=0,
+                        fetched_rows=len(fetched),
+                        output_rows=len(candles),
+                        had_existing=False,
+                        reused_prior_generation=False,
+                        fetch_reason=HealthReason.CACHE_READ_FAILED,
+                        error_type=prior_failure["error_type"],
+                        message=prior_failure["message"],
+                    ),
                 )
             except Exception:
-                failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
+                failure = prior_failure
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
                 source_file=source_file,
                 candles=[],
+                diagnostics=_segment_diagnostics(
+                    symbol=symbol,
+                    interval=interval,
+                    fetch_mode="cache_read_failed",
+                    started_at_ms=started_at_ms,
+                    completed_at_ms=self.clock.now_ms(),
+                    existing_rows=0,
+                    fetched_rows=0,
+                    output_rows=0,
+                    had_existing=False,
+                    reused_prior_generation=False,
+                    fetch_reason=HealthReason.CACHE_READ_FAILED,
+                    error_type=failure["error_type"],
+                    message=failure["message"],
+                ),
                 fetch_reason=HealthReason.CACHE_READ_FAILED,
                 error_type=failure["error_type"],
                 message=failure["message"],
@@ -298,11 +354,27 @@ class RefreshTrustedMarketData:
         except Exception as exc:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED if existing else HealthReason.REFRESH_FAILED
             failure = exception_failure(exc)
+            candles = dedupe_candles(existing)
             return DatasetRefreshCandidate(
                 key=DatasetKey(symbol, interval),
                 path=path,
                 source_file=source_file,
-                candles=dedupe_candles(existing),
+                candles=candles,
+                diagnostics=_segment_diagnostics(
+                    symbol=symbol,
+                    interval=interval,
+                    fetch_mode="incremental_failed_reused_cache" if existing else "refresh_failed",
+                    started_at_ms=started_at_ms,
+                    completed_at_ms=self.clock.now_ms(),
+                    existing_rows=len(existing),
+                    fetched_rows=0,
+                    output_rows=len(candles),
+                    had_existing=bool(existing),
+                    reused_prior_generation=bool(existing),
+                    fetch_reason=reason,
+                    error_type=failure["error_type"],
+                    message=failure["message"],
+                ),
                 had_existing=bool(existing),
                 fetch_reason=reason,
                 error_type=failure["error_type"],
@@ -508,6 +580,40 @@ def _failure_fields_from_health(health: DatasetHealth) -> dict[str, str]:
     error_type = (health.error_type or "").strip() or "Error"
     message = (health.message or "").strip() or error_type
     return {"error_type": error_type, "message": message}
+
+
+def _segment_diagnostics(
+    *,
+    symbol: str,
+    interval: str,
+    fetch_mode: str,
+    started_at_ms: int,
+    completed_at_ms: int,
+    existing_rows: int,
+    fetched_rows: int,
+    output_rows: int,
+    had_existing: bool,
+    reused_prior_generation: bool,
+    fetch_reason: HealthReason | None = None,
+    error_type: str | None = None,
+    message: str | None = None,
+) -> RefreshSegmentDiagnostics:
+    return RefreshSegmentDiagnostics(
+        symbol=symbol,
+        interval=interval,
+        fetch_mode=fetch_mode,
+        started_at_ms=started_at_ms,
+        completed_at_ms=completed_at_ms,
+        elapsed_ms=max(0, completed_at_ms - started_at_ms),
+        existing_rows=existing_rows,
+        fetched_rows=fetched_rows,
+        output_rows=output_rows,
+        had_existing=had_existing,
+        reused_prior_generation=reused_prior_generation,
+        fetch_reason=fetch_reason,
+        error_type=error_type,
+        message=message,
+    )
 
 
 def _now_ms(value: int | None, clock: Clock) -> int:

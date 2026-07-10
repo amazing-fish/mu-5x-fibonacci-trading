@@ -526,18 +526,54 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             store = TrustedDataStore(data_dir=data_dir)
             first_provider = _NoTickerRecordingProvider()
             request = dict(symbols=("MU",), requested_intervals=("5m",), days=1, limit=10, now_ms=86_400_000)
-            RefreshTrustedMarketData(store, first_provider).execute(
+            first = RefreshTrustedMarketData(store, first_provider).execute(
                 RefreshTrustedMarketDataRequest(**request, run_id="run-old")
             )
             second_provider = _NoTickerRecordingProvider()
-            RefreshTrustedMarketData(store, second_provider).execute(
+            second = RefreshTrustedMarketData(store, second_provider).execute(
                 RefreshTrustedMarketDataRequest(**request, run_id="run-new")
             )
+            manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
+            run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
 
         self.assertEqual([("MU-USDT-SWAP", "5m", 1)], first_provider.history_calls)
         self.assertEqual([], first_provider.incremental_calls)
+        self.assertEqual("full_history", first.refresh_segments[0].fetch_mode)
+        self.assertEqual(0, first.refresh_segments[0].existing_rows)
         self.assertEqual([], second_provider.history_calls)
         self.assertEqual([("MU-USDT-SWAP", "5m", 85_800_000)], second_provider.incremental_calls)
+        self.assertEqual("incremental_reuse", second.refresh_segments[0].fetch_mode)
+        self.assertTrue(second.refresh_segments[0].had_existing)
+        self.assertTrue(second.refresh_segments[0].reused_prior_generation)
+        self.assertGreater(second.refresh_segments[0].existing_rows, 0)
+        self.assertEqual(0, second.refresh_segments[0].fetched_rows)
+        self.assertEqual(second.datasets[("MU-USDT-SWAP", "5m")].rows, second.refresh_segments[0].output_rows)
+        self.assertEqual("incremental_reuse", manifest["diagnostics"]["refresh_segments"][0]["fetch_mode"])
+        self.assertEqual("incremental_reuse", run_log[-1]["refresh_segments"][0]["fetch_mode"])
+
+    def test_segment_timing_uses_clock_when_health_now_is_pinned(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=Path(tmp)),
+                _NoTickerRecordingProvider(),
+                clock=_SequenceClock(100, 350),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    symbols=("MU",),
+                    requested_intervals=("5m",),
+                    days=1,
+                    now_ms=86_400_000,
+                    run_id="run-wall-clock-timing",
+                )
+            )
+
+        segment = run.refresh_segments[0]
+        self.assertEqual(100, segment.started_at_ms)
+        self.assertEqual(350, segment.completed_at_ms)
+        self.assertEqual(250, segment.elapsed_ms)
 
 
 class TrustedCandleBundleTests(unittest.TestCase):
@@ -914,6 +950,14 @@ class _FixedClock:
 
     def now_ms(self) -> int:
         return self.now
+
+
+class _SequenceClock:
+    def __init__(self, *values: int):
+        self.values = iter(values)
+
+    def now_ms(self) -> int:
+        return next(self.values)
 
 
 def _manifest_path(data_dir: Path) -> Path:
