@@ -16,6 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
 )
 from mu_strategy.market_data.trusted_data.refresh import (
     DEFAULT_INTERVALS,
+    DEFAULT_MAX_CONCURRENCY,
     RefreshTrustedMarketData,
     RefreshTrustedMarketDataRequest,
 )
@@ -88,6 +89,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
     args = parser.parse_args(argv)
     if args.limit < 0:
         parser.error("--limit must be non-negative")
+    if args.max_concurrency < 1:
+        parser.error("--max-concurrency must be positive")
     if args.loop and args.interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
     intervals = tuple(args.interval or DEFAULT_INTERVALS)
@@ -128,6 +131,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stock-token-config", type=Path, default=Path("config/okx_stock_tokens.json"))
     parser.add_argument("--limit", type=int, default=10, help="Canonical universe limit per Top bucket. Must be non-negative.")
     parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENCY,
+        help=(
+            "Maximum concurrent symbol/interval fetches. Must be positive; "
+            f"defaults to the conservative value {DEFAULT_MAX_CONCURRENCY}."
+        ),
+    )
+    parser.add_argument(
         "--symbol",
         dest="symbols",
         action="append",
@@ -152,6 +164,7 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
             requested_intervals=intervals,
             days=args.days,
             limit=args.limit,
+            max_concurrency=args.max_concurrency,
             symbols=tuple(args.symbols or ()),
             stock_token_config=args.stock_token_config,
         )
