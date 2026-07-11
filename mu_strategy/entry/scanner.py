@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mu_strategy.cli import build_hourly_context
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.execution.plan import initial_stop_price
 from mu_strategy.indicators import macd, rsi
 from mu_strategy.models import Candle, closes

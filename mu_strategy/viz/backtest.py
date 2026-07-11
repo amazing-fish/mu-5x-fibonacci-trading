@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
-from mu_strategy.cli import build_hourly_context
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import BacktestResult, Candle, Trade
