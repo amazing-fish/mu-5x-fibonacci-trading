@@ -44,6 +44,12 @@ Rules:
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
 - Missing or malformed manifest is fail-closed for trading strict policy. Legacy flat `data/live/manifest.json` formats are no longer trusted input for consumers or incremental refresh reuse; without `current.json`, consumers fail closed and the next refresh performs a full-history publication into a new schema v3 generation.
 
+## Core
+
+Package: `mu_strategy.core`
+
+`core.market_context.build_hourly_context` owns the pure mapping from 1h regime calculations to 15m candle timestamps. CLI, entry scanning, and visualization depend on this core function; `mu_strategy.cli` re-exports it for compatibility with existing callers.
+
 ## Strategies
 
 Package: `mu_strategy.strategies`
