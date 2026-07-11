@@ -1,12 +1,13 @@
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
-from mu_strategy.models import EntryDecisionCode
+from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.observations import (
     JsonlObservationRepository,
     ObservationCorruptionError,
@@ -265,6 +266,32 @@ class Stage0ObservationContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ObservationSchemaError, "decision metadata"):
             Stage0Observation.from_dict(payload)
+
+    def test_successful_scan_evidence_requires_allowed_trusted_data(self):
+        ready = _observation(result=_scan(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY))
+
+        with self.assertRaisesRegex(ValueError, "allowed trusted data"):
+            replace(
+                ready,
+                trust_allowed=False,
+                trust_reason=HealthReason.MANIFEST_INVALID,
+                outcome=ObservationOutcome.DATA_GATE_BLOCKED,
+            )
+
+    def test_data_failure_requires_canonical_input_block_metadata(self):
+        blocked = _observation(
+            trusted=_trusted(allowed=False, reason=HealthReason.MANIFEST_INVALID, run_id=None, hashes=()),
+            result=None,
+            failure_code=ObservationFailureCode.TRUSTED_DATA_BLOCKED,
+        )
+
+        with self.assertRaisesRegex(ValueError, "data-gate failure decision metadata"):
+            replace(
+                blocked,
+                decision_code=EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY,
+                disposition=EntryDisposition.READY,
+                decision_stage=EntryDecisionStage.PENDING_ENTRY,
+            )
 
     def test_cycle_rejects_duplicate_observation_ids(self):
         observation = _observation(observation_id="same")

@@ -625,6 +625,12 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
     if observation.failure_code in data_failures:
         if observation.trust_allowed or observation.scan_result is not None:
             raise ValueError("data-gate failure cannot be trusted-allowed or contain a scan result")
+        if (
+            observation.decision_code is not EntryDecisionCode.MARKET_DATA_UNAVAILABLE
+            or observation.disposition is not EntryDisposition.BLOCK
+            or observation.decision_stage is not EntryDecisionStage.INPUT
+        ):
+            raise ValueError("data-gate failure decision metadata must be the canonical input block")
         expected_outcome = ObservationOutcome.DATA_GATE_BLOCKED
     elif observation.failure_code in scanner_failures:
         if not observation.trust_allowed or observation.scan_result is not None:
@@ -638,6 +644,8 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
     elif observation.failure_code is None:
         if observation.scan_result is None:
             raise ValueError("successful observation requires a scan result")
+        if not observation.trust_allowed:
+            raise ValueError("successful observation requires allowed trusted data")
         if any(
             value is None
             for value in (observation.decision_code, observation.disposition, observation.decision_stage)
@@ -648,7 +656,7 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
         metadata = entry_decision_metadata(observation.decision_code)
         if observation.disposition is not metadata.disposition or observation.decision_stage is not metadata.stage:
             raise ValueError("observation decision metadata does not match decision_code catalog")
-        if not observation.trust_allowed or (
+        if (
             observation.disposition is EntryDisposition.BLOCK
             and observation.decision_stage is EntryDecisionStage.INPUT
         ):

@@ -30,6 +30,8 @@ Each symbol in a persisted cycle has exactly one closed `ObservationOutcome`:
 
 Free-text `action`, `reason`, and exception messages are diagnostic fields. Outcome selection uses `TrustDecision.allowed`, `EntryDecisionCode`, `EntryDisposition`, `EntryDecisionStage`, and typed failure codes.
 
+Successful scan evidence is valid only when the trusted gate allowed scanning. Typed trusted-data failures carry only the canonical `MARKET_DATA_UNAVAILABLE / BLOCK / INPUT` metadata shape, so a denied gate cannot be paired with READY or other scanner evidence.
+
 ## Version 1 envelope
 
 Each immutable observation records:
