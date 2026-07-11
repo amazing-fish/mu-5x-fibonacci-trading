@@ -108,6 +108,8 @@ python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
 
+Stage 0 dry-run cycles also append a versioned observation-only record to `data/observations/stage0.jsonl` by default. Use `--observation-log <path>` to choose another ignored local path. This sidecar preserves the existing stdout/dashboard JSON shape and is not an `OrderIntent`, broker authorization, or execution ledger; see [docs/stage0-observations.md](docs/stage0-observations.md).
+
 刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`。这是发布 `data/live/generations/<run_id>/` 并原子替换 `data/live/current.json` 的唯一流程：
 
 ```powershell

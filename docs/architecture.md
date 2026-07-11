@@ -257,6 +257,8 @@ These rules apply to every stage:
 
 **Persistent evidence target.** A versioned observation envelope must record `scan_id`, timestamps, symbol, trusted `run_id`, dataset content hashes, requested/effective intervals, strategy/config fingerprint, typed `decision_code`, derived disposition/stage, compatibility action/reason, and either the full scan result or a typed failure. The existing versionless dashboard JSON remains unchanged; a new contract is required.
 
+The implemented 30-A schema, canonical fingerprint, cycle-sized JSONL commit, strict reader, and non-authorization boundary are documented in [stage0-observations.md](stage0-observations.md).
+
 **Failure, stop, and rollback.**
 
 - `DATA_GATE_BLOCKED`: report and stop before scanner.

@@ -10,6 +10,7 @@ from typing import Any, Callable, TextIO
 from mu_strategy.demo_trading import DEFAULT_WATCHLIST_SYMBOLS, DemoTradingConfig, run_once
 from mu_strategy.live.okx import OKXCredentials, OKXRestClient
 from mu_strategy.live.okx_cli import CREDENTIAL_SOURCE_CHOICES
+from mu_strategy.observations import DEFAULT_STAGE0_OBSERVATION_LOG
 from mu_strategy.viz.entry_dashboard import DEFAULT_REFRESH_SECONDS, write_entry_dashboard
 
 
@@ -35,6 +36,8 @@ def main(
     if args.limit < 0:
         parser.error("--limit must be non-negative; use --limit 0 for watchlist-only scans")
     dry_run = args.dry_run or not args.confirm_demo_orders
+    if not dry_run and args.observation_log is not None:
+        parser.error("--observation-log is a Stage 0 dry-run option and cannot be used with confirmed demo orders")
     config = DemoTradingConfig(
         universe_limit=args.limit,
         days=args.days,
@@ -45,6 +48,7 @@ def main(
         leverage=args.leverage,
         dry_run=dry_run,
         watchlist_symbols=_watchlist_symbols(args),
+        observation_log_path=(args.observation_log or DEFAULT_STAGE0_OBSERVATION_LOG) if dry_run else None,
     )
     broker = _build_broker(dry_run=dry_run, credential_source=args.credential_source)
 
@@ -114,6 +118,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dashboard-output", type=Path, help="Write an auto-refreshing HTML dashboard after each scan cycle.")
     parser.add_argument("--dashboard-refresh-seconds", type=int, default=DEFAULT_REFRESH_SECONDS)
+    parser.add_argument(
+        "--observation-log",
+        type=Path,
+        help=(
+            "Append versioned Stage 0 dry-run observation cycles to this local JSONL file "
+            f"(default: {DEFAULT_STAGE0_OBSERVATION_LOG})."
+        ),
+    )
     return parser
 
 
