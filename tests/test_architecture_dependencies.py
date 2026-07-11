@@ -14,6 +14,10 @@ FORBIDDEN_IMPORTS = (
     "mu_strategy.live",
     "mu_strategy.demo_trading",
 )
+LOW_LEVEL_DEPENDENCY_RULES = (
+    (Path("models.py"), ("mu_strategy",)),
+    (Path("strategy.py"), ("mu_strategy.entry", "mu_strategy.execution")),
+)
 
 
 class ArchitectureDependencyTests(unittest.TestCase):
@@ -47,14 +51,50 @@ class ArchitectureDependencyTests(unittest.TestCase):
             violations,
         )
 
+    def test_shared_entry_contract_dependencies_remain_low_level(self):
+        violations: list[str] = []
+        for relative_path, forbidden_imports in LOW_LEVEL_DEPENDENCY_RULES:
+            path = PACKAGE_ROOT / relative_path
+            source = path.read_text(encoding="utf-8")
+            for line_number, statement in _forbidden_import_statements(
+                source,
+                package="mu_strategy",
+                forbidden_imports=forbidden_imports,
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
 
-def _forbidden_import_statements(source: str, *, package: str) -> list[tuple[int, str]]:
+        for path in sorted((PACKAGE_ROOT / "core").rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            package = ".".join(path.relative_to(REPO_ROOT).parts[:-1])
+            for line_number, statement in _forbidden_import_statements(
+                source,
+                package=package,
+                forbidden_imports=("mu_strategy.entry", "mu_strategy.execution"),
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
+
+        self.assertEqual(
+            [],
+            violations,
+            "Forbidden low-level entry-contract imports:\n" + "\n".join(violations),
+        )
+
+
+def _forbidden_import_statements(
+    source: str,
+    *,
+    package: str,
+    forbidden_imports: tuple[str, ...] = FORBIDDEN_IMPORTS,
+) -> list[tuple[int, str]]:
     tree = ast.parse(source)
     violations: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
-        if any(_is_forbidden_import(target) for target in _import_targets(node, package=package)):
+        if any(
+            _is_forbidden_import(target, forbidden_imports=forbidden_imports)
+            for target in _import_targets(node, package=package)
+        ):
             statement = ast.get_source_segment(source, node) or ast.dump(node)
             violations.append((node.lineno, statement))
     return sorted(violations)
@@ -74,8 +114,8 @@ def _import_targets(node: ast.Import | ast.ImportFrom, *, package: str) -> list[
     return targets
 
 
-def _is_forbidden_import(target: str) -> bool:
-    return any(target == forbidden or target.startswith(f"{forbidden}.") for forbidden in FORBIDDEN_IMPORTS)
+def _is_forbidden_import(target: str, *, forbidden_imports: tuple[str, ...] = FORBIDDEN_IMPORTS) -> bool:
+    return any(target == forbidden or target.startswith(f"{forbidden}.") for forbidden in forbidden_imports)
 
 
 if __name__ == "__main__":

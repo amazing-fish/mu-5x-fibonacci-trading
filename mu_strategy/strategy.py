@@ -4,7 +4,14 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from mu_strategy.models import Candle, EntrySignal
+from mu_strategy.models import (
+    Candle,
+    EntryDecisionCode,
+    EntryDecisionStage,
+    EntryDisposition,
+    EntrySignal,
+    entry_decision_metadata,
+)
 
 
 FEE_PROFILE_RATES = {
@@ -24,6 +31,19 @@ class EntryExecution:
     allowed: bool
     reason: str
     entry_price: float | None = None
+    decision_code: EntryDecisionCode = EntryDecisionCode.UNKNOWN
+
+    def __post_init__(self) -> None:
+        if self.decision_code is not EntryDecisionCode.UNKNOWN:
+            object.__setattr__(self, "allowed", self.disposition is EntryDisposition.READY)
+
+    @property
+    def disposition(self) -> EntryDisposition:
+        return entry_decision_metadata(self.decision_code).disposition
+
+    @property
+    def stage(self) -> EntryDecisionStage:
+        return entry_decision_metadata(self.decision_code).stage
 
 
 @dataclass(frozen=True)
@@ -146,22 +166,35 @@ def should_enter_long(
     config: StrategyConfig,
 ) -> EntrySignal:
     if regime not in config.allowed_regimes:
-        return EntrySignal(False, "1h regime blocks long")
+        return EntrySignal(False, "1h regime blocks long", decision_code=EntryDecisionCode.REGIME_BLOCKED)
     if rsi14 < config.rsi_floor:
-        return EntrySignal(False, "15m RSI below floor")
+        return EntrySignal(False, "15m RSI below floor", decision_code=EntryDecisionCode.RSI_BELOW_FLOOR)
     if macd_hist < macd_hist_prev and macd_hist < 0:
-        return EntrySignal(False, "15m MACD histogram still weakening")
+        return EntrySignal(
+            False,
+            "15m MACD histogram still weakening",
+            decision_code=EntryDecisionCode.MACD_WEAKENING,
+        )
 
     tolerance = fib_level * config.fib_tolerance_pct
     touched = candle.low <= fib_level + tolerance
     reclaimed = candle.close >= fib_level
     if not (touched and reclaimed):
-        return EntrySignal(False, "no confirmed Fibonacci retest")
+        return EntrySignal(
+            False,
+            "no confirmed Fibonacci retest",
+            decision_code=EntryDecisionCode.NO_CONFIRMED_FIB_RETEST,
+        )
 
     hard_stop = candle.close * (1 - config.initial_stop_pct)
     technical_stop = candle.low
     stop_price = max(hard_stop, technical_stop)
-    return EntrySignal(True, "confirmed Fibonacci retest", stop_price)
+    return EntrySignal(
+        True,
+        "confirmed Fibonacci retest",
+        stop_price,
+        decision_code=EntryDecisionCode.SIGNAL_CONFIRMED,
+    )
 
 
 def should_execute_entry(
@@ -177,36 +210,65 @@ def should_execute_entry(
         entry_price = next_candle.open
     elif config.entry_execution == "break_high":
         if next_candle.high <= candle.high:
-            return EntryExecution(False, "next candle does not break signal high")
+            return EntryExecution(
+                False,
+                "next candle does not break signal high",
+                decision_code=EntryDecisionCode.NEXT_CANDLE_DID_NOT_BREAK_SIGNAL_HIGH,
+            )
         entry_price = max(next_candle.open, candle.high)
     elif config.entry_execution == "second_pullback":
-        return EntryExecution(False, "waiting for second pullback")
+        return EntryExecution(
+            False,
+            "waiting for second pullback",
+            decision_code=EntryDecisionCode.WAITING_SECOND_PULLBACK,
+        )
     else:
         raise ValueError(f"unsupported entry_execution: {config.entry_execution}")
 
     signal_range_pct = (candle.high - candle.low) / candle.close if candle.close else 0.0
     if config.max_signal_range_pct is not None and signal_range_pct > config.max_signal_range_pct:
-        return EntryExecution(False, "signal candle too wide")
+        return EntryExecution(
+            False,
+            "signal candle too wide",
+            decision_code=EntryDecisionCode.SIGNAL_CANDLE_TOO_WIDE,
+        )
 
     entry_above_fib_pct = (entry_price / fib_level) - 1 if fib_level else 0.0
     max_entry_above_fib_pct = config.max_entry_above_fib_pct
     if regime == "yellow" and config.yellow_max_entry_above_fib_pct is not None:
         max_entry_above_fib_pct = config.yellow_max_entry_above_fib_pct
     if max_entry_above_fib_pct is not None and entry_above_fib_pct > max_entry_above_fib_pct:
-        return EntryExecution(False, "entry too far above Fibonacci retest")
+        return EntryExecution(
+            False,
+            "entry too far above Fibonacci retest",
+            decision_code=EntryDecisionCode.ENTRY_TOO_FAR_ABOVE_FIB,
+        )
 
     entry_above_signal_close_pct = (entry_price / candle.close) - 1 if candle.close else 0.0
     if (
         config.max_entry_above_signal_close_pct is not None
         and entry_above_signal_close_pct > config.max_entry_above_signal_close_pct
     ):
-        return EntryExecution(False, "entry too far above signal close")
+        return EntryExecution(
+            False,
+            "entry too far above signal close",
+            decision_code=EntryDecisionCode.ENTRY_TOO_FAR_ABOVE_SIGNAL_CLOSE,
+        )
 
     reverse_level = reverse_fibonacci_resistance_level(candles, index, entry_price, config)
     if config.block_reverse_fib_resistance and reverse_level is not None:
-        return EntryExecution(False, f"entry at reverse Fibonacci resistance {reverse_level:.6f}")
+        return EntryExecution(
+            False,
+            f"entry at reverse Fibonacci resistance {reverse_level:.6f}",
+            decision_code=EntryDecisionCode.REVERSE_FIB_RESISTANCE,
+        )
 
-    return EntryExecution(True, "execution accepted", entry_price)
+    return EntryExecution(
+        True,
+        "execution accepted",
+        entry_price,
+        decision_code=EntryDecisionCode.EXECUTION_ACCEPTED,
+    )
 
 
 def recent_swing(candles: list[Candle], end_index: int, lookback: int) -> tuple[float, float] | None:

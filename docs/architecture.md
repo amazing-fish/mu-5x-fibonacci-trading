@@ -91,13 +91,16 @@ Use this layer to apply a fixed strategy across candidate rows and rank them wit
 
 Package: `mu_strategy.execution`
 
-This layer returns non-trading decisions:
+The shared typed entry-decision vocabulary lives in `mu_strategy.models`, the lowest common dependency of strategy primitives, entry scanning, and execution planning. `EntryDecisionCode` maps through one catalog to an `EntryDisposition` and `EntryDecisionStage`; result objects expose the stable code plus derived disposition and stage while retaining their compatibility action and reason fields.
 
-- `allow`: current fixed strategy permits an entry plan.
-- `wait`: signal is incomplete.
-- `block`: risk filter blocks entry.
+This layer returns non-trading decisions with a fixed disposition mapping:
+
+- `READY -> allow`: current fixed strategy permits an entry plan.
+- `WAIT -> wait`: signal or execution timing is incomplete.
+- `BLOCK -> block`: a signal or execution risk filter blocks entry.
 
 It may return margin steps and initial stop planning. It must not place orders or call broker APIs.
+Execution actions are projected from typed disposition; reason text is compatibility display data and never classifies `wait` versus `block`. Legacy direct constructors may omit the code and receive `UNKNOWN`, but `execution_decision()` and strategy production paths never produce `UNKNOWN`.
 
 ## Entry Scanning
 
@@ -109,6 +112,9 @@ This layer turns existing strategy primitives into a reusable scanner result for
 - `scanner.scan_entry`: consumes `15m/1h` candles and a fixed `StrategyConfig`.
 
 The scanner calls existing strategy functions; it does not tune parameters or own broker behavior.
+Scanner actions use the same disposition with a scanner-specific projection: `READY -> enter`, `WAIT -> wait`, and `BLOCK -> skip`. The public strings and compatibility reason messages remain unchanged.
+
+Second-pullback has two deliberately different stages. Execution planning returns `WAITING_SECOND_PULLBACK / WAIT / PENDING_ENTRY -> wait` immediately after signal confirmation. An active, unfilled scanner pending signal returns `SECOND_PULLBACK_LIMIT_READY / READY / PENDING_ENTRY -> enter`; here `enter` means a resting Fibonacci limit plan can be created, not that a fill occurred or a market chase is allowed. The pending scanner path continues to apply the current trading-window gate without reapplying current-bar regime, RSI, or MACD filters.
 
 ## OKX API Execution Preparation
 
@@ -159,6 +165,7 @@ Boundaries:
 - Missing credentials are acceptable in dry-run and fail before order submission in confirmed mode.
 - Dry-run and confirmed demo use the same trusted gate. Invalid, stale, missing, malformed, or failed-run trusted data blocks scanner calls and order generation.
 - A scan cycle carries the trusted `run_id` from the loaded manifest into scan payloads when available.
+- Scan JSON keeps its existing versionless compatibility fields and does not expose `decision_code`, disposition, stage, or Enum representations. Adding structured typed metadata to JSON requires a separate versioned contract change.
 - Dynamic universe limit semantics are explicit: in the default trusted-manifest mode, `limit > 0` returns up to that many crypto universe symbols plus up to that many stock-token universe symbols, `limit == 0` means watchlist-only, and `limit < 0` is rejected.
 - v1 does not implement production order lifecycle, cancel/retry handling, fills, position reconciliation, or risk kill-switches.
 - If no `planned` order exists, the dashboard explicitly reports no order suggestion and no cancel target.

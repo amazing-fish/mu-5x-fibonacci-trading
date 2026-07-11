@@ -12,6 +12,7 @@ class ArchitecturePackageTests(unittest.TestCase):
             "mu_strategy.research",
             "mu_strategy.experiments",
             "mu_strategy.selection",
+            "mu_strategy.entry",
             "mu_strategy.execution",
             "mu_strategy.viz",
             "mu_strategy.commands",

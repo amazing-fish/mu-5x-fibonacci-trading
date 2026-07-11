@@ -1,14 +1,38 @@
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
-from mu_strategy.execution.decision import execution_decision
+import mu_strategy.execution.decision as decision_module
+from mu_strategy.execution.decision import ExecutionDecision, execution_decision
 from mu_strategy.execution.plan import planned_margin_steps
-from mu_strategy.models import Candle
+from mu_strategy.models import (
+    Candle,
+    EntryDecisionCode,
+    EntryDecisionStage,
+    EntryDisposition,
+    EntrySignal,
+)
 from mu_strategy.strategies.registry import baseline_strategy_group
-from mu_strategy.strategy import StrategyConfig, optimized_strategy_group
+from mu_strategy.strategy import EntryExecution, StrategyConfig, optimized_strategy_group
 
 
 class ExecutionPlanningTests(unittest.TestCase):
+    def test_execution_decision_without_candles_has_typed_input_wait(self):
+        decision = execution_decision(
+            [],
+            config=baseline_strategy_group("MU-USDT-SWAP").config,
+            regime="green",
+            rsi14=55,
+            macd_hist=0.3,
+            macd_hist_prev=0.1,
+        )
+
+        self.assertEqual("wait", decision.action)
+        self.assertEqual("no candles", decision.reason)
+        self.assertIs(EntryDecisionCode.NO_CANDLES, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.INPUT, decision.stage)
+
     def test_direct_next_open_strategy_can_allow_entry_with_initial_stop(self):
         config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
         candles = _candidate_signal_candles()
@@ -28,6 +52,9 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertEqual("confirmed Fibonacci retest", decision.reason)
         self.assertAlmostEqual(101.92, decision.initial_stop)
         self.assertEqual((0.20, 0.20, 0.20, 0.40), decision.margin_steps)
+        self.assertIs(EntryDecisionCode.EXECUTION_ACCEPTED, decision.decision_code)
+        self.assertIs(EntryDisposition.READY, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_execution_decision_bases_stop_on_validated_entry_price(self):
         config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
@@ -66,6 +93,9 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertEqual("waiting for second pullback", decision.reason)
         self.assertIsNone(decision.initial_stop)
         self.assertEqual((), decision.margin_steps)
+        self.assertIs(EntryDecisionCode.WAITING_SECOND_PULLBACK, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.PENDING_ENTRY, decision.stage)
 
     def test_execution_decision_waits_outside_us_cash_session(self):
         config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
@@ -86,6 +116,9 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertEqual("outside preferred US cash session", decision.reason)
         self.assertIsNone(decision.initial_stop)
         self.assertEqual((), decision.margin_steps)
+        self.assertIs(EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.INPUT, decision.stage)
 
     def test_execution_decision_waits_when_next_fill_bar_is_outside_us_cash_session(self):
         config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
@@ -113,6 +146,9 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertEqual("next fill bar outside preferred US cash session", decision.reason)
         self.assertIsNone(decision.initial_stop)
         self.assertEqual((), decision.margin_steps)
+        self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_execution_decision_blocks_optimized_execution_filters(self):
         config = optimized_strategy_group("MU-USDT-SWAP").config
@@ -133,6 +169,9 @@ class ExecutionPlanningTests(unittest.TestCase):
         self.assertEqual("signal candle too wide", decision.reason)
         self.assertIsNone(decision.initial_stop)
         self.assertEqual((), decision.margin_steps)
+        self.assertIs(EntryDecisionCode.SIGNAL_CANDLE_TOO_WIDE, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_fixed_strategy_waits_when_fibonacci_retest_has_not_confirmed(self):
         config = baseline_strategy_group("MU-USDT-SWAP").config
@@ -157,6 +196,9 @@ class ExecutionPlanningTests(unittest.TestCase):
 
         self.assertEqual("wait", decision.action)
         self.assertIn("Fibonacci", decision.reason)
+        self.assertIs(EntryDecisionCode.NO_CONFIRMED_FIB_RETEST, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, decision.stage)
 
     def test_fixed_strategy_blocks_red_regime(self):
         config = baseline_strategy_group("MU-USDT-SWAP").config
@@ -175,6 +217,142 @@ class ExecutionPlanningTests(unittest.TestCase):
 
         self.assertEqual("block", decision.action)
         self.assertIn("regime", decision.reason)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, decision.stage)
+
+    def test_execution_decision_waits_for_next_candle_with_typed_code(self):
+        config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
+        candles = _candidate_signal_candles()[:4]
+
+        decision = execution_decision(
+            candles,
+            config=config,
+            regime="green",
+            rsi14=55,
+            macd_hist=0.3,
+            macd_hist_prev=0.1,
+            now_index=3,
+        )
+
+        self.assertEqual("wait", decision.action)
+        self.assertEqual("next candle required for execution gate", decision.reason)
+        self.assertIs(EntryDecisionCode.NEXT_CANDLE_REQUIRED, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
+
+    def test_execution_decision_preserves_wait_for_missing_validated_entry_price(self):
+        config = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="direct_next_open")
+        missing_price = EntryExecution(
+            True,
+            "validated execution price is unavailable",
+            decision_code=EntryDecisionCode.EXECUTION_ACCEPTED,
+        )
+
+        with patch("mu_strategy.execution.decision.should_execute_entry", return_value=missing_price):
+            decision = execution_decision(
+                _candidate_signal_candles(),
+                config=config,
+                regime="green",
+                rsi14=55,
+                macd_hist=0.3,
+                macd_hist_prev=0.1,
+                now_index=3,
+            )
+
+        self.assertEqual("wait", decision.action)
+        self.assertEqual("validated execution price is unavailable", decision.reason)
+        self.assertIs(EntryDecisionCode.EXECUTION_PRICE_UNAVAILABLE, decision.decision_code)
+        self.assertIs(EntryDisposition.WAIT, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
+
+    def test_signal_code_blocks_even_when_reason_copy_changes_completely(self):
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        signal = EntrySignal(
+            False,
+            "policy copy was rewritten without legacy keywords",
+            decision_code=EntryDecisionCode.REGIME_BLOCKED,
+        )
+
+        with patch("mu_strategy.execution.decision.should_enter_long", return_value=signal):
+            decision = execution_decision(
+                _candidate_signal_candles(),
+                config=config,
+                regime="green",
+                rsi14=55,
+                macd_hist=0.3,
+                macd_hist_prev=0.1,
+                now_index=3,
+            )
+
+        self.assertEqual("block", decision.action)
+        self.assertEqual("policy copy was rewritten without legacy keywords", decision.reason)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, decision.decision_code)
+
+    def test_wait_code_stays_wait_when_reason_contains_legacy_macd_keyword(self):
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        signal = EntrySignal(
+            False,
+            "MACD is mentioned for diagnostics, but the signal is merely incomplete",
+            decision_code=EntryDecisionCode.NO_CONFIRMED_FIB_RETEST,
+        )
+
+        with patch("mu_strategy.execution.decision.should_enter_long", return_value=signal):
+            decision = execution_decision(
+                _candidate_signal_candles(),
+                config=config,
+                regime="green",
+                rsi14=55,
+                macd_hist=0.3,
+                macd_hist_prev=0.1,
+                now_index=3,
+            )
+
+        self.assertEqual("wait", decision.action)
+        self.assertIn("MACD", decision.reason)
+        self.assertIs(EntryDecisionCode.NO_CONFIRMED_FIB_RETEST, decision.decision_code)
+
+    def test_unknown_legacy_signal_cannot_fall_back_to_reason_classification(self):
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        legacy_signal = EntrySignal(False, "MACD legacy copy")
+
+        with patch("mu_strategy.execution.decision.should_enter_long", return_value=legacy_signal):
+            with self.assertRaisesRegex(ValueError, "UNKNOWN"):
+                execution_decision(
+                    _candidate_signal_candles(),
+                    config=config,
+                    regime="green",
+                    rsi14=55,
+                    macd_hist=0.3,
+                    macd_hist_prev=0.1,
+                    now_index=3,
+                )
+
+    def test_typed_execution_decision_action_is_projected_from_disposition(self):
+        decision = ExecutionDecision(
+            "wait",
+            "copy is not part of control flow",
+            decision_code=EntryDecisionCode.REGIME_BLOCKED,
+        )
+
+        self.assertEqual("block", decision.action)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, decision.stage)
+
+    def test_legacy_execution_decision_constructor_remains_compatible(self):
+        decision = ExecutionDecision("legacy", "legacy reason", 98.0, (0.2,), 100.0)
+
+        self.assertEqual("legacy", decision.action)
+        self.assertEqual("legacy reason", decision.reason)
+        self.assertEqual(98.0, decision.initial_stop)
+        self.assertEqual((0.2,), decision.margin_steps)
+        self.assertEqual(100.0, decision.fib_level)
+        self.assertIs(EntryDecisionCode.UNKNOWN, decision.decision_code)
+        self.assertIs(EntryDisposition.UNKNOWN, decision.disposition)
+        self.assertIs(EntryDecisionStage.UNKNOWN, decision.stage)
+
+    def test_reason_classifier_is_removed(self):
+        self.assertFalse(hasattr(decision_module, "_is_hard_block"))
 
     def test_planned_margin_steps_are_copied_from_config(self):
         config = baseline_strategy_group("MU-USDT-SWAP").config

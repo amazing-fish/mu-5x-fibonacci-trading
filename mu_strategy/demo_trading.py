@@ -17,6 +17,7 @@ from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
+from mu_strategy.models import EntryDecisionCode
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -434,7 +435,7 @@ def _scan_payload(
     source: str = "top",
     second_pullback_wait_bars: int | None = None,
 ) -> dict[str, Any]:
-    payload = asdict(result)
+    payload = _entry_scan_result_payload(result)
     payload["source"] = source
     if bundle.run_id:
         payload["run_id"] = bundle.run_id
@@ -444,6 +445,24 @@ def _scan_payload(
         payload["second_pullback_wait_bars"] = second_pullback_wait_bars
     payload["data_files"] = {interval: str(path) for interval, path in bundle.files_by_interval.items()}
     return payload
+
+
+def _entry_scan_result_payload(result: EntryScanResult) -> dict[str, Any]:
+    return {
+        "symbol": result.symbol,
+        "action": result.action,
+        "reason": result.reason,
+        "last_close": result.last_close,
+        "regime_1h": result.regime_1h,
+        "rsi14": result.rsi14,
+        "macd_hist": result.macd_hist,
+        "macd_hist_prev": result.macd_hist_prev,
+        "fib_level": result.fib_level,
+        "fib_distance_pct": result.fib_distance_pct,
+        "trigger_price": result.trigger_price,
+        "initial_stop": result.initial_stop,
+        "signal_time_ms": result.signal_time_ms,
+    }
 
 
 def _stale_scan_result(symbol: str, bundle: CandleBundle, data_error: dict[str, Any]) -> EntryScanResult:
@@ -469,6 +488,7 @@ def _data_error_scan_result(
         rsi14=None,
         macd_hist=None,
         macd_hist_prev=None,
+        decision_code=EntryDecisionCode.MARKET_DATA_UNAVAILABLE,
     )
 
 
@@ -490,7 +510,7 @@ def _data_error_scan_payload(
     *,
     source: str = "top",
 ) -> dict[str, Any]:
-    payload = asdict(result)
+    payload = _entry_scan_result_payload(result)
     payload["source"] = source
     payload["data_files"] = {}
     payload["data_error"] = data_error
