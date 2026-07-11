@@ -1,8 +1,9 @@
 import unittest
 from datetime import datetime, timezone
 
-from mu_strategy.models import Candle
+from mu_strategy.models import Candle, EntryDecisionCode, EntryDecisionStage, EntryDisposition, EntrySignal
 from mu_strategy.strategy import (
+    EntryExecution,
     StrategyConfig,
     fee_profile_label,
     fibonacci_levels,
@@ -58,7 +59,11 @@ class StrategyRuleTests(unittest.TestCase):
         )
 
         self.assertTrue(signal.allowed)
+        self.assertEqual("confirmed Fibonacci retest", signal.reason)
         self.assertAlmostEqual(signal.stop_price, 98.8)
+        self.assertIs(EntryDecisionCode.SIGNAL_CONFIRMED, signal.decision_code)
+        self.assertIs(EntryDisposition.READY, signal.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, signal.stage)
 
     def test_15m_entry_rejects_red_regime(self):
         config = StrategyConfig()
@@ -67,6 +72,63 @@ class StrategyRuleTests(unittest.TestCase):
         signal = should_enter_long(candle, 100, "red", 55, 0.4, 0.2, config)
 
         self.assertFalse(signal.allowed)
+        self.assertEqual("1h regime blocks long", signal.reason)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, signal.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, signal.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, signal.stage)
+
+    def test_entry_signal_rejections_have_stable_typed_codes(self):
+        config = StrategyConfig()
+        confirmed_retest = Candle(open_time_ms=1, open=101, high=103, low=99.2, close=100.5, volume=1000)
+        no_retest = Candle(open_time_ms=1, open=103, high=104, low=102, close=103, volume=1000)
+        cases = [
+            (
+                "rsi",
+                should_enter_long(confirmed_retest, 100, "green", 44, 0.4, 0.2, config),
+                "15m RSI below floor",
+                EntryDecisionCode.RSI_BELOW_FLOOR,
+                EntryDisposition.BLOCK,
+            ),
+            (
+                "macd",
+                should_enter_long(confirmed_retest, 100, "green", 55, -0.4, -0.2, config),
+                "15m MACD histogram still weakening",
+                EntryDecisionCode.MACD_WEAKENING,
+                EntryDisposition.BLOCK,
+            ),
+            (
+                "no_retest",
+                should_enter_long(no_retest, 100, "green", 55, 0.4, 0.2, config),
+                "no confirmed Fibonacci retest",
+                EntryDecisionCode.NO_CONFIRMED_FIB_RETEST,
+                EntryDisposition.WAIT,
+            ),
+        ]
+
+        for name, signal, reason, code, disposition in cases:
+            with self.subTest(name=name):
+                self.assertFalse(signal.allowed)
+                self.assertEqual(reason, signal.reason)
+                self.assertIsNone(signal.stop_price)
+                self.assertIs(code, signal.decision_code)
+                self.assertIs(disposition, signal.disposition)
+                self.assertIs(EntryDecisionStage.SIGNAL, signal.stage)
+
+    def test_legacy_primitive_positional_constructors_remain_compatible(self):
+        signal = EntrySignal(False, "legacy signal", 99.0)
+        execution = EntryExecution(False, "legacy execution", 101.0)
+
+        self.assertEqual((False, "legacy signal", 99.0), (signal.allowed, signal.reason, signal.stop_price))
+        self.assertIs(EntryDecisionCode.UNKNOWN, signal.decision_code)
+        self.assertIs(EntryDisposition.UNKNOWN, signal.disposition)
+        self.assertIs(EntryDecisionStage.UNKNOWN, signal.stage)
+        self.assertEqual(
+            (False, "legacy execution", 101.0),
+            (execution.allowed, execution.reason, execution.entry_price),
+        )
+        self.assertIs(EntryDecisionCode.UNKNOWN, execution.decision_code)
+        self.assertIs(EntryDisposition.UNKNOWN, execution.disposition)
+        self.assertIs(EntryDecisionStage.UNKNOWN, execution.stage)
 
     def test_preferred_us_cash_window_filters_non_session_bars(self):
         config = StrategyConfig()
@@ -172,7 +234,10 @@ class StrategyRuleTests(unittest.TestCase):
         decision = should_execute_entry(candles, 1, candles[2], 100, "green", config)
 
         self.assertFalse(decision.allowed)
-        self.assertIn("too far above Fibonacci", decision.reason)
+        self.assertEqual("entry too far above Fibonacci retest", decision.reason)
+        self.assertIs(EntryDecisionCode.ENTRY_TOO_FAR_ABOVE_FIB, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_optimized_execution_rejects_wide_signal_candle(self):
         config = optimized_strategy_group().config
@@ -185,7 +250,10 @@ class StrategyRuleTests(unittest.TestCase):
         decision = should_execute_entry(candles, 1, candles[2], 100, "green", config)
 
         self.assertFalse(decision.allowed)
-        self.assertIn("signal candle too wide", decision.reason)
+        self.assertEqual("signal candle too wide", decision.reason)
+        self.assertIs(EntryDecisionCode.SIGNAL_CANDLE_TOO_WIDE, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_direct_next_open_execution_does_not_require_breaking_signal_high(self):
         config = StrategyConfig(entry_execution="direct_next_open")
@@ -199,6 +267,68 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertTrue(decision.allowed)
         self.assertAlmostEqual(100.9, decision.entry_price)
+        self.assertEqual("execution accepted", decision.reason)
+        self.assertIs(EntryDecisionCode.EXECUTION_ACCEPTED, decision.decision_code)
+        self.assertIs(EntryDisposition.READY, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
+
+    def test_execution_waits_have_stable_typed_codes(self):
+        candles = [
+            Candle(0, 100, 101, 99, 100, 1000),
+            Candle(900_000, 100, 102, 99.8, 100.5, 1000),
+            Candle(1_800_000, 100.4, 101.9, 100.2, 101.0, 1000),
+        ]
+        cases = [
+            (
+                "break_high",
+                should_execute_entry(candles, 1, candles[2], 100, "green", StrategyConfig()),
+                "next candle does not break signal high",
+                EntryDecisionCode.NEXT_CANDLE_DID_NOT_BREAK_SIGNAL_HIGH,
+                EntryDecisionStage.EXECUTION,
+            ),
+            (
+                "second_pullback",
+                should_execute_entry(
+                    candles,
+                    1,
+                    candles[2],
+                    100,
+                    "green",
+                    StrategyConfig(entry_execution="second_pullback"),
+                ),
+                "waiting for second pullback",
+                EntryDecisionCode.WAITING_SECOND_PULLBACK,
+                EntryDecisionStage.PENDING_ENTRY,
+            ),
+        ]
+
+        for name, decision, reason, code, stage in cases:
+            with self.subTest(name=name):
+                self.assertFalse(decision.allowed)
+                self.assertEqual(reason, decision.reason)
+                self.assertIsNone(decision.entry_price)
+                self.assertIs(code, decision.decision_code)
+                self.assertIs(EntryDisposition.WAIT, decision.disposition)
+                self.assertIs(stage, decision.stage)
+
+    def test_execution_rejects_entry_too_far_above_signal_close_with_stable_code(self):
+        config = StrategyConfig(
+            entry_execution="direct_next_open",
+            max_entry_above_signal_close_pct=0.01,
+        )
+        candles = [
+            Candle(0, 100, 101, 99, 100, 1000),
+            Candle(900_000, 100, 101, 99.8, 100, 1000),
+            Candle(1_800_000, 105, 106, 104, 105, 1000),
+        ]
+
+        decision = should_execute_entry(candles, 1, candles[2], 100, "green", config)
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual("entry too far above signal close", decision.reason)
+        self.assertIs(EntryDecisionCode.ENTRY_TOO_FAR_ABOVE_SIGNAL_CLOSE, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_execution_rejects_reverse_fibonacci_resistance(self):
         config = StrategyConfig(block_reverse_fib_resistance=True)
@@ -214,6 +344,9 @@ class StrategyRuleTests(unittest.TestCase):
 
         self.assertFalse(decision.allowed)
         self.assertIn("reverse Fibonacci resistance", decision.reason)
+        self.assertIs(EntryDecisionCode.REVERSE_FIB_RESISTANCE, decision.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, decision.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
 
 if __name__ == "__main__":

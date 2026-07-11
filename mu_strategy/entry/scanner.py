@@ -5,7 +5,15 @@ from dataclasses import dataclass
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.execution.plan import initial_stop_price
 from mu_strategy.indicators import macd, rsi
-from mu_strategy.models import Candle, closes
+from mu_strategy.models import (
+    Candle,
+    EntryDecisionCode,
+    EntryDecisionStage,
+    EntryDisposition,
+    closes,
+    entry_decision_metadata,
+    scanner_action_for,
+)
 from mu_strategy.strategy import StrategyConfig, is_preferred_us_cash_window, nearest_fib_retest_level, should_enter_long
 
 
@@ -24,6 +32,19 @@ class EntryScanResult:
     trigger_price: float | None = None
     initial_stop: float | None = None
     signal_time_ms: int | None = None
+    decision_code: EntryDecisionCode = EntryDecisionCode.UNKNOWN
+
+    def __post_init__(self) -> None:
+        if self.decision_code is not EntryDecisionCode.UNKNOWN:
+            object.__setattr__(self, "action", scanner_action_for(self.disposition))
+
+    @property
+    def disposition(self) -> EntryDisposition:
+        return entry_decision_metadata(self.decision_code).disposition
+
+    @property
+    def stage(self) -> EntryDecisionStage:
+        return entry_decision_metadata(self.decision_code).stage
 
 
 def scan_entry(
@@ -45,6 +66,7 @@ def scan_entry(
             rsi14=None,
             macd_hist=None,
             macd_hist_prev=None,
+            decision_code=EntryDecisionCode.NO_CANDLES,
         )
 
     close_values = closes(candles_15m)
@@ -79,6 +101,7 @@ def scan_entry(
                     rsi14=last_rsi,
                     macd_hist=last_hist,
                     macd_hist_prev=previous_hist,
+                    decision_code=EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW,
                 )
             return _result_for_recent_signal(
                 symbol=symbol,
@@ -114,6 +137,7 @@ def scan_entry(
             rsi14=last_rsi,
             macd_hist=last_hist,
             macd_hist_prev=previous_hist,
+            decision_code=EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW,
         )
 
     signal = _latest_recent_signal(
@@ -134,6 +158,7 @@ def scan_entry(
             rsi14=last_rsi,
             macd_hist=last_hist,
             macd_hist_prev=previous_hist,
+            decision_code=EntryDecisionCode.NO_RECENT_CONFIRMED_FIB_RETEST,
         )
 
     return _result_for_recent_signal(
@@ -165,6 +190,11 @@ def _result_for_recent_signal(
     distance_pct = (last_candle.close / fib_level) - 1 if fib_level else None
     close_is_near_fib = distance_pct is not None and abs(distance_pct) <= max_fib_distance_pct
     if distance_pct is not None and (close_is_near_fib or config.entry_execution == "second_pullback"):
+        decision_code = (
+            EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY
+            if config.entry_execution == "second_pullback"
+            else EntryDecisionCode.SIGNAL_CONFIRMED
+        )
         return EntryScanResult(
             symbol=symbol,
             action="enter",
@@ -183,6 +213,7 @@ def _result_for_recent_signal(
             trigger_price=fib_level,
             initial_stop=initial_stop_price(fib_level, config),
             signal_time_ms=signal_candle.open_time_ms,
+            decision_code=decision_code,
         )
 
     return EntryScanResult(
@@ -197,6 +228,7 @@ def _result_for_recent_signal(
         fib_level=fib_level,
         fib_distance_pct=distance_pct,
         signal_time_ms=signal_candle.open_time_ms,
+        decision_code=EntryDecisionCode.PRICE_AWAY_FROM_FIB,
     )
 
 
@@ -212,10 +244,13 @@ def _blocked_result(
 ) -> EntryScanResult | None:
     if regime == "red":
         reason = "1h regime is red"
+        decision_code = EntryDecisionCode.REGIME_BLOCKED
     elif rsi14 < config.rsi_floor:
         reason = "15m RSI is below floor"
+        decision_code = EntryDecisionCode.RSI_BELOW_FLOOR
     elif macd_hist < macd_hist_prev and macd_hist < 0:
         reason = "15m MACD histogram still weakening"
+        decision_code = EntryDecisionCode.MACD_WEAKENING
     else:
         return None
 
@@ -228,6 +263,7 @@ def _blocked_result(
         rsi14=rsi14,
         macd_hist=macd_hist,
         macd_hist_prev=macd_hist_prev,
+        decision_code=decision_code,
     )
 
 

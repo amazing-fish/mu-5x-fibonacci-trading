@@ -6,12 +6,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from mu_strategy.demo_trading import DemoTradingConfig, generate_client_order_id, run_once
+from mu_strategy.demo_trading import DemoTradingConfig, _data_error_scan_result, generate_client_order_id, run_once
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.service import CandleBundle
 from mu_strategy.market_data.symbols import ResolvedSymbol
 from mu_strategy.market_data.universe import OKXSwapTicker
-from mu_strategy.models import Candle
+from mu_strategy.models import Candle, EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -49,6 +49,22 @@ class StubBroker:
 
 
 class OKXDemoLoopTests(unittest.TestCase):
+    LEGACY_SCAN_FIELDS = {
+        "symbol",
+        "action",
+        "reason",
+        "last_close",
+        "regime_1h",
+        "rsi14",
+        "macd_hist",
+        "macd_hist_prev",
+        "fib_level",
+        "fib_distance_pct",
+        "trigger_price",
+        "initial_stop",
+        "signal_time_ms",
+    }
+
     def test_generate_client_order_id_is_stable_and_okx_safe(self):
         first = generate_client_order_id("BTC-USDT-SWAP", 123, 100.0)
         second = generate_client_order_id("BTC-USDT-SWAP", 123, 100.0)
@@ -69,6 +85,83 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("planned", result["orders"][0]["status"])
         self.assertEqual("BTC-USDT-SWAP", result["orders"][0]["symbol"])
         self.assertEqual(10.0, result["orders"][0]["notional_usdt"])
+
+    def test_run_once_scan_payload_keeps_exact_legacy_key_set_without_typed_metadata(self):
+        def typed_scanner(symbol, candles_15m, candles_1h, **kwargs):
+            return EntryScanResult(
+                symbol=symbol,
+                action="wait",
+                reason="recent retest confirmed; resting second-pullback fib limit",
+                last_close=100.5,
+                regime_1h="green",
+                rsi14=55.0,
+                macd_hist=0.2,
+                macd_hist_prev=0.1,
+                fib_level=100.0,
+                fib_distance_pct=0.005,
+                trigger_price=100.0,
+                initial_stop=98.0,
+                signal_time_ms=123,
+                decision_code=EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY,
+            )
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
+            broker=None,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=typed_scanner,
+        )
+
+        scan = result["scans"][0]
+        self.assertEqual(
+            self.LEGACY_SCAN_FIELDS | {"source", "second_pullback_wait_bars", "data_files"},
+            set(scan),
+        )
+        self.assertEqual("enter", scan["action"])
+        self.assertEqual("recent retest confirmed; resting second-pullback fib limit", scan["reason"])
+        self.assertEqual(1, len(result["orders"]))
+        self.assertNotIn("decision_code", scan)
+        self.assertNotIn("disposition", scan)
+        self.assertNotIn("stage", scan)
+        json.dumps(result)
+
+    def test_run_once_error_scan_payload_keeps_exact_legacy_key_set_without_typed_metadata(self):
+        def failing_loader(symbol, **kwargs):
+            raise RuntimeError("fetch timeout")
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
+            broker=None,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=failing_loader,
+            scanner=lambda *args, **kwargs: self.fail("failed data load must not be scanned"),
+        )
+
+        scan = result["scans"][0]
+        self.assertEqual(
+            self.LEGACY_SCAN_FIELDS | {"source", "data_files", "data_error"},
+            set(scan),
+        )
+        self.assertEqual("skip", scan["action"])
+        self.assertEqual("market_data_load_failed", scan["reason"])
+        self.assertEqual([], result["orders"])
+        self.assertNotIn("decision_code", scan)
+        self.assertNotIn("disposition", scan)
+        self.assertNotIn("stage", scan)
+        json.dumps(result)
+
+    def test_data_error_scan_result_has_typed_input_block(self):
+        result = _data_error_scan_result(
+            "BTC-USDT-SWAP",
+            {"reason": "market_data_load_failed"},
+        )
+
+        self.assertEqual("skip", result.action)
+        self.assertEqual("market_data_load_failed", result.reason)
+        self.assertIs(EntryDecisionCode.MARKET_DATA_UNAVAILABLE, result.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, result.disposition)
+        self.assertIs(EntryDecisionStage.INPUT, result.stage)
 
     def test_run_once_scans_with_current_baseline_strategy_config(self):
         captured = {}
