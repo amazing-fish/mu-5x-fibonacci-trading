@@ -19,6 +19,7 @@ data/live/generations/**
 !data/live/generations/*/okx/*/
 !data/live/generations/*/okx/*/*.csv
 data/*.csv
+data/observations/
 reports/live/
 reports/*.html
 reports/*.md

@@ -11,13 +11,22 @@ from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bundle, trust_error_payload
-from mu_strategy.market_data.trusted_data.contracts import FreshnessState, SystemClock, TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
+from mu_strategy.market_data.trusted_data.contracts import (
+    Clock,
+    FreshnessState,
+    SystemClock,
+    TrustedConsumerRefreshError,
+    TrustedLoadContext,
+    UniverseSnapshot,
+)
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import EntryDecisionCode
+from mu_strategy.observations import JsonlObservationRepository, ObservationRepository
+from mu_strategy.stage0 import Stage0CycleRecorder
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -41,6 +50,7 @@ class DemoTradingConfig:
     dry_run: bool = True
     max_candle_staleness_bars: int = 3
     watchlist_symbols: tuple[str, ...] = DEFAULT_WATCHLIST_SYMBOLS
+    observation_log_path: Path | None = None
 
     def __post_init__(self) -> None:
         validate_universe_limit(self.universe_limit)
@@ -53,8 +63,24 @@ def run_once(
     universe_provider: UniverseProvider | None = None,
     candle_loader: CandleLoader | None = None,
     scanner: Scanner = scan_entry,
+    observation_repository: ObservationRepository | None = None,
+    observation_clock: Clock | None = None,
+    observation_id_factory: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
+    if observation_repository is None and config.observation_log_path is not None:
+        observation_repository = JsonlObservationRepository(config.observation_log_path)
+    if observation_repository is not None and not config.dry_run:
+        raise ValueError("Stage 0 observation persistence is available only for dry-run cycles")
+    stage0_recorder = (
+        Stage0CycleRecorder(
+            observation_repository,
+            clock=observation_clock,
+            id_factory=observation_id_factory,
+        )
+        if observation_repository is not None
+        else None
+    )
     default_trusted_loader = candle_loader is None
     if default_trusted_loader and config.refresh:
         raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
@@ -120,8 +146,9 @@ def run_once(
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
         data_error = None
         bundle = None
+        result = None
+        requested_intervals = ("15m", "1h")
         try:
-            requested_intervals = ("15m", "1h")
             loader_kwargs = {
                 "intervals": requested_intervals,
                 "days": config.days,
@@ -139,8 +166,6 @@ def run_once(
         except Exception as exc:
             data_error = _market_data_load_error(ticker.inst_id, exc)
             data_errors.append(data_error)
-            result = _data_error_scan_result(ticker.inst_id, data_error)
-            scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
 
         if bundle is not None:
             cycle_run_id = cycle_run_id or bundle.run_id
@@ -152,26 +177,71 @@ def run_once(
             )
             if data_error is not None:
                 data_errors.append(data_error)
-                result = _stale_scan_result(ticker.inst_id, bundle, data_error)
-                scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
 
-        if bundle is not None and data_error is None:
-            strategy_config = baseline_strategy_group(ticker.inst_id).config
-            result = scanner(
-                ticker.inst_id,
-                bundle.candles_by_interval.get("15m", []),
-                bundle.candles_by_interval.get("1h", []),
-                config=strategy_config,
+        strategy_group = baseline_strategy_group(ticker.inst_id)
+        strategy_config = strategy_group.config
+        if stage0_recorder is not None:
+            staged = stage0_recorder.observe_symbol(
+                symbol=ticker.inst_id,
+                source=ticker.source,
+                bundle=bundle,
+                requested_intervals=requested_intervals,
+                strategy_name=strategy_group.name,
+                strategy_config=strategy_config,
+                scanner=scanner,
+                data_error=data_error,
             )
-            scan_results.append(result)
-            scans.append(
-                _scan_payload(
-                    result,
-                    bundle,
-                    source=ticker.source,
-                    second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
+            if data_error is None and staged.data_error is not None:
+                data_errors.append(staged.data_error)
+            data_error = staged.data_error
+            result = staged.scan_result
+            if result is None:
+                result = (
+                    _stale_scan_result(ticker.inst_id, bundle, data_error)
+                    if bundle is not None
+                    else _data_error_scan_result(ticker.inst_id, data_error)
                 )
-            )
+                if bundle is not None:
+                    scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
+                else:
+                    scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
+            else:
+                scan_results.append(result)
+                scans.append(
+                    _scan_payload(
+                        result,
+                        bundle,
+                        source=ticker.source,
+                        second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
+                    )
+                )
+        else:
+            if data_error is not None:
+                result = (
+                    _stale_scan_result(ticker.inst_id, bundle, data_error)
+                    if bundle is not None
+                    else _data_error_scan_result(ticker.inst_id, data_error)
+                )
+                if bundle is not None:
+                    scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
+                else:
+                    scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
+            if bundle is not None and data_error is None:
+                result = scanner(
+                    ticker.inst_id,
+                    bundle.candles_by_interval.get("15m", []),
+                    bundle.candles_by_interval.get("1h", []),
+                    config=strategy_config,
+                )
+                scan_results.append(result)
+                scans.append(
+                    _scan_payload(
+                        result,
+                        bundle,
+                        source=ticker.source,
+                        second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
+                    )
+                )
 
         if not config.dry_run:
             stale_orders = _expire_stale_limit_orders(
@@ -204,6 +274,9 @@ def run_once(
                     remaining_capacity += len(successful_expirations)
             if data_error is not None:
                 continue
+
+    if stage0_recorder is not None:
+        stage0_recorder.commit()
 
     for result in scan_results:
         if result.symbol not in entry_eligible_inst_ids:
