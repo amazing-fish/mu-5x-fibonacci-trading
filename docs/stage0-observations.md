@@ -56,13 +56,14 @@ The fingerprint deliberately excludes observation/cycle IDs, timestamps, compati
 
 ## Cycle commit and failure semantics
 
-One JSONL line contains one complete `Stage0ObservationCycle` and all of its symbol observations. Before append, the repository persists a transient `<log>.invalid` marker containing the cycle ID. It appends the canonical cycle line, flushes it, calls `fsync`, and only then removes the marker before `run_once` can return the legacy payload or produce a dry-run order plan.
+One JSONL line contains one complete `Stage0ObservationCycle` and all of its symbol observations. Before append, the repository persists a transient `<log>.invalid` marker containing the cycle ID. It appends the canonical cycle line, flushes it, calls `fsync`, and only then removes the marker before `run_once` can return the legacy payload or produce a dry-run order plan. Marker creation/removal and first log-file creation also flush the parent-directory entry on POSIX and Windows. If the marker-removal directory flush fails, the repository restores the marker and reports a failed write.
 
 This cycle-sized commit boundary prevents a later symbol write failure from exposing an earlier subset as a complete cycle. A short or interrupted write can leave only a corrupted trailing line. The strict reader rejects:
 
 - unknown schema versions;
 - missing or unknown fields;
 - invalid enum/value combinations;
+- decision disposition/stage metadata that disagrees with the authoritative decision-code catalog;
 - non-numeric or non-finite typed scan fields;
 - allowed records without complete run/hash provenance;
 - result fingerprints that do not match canonical content;

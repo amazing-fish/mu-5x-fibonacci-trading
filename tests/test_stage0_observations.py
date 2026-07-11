@@ -14,6 +14,7 @@ from mu_strategy.observations import (
     ObservationOutcome,
     ObservationSchemaError,
     ObservationWriteError,
+    Stage0Observation,
     Stage0ObservationCycle,
     TrustedObservationReference,
     build_stage0_observation,
@@ -227,6 +228,43 @@ class Stage0ObservationContractTests(unittest.TestCase):
             self.assertTrue(repository.invalid_marker_path.exists())
             with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
                 JsonlObservationRepository(path).read_cycles()
+
+    def test_append_fsyncs_parent_directory_for_marker_log_creation_and_marker_removal(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            with patch.object(repository, "_fsync_parent_directory", create=True) as fsync_parent:
+                repository.append_cycle(_cycle("cycle-a", "obs-a"))
+                self.assertEqual(3, fsync_parent.call_count)
+
+                repository.append_cycle(_cycle("cycle-b", "obs-b"))
+                self.assertEqual(5, fsync_parent.call_count)
+
+    def test_marker_removal_directory_fsync_failure_restores_failed_write_marker(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            directory_fsyncs = (None, None, OSError("directory fsync failed"), None)
+            with patch.object(
+                repository,
+                "_fsync_parent_directory",
+                create=True,
+                side_effect=directory_fsyncs,
+            ):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+
+            self.assertTrue(repository.invalid_marker_path.exists())
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_cycles()
+
+    def test_reader_rejects_decision_metadata_that_disagrees_with_catalog(self):
+        payload = _observation(result=_scan(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY)).to_dict()
+        payload["disposition"] = "wait"
+        payload["outcome"] = "normal_no_action"
+
+        with self.assertRaisesRegex(ObservationSchemaError, "decision metadata"):
+            Stage0Observation.from_dict(payload)
 
     def test_cycle_rejects_duplicate_observation_ids(self):
         observation = _observation(observation_id="same")

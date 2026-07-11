@@ -13,7 +13,7 @@ from typing import Any, Mapping, Protocol
 
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
-from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition
+from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
 
 
 OBSERVATION_SCHEMA_VERSION = 1
@@ -394,17 +394,25 @@ class JsonlObservationRepository:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.invalid_marker_path.exists():
                 raise OSError("observation repository has an unresolved invalid marker")
-            with self.invalid_marker_path.open("xb") as marker:
-                marker.write(cycle.cycle_id.encode("utf-8"))
-                marker.flush()
-                os.fsync(marker.fileno())
+            self._write_invalid_marker(cycle.cycle_id, exclusive=True)
+            log_existed = self.path.exists()
             with self.path.open("ab") as handle:
                 written = handle.write(encoded)
                 if written != len(encoded):
                     raise OSError(f"short observation write: {written}/{len(encoded)} bytes")
                 handle.flush()
                 os.fsync(handle.fileno())
+            if not log_existed:
+                self._fsync_parent_directory()
             self.invalid_marker_path.unlink()
+            try:
+                self._fsync_parent_directory()
+            except OSError:
+                try:
+                    self._write_invalid_marker(cycle.cycle_id, exclusive=False)
+                except OSError:
+                    pass
+                raise
         except OSError as exc:
             raise ObservationWriteError(f"observation cycle write failed: {type(exc).__name__}") from exc
 
@@ -433,6 +441,17 @@ class JsonlObservationRepository:
     def _reject_invalid_marker(self) -> None:
         if self.invalid_marker_path.exists():
             raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+
+    def _write_invalid_marker(self, cycle_id: str, *, exclusive: bool) -> None:
+        mode = "xb" if exclusive else "wb"
+        with self.invalid_marker_path.open(mode) as marker:
+            marker.write(cycle_id.encode("utf-8"))
+            marker.flush()
+            os.fsync(marker.fileno())
+        self._fsync_parent_directory()
+
+    def _fsync_parent_directory(self) -> None:
+        _fsync_directory(self.path.parent)
 
 
 def build_stage0_observation(
@@ -626,6 +645,9 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
             raise ValueError("successful observation requires typed decision metadata")
         if observation.decision_code is EntryDecisionCode.UNKNOWN:
             raise ValueError("successful observation decision_code must not be UNKNOWN")
+        metadata = entry_decision_metadata(observation.decision_code)
+        if observation.disposition is not metadata.disposition or observation.decision_stage is not metadata.stage:
+            raise ValueError("observation decision metadata does not match decision_code catalog")
         if not observation.trust_allowed or (
             observation.disposition is EntryDisposition.BLOCK
             and observation.decision_stage is EntryDecisionStage.INPUT
@@ -645,6 +667,62 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
 
 def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "nt":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(directory, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    flush_file_buffers = kernel32.FlushFileBuffers
+    flush_file_buffers.argtypes = (wintypes.HANDLE,)
+    flush_file_buffers.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    generic_write = 0x40000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    handle = create_file(
+        str(directory),
+        generic_write,
+        share_read_write_delete,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(directory))
+    try:
+        if not flush_file_buffers(handle):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(directory))
+    finally:
+        close_handle(handle)
 
 
 def _require_exact_fields(payload: dict[str, Any], expected: set[str], label: str) -> None:
