@@ -577,6 +577,8 @@ class StrategyReleaseCandidateV1:
             raise ValueError("candidate supported_symbols must be sorted and unique")
         if self.dataset.symbol not in self.supported_symbols:
             raise ValueError("candidate dataset symbol must be supported")
+        if self.strategy_config.values["symbol"] != self.dataset.symbol:
+            raise ValueError("candidate config symbol must match the dataset symbol")
         if not _GIT_SHA_PATTERN.fullmatch(self.evaluated_code_commit_sha):
             raise ValueError("evaluated_code_commit_sha must be lowercase full SHA-1")
         if self.experiment_protocol_id != EXPERIMENT_PROTOCOL_ID:

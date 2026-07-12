@@ -38,6 +38,7 @@ class LiveScmReview:
     decision: ReleaseDecision
     statement: str
     review_url: str
+    includes_created_edit: bool
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,8 @@ def capture_verified_approval(
         raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     if live.decision is not ReleaseDecision.APPROVED:
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
+    if live.includes_created_edit:
+        raise ScmReviewVerificationError("SCM review statement was edited after creation")
     if live.statement != approval_statement(candidate):
         raise ScmReviewVerificationError("SCM review statement does not bind the exact candidate and implementation")
 
@@ -200,28 +203,30 @@ class GitHubCliScmReviewProvider:
     ) -> LiveScmReview | None:
         endpoint = f"repos/{repository}/pulls/{pull_request_number}/reviews/{review_record_id}"
         try:
-            payload = self._gh_json(endpoint)
+            rest_payload = self._gh_json(endpoint)
         except subprocess.CalledProcessError as exc:
             if "HTTP 404" in exc.stderr:
                 return None
             raise
+        payload = self._gh_graphql_review(_required_text(rest_payload, "node_id"))
         state = _required_text(payload, "state")
         decision = ReleaseDecision.APPROVED if state == "APPROVED" else ReleaseDecision.REJECTED
-        submitted_at = _required_text(payload, "submitted_at")
+        submitted_at = _required_text(payload, "submittedAt")
         reviewed_at_ms = int(datetime.fromisoformat(submitted_at.replace("Z", "+00:00")).timestamp() * 1000)
-        user = payload.get("user")
+        user = payload.get("author")
         if not isinstance(user, dict):
             raise ScmReviewVerificationError("SCM review user is missing")
         return LiveScmReview(
             scm_provider="github",
             repository=repository,
             pull_request_number=pull_request_number,
-            review_record_id=str(payload.get("id", "")),
+            review_record_id=str(_required_int(payload, "databaseId")),
             reviewer_id=_required_text(user, "login"),
             reviewed_at_ms=reviewed_at_ms,
             decision=decision,
             statement=_required_text(payload, "body"),
-            review_url=_required_text(payload, "html_url"),
+            review_url=_required_text(payload, "url"),
+            includes_created_edit=_required_bool(payload, "includesCreatedEdit"),
         )
 
     @staticmethod
@@ -253,11 +258,55 @@ class GitHubCliScmReviewProvider:
             raise ScmReviewVerificationError("SCM paginated response items must be objects")
         return items
 
+    @staticmethod
+    def _gh_graphql_review(node_id: str) -> dict:
+        query = """
+        query($id: ID!) {
+          node(id: $id) {
+            ... on PullRequestReview {
+              databaseId
+              body
+              state
+              submittedAt
+              url
+              includesCreatedEdit
+              author { login }
+            }
+          }
+        }
+        """
+        completed = subprocess.run(
+            ("gh", "api", "graphql", "-f", f"query={query}", "-F", f"id={node_id}"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        node = data.get("node") if isinstance(data, dict) else None
+        if not isinstance(node, dict):
+            raise ScmReviewVerificationError("SCM GraphQL review node is missing")
+        return node
+
 
 def _required_text(payload: dict, field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value:
         raise ScmReviewVerificationError(f"SCM {field_name} must be non-empty text")
+    return value
+
+
+def _required_int(payload: dict, field_name: str) -> int:
+    value = payload.get(field_name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ScmReviewVerificationError(f"SCM {field_name} must be an integer")
+    return value
+
+
+def _required_bool(payload: dict, field_name: str) -> bool:
+    value = payload.get(field_name)
+    if not isinstance(value, bool):
+        raise ScmReviewVerificationError(f"SCM {field_name} must be a boolean")
     return value
 
 

@@ -142,7 +142,11 @@ class StrategyReleaseContractTests(unittest.TestCase):
         base = _candidate()
         changed = (
             _candidate(evaluated_code_commit_sha="b" * 40),
-            _candidate(config=StrategyConfigPayloadV1.from_config(replace(StrategyConfig(), fib_lookback=33))),
+            _candidate(
+                config=StrategyConfigPayloadV1.from_config(
+                    replace(baseline_strategy_group("MU-USDT-SWAP").config, fib_lookback=33)
+                )
+            ),
             _candidate(dataset=_dataset(run_id="b" * 32)),
             _candidate(windows=_windows(offset_ms=900_000)),
             _candidate(assumptions=replace(_assumptions(), fee_rate="0.0002")),
@@ -153,6 +157,13 @@ class StrategyReleaseContractTests(unittest.TestCase):
         for candidate in changed:
             with self.subTest(candidate=candidate.candidate_fingerprint):
                 self.assertNotEqual(base.candidate_fingerprint, candidate.candidate_fingerprint)
+
+    def test_candidate_rejects_a_config_symbol_that_differs_from_the_dataset(self):
+        mismatched = StrategyConfigPayloadV1.from_config(
+            baseline_strategy_group("BTC-USDT-SWAP").config
+        )
+        with self.assertRaisesRegex(ValueError, "config symbol"):
+            _candidate(config=mismatched)
 
     def test_windows_are_exactly_ordered_contiguous_and_end_exclusive(self):
         valid = _windows()
@@ -247,6 +258,7 @@ class PromotionVerificationTests(unittest.TestCase):
         invalid_records = (
             None,
             replace(valid, reviewer_id=pull_request.author_id),
+            replace(valid, includes_created_edit=True),
             replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
             replace(valid, decision=ReleaseDecision.REJECTED),
             replace(valid, repository="other/repository"),
@@ -505,6 +517,7 @@ def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
         decision=ReleaseDecision.APPROVED,
         statement=approval_statement(candidate),
         review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
+        includes_created_edit=False,
     )
 
 
