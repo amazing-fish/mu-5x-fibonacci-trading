@@ -34,7 +34,7 @@ class GitState:
 
 
 class GenerationReader(Protocol):
-    def read(self, run_id: str, symbol: str): ...
+    def read(self, *, run_id: str, symbol: str): ...
 
 
 GitStateProvider = Callable[[Path], GitState]
@@ -74,8 +74,8 @@ def build_strategy_release_candidate(
         slippage_bps="0",
         partial_fill_model=PartialFillModel.NONE,
     )
-    reader = generation_reader or HistoricalTrustedGenerationReader(request.data_dir)
-    generation = reader.read(request.run_id, request.symbol)
+    reader = generation_reader or HistoricalTrustedGenerationReader(data_dir=request.data_dir)
+    generation = reader.read(run_id=request.run_id, symbol=request.symbol)
     results = run_release_experiment(
         generation,
         config=group.config,

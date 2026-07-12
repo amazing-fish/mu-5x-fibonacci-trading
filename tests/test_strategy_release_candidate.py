@@ -239,7 +239,7 @@ class CandidateGenerationTests(unittest.TestCase):
                 json.dumps(candidate.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":")),
                 output_path.read_text(encoding="utf-8"),
             )
-            reader.read.assert_called_once_with(request.run_id, request.symbol)
+            reader.read.assert_called_once_with(run_id=request.run_id, symbol=request.symbol)
 
     def test_generation_has_no_current_refresh_provider_or_broker_side_effects(self):
         generation, windows = _synthetic_generation_and_windows()
@@ -263,6 +263,23 @@ class CandidateGenerationTests(unittest.TestCase):
 
         for prohibited in (current, refresh, fetch, private_read, leverage, submit, cancel):
             prohibited.assert_not_called()
+
+    def test_generation_constructs_default_historical_reader_with_keyword_data_dir(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+
+        with TemporaryDirectory() as tmp, patch(
+            "mu_strategy.commands.build_strategy_release_candidate.HistoricalTrustedGenerationReader",
+            autospec=True,
+        ) as reader_type:
+            request = _candidate_request(Path(tmp), windows, exact_sha)
+            reader_type.return_value.read.return_value = generation
+            build_strategy_release_candidate(
+                request,
+                git_state_provider=lambda _root: GitState(head_sha=exact_sha, is_clean=True),
+            )
+
+        reader_type.assert_called_once_with(data_dir=request.data_dir)
 
 
 def _copy_generation(root: Path) -> Path:
