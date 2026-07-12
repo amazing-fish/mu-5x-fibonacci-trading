@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition
@@ -19,11 +20,22 @@ from mu_strategy.observations import (
     Stage0ObservationCycle,
     TrustedObservationReference,
     build_stage0_observation,
+    canonical_payload_sha256,
     sanitize_observation_text,
 )
 
 
 class Stage0ObservationContractTests(unittest.TestCase):
+    def test_shared_canonical_json_matches_stage0_contract(self):
+        payload = {"z": ("é",), "a": 1}
+
+        self.assertEqual('{"a":1,"z":["\\u00e9"]}', canonical_json(payload))
+        self.assertEqual(canonical_payload_sha256(payload), canonical_sha256(payload))
+
+    def test_shared_canonical_json_rejects_non_finite_numbers(self):
+        with self.assertRaises(ValueError):
+            canonical_json({"value": float("nan")})
+
     def test_classifies_closed_outcomes_from_typed_control_fields(self):
         blocked = _observation(
             trusted=_trusted(allowed=False, reason=HealthReason.MANIFEST_INVALID, run_id=None, hashes=()),

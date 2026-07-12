@@ -26,6 +26,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 - `mu_strategy.experiments`：walk-forward 与消融实验。
 - `mu_strategy.viz`：HTML 回测报告渲染。
 - `mu_strategy.research`：当前研究结论入口。
+- `mu_strategy.research.strategy_releases`：内容寻址的策略候选、SCM 审批快照和 strict exact-ID release resolver；详见 [docs/strategy-release-provenance.md](docs/strategy-release-provenance.md)。
 - `mu_strategy.selection`：固定策略下的候选标的排序。
 - `mu_strategy.execution`：非交易的入场与风险规划。
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。

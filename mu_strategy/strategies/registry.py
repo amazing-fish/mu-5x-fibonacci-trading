@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -11,11 +12,111 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class StrategyRuleDescriptor:
+    strategy_rule_id: str
+    strategy_name: str
+    semantic_version: int
+    side: str
+    order_type: str
+
+    def __post_init__(self) -> None:
+        expected_suffix = f".v{self.semantic_version}"
+        if (
+            self.semantic_version <= 0
+            or not re.fullmatch(r"[a-z0-9]+(?:[._][a-z0-9]+)*\.v[1-9][0-9]*", self.strategy_rule_id)
+            or not self.strategy_rule_id.endswith(expected_suffix)
+        ):
+            raise ValueError("strategy_rule_id must be a versioned canonical identity")
+        if not self.strategy_name:
+            raise ValueError("strategy_name is required")
+        if self.side != "buy" or self.order_type != "limit":
+            raise ValueError("R0 rule descriptors must describe the long-only limit-entry shape")
+
+
+@dataclass(frozen=True)
 class StrategyGroup:
     name: str
     label: str
     config: "StrategyConfig"
     components: StrategyComponents = field(default_factory=StrategyComponents)
+
+    @property
+    def rule(self) -> StrategyRuleDescriptor:
+        return strategy_rule_descriptor(self.name)
+
+
+_STRATEGY_RULE_DESCRIPTORS = {
+    "legacy_break_high": StrategyRuleDescriptor(
+        "mu.legacy_break_high.long_limit.v1", "legacy_break_high", 1, "buy", "limit"
+    ),
+    "baseline": StrategyRuleDescriptor(
+        "mu.baseline.second_pullback.long_limit.v1", "baseline", 1, "buy", "limit"
+    ),
+    "direct_next_open": StrategyRuleDescriptor(
+        "mu.direct_next_open.long_limit.v1", "direct_next_open", 1, "buy", "limit"
+    ),
+    "baseline_half_protect": StrategyRuleDescriptor(
+        "mu.baseline_half_protect.long_limit.v1", "baseline_half_protect", 1, "buy", "limit"
+    ),
+    "baseline_green_wide": StrategyRuleDescriptor(
+        "mu.baseline_green_wide.long_limit.v1", "baseline_green_wide", 1, "buy", "limit"
+    ),
+    "baseline_yellow_wide": StrategyRuleDescriptor(
+        "mu.baseline_yellow_wide.long_limit.v1", "baseline_yellow_wide", 1, "buy", "limit"
+    ),
+    "baseline_yellow_green_wide": StrategyRuleDescriptor(
+        "mu.baseline_yellow_green_wide.long_limit.v1", "baseline_yellow_green_wide", 1, "buy", "limit"
+    ),
+    "baseline_half_green_wide": StrategyRuleDescriptor(
+        "mu.baseline_half_green_wide.long_limit.v1", "baseline_half_green_wide", 1, "buy", "limit"
+    ),
+    "baseline_delayed_tighten": StrategyRuleDescriptor(
+        "mu.baseline_delayed_tighten.long_limit.v1", "baseline_delayed_tighten", 1, "buy", "limit"
+    ),
+    "baseline_delayed_tighten_slow_start": StrategyRuleDescriptor(
+        "mu.baseline_delayed_tighten_slow_start.long_limit.v1",
+        "baseline_delayed_tighten_slow_start",
+        1,
+        "buy",
+        "limit",
+    ),
+    "baseline_delayed_tighten_fast_start": StrategyRuleDescriptor(
+        "mu.baseline_delayed_tighten_fast_start.long_limit.v1",
+        "baseline_delayed_tighten_fast_start",
+        1,
+        "buy",
+        "limit",
+    ),
+    "baseline_delayed_tighten_smooth": StrategyRuleDescriptor(
+        "mu.baseline_delayed_tighten_smooth.long_limit.v1",
+        "baseline_delayed_tighten_smooth",
+        1,
+        "buy",
+        "limit",
+    ),
+    "optimized_v2": StrategyRuleDescriptor(
+        "mu.optimized.long_limit.v2", "optimized_v2", 2, "buy", "limit"
+    ),
+}
+
+_STRATEGY_RULE_ALIASES = {"second_pullback_limit_8": "baseline"}
+
+
+def strategy_rule_descriptor(strategy_name: str) -> StrategyRuleDescriptor:
+    canonical_name = _STRATEGY_RULE_ALIASES.get(strategy_name, strategy_name)
+    try:
+        return _STRATEGY_RULE_DESCRIPTORS[canonical_name]
+    except KeyError as exc:
+        raise ValueError(f"strategy has no registered rule identity: {strategy_name}") from exc
+
+
+def validate_strategy_rule_descriptors(descriptors: tuple[StrategyRuleDescriptor, ...]) -> None:
+    ids = [descriptor.strategy_rule_id for descriptor in descriptors]
+    names = [descriptor.strategy_name for descriptor in descriptors]
+    if len(ids) != len(set(ids)):
+        raise ValueError("strategy_rule_id values must be unique")
+    if len(names) != len(set(names)):
+        raise ValueError("strategy_name values must be unique")
 
 
 def _config(**kwargs) -> "StrategyConfig":

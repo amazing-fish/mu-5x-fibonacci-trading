@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -11,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
+from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
@@ -358,7 +358,7 @@ class Stage0ObservationCycle:
         }
 
     def to_json(self) -> str:
-        return _canonical_json(self.to_dict())
+        return canonical_json(self.to_dict())
 
     @classmethod
     def from_dict(cls, payload: Any) -> "Stage0ObservationCycle":
@@ -548,7 +548,7 @@ def sanitize_observation_text(value: str) -> str:
 def canonical_payload_sha256(payload: Any) -> str:
     if is_dataclass(payload) and not isinstance(payload, type):
         payload = asdict(payload)
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return canonical_sha256(payload)
 
 
 def _result_fingerprint(observation: Stage0Observation) -> str:
@@ -575,7 +575,7 @@ def _result_fingerprint(observation: Stage0Observation) -> str:
         "scan_result": observation.scan_result.to_dict() if observation.scan_result else None,
         "provenance": observation.provenance,
     }
-    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return canonical_sha256(payload)
 
 
 def _validate_observation_semantics(observation: Stage0Observation) -> None:
@@ -671,10 +671,6 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
         raise ValueError("unsupported observation failure_code")
     if observation.outcome is not expected_outcome:
         raise ValueError("observation outcome does not match typed control fields")
-
-
-def _canonical_json(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
 
 
 def _fsync_directory(directory: Path) -> None:

@@ -88,6 +88,18 @@ Package: `mu_strategy.experiments`
 
 `experiments.fibonacci_pullback` runs 1h-12h Fibonacci lookback sweeps for one or more assets and renders the ranking reports used by `docs/fibonacci-preferred-parameters.md`.
 
+## Strategy Release Provenance
+
+Package: `mu_strategy.research.strategy_releases`
+
+R0 gives staged execution a self-contained strategy identity without changing strategy behavior. The registry owns the versioned rule ID, the v1 config payload owns every `StrategyConfig` field, and a candidate binds those values to an exact evaluated Git SHA, explicit trusted generation and interval hashes, closed experiment protocol, assumptions, windows, and canonical results. The initial release domain is explicitly the MU baseline: its rule ID/name/symbol and second-pullback/baseline-stop semantic discriminators are code-checked against the registry, while numeric parameters remain config-addressed and independently reviewable.
+
+Candidate generation reads only an explicit historical generation and requires a clean exact-HEAD match. Every window requires the exact gap-free set of fixed-step `15m` and `1h` opens before context construction; hourly regime state becomes available at candle close to prevent missing-hour carry, pre-window carry, and future-close lookahead. The runner and candidate parser share one protocol-assumption validator: fee profile is closed, fee profile/rate must match the frozen config, explicit slippage is zero, schema-v3 effective evidence closes over `5m`/`15m`/`1h`, and every cold-start result starts from the declared equity. Result parsing also verifies return/equity/P&L/zero-trade arithmetic within the documented decimal tolerance, and nested schema versions are strict integers rather than boolean-equivalent values. Candidate generation cannot read `current.json`, refresh data, use network/private APIs, or reach Broker mutation. Candidate files are ignored local artifacts until a live independent SCM review binds their exact fingerprint and evaluated SHA.
+
+Promotion verifies the trusted live PR author, evaluated commit author/committer lineage, review independence, and the GraphQL review node's unedited state before capturing approval evidence. `lastEditedAt != null` or `includesCreatedEdit=true` fails closed, as do missing mapped commit identities. Runtime resolution is deliberately offline: `StrictStrategyReleaseResolver` requires an exact content-addressed release ID plus expected rule and symbol, binds the config/dataset/supported symbol identities, and has no by-name/latest/current-pointer fallback. SCM establishes approval authenticity at promotion time; runtime rejects self-consistent snapshots that change the closed GitHub provider/repository, review-record/URL coordinates, canonical approval statement, or captured reviewer/author independence, then checks every duplicated binding and content digest.
+
+The first MU candidate has passed reproducibility and independent local evidence review but is not an approved release until immutable SCM evidence exists. 30-B must receive an explicit approved release ID; approval permits only future staged dry-run intent construction and never authorizes Demo or Production Broker mutation. See [strategy-release-provenance.md](strategy-release-provenance.md).
+
 ## Selection
 
 Package: `mu_strategy.selection`
