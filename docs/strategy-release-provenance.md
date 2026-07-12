@@ -26,8 +26,8 @@ TRAIN, VALIDATION, and OUT_OF_SAMPLE are explicit contiguous `[start_ms, end_ms)
 
 The first locally reviewed MU candidate uses:
 
-- candidate fingerprint `19605cda72951169f5f96a03523097e0f677cc38f270cee8d83a93331a159084`;
-- evaluated implementation SHA `6c51629945e0a18063282a5ec0449eb97f99b9fb`;
+- candidate fingerprint `7ff90589b2f9587f021d3c519e46b2547744d0faf58dd7fcd300f515f938bc61`;
+- evaluated implementation SHA `6e849f5c807fd1df405f9ad87da3141ee67f8a84`;
 - trusted generation `e702be27d2de4b2d92b12bf01c70d02d`;
 - 7,051 / 2,350 / 2,351 `15m` candles in the three cold-start windows;
 - byte-identical repeated candidate output.
