@@ -88,6 +88,18 @@ Package: `mu_strategy.experiments`
 
 `experiments.fibonacci_pullback` runs 1h-12h Fibonacci lookback sweeps for one or more assets and renders the ranking reports used by `docs/fibonacci-preferred-parameters.md`.
 
+## Strategy Release Provenance
+
+Package: `mu_strategy.research.strategy_releases`
+
+R0 gives staged execution a self-contained strategy identity without changing strategy behavior. The registry owns the versioned rule ID, the v1 config payload owns every `StrategyConfig` field, and a candidate binds those values to an exact evaluated Git SHA, explicit trusted generation and interval hashes, closed experiment protocol, assumptions, windows, and canonical results.
+
+Candidate generation reads only an explicit historical generation and requires a clean exact-HEAD match. It cannot read `current.json`, refresh data, use network/private APIs, or reach Broker mutation. Candidate files are ignored local artifacts until a live independent SCM review binds their exact fingerprint and evaluated SHA.
+
+Promotion verifies the live review and reviewer independence before capturing approval evidence. Runtime resolution is deliberately offline: `StrictStrategyReleaseResolver` requires an exact content-addressed release ID plus expected rule and symbol, and has no by-name/latest/current-pointer fallback. SCM establishes approval authenticity at promotion time; runtime checks the embedded snapshot and content integrity.
+
+The first MU candidate has passed reproducibility and independent local evidence review but is not an approved release until immutable SCM evidence exists. 30-B must receive an explicit approved release ID; approval permits only future staged dry-run intent construction and never authorizes Demo or Production Broker mutation. See [strategy-release-provenance.md](strategy-release-provenance.md).
+
 ## Selection
 
 Package: `mu_strategy.selection`
