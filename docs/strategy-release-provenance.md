@@ -26,8 +26,8 @@ TRAIN, VALIDATION, and OUT_OF_SAMPLE are explicit contiguous `[start_ms, end_ms)
 
 The first locally reviewed MU candidate uses:
 
-- candidate fingerprint `6c01e995784bfc22c23923ee106f054756cf853128aa5cd1c74bb6e9a8557ba5`;
-- evaluated implementation SHA `dcdb565d9c43f9aa5844957d49c96d97a0b07f84`;
+- candidate fingerprint `e9eb5a07017565a1d62f21c453c7bbfb7bfa885c92c4b340c713332ecb63f648`;
+- evaluated implementation SHA `b92985b2e9709bcd95effb84e77e7975f916c620`;
 - trusted generation `e702be27d2de4b2d92b12bf01c70d02d`;
 - 7,048 / 2,352 / 2,348 `15m` candles in three hour-aligned cold-start windows;
 - byte-identical repeated candidate output.
@@ -54,13 +54,13 @@ candidate_fingerprint=<64 lowercase hex>
 evaluated_code_commit_sha=<40 lowercase hex>
 ```
 
-Missing, deleted, edited, dismissed, self-authored, or mismatched review evidence fails closed. Only after live verification does promotion capture the SCM coordinates and canonical snapshot, construct the content-addressed release, and atomically write `config/strategy-releases/<strategy_release_id>.json`.
+Missing, deleted, dismissed, self-authored, or mismatched review evidence fails closed. Promotion reads the authoritative GraphQL review node and rejects `includesCreatedEdit=true`, so a summary edited after submission cannot be presented as the original approval bytes. Only after live verification does promotion capture the SCM coordinates and canonical snapshot, construct the content-addressed release, and atomically write `config/strategy-releases/<strategy_release_id>.json`.
 
 Authenticity and integrity remain separate. Promotion establishes authenticity by querying SCM and checking reviewer independence. Runtime does not contact SCM; it verifies the embedded snapshot digest and all duplicated bindings. A digest alone is not treated as proof of reviewer identity.
 
 ## Runtime resolution and rollback
 
-`StrictStrategyReleaseResolver.resolve(strategy_release_id, *, expected_rule_id, expected_symbol)` validates `sr1_[0-9a-f]{64}` before path construction and reads exactly one artifact. It rejects missing, malformed, corrupt, rejected, path-mismatched, rule-mismatched, or symbol-mismatched content. There is no strategy-name, newest-file, or mutable current-pointer lookup. Later checkout or registry changes do not reinterpret a self-contained release.
+`StrictStrategyReleaseResolver.resolve(strategy_release_id, *, expected_rule_id, expected_symbol)` validates `sr1_[0-9a-f]{64}` before path construction and reads exactly one artifact. Candidate construction binds the full config payload symbol to both the dataset and supported-symbol identity. Resolution rejects missing, malformed, corrupt, rejected, path-mismatched, rule-mismatched, or symbol-mismatched content. There is no strategy-name, newest-file, or mutable current-pointer lookup. Later checkout or registry changes do not reinterpret a self-contained release.
 
 Rollback removes the R0 release artifact or code change; it does not change trusted generations, observations, account state, leverage, orders, or positions. Candidate generation and runtime resolution have no network or Broker path.
 
