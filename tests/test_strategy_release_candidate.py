@@ -10,6 +10,7 @@ from mu_strategy.commands.build_strategy_release_candidate import (
     CandidateGenerationRequest,
     GitState,
     build_strategy_release_candidate,
+    read_git_state,
 )
 
 from mu_strategy.experiments.release_candidate import (
@@ -182,6 +183,11 @@ class ReleaseExperimentRunnerTests(unittest.TestCase):
 
 
 class CandidateGenerationTests(unittest.TestCase):
+    def test_real_git_provider_rejects_a_repository_other_than_the_loaded_checkout(self):
+        with TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "loaded checkout"):
+                read_git_state(Path(tmp))
+
     def test_generation_rejects_dirty_or_non_exact_git_state(self):
         generation, windows = _synthetic_generation_and_windows()
         exact_sha = "1" * 40

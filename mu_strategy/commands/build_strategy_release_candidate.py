@@ -106,6 +106,9 @@ def build_strategy_release_candidate(
 
 
 def read_git_state(repository_root: Path) -> GitState:
+    loaded_checkout = Path(__file__).resolve().parents[2]
+    if repository_root.resolve() != loaded_checkout:
+        raise ValueError("repository_root must be the loaded checkout")
     head = _run_git(repository_root, "rev-parse", "HEAD")
     status = _run_git(repository_root, "status", "--porcelain", "--untracked-files=normal")
     return GitState(head_sha=head, is_clean=not status)
