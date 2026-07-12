@@ -46,7 +46,7 @@ python -m mu_strategy.commands.build_strategy_release_candidate `
   --validation-end-ms <ms> --oos-end-ms <ms>
 ```
 
-Promotion queries the trusted live PR and review record. The PR must contain the evaluated commit, its author must differ from the reviewer, the live decision must be `APPROVED`, and the review body must equal these canonical bytes with the exact candidate and evaluated SHA:
+Promotion queries the trusted live PR, evaluated commit identity, and review record. The PR must contain the evaluated commit; the reviewer must differ from the PR author and the evaluated commit's mapped GitHub author and committer. Missing commit identity fails closed. The live decision must be `APPROVED`, and the review body must equal these canonical bytes with the exact candidate and evaluated SHA:
 
 ```text
 APPROVED_STRATEGY_RELEASE_V1
