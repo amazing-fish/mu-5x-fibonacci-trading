@@ -119,6 +119,19 @@ The GitHub GraphQL review response is a strict required-nullable contract. Promo
 
 This distinction is deliberate: explicit `null` is positive live evidence that GitHub reports no later edit, while an omitted field is incomplete provenance and therefore fails closed.
 
+The offline snapshot is not a signature, but it is still a closed repository-specific contract rather than an arbitrary self-authored envelope. Construction and runtime parsing reject any snapshot that violates an offline-checkable promotion invariant:
+
+| Embedded snapshot state | Offline behavior |
+|---|---|
+| provider is not `github` or repository is not `amazing-fish/mu-5x-fibonacci-trading` | reject |
+| review record ID is not a positive GitHub numeric database ID | reject |
+| review URL does not exactly bind the trusted repository, PR number, and review record ID | reject |
+| reviewer equals the captured evaluated-commit author, compared case-insensitively | reject |
+| statement is not the canonical three-line approval for the embedded candidate fingerprint and evaluated commit | reject |
+| duplicated decision, candidate, implementation, snapshot digest, or release content address differs | reject |
+
+The live promotion query remains the authenticity boundary for PR-author and evaluated-commit committer independence, edit history, review state, and record existence. The offline checks prevent a self-consistent artifact from changing the trusted coordinates or the evidence fields that v1 already embeds; they do not claim to replace that live verification.
+
 ### `StrategyRelease`
 
 The release contains the full candidate and approval plus `strategy_release_id = "sr1_" + SHA256(canonical candidate + canonical approval)`. The release constructor requires matching candidate fingerprints and an `APPROVED` decision. Rejected evidence can be stored as review evidence but cannot construct an execution-eligible release.

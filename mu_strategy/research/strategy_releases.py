@@ -246,10 +246,13 @@ def _wire_value(value: Any) -> Any:
 
 
 STRATEGY_RELEASE_SCHEMA_VERSION = 1
+STRATEGY_RELEASE_SCM_PROVIDER = "github"
+STRATEGY_RELEASE_SCM_REPOSITORY = "amazing-fish/mu-5x-fibonacci-trading"
 EXPERIMENT_PROTOCOL_ID = "mu.baseline.walk_forward.cold_start.v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_GITHUB_REVIEW_RECORD_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
 _RELEASE_ID_PATTERN = re.compile(r"^sr1_[0-9a-f]{64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
 
@@ -709,6 +712,12 @@ class ScmReviewSnapshotV1:
         for field_name in ("scm_provider", "repository", "review_record_id", "reviewer_id", "author_id", "statement"):
             if not getattr(self, field_name):
                 raise ValueError(f"SCM review {field_name} is required")
+        if self.scm_provider != STRATEGY_RELEASE_SCM_PROVIDER:
+            raise ValueError("SCM review provider is not trusted")
+        if self.repository != STRATEGY_RELEASE_SCM_REPOSITORY:
+            raise ValueError("SCM review repository is not trusted")
+        if not _GITHUB_REVIEW_RECORD_ID_PATTERN.fullmatch(self.review_record_id):
+            raise ValueError("SCM review record ID must be a positive GitHub database ID")
         if isinstance(self.pull_request_number, bool) or not isinstance(self.pull_request_number, int) or self.pull_request_number <= 0:
             raise ValueError("pull_request_number must be positive")
         if isinstance(self.reviewed_at_ms, bool) or not isinstance(self.reviewed_at_ms, int) or self.reviewed_at_ms < 0:
@@ -717,8 +726,20 @@ class ScmReviewSnapshotV1:
             raise ValueError("review candidate fingerprint must be SHA-256")
         if not _GIT_SHA_PATTERN.fullmatch(self.evaluated_code_commit_sha):
             raise ValueError("review implementation commit must be full SHA-1")
-        if not self.review_url.startswith("https://"):
-            raise ValueError("review_url must be HTTPS")
+        if self.reviewer_id.casefold() == self.author_id.casefold():
+            raise ValueError("SCM reviewer must be independent from captured author")
+        expected_statement = strategy_release_approval_statement(
+            self.candidate_fingerprint,
+            self.evaluated_code_commit_sha,
+        )
+        if self.statement != expected_statement:
+            raise ValueError("SCM review statement is not canonical")
+        expected_url = (
+            f"https://github.com/{self.repository}/pull/{self.pull_request_number}"
+            f"#pullrequestreview-{self.review_record_id}"
+        )
+        if self.review_url != expected_url:
+            raise ValueError("SCM review URL does not match trusted review coordinates")
         if self.snapshot_sha256 != canonical_sha256(self._snapshot_payload()):
             raise ValueError("SCM review snapshot hash does not match canonical evidence")
 
@@ -1004,6 +1025,19 @@ def _scm_snapshot_payload(*, schema_version: int, decision: ReleaseDecision, **k
         "statement": kwargs["statement"],
         "review_url": kwargs["review_url"],
     }
+
+
+def strategy_release_approval_statement(
+    candidate_fingerprint: str,
+    evaluated_code_commit_sha: str,
+) -> str:
+    return "\n".join(
+        (
+            "APPROVED_STRATEGY_RELEASE_V1",
+            f"candidate_fingerprint={candidate_fingerprint}",
+            f"evaluated_code_commit_sha={evaluated_code_commit_sha}",
+        )
+    )
 
 
 def _strategy_release_id(candidate: StrategyReleaseCandidateV1, approval: StrategyReleaseApprovalV1) -> str:

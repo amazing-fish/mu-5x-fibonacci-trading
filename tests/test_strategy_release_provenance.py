@@ -17,7 +17,7 @@ from mu_strategy.commands.promote_strategy_release import (
     capture_verified_approval,
     promote_strategy_release,
 )
-from mu_strategy.canonical import canonical_json
+from mu_strategy.canonical import canonical_json, canonical_sha256
 
 from mu_strategy.research.strategy_releases import (
     EXPERIMENT_PROTOCOL_ID,
@@ -339,14 +339,19 @@ class PromotionVerificationTests(unittest.TestCase):
         pull_request = _live_pull_request(candidate)
         invalid_records = (
             None,
+            replace(valid, scm_provider="gitlab"),
             replace(valid, reviewer_id=pull_request.author_id),
+            replace(valid, reviewer_id=pull_request.author_id.upper()),
             replace(valid, reviewer_id=pull_request.commits[0].author_id),
+            replace(valid, reviewer_id=pull_request.commits[0].author_id.upper()),
             replace(valid, reviewer_id=pull_request.commits[0].committer_id),
+            replace(valid, reviewer_id=pull_request.commits[0].committer_id.upper()),
             replace(valid, includes_created_edit=True),
             replace(valid, last_edited_at_ms=1_700_100_000_001),
             replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
             replace(valid, decision=ReleaseDecision.REJECTED),
             replace(valid, repository="other/repository"),
+            replace(valid, review_url="https://attacker.invalid/review/1"),
         )
 
         for record in invalid_records:
@@ -465,6 +470,52 @@ class StrictStrategyReleaseResolverTests(unittest.TestCase):
         self.assertEqual(inspect.Parameter.empty, parameters["expected_symbol"].default)
         self.assertNotIn("latest", dir(resolver))
         self.assertNotIn("by_name", dir(resolver))
+
+    def test_self_consistent_untrusted_approval_snapshots_fail_closed(self):
+        candidate = _candidate()
+        release = StrategyReleaseV1.create(candidate=candidate, approval=_approval(candidate))
+        invalid_snapshots = (
+            ("provider", {"scm_provider": "gitlab"}),
+            ("repository", {"repository": "attacker/fork"}),
+            ("independent", {"reviewer_id": "RELEASE-AUTHOR"}),
+            ("record", {"review_record_id": "not-numeric"}),
+            ("record", {"review_record_id": "0"}),
+            ("statement", {"statement": "self-authored approval"}),
+            ("URL", {"review_url": "https://attacker.invalid/review/1"}),
+            (
+                "URL",
+                {
+                    "review_url": "https://github.com/amazing-fish/mu-5x-fibonacci-trading/"
+                    "pull/46#pullrequestreview-1"
+                },
+            ),
+            (
+                "URL",
+                {
+                    "review_url": "https://github.com/amazing-fish/mu-5x-fibonacci-trading/"
+                    "pull/45#pullrequestreview-2"
+                },
+            ),
+        )
+
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            resolver = StrictStrategyReleaseResolver(release_dir)
+            for expected_error, snapshot_updates in invalid_snapshots:
+                with self.subTest(snapshot_updates=snapshot_updates):
+                    wire = _readdress_release_with_snapshot_updates(release, snapshot_updates)
+                    release_id = wire["strategy_release_id"]
+                    (release_dir / f"{release_id}.json").write_text(
+                        canonical_json(wire),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(StrategyReleaseResolutionError, expected_error):
+                        resolver.resolve(
+                            release_id,
+                            expected_rule_id=candidate.strategy_rule_id,
+                            expected_symbol=candidate.dataset.symbol,
+                        )
 
     def test_invalid_id_mismatch_missing_corrupt_and_path_binding_fail_closed(self):
         candidate = _candidate()
@@ -601,17 +652,34 @@ def _approval(
         scm_provider="github",
         repository="amazing-fish/mu-5x-fibonacci-trading",
         pull_request_number=45,
-        review_record_id="PRR_review_1",
+        review_record_id="1",
         reviewer_id="independent-reviewer",
         author_id="release-author",
         reviewed_at_ms=1_700_100_000_000,
         decision=decision,
         candidate_fingerprint=candidate.candidate_fingerprint,
         evaluated_code_commit_sha=candidate.evaluated_code_commit_sha,
-        statement="APPROVE exact candidate and evaluated implementation",
+        statement=approval_statement(candidate),
         review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
     )
     return StrategyReleaseApprovalV1.create(review_snapshot=snapshot)
+
+
+def _readdress_release_with_snapshot_updates(
+    release: StrategyReleaseV1,
+    snapshot_updates: dict,
+) -> dict:
+    wire = release.to_dict()
+    snapshot = wire["approval"]["review_snapshot"]
+    snapshot.update(snapshot_updates)
+    snapshot["snapshot_sha256"] = canonical_sha256(
+        {key: value for key, value in snapshot.items() if key != "snapshot_sha256"}
+    )
+    wire["approval"]["approval_snapshot_sha256"] = snapshot["snapshot_sha256"]
+    wire["strategy_release_id"] = "sr1_" + canonical_sha256(
+        {"candidate": wire["candidate"], "approval": wire["approval"]}
+    )
+    return wire
 
 
 def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
@@ -619,7 +687,7 @@ def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
         scm_provider="github",
         repository="amazing-fish/mu-5x-fibonacci-trading",
         pull_request_number=45,
-        review_record_id="PRR_review_1",
+        review_record_id="1",
         reviewer_id="independent-reviewer",
         reviewed_at_ms=1_700_100_000_000,
         decision=ReleaseDecision.APPROVED,

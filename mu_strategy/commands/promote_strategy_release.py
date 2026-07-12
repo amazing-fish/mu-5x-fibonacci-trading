@@ -14,13 +14,15 @@ from mu_strategy.canonical import canonical_json
 from mu_strategy.research.strategy_releases import (
     ReleaseDecision,
     ScmReviewSnapshotV1,
+    STRATEGY_RELEASE_SCM_REPOSITORY,
     StrategyReleaseApprovalV1,
     StrategyReleaseCandidateV1,
     StrategyReleaseV1,
+    strategy_release_approval_statement,
 )
 
 
-TRUSTED_SCM_REPOSITORY = "amazing-fish/mu-5x-fibonacci-trading"
+TRUSTED_SCM_REPOSITORY = STRATEGY_RELEASE_SCM_REPOSITORY
 
 
 class ScmReviewVerificationError(ValueError):
@@ -75,12 +77,9 @@ class ScmReviewProvider(Protocol):
 
 
 def approval_statement(candidate: StrategyReleaseCandidateV1) -> str:
-    return "\n".join(
-        (
-            "APPROVED_STRATEGY_RELEASE_V1",
-            f"candidate_fingerprint={candidate.candidate_fingerprint}",
-            f"evaluated_code_commit_sha={candidate.evaluated_code_commit_sha}",
-        )
+    return strategy_release_approval_statement(
+        candidate.candidate_fingerprint,
+        candidate.evaluated_code_commit_sha,
     )
 
 
@@ -126,12 +125,14 @@ def capture_verified_approval(
         or live.review_record_id != review_record_id
     ):
         raise ScmReviewVerificationError("SCM review coordinates do not match the requested record")
+    if not pull_request.author_id:
+        raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     authors = {
-        pull_request.author_id,
-        evaluated_commit.author_id,
-        evaluated_commit.committer_id,
+        pull_request.author_id.casefold(),
+        evaluated_commit.author_id.casefold(),
+        evaluated_commit.committer_id.casefold(),
     }
-    if not pull_request.author_id or live.reviewer_id in authors:
+    if live.reviewer_id.casefold() in authors:
         raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     if live.decision is not ReleaseDecision.APPROVED:
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
@@ -142,20 +143,23 @@ def capture_verified_approval(
     if live.statement != approval_statement(candidate):
         raise ScmReviewVerificationError("SCM review statement does not bind the exact candidate and implementation")
 
-    snapshot = ScmReviewSnapshotV1.create(
-        scm_provider=live.scm_provider,
-        repository=live.repository,
-        pull_request_number=live.pull_request_number,
-        review_record_id=live.review_record_id,
-        reviewer_id=live.reviewer_id,
-        author_id=evaluated_commit.author_id,
-        reviewed_at_ms=live.reviewed_at_ms,
-        decision=live.decision,
-        candidate_fingerprint=candidate.candidate_fingerprint,
-        evaluated_code_commit_sha=candidate.evaluated_code_commit_sha,
-        statement=live.statement,
-        review_url=live.review_url,
-    )
+    try:
+        snapshot = ScmReviewSnapshotV1.create(
+            scm_provider=live.scm_provider,
+            repository=live.repository,
+            pull_request_number=live.pull_request_number,
+            review_record_id=live.review_record_id,
+            reviewer_id=live.reviewer_id,
+            author_id=evaluated_commit.author_id,
+            reviewed_at_ms=live.reviewed_at_ms,
+            decision=live.decision,
+            candidate_fingerprint=candidate.candidate_fingerprint,
+            evaluated_code_commit_sha=candidate.evaluated_code_commit_sha,
+            statement=live.statement,
+            review_url=live.review_url,
+        )
+    except ValueError as exc:
+        raise ScmReviewVerificationError(f"invalid SCM review snapshot: {exc}") from exc
     return StrategyReleaseApprovalV1.create(review_snapshot=snapshot)
 
 
