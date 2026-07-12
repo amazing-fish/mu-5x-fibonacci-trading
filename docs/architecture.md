@@ -94,7 +94,7 @@ Package: `mu_strategy.research.strategy_releases`
 
 R0 gives staged execution a self-contained strategy identity without changing strategy behavior. The registry owns the versioned rule ID, the v1 config payload owns every `StrategyConfig` field, and a candidate binds those values to an exact evaluated Git SHA, explicit trusted generation and interval hashes, closed experiment protocol, assumptions, windows, and canonical results.
 
-Candidate generation reads only an explicit historical generation and requires a clean exact-HEAD match. It cannot read `current.json`, refresh data, use network/private APIs, or reach Broker mutation. Candidate files are ignored local artifacts until a live independent SCM review binds their exact fingerprint and evaluated SHA.
+Candidate generation reads only an explicit historical generation and requires a clean exact-HEAD match. Cold-start experiment windows admit only complete 1h source candles inside the split, and hourly regime state becomes available at candle close to prevent pre-window carry and future-close lookahead. Candidate generation cannot read `current.json`, refresh data, use network/private APIs, or reach Broker mutation. Candidate files are ignored local artifacts until a live independent SCM review binds their exact fingerprint and evaluated SHA.
 
 Promotion verifies the live review and reviewer independence before capturing approval evidence. Runtime resolution is deliberately offline: `StrictStrategyReleaseResolver` requires an exact content-addressed release ID plus expected rule and symbol, and has no by-name/latest/current-pointer fallback. SCM establishes approval authenticity at promotion time; runtime checks the embedded snapshot and content integrity.
 

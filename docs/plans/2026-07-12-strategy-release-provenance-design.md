@@ -116,6 +116,7 @@ The initial closed protocol ID is `mu.baseline.walk_forward.cold_start.v1`. It f
 
 - each TRAIN/VALIDATION/OOS evaluation window is `[start_ms, end_ms)` and the three windows are contiguous and ordered;
 - `input_start_ms == start_ms`: each split deliberately cold-starts indicators and strategy state, matching the current independent-window walk-forward behavior;
+- only complete 1h source candles contained by the split are eligible, and their regime state becomes visible at candle close, never at candle open; pre-window partial hours and future closes are excluded;
 - no position, pending signal, indicator state, or equity carries across a split;
 - only candles inside the split can create entries;
 - any open position at the split end is force-closed using the existing deterministic `end_of_data` rule;

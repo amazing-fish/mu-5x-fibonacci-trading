@@ -22,14 +22,14 @@ These identities are orthogonal. Registry membership is not approval, a config h
 
 `mu.baseline.walk_forward.cold_start.v1` reads an explicit `data/live/generations/<run_id>/manifest.json`. It never reads `current.json`, recalculates historical freshness from wall-clock time, refreshes data, or calls a provider. The reader validates schema v3 identity, source containment, row counts, and the canonical content SHA-256 of every effective interval.
 
-TRAIN, VALIDATION, and OUT_OF_SAMPLE are explicit contiguous `[start_ms, end_ms)` windows with `input_start_ms == start_ms`. Each window starts with fresh indicator, position, pending-signal, and equity state. The existing deterministic OHLC backtest closes any remaining position with `end_of_data`. The candidate records starting equity, fee profile/rate, fill model, slippage, and partial-fill model; result summaries use canonical finite decimal strings.
+TRAIN, VALIDATION, and OUT_OF_SAMPLE are explicit contiguous `[start_ms, end_ms)` windows with `input_start_ms == start_ms`. Each window starts with fresh indicator, position, pending-signal, and equity state. Only complete 1h candles whose source interval is inside the split are used, and their regime becomes available at the 1h close rather than its open; pre-window state and future hourly closes cannot leak into the split. The existing deterministic OHLC backtest closes any remaining position with `end_of_data`. The candidate records starting equity, fee profile/rate, fill model, slippage, and partial-fill model; result summaries use canonical finite decimal strings.
 
 The first locally reviewed MU candidate uses:
 
-- candidate fingerprint `7ff90589b2f9587f021d3c519e46b2547744d0faf58dd7fcd300f515f938bc61`;
-- evaluated implementation SHA `6e849f5c807fd1df405f9ad87da3141ee67f8a84`;
+- candidate fingerprint `6c01e995784bfc22c23923ee106f054756cf853128aa5cd1c74bb6e9a8557ba5`;
+- evaluated implementation SHA `dcdb565d9c43f9aa5844957d49c96d97a0b07f84`;
 - trusted generation `e702be27d2de4b2d92b12bf01c70d02d`;
-- 7,051 / 2,350 / 2,351 `15m` candles in the three cold-start windows;
+- 7,048 / 2,352 / 2,348 `15m` candles in three hour-aligned cold-start windows;
 - byte-identical repeated candidate output.
 
 An independent local evidence review found no P0-P3 issue, but that verdict is deliberately not sufficient for promotion. There is no tracked approved release until a live immutable SCM review passes the promotion gate.
