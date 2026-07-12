@@ -1,6 +1,20 @@
+import inspect
+import json
 import math
 import unittest
 from dataclasses import fields, replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
+
+from mu_strategy.commands.promote_strategy_release import (
+    LiveScmReview,
+    ScmReviewVerificationError,
+    approval_statement,
+    capture_verified_approval,
+    promote_strategy_release,
+)
+from mu_strategy.canonical import canonical_json
 
 from mu_strategy.research.strategy_releases import (
     EXPERIMENT_PROTOCOL_ID,
@@ -17,7 +31,9 @@ from mu_strategy.research.strategy_releases import (
     StrategyReleaseApprovalV1,
     StrategyReleaseCandidateV1,
     StrategyReleaseV1,
+    StrategyReleaseResolutionError,
     StrategyReleaseSchemaError,
+    StrictStrategyReleaseResolver,
     TrustedExperimentDatasetV1,
 )
 from mu_strategy.strategies.registry import (
@@ -187,6 +203,168 @@ class StrategyReleaseContractTests(unittest.TestCase):
             StrategyReleaseCandidateV1.from_dict(tampered)
 
 
+class PromotionVerificationTests(unittest.TestCase):
+    def test_live_independent_review_is_captured_with_reproducible_snapshot(self):
+        candidate = _candidate()
+        provider = Mock()
+        provider.current_actor_id.return_value = "release-author"
+        live = _live_review(candidate)
+        provider.fetch_review.return_value = live
+
+        approval = capture_verified_approval(
+            candidate,
+            repository=live.repository,
+            pull_request_number=live.pull_request_number,
+            review_record_id=live.review_record_id,
+            provider=provider,
+        )
+
+        self.assertEqual(ReleaseDecision.APPROVED, approval.decision)
+        self.assertEqual(candidate.candidate_fingerprint, approval.candidate_fingerprint)
+        self.assertEqual(live.reviewer_id, approval.review_snapshot.reviewer_id)
+        self.assertEqual(
+            approval.review_snapshot,
+            ScmReviewSnapshotV1.from_dict(approval.review_snapshot.to_dict()),
+        )
+        provider.fetch_review.assert_called_once_with(
+            repository=live.repository,
+            pull_request_number=live.pull_request_number,
+            review_record_id=live.review_record_id,
+        )
+
+    def test_missing_self_or_mismatched_live_review_is_rejected(self):
+        candidate = _candidate()
+        valid = _live_review(candidate)
+        invalid_records = (
+            None,
+            replace(valid, reviewer_id="release-author"),
+            replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
+            replace(valid, decision=ReleaseDecision.REJECTED),
+            replace(valid, repository="other/repository"),
+        )
+
+        for record in invalid_records:
+            with self.subTest(record=record):
+                provider = Mock()
+                provider.current_actor_id.return_value = "release-author"
+                provider.fetch_review.return_value = record
+                with self.assertRaises(ScmReviewVerificationError):
+                    capture_verified_approval(
+                        candidate,
+                        repository=valid.repository,
+                        pull_request_number=valid.pull_request_number,
+                        review_record_id=valid.review_record_id,
+                        provider=provider,
+                    )
+
+    def test_promotion_writes_only_the_canonical_content_addressed_release(self):
+        candidate = _candidate()
+        live = _live_review(candidate)
+        provider = Mock()
+        provider.current_actor_id.return_value = "release-author"
+        provider.fetch_review.return_value = live
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path = root / "candidate.json"
+            candidate_path.write_text(canonical_json(candidate.to_dict()), encoding="utf-8")
+            release, output_path = promote_strategy_release(
+                candidate_path,
+                release_dir=root / "releases",
+                repository=live.repository,
+                pull_request_number=live.pull_request_number,
+                review_record_id=live.review_record_id,
+                provider=provider,
+            )
+
+            self.assertEqual(root / "releases" / f"{release.strategy_release_id}.json", output_path)
+            self.assertEqual(canonical_json(release.to_dict()), output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                release,
+                StrategyReleaseV1.from_dict(json.loads(output_path.read_text(encoding="utf-8"))),
+            )
+
+
+class StrictStrategyReleaseResolverTests(unittest.TestCase):
+    def test_exact_release_resolves_without_git_registry_or_scm_lookup(self):
+        release = StrategyReleaseV1.create(candidate=_candidate(), approval=_approval(_candidate()))
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            path = release_dir / f"{release.strategy_release_id}.json"
+            path.write_text(json.dumps(release.to_dict()), encoding="utf-8")
+            resolver = StrictStrategyReleaseResolver(release_dir)
+
+            with patch("mu_strategy.strategies.registry.strategy_rule_descriptor") as registry, patch(
+                "subprocess.run"
+            ) as git_or_scm:
+                restored = resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id="mu.baseline.second_pullback.long_limit.v1",
+                    expected_symbol="MU-USDT-SWAP",
+                )
+
+        self.assertEqual(release, restored)
+        registry.assert_not_called()
+        git_or_scm.assert_not_called()
+        parameters = inspect.signature(StrictStrategyReleaseResolver.resolve).parameters
+        self.assertEqual(inspect.Parameter.KEYWORD_ONLY, parameters["expected_rule_id"].kind)
+        self.assertEqual(inspect.Parameter.empty, parameters["expected_rule_id"].default)
+        self.assertEqual(inspect.Parameter.empty, parameters["expected_symbol"].default)
+        self.assertNotIn("latest", dir(resolver))
+        self.assertNotIn("by_name", dir(resolver))
+
+    def test_invalid_id_mismatch_missing_corrupt_and_path_binding_fail_closed(self):
+        candidate = _candidate()
+        release = StrategyReleaseV1.create(candidate=candidate, approval=_approval(candidate))
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            resolver = StrictStrategyReleaseResolver(release_dir)
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "strategy_release_id"):
+                resolver.resolve(
+                    "../latest",
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                )
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "not found"):
+                resolver.resolve(
+                    "sr1_" + "0" * 64,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                )
+
+            path = release_dir / f"{release.strategy_release_id}.json"
+            path.write_text("{not-json", encoding="utf-8")
+            with self.assertRaises(StrategyReleaseResolutionError):
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                )
+
+            path.write_text(json.dumps(release.to_dict()), encoding="utf-8")
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "rule"):
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id="mu.other.long_limit.v1",
+                    expected_symbol=candidate.dataset.symbol,
+                )
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "symbol"):
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol="BTC-USDT-SWAP",
+                )
+
+            alias_id = "sr1_" + "f" * 64
+            (release_dir / f"{alias_id}.json").write_text(json.dumps(release.to_dict()), encoding="utf-8")
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "path"):
+                resolver.resolve(
+                    alias_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                )
+
+
 def _dataset(*, run_id: str = "a" * 32) -> TrustedExperimentDatasetV1:
     return TrustedExperimentDatasetV1(
         run_id=run_id,
@@ -281,6 +459,20 @@ def _approval(
         review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
     )
     return StrategyReleaseApprovalV1.create(review_snapshot=snapshot)
+
+
+def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
+    return LiveScmReview(
+        scm_provider="github",
+        repository="amazing-fish/mu-5x-fibonacci-trading",
+        pull_request_number=45,
+        review_record_id="PRR_review_1",
+        reviewer_id="independent-reviewer",
+        reviewed_at_ms=1_700_100_000_000,
+        decision=ReleaseDecision.APPROVED,
+        statement=approval_statement(candidate),
+        review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
+    )
 
 
 if __name__ == "__main__":

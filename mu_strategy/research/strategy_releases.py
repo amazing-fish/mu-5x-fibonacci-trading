@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, fields as dataclass_fields
 from decimal import Decimal, InvalidOperation
 from enum import Enum, unique
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -80,6 +82,10 @@ _WINDOW_TUPLE_FIELDS = {"trading_windows_bjt", "trading_windows_et"}
 
 
 class StrategyReleaseSchemaError(ValueError):
+    pass
+
+
+class StrategyReleaseResolutionError(ValueError):
     pass
 
 
@@ -905,6 +911,45 @@ class StrategyReleaseV1:
             if isinstance(exc, StrategyReleaseSchemaError):
                 raise
             raise StrategyReleaseSchemaError(f"invalid release: {exc}") from exc
+
+
+class StrictStrategyReleaseResolver:
+    def __init__(self, release_dir: Path) -> None:
+        self._release_dir = release_dir
+
+    def resolve(
+        self,
+        strategy_release_id: str,
+        *,
+        expected_rule_id: str,
+        expected_symbol: str,
+    ) -> StrategyReleaseV1:
+        if not isinstance(strategy_release_id, str) or not _RELEASE_ID_PATTERN.fullmatch(strategy_release_id):
+            raise StrategyReleaseResolutionError("strategy_release_id has invalid format")
+        if not expected_rule_id:
+            raise StrategyReleaseResolutionError("expected rule ID is required")
+        if not expected_symbol:
+            raise StrategyReleaseResolutionError("expected symbol is required")
+
+        path = self._release_dir / f"{strategy_release_id}.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            release = StrategyReleaseV1.from_dict(payload)
+        except FileNotFoundError as exc:
+            raise StrategyReleaseResolutionError(f"strategy release not found: {strategy_release_id}") from exc
+        except (OSError, json.JSONDecodeError, StrategyReleaseSchemaError, ValueError) as exc:
+            raise StrategyReleaseResolutionError(f"invalid strategy release {strategy_release_id}: {exc}") from exc
+
+        if release.strategy_release_id != strategy_release_id:
+            raise StrategyReleaseResolutionError("strategy release path does not match content identity")
+        if release.candidate.strategy_rule_id != expected_rule_id:
+            raise StrategyReleaseResolutionError("strategy release rule does not match expected rule")
+        if (
+            expected_symbol not in release.candidate.supported_symbols
+            or release.candidate.dataset.symbol != expected_symbol
+        ):
+            raise StrategyReleaseResolutionError("strategy release symbol does not match expected symbol")
+        return release
 
 
 def _candidate_result_payload(
