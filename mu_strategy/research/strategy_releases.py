@@ -256,6 +256,15 @@ def _wire_value(value: Any) -> Any:
 STRATEGY_RELEASE_SCHEMA_VERSION = 1
 STRATEGY_RELEASE_SCM_PROVIDER = "github"
 STRATEGY_RELEASE_SCM_REPOSITORY = "amazing-fish/mu-5x-fibonacci-trading"
+STRATEGY_RELEASE_V1_RULE_ID = "mu.baseline.second_pullback.long_limit.v1"
+STRATEGY_RELEASE_V1_STRATEGY_NAME = "baseline"
+STRATEGY_RELEASE_V1_SYMBOL = "MU-USDT-SWAP"
+STRATEGY_RELEASE_V1_RULE_CONFIG_BINDINGS = (
+    ("entry_execution", "second_pullback"),
+    ("stop_tightening", "baseline"),
+    ("yellow_stop_tightening", None),
+    ("green_stop_tightening", None),
+)
 EXPERIMENT_PROTOCOL_ID = "mu.baseline.walk_forward.cold_start.v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -630,14 +639,24 @@ class StrategyReleaseCandidateV1:
     def __post_init__(self) -> None:
         if self.schema_version != STRATEGY_RELEASE_SCHEMA_VERSION:
             raise ValueError("unsupported candidate schema_version")
-        if not self.strategy_rule_id or not self.strategy_name:
-            raise ValueError("candidate strategy identity is required")
+        if (
+            self.strategy_rule_id != STRATEGY_RELEASE_V1_RULE_ID
+            or self.strategy_name != STRATEGY_RELEASE_V1_STRATEGY_NAME
+        ):
+            raise ValueError("candidate rule identity is outside the closed v1 release domain")
         if not self.supported_symbols or tuple(sorted(set(self.supported_symbols))) != self.supported_symbols:
             raise ValueError("candidate supported_symbols must be sorted and unique")
+        if self.supported_symbols != (STRATEGY_RELEASE_V1_SYMBOL,):
+            raise ValueError("candidate supported_symbols must match the closed v1 release scope")
         if self.dataset.symbol not in self.supported_symbols:
             raise ValueError("candidate dataset symbol must be supported")
         if self.strategy_config.values["symbol"] != self.dataset.symbol:
             raise ValueError("candidate config symbol must match the dataset symbol")
+        for field_name, expected_value in STRATEGY_RELEASE_V1_RULE_CONFIG_BINDINGS:
+            if self.strategy_config.values[field_name] != expected_value:
+                raise ValueError(
+                    f"candidate config {field_name} does not match the v1 rule identity"
+                )
         if not _GIT_SHA_PATTERN.fullmatch(self.evaluated_code_commit_sha):
             raise ValueError("evaluated_code_commit_sha must be lowercase full SHA-1")
         if self.experiment_protocol_id != EXPERIMENT_PROTOCOL_ID:

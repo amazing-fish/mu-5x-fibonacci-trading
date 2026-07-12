@@ -18,6 +18,8 @@ R0 separates a named research strategy from an execution-eligible strategy relea
 
 These identities are orthogonal. Registry membership is not approval, a config hash is not code provenance, and a positive backtest result is not broker authorization.
 
+R0 v1 is closed to `mu.baseline.second_pullback.long_limit.v1` / `baseline` on `MU-USDT-SWAP`. Parsing requires `entry_execution=second_pullback`, base `stop_tightening=baseline`, and no yellow/green stop override, matching the registry-owned baseline semantic shape. Numeric settings such as lookbacks, tolerances, fees, and wait bars may still produce a different config-addressed candidate for independent review; they are not collapsed into the rule ID. A future strategy rule or symbol needs an explicit versioned release-domain binding rather than reusing this identity with different executable semantics.
+
 ## Historical experiment protocol
 
 `mu.baseline.walk_forward.cold_start.v1` reads an explicit `data/live/generations/<run_id>/manifest.json`. It never reads `current.json`, recalculates historical freshness from wall-clock time, refreshes data, or calls a provider. The reader validates schema v3 identity, source containment, row counts, and the canonical content SHA-256 of every effective interval.

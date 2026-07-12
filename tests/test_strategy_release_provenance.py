@@ -30,6 +30,10 @@ from mu_strategy.research.strategy_releases import (
     ReleaseDecision,
     ScmReviewSnapshotV1,
     SelectionReasonCode,
+    STRATEGY_RELEASE_V1_RULE_CONFIG_BINDINGS,
+    STRATEGY_RELEASE_V1_RULE_ID,
+    STRATEGY_RELEASE_V1_STRATEGY_NAME,
+    STRATEGY_RELEASE_V1_SYMBOL,
     StrategyConfigPayloadV1,
     StrategyReleaseApprovalV1,
     StrategyReleaseCandidateV1,
@@ -53,9 +57,12 @@ class StrategyRuleIdentityTests(unittest.TestCase):
     def test_baseline_rule_identity_is_owned_by_registry(self):
         group = baseline_strategy_group("MU-USDT-SWAP")
 
-        self.assertEqual("mu.baseline.second_pullback.long_limit.v1", group.rule.strategy_rule_id)
+        self.assertEqual(STRATEGY_RELEASE_V1_RULE_ID, group.rule.strategy_rule_id)
         self.assertEqual(group.rule, strategy_rule_descriptor("baseline"))
-        self.assertEqual("baseline", group.rule.strategy_name)
+        self.assertEqual(STRATEGY_RELEASE_V1_STRATEGY_NAME, group.rule.strategy_name)
+        self.assertEqual(STRATEGY_RELEASE_V1_SYMBOL, group.config.symbol)
+        for field_name, expected_value in STRATEGY_RELEASE_V1_RULE_CONFIG_BINDINGS:
+            self.assertEqual(expected_value, getattr(group.config, field_name))
         self.assertEqual(1, group.rule.semantic_version)
         self.assertEqual("buy", group.rule.side)
         self.assertEqual("limit", group.rule.order_type)
@@ -209,6 +216,27 @@ class StrategyReleaseContractTests(unittest.TestCase):
         def boolean_config_schema_version(wire):
             wire["strategy_config"]["schema_version"] = True
 
+        def mismatched_rule_id(wire):
+            wire["strategy_rule_id"] = "mu.legacy_break_high.long_limit.v1"
+
+        def mismatched_strategy_name(wire):
+            wire["strategy_name"] = "legacy_break_high"
+
+        def broadened_symbol_scope(wire):
+            wire["supported_symbols"] = ["BTC-USDT-SWAP", "MU-USDT-SWAP"]
+
+        def mismatched_entry_execution(wire):
+            wire["strategy_config"]["fields"]["entry_execution"] = "break_high"
+
+        def mismatched_stop_tightening(wire):
+            wire["strategy_config"]["fields"]["stop_tightening"] = "half_protect"
+
+        def mismatched_yellow_stop_override(wire):
+            wire["strategy_config"]["fields"]["yellow_stop_tightening"] = "wide"
+
+        def mismatched_green_stop_override(wire):
+            wire["strategy_config"]["fields"]["green_stop_tightening"] = "wide"
+
         invalid_candidates = (
             ("fee", mismatched_fee_profile),
             ("fee", mismatched_fee_rate),
@@ -218,6 +246,13 @@ class StrategyReleaseContractTests(unittest.TestCase):
             ("effective_intervals", missing_schema_v3_base_interval),
             ("fee_profile", unsupported_fee_profile),
             ("schema_version", boolean_config_schema_version),
+            ("rule identity", mismatched_rule_id),
+            ("rule identity", mismatched_strategy_name),
+            ("supported_symbols", broadened_symbol_scope),
+            ("entry_execution", mismatched_entry_execution),
+            ("stop_tightening", mismatched_stop_tightening),
+            ("yellow_stop_tightening", mismatched_yellow_stop_override),
+            ("green_stop_tightening", mismatched_green_stop_override),
         )
         for expected_error, mutate in invalid_candidates:
             with self.subTest(mutation=mutate.__name__):

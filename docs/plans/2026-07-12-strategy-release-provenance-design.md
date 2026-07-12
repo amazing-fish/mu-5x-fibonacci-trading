@@ -102,6 +102,18 @@ Candidate construction and parsing also enforce the closed protocol's offline-ch
 
 The experiment runner and candidate parser share the same assumption validator. Result arithmetic allows only a `0.00000000001` absolute tolerance for independently quantized 12-decimal float outputs; this covers the bounded rounding difference in the current canonical candidate without permitting economically material contradictions. Recomputing per-result, aggregate-result, config, and candidate fingerprints cannot turn evidence that violates these relationships into a valid candidate. Relationships that require candle/trade replay remain promotion-review evidence rather than being guessed offline.
 
+R0's v1 release domain is deliberately closed to the first approved baseline rather than pretending every registry strategy already has release evidence:
+
+| Rule/config relationship | v1 requirement |
+|---|---|
+| `strategy_rule_id` / `strategy_name` | `mu.baseline.second_pullback.long_limit.v1` / `baseline` |
+| `supported_symbols` and dataset/config symbol | exactly `MU-USDT-SWAP` |
+| entry semantic discriminator | `entry_execution: second_pullback` |
+| base exit semantic discriminator | `stop_tightening: baseline` |
+| regime-specific exit overrides | `yellow_stop_tightening: null`, `green_stop_tightening: null` |
+
+Other executable parameters remain config-addressed and may change only by producing a different candidate and independent approval; they are not frozen to one global hash. Supporting another semantic rule or symbol requires an explicit versioned release-domain binding rather than changing these v1 meanings in place.
+
 ### `StrategyReleaseApproval`
 
 Approval is a detached statement over exactly one `candidate_fingerprint`. Its canonical evidence snapshot is embedded in the release and contains:
