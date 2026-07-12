@@ -29,8 +29,7 @@ from mu_strategy.research.strategy_releases import (
     ExperimentWindow,
     ExperimentWindowResultV1,
     ExperimentWindowRole,
-    FillModel,
-    PartialFillModel,
+    validate_release_experiment_assumptions,
 )
 from mu_strategy.strategy import StrategyConfig
 
@@ -198,14 +197,11 @@ def run_release_experiment(
 
 
 def _validate_runner_assumptions(config: StrategyConfig, assumptions: BacktestAssumptionsV1) -> None:
-    if assumptions.fee_profile != config.fee_profile or Decimal(assumptions.fee_rate) != Decimal(str(config.fee_rate)):
-        raise ValueError("experiment fee assumptions must match the strategy config")
-    if assumptions.fill_model is not FillModel.DETERMINISTIC_OHLC:
-        raise ValueError("unsupported experiment fill model")
-    if Decimal(assumptions.slippage_bps) != 0:
-        raise ValueError("v1 experiment requires zero explicit slippage")
-    if assumptions.partial_fill_model is not PartialFillModel.NONE:
-        raise ValueError("v1 experiment does not model partial fills")
+    validate_release_experiment_assumptions(
+        config_fee_profile=config.fee_profile,
+        config_fee_rate=config.fee_rate,
+        assumptions=assumptions,
+    )
 
 
 def _validate_runner_windows(

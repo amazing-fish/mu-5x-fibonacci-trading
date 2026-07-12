@@ -85,6 +85,22 @@ The frozen v1 candidate contains:
 
 Candidate identity includes every item above except its own fingerprint and presentation-only labels/paths.
 
+Candidate construction and parsing also enforce the closed protocol's offline-checkable cross-field invariants before fingerprints are considered sufficient:
+
+| Candidate state | Behavior |
+|---|---|
+| config or assumptions `fee_profile` is outside the closed `market` / `limit` domain | reject |
+| assumptions `fee_profile` or `fee_rate` differs from the frozen strategy config | reject |
+| explicit `slippage_bps` is non-zero | reject |
+| effective pinned dataset omits protocol-required `15m` / `1h`, or violates schema-v3's native-interval requirement for `5m` | reject |
+| any cold-start window result has a different `starting_equity` from the assumptions | reject |
+| result return differs from `ending_equity / starting_equity - 1` beyond the declared decimal tolerance | reject |
+| result net equity change differs from `gross_profit - gross_loss` beyond the declared decimal tolerance | reject |
+| zero-trade result reports P&L, return, equity change, or drawdown; or directional P&L requires more trades than reported | reject |
+| fill or partial-fill model is outside the closed v1 enum | reject during typed parsing |
+
+The experiment runner and candidate parser share the same assumption validator. Result arithmetic allows only a `0.00000000001` absolute tolerance for independently quantized 12-decimal float outputs; this covers the bounded rounding difference in the current canonical candidate without permitting economically material contradictions. Recomputing per-result, aggregate-result, config, and candidate fingerprints cannot turn evidence that violates these relationships into a valid candidate. Relationships that require candle/trade replay remain promotion-review evidence rather than being guessed offline.
+
 ### `StrategyReleaseApproval`
 
 Approval is a detached statement over exactly one `candidate_fingerprint`. Its canonical evidence snapshot is embedded in the release and contains:

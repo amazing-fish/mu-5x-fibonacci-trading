@@ -142,6 +142,13 @@ class StrategyReleaseContractTests(unittest.TestCase):
 
     def test_candidate_identity_changes_for_each_control_dimension(self):
         base = _candidate()
+        fee_config = StrategyConfigPayloadV1.from_config(
+            replace(
+                baseline_strategy_group("MU-USDT-SWAP").config,
+                fee_profile="limit",
+                fee_rate=0.0002,
+            )
+        )
         changed = (
             _candidate(evaluated_code_commit_sha="b" * 40),
             _candidate(
@@ -151,7 +158,10 @@ class StrategyReleaseContractTests(unittest.TestCase):
             ),
             _candidate(dataset=_dataset(run_id="b" * 32)),
             _candidate(windows=_windows(offset_ms=900_000)),
-            _candidate(assumptions=replace(_assumptions(), fee_rate="0.0002")),
+            _candidate(
+                config=fee_config,
+                assumptions=replace(_assumptions(), fee_profile="limit", fee_rate="0.0002"),
+            ),
             _candidate(results=_results(ending_equity="10001")),
             _candidate(selection_reason=SelectionReasonCode.REVALIDATED_BASELINE),
         )
@@ -166,6 +176,80 @@ class StrategyReleaseContractTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "config symbol"):
             _candidate(config=mismatched)
+
+    def test_readdressed_candidate_rejects_protocol_cross_field_mismatches(self):
+        candidate = _candidate()
+
+        def mismatched_fee_profile(wire):
+            wire["assumptions"]["fee_profile"] = "limit"
+
+        def mismatched_fee_rate(wire):
+            wire["assumptions"]["fee_rate"] = "0.0002"
+
+        def nonzero_slippage(wire):
+            wire["assumptions"]["slippage_bps"] = "1"
+
+        def mismatched_starting_equity(wire):
+            wire["assumptions"]["starting_equity"] = "9000"
+
+        def missing_required_interval(wire):
+            wire["dataset"]["requested_intervals"] = ["5m", "15m"]
+            wire["dataset"]["effective_intervals"] = ["5m", "15m"]
+            wire["dataset"]["content_sha256_by_interval"].pop("1h")
+
+        def missing_schema_v3_base_interval(wire):
+            wire["dataset"]["requested_intervals"] = ["15m", "1h"]
+            wire["dataset"]["effective_intervals"] = ["15m", "1h"]
+            wire["dataset"]["content_sha256_by_interval"].pop("5m")
+
+        def unsupported_fee_profile(wire):
+            wire["strategy_config"]["fields"]["fee_profile"] = "attacker_defined"
+            wire["assumptions"]["fee_profile"] = "attacker_defined"
+
+        invalid_candidates = (
+            ("fee", mismatched_fee_profile),
+            ("fee", mismatched_fee_rate),
+            ("slippage", nonzero_slippage),
+            ("starting equity", mismatched_starting_equity),
+            ("required intervals", missing_required_interval),
+            ("effective_intervals", missing_schema_v3_base_interval),
+            ("fee_profile", unsupported_fee_profile),
+        )
+        for expected_error, mutate in invalid_candidates:
+            with self.subTest(mutation=mutate.__name__):
+                wire = candidate.to_dict()
+                mutate(wire)
+                _readdress_candidate_wire(wire)
+
+                with self.assertRaisesRegex(StrategyReleaseSchemaError, expected_error):
+                    StrategyReleaseCandidateV1.from_dict(wire)
+
+    def test_readdressed_candidate_rejects_result_arithmetic_mismatches(self):
+        candidate = _candidate()
+
+        def impossible_return(wire):
+            wire["results"][0]["total_return_pct"] = "-2"
+
+        def impossible_net_pnl(wire):
+            wire["results"][0]["ending_equity"] = "10001"
+            wire["results"][0]["total_return_pct"] = "0.0001"
+
+        def impossible_zero_trade_summary(wire):
+            wire["results"][0]["trade_count"] = 0
+
+        invalid_results = (
+            ("total return", impossible_return),
+            ("gross profit", impossible_net_pnl),
+            ("zero-trade", impossible_zero_trade_summary),
+        )
+        for expected_error, mutate in invalid_results:
+            with self.subTest(mutation=mutate.__name__):
+                wire = candidate.to_dict()
+                mutate(wire)
+                _readdress_candidate_wire(wire)
+
+                with self.assertRaisesRegex(StrategyReleaseSchemaError, expected_error):
+                    StrategyReleaseCandidateV1.from_dict(wire)
 
     def test_windows_are_exactly_ordered_contiguous_and_end_exclusive(self):
         valid = _windows()
@@ -602,15 +686,16 @@ def _assumptions() -> BacktestAssumptionsV1:
 
 
 def _results(*, ending_equity: str = "10000") -> tuple[ExperimentWindowResultV1, ...]:
+    changed = ending_equity != "10000"
     return tuple(
         ExperimentWindowResultV1.create(
             role=role,
-            trade_count=1,
+            trade_count=2,
             starting_equity="10000",
             ending_equity=ending_equity,
-            gross_profit="10",
+            gross_profit="11" if changed else "10",
             gross_loss="10",
-            total_return_pct="0",
+            total_return_pct="0.0001" if changed else "0",
             max_drawdown_pct="-0.01",
         )
         for role in ExperimentWindowRole
@@ -680,6 +765,25 @@ def _readdress_release_with_snapshot_updates(
         {"candidate": wire["candidate"], "approval": wire["approval"]}
     )
     return wire
+
+
+def _readdress_candidate_wire(wire: dict) -> None:
+    wire["strategy_config_sha256"] = canonical_sha256(wire["strategy_config"])
+    for result in wire["results"]:
+        result["result_fingerprint"] = canonical_sha256(
+            {key: value for key, value in result.items() if key != "result_fingerprint"}
+        )
+    wire["result_fingerprint"] = canonical_sha256(
+        {
+            "experiment_protocol_id": wire["experiment_protocol_id"],
+            "windows": wire["windows"],
+            "assumptions": wire["assumptions"],
+            "results": wire["results"],
+        }
+    )
+    wire["candidate_fingerprint"] = canonical_sha256(
+        {key: value for key, value in wire.items() if key != "candidate_fingerprint"}
+    )
 
 
 def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:

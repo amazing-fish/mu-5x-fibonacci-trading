@@ -355,18 +355,22 @@ def _synthetic_generation_and_windows() -> tuple[HistoricalTrustedGeneration, tu
         Candle(start + index * 3_600_000, 100 + index, 101 + index, 99 + index, 100.5 + index, 1000)
         for index in range(3)
     )
+    candles_5m = tuple(
+        Candle(start + index * 300_000, 100 + index, 101 + index, 99 + index, 100.5 + index, 1000)
+        for index in range(36)
+    )
     reference = TrustedExperimentDatasetV1(
         run_id="a" * 32,
         symbol="MU-USDT-SWAP",
         manifest_schema_version=3,
-        requested_intervals=("15m", "1h"),
-        effective_intervals=("15m", "1h"),
-        content_sha256_by_interval=(("15m", "a" * 64), ("1h", "b" * 64)),
+        requested_intervals=("5m", "15m", "1h"),
+        effective_intervals=("5m", "15m", "1h"),
+        content_sha256_by_interval=(("15m", "a" * 64), ("1h", "b" * 64), ("5m", "c" * 64)),
     )
     generation = HistoricalTrustedGeneration(
         reference=reference,
-        candles_by_interval={"15m": candles_15m, "1h": candles_1h},
-        published_freshness_by_interval={"15m": "fresh", "1h": "fresh"},
+        candles_by_interval={"5m": candles_5m, "15m": candles_15m, "1h": candles_1h},
+        published_freshness_by_interval={"5m": "fresh", "15m": "fresh", "1h": "fresh"},
         completed_at_ms=start + 12 * interval_ms,
     )
     width = 4 * interval_ms

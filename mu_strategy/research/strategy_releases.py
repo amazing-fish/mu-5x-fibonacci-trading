@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from mu_strategy.canonical import canonical_sha256
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig
 
 
 STRATEGY_CONFIG_SCHEMA_VERSION = 1
@@ -157,6 +157,10 @@ def _validate_config_values(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_config_value(field_name: str, value: Any) -> Any:
+    if field_name == "fee_profile":
+        if value not in FEE_PROFILE_CHOICES:
+            raise StrategyReleaseSchemaError("strategy config fee_profile is unsupported")
+        return value
     if field_name in _DECIMAL_FIELDS:
         if value is None and field_name in _OPTIONAL_DECIMAL_FIELDS:
             return None
@@ -255,6 +259,7 @@ _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _GITHUB_REVIEW_RECORD_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
 _RELEASE_ID_PATTERN = re.compile(r"^sr1_[0-9a-f]{64}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
+_RESULT_ARITHMETIC_TOLERANCE = Decimal("0.00000000001")
 
 
 @unique
@@ -343,8 +348,8 @@ class BacktestAssumptionsV1:
         _require_decimal_range(self.starting_equity, "starting_equity", minimum=Decimal("0"), exclusive_minimum=True)
         _require_decimal_range(self.fee_rate, "fee_rate", minimum=Decimal("0"))
         _require_decimal_range(self.slippage_bps, "slippage_bps", minimum=Decimal("0"))
-        if not self.fee_profile:
-            raise ValueError("fee_profile is required")
+        if self.fee_profile not in FEE_PROFILE_CHOICES:
+            raise ValueError("fee_profile is unsupported")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -385,6 +390,25 @@ class BacktestAssumptionsV1:
             raise StrategyReleaseSchemaError(f"invalid assumptions: {exc}") from exc
 
 
+def validate_release_experiment_assumptions(
+    *,
+    config_fee_profile: str,
+    config_fee_rate: Any,
+    assumptions: BacktestAssumptionsV1,
+) -> None:
+    if (
+        assumptions.fee_profile != config_fee_profile
+        or Decimal(assumptions.fee_rate) != Decimal(str(config_fee_rate))
+    ):
+        raise ValueError("experiment fee assumptions must match the strategy config")
+    if assumptions.fill_model is not FillModel.DETERMINISTIC_OHLC:
+        raise ValueError("unsupported experiment fill model")
+    if Decimal(assumptions.slippage_bps) != 0:
+        raise ValueError("v1 experiment requires zero explicit slippage")
+    if assumptions.partial_fill_model is not PartialFillModel.NONE:
+        raise ValueError("v1 experiment does not model partial fills")
+
+
 @dataclass(frozen=True)
 class ExperimentWindowResultV1:
     role: ExperimentWindowRole
@@ -403,17 +427,42 @@ class ExperimentWindowResultV1:
             raise ValueError("unsupported result schema_version")
         if isinstance(self.trade_count, bool) or not isinstance(self.trade_count, int) or self.trade_count < 0:
             raise ValueError("trade_count must be a non-negative integer")
-        _require_decimal_range(self.starting_equity, "starting_equity", minimum=Decimal("0"), exclusive_minimum=True)
-        _require_decimal_range(self.ending_equity, "ending_equity", minimum=Decimal("0"))
-        _require_decimal_range(self.gross_profit, "gross_profit", minimum=Decimal("0"))
-        _require_decimal_range(self.gross_loss, "gross_loss", minimum=Decimal("0"))
-        _require_decimal_range(self.total_return_pct, "total_return_pct")
-        _require_decimal_range(
+        starting_equity = _require_decimal_range(
+            self.starting_equity,
+            "starting_equity",
+            minimum=Decimal("0"),
+            exclusive_minimum=True,
+        )
+        ending_equity = _require_decimal_range(self.ending_equity, "ending_equity", minimum=Decimal("0"))
+        gross_profit = _require_decimal_range(self.gross_profit, "gross_profit", minimum=Decimal("0"))
+        gross_loss = _require_decimal_range(self.gross_loss, "gross_loss", minimum=Decimal("0"))
+        total_return_pct = _require_decimal_range(self.total_return_pct, "total_return_pct")
+        max_drawdown_pct = _require_decimal_range(
             self.max_drawdown_pct,
             "max_drawdown_pct",
             minimum=Decimal("-1"),
             maximum=Decimal("0"),
         )
+        expected_return = (ending_equity / starting_equity) - 1
+        if abs(total_return_pct - expected_return) > _RESULT_ARITHMETIC_TOLERANCE:
+            raise ValueError("result total return does not match starting and ending equity")
+        net_equity_change = ending_equity - starting_equity
+        if abs(net_equity_change - (gross_profit - gross_loss)) > _RESULT_ARITHMETIC_TOLERANCE:
+            raise ValueError("result gross profit and loss do not match the equity change")
+        if self.trade_count == 0 and any(
+            abs(value) > _RESULT_ARITHMETIC_TOLERANCE
+            for value in (
+                net_equity_change,
+                gross_profit,
+                gross_loss,
+                total_return_pct,
+                max_drawdown_pct,
+            )
+        ):
+            raise ValueError("zero-trade result must not report P&L, return, equity change, or drawdown")
+        directional_trade_minimum = int(gross_profit > 0) + int(gross_loss > 0)
+        if self.trade_count < directional_trade_minimum:
+            raise ValueError("result trade count cannot produce the reported directional P&L")
         expected = canonical_sha256(self._fingerprint_payload())
         if self.result_fingerprint != expected:
             raise ValueError("result fingerprint does not match canonical summary")
@@ -507,6 +556,9 @@ class TrustedExperimentDatasetV1:
             raise ValueError("dataset intervals must be unique")
         if not set(self.requested_intervals).issubset(self.effective_intervals):
             raise ValueError("requested intervals must be a subset of effective intervals")
+        effective = set(self.effective_intervals)
+        if any(interval in effective for interval in ("15m", "1h")) and "5m" not in effective:
+            raise ValueError("dataset effective_intervals must include 5m when native intervals are present")
         if tuple(sorted(self.content_sha256_by_interval)) != self.content_sha256_by_interval:
             raise ValueError("dataset content hashes must be sorted by interval")
         hashes = dict(self.content_sha256_by_interval)
@@ -586,10 +638,20 @@ class StrategyReleaseCandidateV1:
             raise ValueError("evaluated_code_commit_sha must be lowercase full SHA-1")
         if self.experiment_protocol_id != EXPERIMENT_PROTOCOL_ID:
             raise ValueError("unsupported experiment protocol")
+        validate_release_experiment_assumptions(
+            config_fee_profile=self.strategy_config.values["fee_profile"],
+            config_fee_rate=self.strategy_config.values["fee_rate"],
+            assumptions=self.assumptions,
+        )
+        required_intervals = {"15m", "1h"}
+        if not required_intervals.issubset(self.dataset.effective_intervals):
+            raise ValueError("candidate dataset is missing required intervals")
         _validate_windows(self.windows)
         expected_roles = tuple(ExperimentWindowRole)
         if tuple(result.role for result in self.results) != expected_roles:
             raise ValueError("candidate requires one ordered result per experiment window")
+        if any(result.starting_equity != self.assumptions.starting_equity for result in self.results):
+            raise ValueError("candidate result starting equity must match the assumptions")
         expected_result_fingerprint = canonical_sha256(self._result_payload())
         if self.result_fingerprint != expected_result_fingerprint:
             raise ValueError("candidate result fingerprint does not match canonical results")
