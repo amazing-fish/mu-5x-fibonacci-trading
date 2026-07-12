@@ -255,7 +255,7 @@ class GitHubCliScmReviewProvider:
             statement=_required_text(payload, "body"),
             review_url=_required_text(payload, "url"),
             includes_created_edit=_required_bool(payload, "includesCreatedEdit"),
-            last_edited_at_ms=_optional_datetime_ms(payload, "lastEditedAt"),
+            last_edited_at_ms=_required_nullable_datetime_ms(payload, "lastEditedAt"),
         )
 
     @staticmethod
@@ -312,6 +312,9 @@ class GitHubCliScmReviewProvider:
             text=True,
         )
         payload = json.loads(completed.stdout)
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            raise ScmReviewVerificationError("SCM GraphQL errors prevent review verification")
         data = payload.get("data") if isinstance(payload, dict) else None
         node = data.get("node") if isinstance(data, dict) else None
         if not isinstance(node, dict):
@@ -348,8 +351,10 @@ def _optional_actor_login(payload: object) -> str | None:
     return _required_text(payload, "login")
 
 
-def _optional_datetime_ms(payload: dict, field_name: str) -> int | None:
-    value = payload.get(field_name)
+def _required_nullable_datetime_ms(payload: dict, field_name: str) -> int | None:
+    if field_name not in payload:
+        raise ScmReviewVerificationError(f"SCM {field_name} is required")
+    value = payload[field_name]
     if value is None:
         return None
     if not isinstance(value, str) or not value:

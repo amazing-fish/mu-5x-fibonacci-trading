@@ -104,6 +104,21 @@ The approval statement cannot approve a different candidate or implementation co
 
 A reviewer can therefore approve the candidate without predicting the final release ID, while the release retains a tamper-evident snapshot of the SCM evidence used by the promotion gate.
 
+The GitHub GraphQL review response is a strict required-nullable contract. Promotion handles every edit-provenance state as follows:
+
+| Live response state | Promotion behavior |
+|---|---|
+| top-level `errors` is present and non-empty | reject the response |
+| `data.node` is missing or is not an object | reject the response |
+| `includesCreatedEdit` is missing or is not a boolean | reject the response |
+| `lastEditedAt` is missing | reject the response |
+| `includesCreatedEdit: false` and `lastEditedAt: null` | continue through the remaining independent-review gates |
+| `includesCreatedEdit: true` | reject the review as edited during creation |
+| `lastEditedAt` is a valid timestamp | reject the review as edited after creation |
+| `lastEditedAt` is malformed or has the wrong type | reject the response |
+
+This distinction is deliberate: explicit `null` is positive live evidence that GitHub reports no later edit, while an omitted field is incomplete provenance and therefore fails closed.
+
 ### `StrategyRelease`
 
 The release contains the full candidate and approval plus `strategy_release_id = "sr1_" + SHA256(canonical candidate + canonical approval)`. The release constructor requires matching candidate fingerprints and an `APPROVED` decision. Rejected evidence can be stored as review evidence but cannot construct an execution-eligible release.

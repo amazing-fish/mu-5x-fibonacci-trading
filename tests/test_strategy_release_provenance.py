@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from mu_strategy.commands.promote_strategy_release import (
+    GitHubCliScmReviewProvider,
     LiveScmCommit,
     LiveScmReview,
     LiveScmPullRequest,
@@ -215,6 +216,83 @@ class StrategyReleaseContractTests(unittest.TestCase):
         tampered["evaluated_code_commit_sha"] = "b" * 40
         with self.assertRaisesRegex((StrategyReleaseSchemaError, ValueError), "fingerprint"):
             StrategyReleaseCandidateV1.from_dict(tampered)
+
+
+class GitHubCliScmReviewProviderTests(unittest.TestCase):
+    def test_review_last_edited_at_is_required_nullable_and_parsed(self):
+        provider = GitHubCliScmReviewProvider()
+        cases = (
+            (None, None),
+            ("2023-11-16T02:00:00Z", 1_700_100_000_000),
+        )
+
+        for wire_value, expected_ms in cases:
+            with self.subTest(last_edited_at=wire_value), patch.object(
+                provider, "_gh_json", return_value={"node_id": "PRR_1"}
+            ), patch.object(
+                provider,
+                "_gh_graphql_review",
+                return_value=self._review_payload(lastEditedAt=wire_value),
+            ):
+                review = provider.fetch_review(
+                    repository="amazing-fish/mu-5x-fibonacci-trading",
+                    pull_request_number=46,
+                    review_record_id="123",
+                )
+
+            self.assertIsNotNone(review)
+            self.assertEqual(expected_ms, review.last_edited_at_ms)
+
+    def test_review_rejects_missing_or_malformed_last_edited_at(self):
+        provider = GitHubCliScmReviewProvider()
+        invalid_payloads = (
+            self._review_payload(include_last_edited_at=False),
+            self._review_payload(lastEditedAt=123),
+            self._review_payload(lastEditedAt="not-a-timestamp"),
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), patch.object(
+                provider, "_gh_json", return_value={"node_id": "PRR_1"}
+            ), patch.object(provider, "_gh_graphql_review", return_value=payload):
+                with self.assertRaisesRegex(ScmReviewVerificationError, "lastEditedAt"):
+                    provider.fetch_review(
+                        repository="amazing-fish/mu-5x-fibonacci-trading",
+                        pull_request_number=46,
+                        review_record_id="123",
+                    )
+
+    def test_graphql_review_rejects_nonempty_errors_even_with_a_node(self):
+        completed = Mock(
+            stdout=json.dumps(
+                {
+                    "data": {"node": self._review_payload(lastEditedAt=None)},
+                    "errors": [{"message": "field resolution failed"}],
+                }
+            )
+        )
+        with patch(
+            "mu_strategy.commands.promote_strategy_release.subprocess.run",
+            return_value=completed,
+        ):
+            with self.assertRaisesRegex(ScmReviewVerificationError, "GraphQL errors"):
+                GitHubCliScmReviewProvider._gh_graphql_review("PRR_1")
+
+    @staticmethod
+    def _review_payload(*, include_last_edited_at=True, **overrides):
+        payload = {
+            "databaseId": 123,
+            "body": "approval",
+            "state": "APPROVED",
+            "submittedAt": "2023-11-16T02:00:00Z",
+            "url": "https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/46#pullrequestreview-123",
+            "includesCreatedEdit": False,
+            "author": {"login": "independent-reviewer"},
+        }
+        if include_last_edited_at:
+            payload["lastEditedAt"] = None
+        payload.update(overrides)
+        return payload
 
 
 class PromotionVerificationTests(unittest.TestCase):
