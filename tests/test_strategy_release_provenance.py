@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from mu_strategy.commands.promote_strategy_release import (
+    LiveScmCommit,
     LiveScmReview,
     LiveScmPullRequest,
     ScmReviewVerificationError,
@@ -236,7 +237,10 @@ class PromotionVerificationTests(unittest.TestCase):
         self.assertEqual(ReleaseDecision.APPROVED, approval.decision)
         self.assertEqual(candidate.candidate_fingerprint, approval.candidate_fingerprint)
         self.assertEqual(live.reviewer_id, approval.review_snapshot.reviewer_id)
-        self.assertEqual(pull_request.author_id, approval.review_snapshot.author_id)
+        self.assertEqual(
+            pull_request.commits[0].author_id,
+            approval.review_snapshot.author_id,
+        )
         self.assertEqual(
             approval.review_snapshot,
             ScmReviewSnapshotV1.from_dict(approval.review_snapshot.to_dict()),
@@ -258,6 +262,8 @@ class PromotionVerificationTests(unittest.TestCase):
         invalid_records = (
             None,
             replace(valid, reviewer_id=pull_request.author_id),
+            replace(valid, reviewer_id=pull_request.commits[0].author_id),
+            replace(valid, reviewer_id=pull_request.commits[0].committer_id),
             replace(valid, includes_created_edit=True),
             replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
             replace(valid, decision=ReleaseDecision.REJECTED),
@@ -279,7 +285,10 @@ class PromotionVerificationTests(unittest.TestCase):
                     )
 
         provider = Mock()
-        provider.fetch_pull_request.return_value = replace(pull_request, commit_shas=("b" * 40,))
+        provider.fetch_pull_request.return_value = replace(
+            pull_request,
+            commits=(LiveScmCommit("b" * 40, "other-author", "other-committer"),),
+        )
         provider.fetch_review.return_value = valid
         with self.assertRaisesRegex(ScmReviewVerificationError, "evaluated commit"):
             capture_verified_approval(
@@ -301,6 +310,26 @@ class PromotionVerificationTests(unittest.TestCase):
             )
         provider.fetch_pull_request.assert_not_called()
         provider.fetch_review.assert_not_called()
+
+        for missing_identity in (
+            LiveScmCommit(candidate.evaluated_code_commit_sha, None, "release-committer"),
+            LiveScmCommit(candidate.evaluated_code_commit_sha, "release-author", None),
+        ):
+            with self.subTest(missing_identity=missing_identity):
+                provider = Mock()
+                provider.fetch_pull_request.return_value = replace(
+                    pull_request,
+                    commits=(missing_identity,),
+                )
+                provider.fetch_review.return_value = valid
+                with self.assertRaisesRegex(ScmReviewVerificationError, "identity"):
+                    capture_verified_approval(
+                        candidate,
+                        repository=valid.repository,
+                        pull_request_number=valid.pull_request_number,
+                        review_record_id=valid.review_record_id,
+                        provider=provider,
+                    )
 
     def test_promotion_writes_only_the_canonical_content_addressed_release(self):
         candidate = _candidate()
@@ -525,8 +554,11 @@ def _live_pull_request(candidate: StrategyReleaseCandidateV1) -> LiveScmPullRequ
     return LiveScmPullRequest(
         repository="amazing-fish/mu-5x-fibonacci-trading",
         pull_request_number=45,
-        author_id="release-author",
-        commit_shas=(candidate.evaluated_code_commit_sha, "c" * 40),
+        author_id="pr-author",
+        commits=(
+            LiveScmCommit(candidate.evaluated_code_commit_sha, "release-author", "release-committer"),
+            LiveScmCommit("c" * 40, "docs-author", "docs-committer"),
+        ),
     )
 
 

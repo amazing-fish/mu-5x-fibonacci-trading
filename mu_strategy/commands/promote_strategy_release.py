@@ -42,11 +42,18 @@ class LiveScmReview:
 
 
 @dataclass(frozen=True)
+class LiveScmCommit:
+    sha: str
+    author_id: str | None
+    committer_id: str | None
+
+
+@dataclass(frozen=True)
 class LiveScmPullRequest:
     repository: str
     pull_request_number: int
     author_id: str
-    commit_shas: tuple[str, ...]
+    commits: tuple[LiveScmCommit, ...]
 
 
 class ScmReviewProvider(Protocol):
@@ -97,8 +104,14 @@ def capture_verified_approval(
         or pull_request.pull_request_number != pull_request_number
     ):
         raise ScmReviewVerificationError("SCM pull request coordinates do not match")
-    if candidate.evaluated_code_commit_sha not in pull_request.commit_shas:
+    evaluated_commit = next(
+        (commit for commit in pull_request.commits if commit.sha == candidate.evaluated_code_commit_sha),
+        None,
+    )
+    if evaluated_commit is None:
         raise ScmReviewVerificationError("SCM pull request does not contain the evaluated commit")
+    if not evaluated_commit.author_id or not evaluated_commit.committer_id:
+        raise ScmReviewVerificationError("SCM evaluated commit identity is incomplete")
     live = provider.fetch_review(
         repository=repository,
         pull_request_number=pull_request_number,
@@ -112,7 +125,12 @@ def capture_verified_approval(
         or live.review_record_id != review_record_id
     ):
         raise ScmReviewVerificationError("SCM review coordinates do not match the requested record")
-    if not pull_request.author_id or live.reviewer_id == pull_request.author_id:
+    authors = {
+        pull_request.author_id,
+        evaluated_commit.author_id,
+        evaluated_commit.committer_id,
+    }
+    if not pull_request.author_id or live.reviewer_id in authors:
         raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     if live.decision is not ReleaseDecision.APPROVED:
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
@@ -127,7 +145,7 @@ def capture_verified_approval(
         pull_request_number=live.pull_request_number,
         review_record_id=live.review_record_id,
         reviewer_id=live.reviewer_id,
-        author_id=pull_request.author_id,
+        author_id=evaluated_commit.author_id,
         reviewed_at_ms=live.reviewed_at_ms,
         decision=live.decision,
         candidate_fingerprint=candidate.candidate_fingerprint,
@@ -184,14 +202,21 @@ class GitHubCliScmReviewProvider:
         user = payload.get("user")
         if not isinstance(user, dict):
             raise ScmReviewVerificationError("SCM pull request user is missing")
-        commit_shas = tuple(_required_text(item, "sha") for item in commits)
-        if not commit_shas:
+        commit_records = tuple(
+            LiveScmCommit(
+                sha=_required_text(item, "sha"),
+                author_id=_optional_actor_login(item.get("author")),
+                committer_id=_optional_actor_login(item.get("committer")),
+            )
+            for item in commits
+        )
+        if not commit_records:
             raise ScmReviewVerificationError("SCM pull request commits are missing")
         return LiveScmPullRequest(
             repository=repository,
             pull_request_number=pull_request_number,
             author_id=_required_text(user, "login"),
-            commit_shas=commit_shas,
+            commits=commit_records,
         )
 
     def fetch_review(
@@ -308,6 +333,14 @@ def _required_bool(payload: dict, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ScmReviewVerificationError(f"SCM {field_name} must be a boolean")
     return value
+
+
+def _optional_actor_login(payload: object) -> str | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ScmReviewVerificationError("SCM commit actor must be an object or null")
+    return _required_text(payload, "login")
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
