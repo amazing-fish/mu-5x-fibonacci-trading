@@ -206,6 +206,9 @@ class StrategyReleaseContractTests(unittest.TestCase):
             wire["strategy_config"]["fields"]["fee_profile"] = "attacker_defined"
             wire["assumptions"]["fee_profile"] = "attacker_defined"
 
+        def boolean_config_schema_version(wire):
+            wire["strategy_config"]["schema_version"] = True
+
         invalid_candidates = (
             ("fee", mismatched_fee_profile),
             ("fee", mismatched_fee_rate),
@@ -214,6 +217,7 @@ class StrategyReleaseContractTests(unittest.TestCase):
             ("required intervals", missing_required_interval),
             ("effective_intervals", missing_schema_v3_base_interval),
             ("fee_profile", unsupported_fee_profile),
+            ("schema_version", boolean_config_schema_version),
         )
         for expected_error, mutate in invalid_candidates:
             with self.subTest(mutation=mutate.__name__):

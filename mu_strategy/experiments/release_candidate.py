@@ -34,6 +34,9 @@ from mu_strategy.research.strategy_releases import (
 from mu_strategy.strategy import StrategyConfig
 
 
+_RELEASE_INTERVAL_MS = {"15m": 900_000, "1h": 3_600_000}
+
+
 class HistoricalGenerationError(ValueError):
     pass
 
@@ -153,7 +156,7 @@ def run_release_experiment(
     _validate_runner_windows(generation, windows)
     candles_15m = tuple(generation.candles_by_interval.get("15m", ()))
     candles_1h = tuple(generation.candles_by_interval.get("1h", ()))
-    hourly_interval_ms = _infer_interval_ms(candles_1h)
+    hourly_interval_ms = _RELEASE_INTERVAL_MS["1h"]
     summaries: list[ExperimentWindowResultV1] = []
 
     for window in windows:
@@ -216,19 +219,28 @@ def _validate_runner_windows(
     candles = tuple(generation.candles_by_interval.get("15m", ()))
     if not candles:
         raise ValueError("historical generation has no 15m candles")
-    interval_ms = _infer_interval_ms(candles)
+    interval_ms = _RELEASE_INTERVAL_MS["15m"]
     data_start = min(candle.open_time_ms for candle in candles)
     data_end = max(candle.open_time_ms for candle in candles) + interval_ms
     if windows[0].start_ms < data_start or windows[-1].end_ms > data_end:
         raise ValueError("experiment window is outside pinned data")
-
-
-def _infer_interval_ms(candles: tuple[Candle, ...]) -> int:
-    ordered = sorted({candle.open_time_ms for candle in candles})
-    deltas = [later - earlier for earlier, later in zip(ordered, ordered[1:]) if later > earlier]
-    if not deltas:
-        raise ValueError("cannot infer candle interval")
-    return min(deltas)
+    for required_interval, required_interval_ms in _RELEASE_INTERVAL_MS.items():
+        interval_candles = tuple(generation.candles_by_interval.get(required_interval, ()))
+        for window in windows:
+            if (window.end_ms - window.start_ms) % required_interval_ms:
+                raise ValueError(f"experiment {required_interval} coverage requires aligned window boundaries")
+            expected_opens = tuple(range(window.start_ms, window.end_ms, required_interval_ms))
+            actual_opens = tuple(
+                sorted(
+                    candle.open_time_ms
+                    for candle in interval_candles
+                    if window.start_ms <= candle.open_time_ms < window.end_ms
+                )
+            )
+            if actual_opens != expected_opens:
+                raise ValueError(
+                    f"experiment {required_interval} coverage must be complete and gap-free for every window"
+                )
 
 
 def _quantized_decimal(value: int | float | Decimal) -> str:

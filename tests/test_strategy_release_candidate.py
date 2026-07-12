@@ -203,6 +203,34 @@ class ReleaseExperimentRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside pinned data"):
             run_release_experiment(generation, config=config, windows=shifted, assumptions=_assumptions())
 
+    def test_runner_rejects_incomplete_required_interval_coverage(self):
+        generation, windows = _synthetic_generation_and_windows(hours_per_window=4)
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        missing_candles = (
+            ("1h", 0),
+            ("1h", 5),
+            ("1h", 11),
+            ("15m", 5),
+        )
+
+        for interval, missing_index in missing_candles:
+            with self.subTest(interval=interval, missing_index=missing_index):
+                candles = dict(generation.candles_by_interval)
+                candles[interval] = tuple(
+                    candle
+                    for index, candle in enumerate(candles[interval])
+                    if index != missing_index
+                )
+                incomplete = replace(generation, candles_by_interval=candles)
+
+                with self.assertRaisesRegex(ValueError, f"{interval} coverage"):
+                    run_release_experiment(
+                        incomplete,
+                        config=config,
+                        windows=windows,
+                        assumptions=_assumptions(),
+                    )
+
 
 class CandidateGenerationTests(unittest.TestCase):
     def test_real_git_provider_rejects_a_repository_other_than_the_loaded_checkout(self):
@@ -344,20 +372,24 @@ def _candidate_request(
     )
 
 
-def _synthetic_generation_and_windows() -> tuple[HistoricalTrustedGeneration, tuple[ExperimentWindow, ...]]:
+def _synthetic_generation_and_windows(
+    *,
+    hours_per_window: int = 1,
+) -> tuple[HistoricalTrustedGeneration, tuple[ExperimentWindow, ...]]:
     start = 1_700_000_000_000
     interval_ms = 900_000
+    total_hours = 3 * hours_per_window
     candles_15m = tuple(
         Candle(start + index * interval_ms, 100 + index, 101 + index, 99 + index, 100.5 + index, 1000)
-        for index in range(12)
+        for index in range(total_hours * 4)
     )
     candles_1h = tuple(
         Candle(start + index * 3_600_000, 100 + index, 101 + index, 99 + index, 100.5 + index, 1000)
-        for index in range(3)
+        for index in range(total_hours)
     )
     candles_5m = tuple(
         Candle(start + index * 300_000, 100 + index, 101 + index, 99 + index, 100.5 + index, 1000)
-        for index in range(36)
+        for index in range(total_hours * 12)
     )
     reference = TrustedExperimentDatasetV1(
         run_id="a" * 32,
@@ -371,9 +403,9 @@ def _synthetic_generation_and_windows() -> tuple[HistoricalTrustedGeneration, tu
         reference=reference,
         candles_by_interval={"5m": candles_5m, "15m": candles_15m, "1h": candles_1h},
         published_freshness_by_interval={"5m": "fresh", "15m": "fresh", "1h": "fresh"},
-        completed_at_ms=start + 12 * interval_ms,
+        completed_at_ms=start + total_hours * 3_600_000,
     )
-    width = 4 * interval_ms
+    width = hours_per_window * 3_600_000
     windows = (
         ExperimentWindow(ExperimentWindowRole.TRAIN, start, start, start + width),
         ExperimentWindow(ExperimentWindowRole.VALIDATION, start + width, start + width, start + 2 * width),

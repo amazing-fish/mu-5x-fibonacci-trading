@@ -95,7 +95,11 @@ class StrategyConfigPayloadV1:
     schema_version: int = STRATEGY_CONFIG_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != STRATEGY_CONFIG_SCHEMA_VERSION:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version != STRATEGY_CONFIG_SCHEMA_VERSION
+        ):
             raise StrategyReleaseSchemaError(f"unsupported strategy config schema_version: {self.schema_version}")
         normalized = _validate_config_values(dict(self.values))
         object.__setattr__(self, "values", MappingProxyType(normalized))
@@ -127,7 +131,7 @@ class StrategyConfigPayloadV1:
             raise StrategyReleaseSchemaError(f"strategy config payload has missing fields: {sorted(missing)}")
         if not isinstance(payload["fields"], dict):
             raise StrategyReleaseSchemaError("strategy config fields must be an object")
-        return cls(values=payload["fields"], schema_version=payload["schema_version"])
+        return cls(values=payload["fields"], schema_version=_required_int(payload, "schema_version"))
 
     def to_dict(self) -> dict[str, Any]:
         return {

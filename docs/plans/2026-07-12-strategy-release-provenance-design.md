@@ -89,6 +89,7 @@ Candidate construction and parsing also enforce the closed protocol's offline-ch
 
 | Candidate state | Behavior |
 |---|---|
+| any nested schema version is a boolean, non-integer, or not the exact supported version | reject |
 | config or assumptions `fee_profile` is outside the closed `market` / `limit` domain | reject |
 | assumptions `fee_profile` or `fee_rate` differs from the frozen strategy config | reject |
 | explicit `slippage_bps` is non-zero | reject |
@@ -161,6 +162,7 @@ The initial closed protocol ID is `mu.baseline.walk_forward.cold_start.v1`. It f
 - each TRAIN/VALIDATION/OOS evaluation window is `[start_ms, end_ms)` and the three windows are contiguous and ordered;
 - `input_start_ms == start_ms`: each split deliberately cold-starts indicators and strategy state, matching the current independent-window walk-forward behavior;
 - only complete 1h source candles contained by the split are eligible, and their regime state becomes visible at candle close, never at candle open; pre-window partial hours and future closes are excluded;
+- each window requires the exact gap-free set of `15m` opens at 900,000 ms steps and `1h` source opens at 3,600,000 ms steps; late starts, early ends, interior gaps, duplicates, or partial-step boundaries fail before context construction;
 - no position, pending signal, indicator state, or equity carries across a split;
 - only candles inside the split can create entries;
 - any open position at the split end is force-closed using the existing deterministic `end_of_data` rule;
