@@ -391,10 +391,11 @@ class JsonlObservationRepository:
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            created_directories = self._create_parent_directories()
             if self.invalid_marker_path.exists():
                 raise OSError("observation repository has an unresolved invalid marker")
             self._write_invalid_marker(cycle.cycle_id, exclusive=True)
+            self._fsync_created_directory_entries(created_directories)
             log_existed = self.path.exists()
             with self.path.open("ab") as handle:
                 written = handle.write(encoded)
@@ -452,6 +453,23 @@ class JsonlObservationRepository:
 
     def _fsync_parent_directory(self) -> None:
         _fsync_directory(self.path.parent)
+
+    def _create_parent_directories(self) -> tuple[Path, ...]:
+        created_directories: list[Path] = []
+        directory = self.path.parent
+        while not directory.exists():
+            created_directories.append(directory)
+            parent = directory.parent
+            if parent == directory:
+                raise OSError("observation repository has no existing parent directory")
+            directory = parent
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return tuple(created_directories)
+
+    @staticmethod
+    def _fsync_created_directory_entries(created_directories: tuple[Path, ...]) -> None:
+        for directory in created_directories:
+            _fsync_directory(directory.parent)
 
 
 def build_stage0_observation(

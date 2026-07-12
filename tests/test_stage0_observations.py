@@ -253,6 +253,54 @@ class Stage0ObservationContractTests(unittest.TestCase):
                 repository.append_cycle(_cycle("cycle-b", "obs-b"))
                 self.assertEqual(5, fsync_parent.call_count)
 
+    def test_first_append_fsyncs_each_new_directory_entry_bottom_up_and_restarts(self):
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+            cycle = _cycle("cycle-a", "obs-a")
+
+            with patch("mu_strategy.observations._fsync_directory") as fsync_directory:
+                JsonlObservationRepository(path).append_cycle(cycle)
+
+            flushed_directories = [invocation.args[0] for invocation in fsync_directory.call_args_list]
+            self.assertEqual(
+                [
+                    path.parent,
+                    path.parent.parent,
+                    existing_root,
+                    path.parent,
+                    path.parent,
+                ],
+                flushed_directories,
+            )
+            self.assertEqual((cycle,), JsonlObservationRepository(path).read_cycles())
+
+    def test_new_parent_directory_fsync_failure_leaves_fail_closed_marker(self):
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+            repository = JsonlObservationRepository(path)
+            flushed_directories = []
+
+            def fail_new_parent_flush(directory):
+                flushed_directories.append(directory)
+                if directory == path.parent.parent:
+                    raise OSError("new parent directory fsync failed")
+
+            with patch("mu_strategy.observations._fsync_directory", side_effect=fail_new_parent_flush):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+
+            self.assertEqual([path.parent, path.parent.parent], flushed_directories)
+            self.assertTrue(repository.invalid_marker_path.exists())
+            self.assertFalse(path.exists())
+            with self.assertRaises(ObservationWriteError):
+                repository.append_cycle(_cycle("cycle-b", "obs-b"))
+            self.assertTrue(repository.invalid_marker_path.exists())
+            self.assertFalse(path.exists())
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                JsonlObservationRepository(path).read_cycles()
+
     def test_marker_removal_directory_fsync_failure_restores_failed_write_marker(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
