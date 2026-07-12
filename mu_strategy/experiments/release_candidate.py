@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from mu_strategy.backtest import run_backtest
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
     IntegrityState,
@@ -21,6 +24,15 @@ from mu_strategy.market_data.trusted_data.store import (
 )
 from mu_strategy.models import Candle
 from mu_strategy.research.strategy_releases import TrustedExperimentDatasetV1
+from mu_strategy.research.strategy_releases import (
+    BacktestAssumptionsV1,
+    ExperimentWindow,
+    ExperimentWindowResultV1,
+    ExperimentWindowRole,
+    FillModel,
+    PartialFillModel,
+)
+from mu_strategy.strategy import StrategyConfig
 
 
 class HistoricalGenerationError(ValueError):
@@ -129,3 +141,101 @@ class HistoricalTrustedGenerationReader:
             published_freshness_by_interval=freshness_by_interval,
             completed_at_ms=snapshot.completed_at_ms,
         )
+
+
+def run_release_experiment(
+    generation: HistoricalTrustedGeneration,
+    *,
+    config: StrategyConfig,
+    windows: tuple[ExperimentWindow, ...],
+    assumptions: BacktestAssumptionsV1,
+) -> tuple[ExperimentWindowResultV1, ...]:
+    _validate_runner_assumptions(config, assumptions)
+    _validate_runner_windows(generation, windows)
+    candles_15m = tuple(generation.candles_by_interval.get("15m", ()))
+    candles_1h = tuple(generation.candles_by_interval.get("1h", ()))
+    hourly_interval_ms = _infer_interval_ms(candles_1h)
+    summaries: list[ExperimentWindowResultV1] = []
+
+    for window in windows:
+        segment_15m = [
+            candle for candle in candles_15m if window.start_ms <= candle.open_time_ms < window.end_ms
+        ]
+        segment_1h = [
+            candle
+            for candle in candles_1h
+            if candle.open_time_ms < window.end_ms
+            and candle.open_time_ms + hourly_interval_ms > window.start_ms
+        ]
+        if not segment_15m or not segment_1h:
+            raise ValueError(f"experiment window {window.role.value} has no required candles")
+        context = build_hourly_context(segment_15m, segment_1h)
+        result = run_backtest(
+            segment_15m,
+            context,
+            config=config,
+            starting_equity=float(assumptions.starting_equity),
+        )
+        gross_profit = sum(trade.pnl for trade in result.trades if trade.pnl > 0)
+        gross_loss = -sum(trade.pnl for trade in result.trades if trade.pnl < 0)
+        summaries.append(
+            ExperimentWindowResultV1.create(
+                role=window.role,
+                trade_count=result.trade_count,
+                starting_equity=_quantized_decimal(result.starting_equity),
+                ending_equity=_quantized_decimal(result.ending_equity),
+                gross_profit=_quantized_decimal(gross_profit),
+                gross_loss=_quantized_decimal(gross_loss),
+                total_return_pct=_quantized_decimal(result.total_return_pct),
+                max_drawdown_pct=_quantized_decimal(result.max_drawdown_pct),
+            )
+        )
+    return tuple(summaries)
+
+
+def _validate_runner_assumptions(config: StrategyConfig, assumptions: BacktestAssumptionsV1) -> None:
+    if assumptions.fee_profile != config.fee_profile or Decimal(assumptions.fee_rate) != Decimal(str(config.fee_rate)):
+        raise ValueError("experiment fee assumptions must match the strategy config")
+    if assumptions.fill_model is not FillModel.DETERMINISTIC_OHLC:
+        raise ValueError("unsupported experiment fill model")
+    if Decimal(assumptions.slippage_bps) != 0:
+        raise ValueError("v1 experiment requires zero explicit slippage")
+    if assumptions.partial_fill_model is not PartialFillModel.NONE:
+        raise ValueError("v1 experiment does not model partial fills")
+
+
+def _validate_runner_windows(
+    generation: HistoricalTrustedGeneration,
+    windows: tuple[ExperimentWindow, ...],
+) -> None:
+    if tuple(window.role for window in windows) != tuple(ExperimentWindowRole):
+        raise ValueError("experiment windows must be TRAIN, VALIDATION, and OUT_OF_SAMPLE")
+    for previous, current in zip(windows, windows[1:]):
+        if previous.end_ms != current.start_ms:
+            raise ValueError("experiment windows must be contiguous")
+    candles = tuple(generation.candles_by_interval.get("15m", ()))
+    if not candles:
+        raise ValueError("historical generation has no 15m candles")
+    interval_ms = _infer_interval_ms(candles)
+    data_start = min(candle.open_time_ms for candle in candles)
+    data_end = max(candle.open_time_ms for candle in candles) + interval_ms
+    if windows[0].start_ms < data_start or windows[-1].end_ms > data_end:
+        raise ValueError("experiment window is outside pinned data")
+
+
+def _infer_interval_ms(candles: tuple[Candle, ...]) -> int:
+    ordered = sorted({candle.open_time_ms for candle in candles})
+    deltas = [later - earlier for earlier, later in zip(ordered, ordered[1:]) if later > earlier]
+    if not deltas:
+        raise ValueError("cannot infer candle interval")
+    return min(deltas)
+
+
+def _quantized_decimal(value: int | float | Decimal) -> str:
+    decimal_value = Decimal(str(value))
+    if not decimal_value.is_finite():
+        raise ValueError("experiment metrics must be finite")
+    quantized = decimal_value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_EVEN)
+    if quantized == 0:
+        return "0"
+    return format(quantized.normalize(), "f")
