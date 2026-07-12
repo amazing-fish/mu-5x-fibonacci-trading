@@ -20,6 +20,9 @@ from mu_strategy.research.strategy_releases import (
 )
 
 
+TRUSTED_SCM_REPOSITORY = "amazing-fish/mu-5x-fibonacci-trading"
+
+
 class ScmReviewVerificationError(ValueError):
     pass
 
@@ -37,8 +40,21 @@ class LiveScmReview:
     review_url: str
 
 
+@dataclass(frozen=True)
+class LiveScmPullRequest:
+    repository: str
+    pull_request_number: int
+    author_id: str
+    commit_shas: tuple[str, ...]
+
+
 class ScmReviewProvider(Protocol):
-    def current_actor_id(self) -> str: ...
+    def fetch_pull_request(
+        self,
+        *,
+        repository: str,
+        pull_request_number: int,
+    ) -> LiveScmPullRequest | None: ...
 
     def fetch_review(
         self,
@@ -67,7 +83,21 @@ def capture_verified_approval(
     review_record_id: str,
     provider: ScmReviewProvider,
 ) -> StrategyReleaseApprovalV1:
-    author_id = provider.current_actor_id()
+    if repository != TRUSTED_SCM_REPOSITORY:
+        raise ScmReviewVerificationError("promotion requires the trusted repository")
+    pull_request = provider.fetch_pull_request(
+        repository=repository,
+        pull_request_number=pull_request_number,
+    )
+    if pull_request is None:
+        raise ScmReviewVerificationError("SCM pull request is missing or deleted")
+    if (
+        pull_request.repository != repository
+        or pull_request.pull_request_number != pull_request_number
+    ):
+        raise ScmReviewVerificationError("SCM pull request coordinates do not match")
+    if candidate.evaluated_code_commit_sha not in pull_request.commit_shas:
+        raise ScmReviewVerificationError("SCM pull request does not contain the evaluated commit")
     live = provider.fetch_review(
         repository=repository,
         pull_request_number=pull_request_number,
@@ -81,7 +111,7 @@ def capture_verified_approval(
         or live.review_record_id != review_record_id
     ):
         raise ScmReviewVerificationError("SCM review coordinates do not match the requested record")
-    if not author_id or live.reviewer_id == author_id:
+    if not pull_request.author_id or live.reviewer_id == pull_request.author_id:
         raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     if live.decision is not ReleaseDecision.APPROVED:
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
@@ -94,7 +124,7 @@ def capture_verified_approval(
         pull_request_number=live.pull_request_number,
         review_record_id=live.review_record_id,
         reviewer_id=live.reviewer_id,
-        author_id=author_id,
+        author_id=pull_request.author_id,
         reviewed_at_ms=live.reviewed_at_ms,
         decision=live.decision,
         candidate_fingerprint=candidate.candidate_fingerprint,
@@ -134,9 +164,32 @@ def promote_strategy_release(
 
 
 class GitHubCliScmReviewProvider:
-    def current_actor_id(self) -> str:
-        payload = self._gh_json("user")
-        return _required_text(payload, "login")
+    def fetch_pull_request(
+        self,
+        *,
+        repository: str,
+        pull_request_number: int,
+    ) -> LiveScmPullRequest | None:
+        endpoint = f"repos/{repository}/pulls/{pull_request_number}"
+        try:
+            payload = self._gh_json(endpoint)
+            commits = self._gh_paginated_json_list(f"{endpoint}/commits?per_page=100")
+        except subprocess.CalledProcessError as exc:
+            if "HTTP 404" in exc.stderr:
+                return None
+            raise
+        user = payload.get("user")
+        if not isinstance(user, dict):
+            raise ScmReviewVerificationError("SCM pull request user is missing")
+        commit_shas = tuple(_required_text(item, "sha") for item in commits)
+        if not commit_shas:
+            raise ScmReviewVerificationError("SCM pull request commits are missing")
+        return LiveScmPullRequest(
+            repository=repository,
+            pull_request_number=pull_request_number,
+            author_id=_required_text(user, "login"),
+            commit_shas=commit_shas,
+        )
 
     def fetch_review(
         self,
@@ -183,6 +236,22 @@ class GitHubCliScmReviewProvider:
         if not isinstance(payload, dict):
             raise ScmReviewVerificationError("SCM response must be an object")
         return payload
+
+    @staticmethod
+    def _gh_paginated_json_list(endpoint: str) -> list[dict]:
+        completed = subprocess.run(
+            ("gh", "api", "--paginate", "--slurp", endpoint),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pages = json.loads(completed.stdout)
+        if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+            raise ScmReviewVerificationError("SCM paginated response must contain list pages")
+        items = [item for page in pages for item in page]
+        if not all(isinstance(item, dict) for item in items):
+            raise ScmReviewVerificationError("SCM paginated response items must be objects")
+        return items
 
 
 def _required_text(payload: dict, field_name: str) -> str:

@@ -158,6 +158,28 @@ class ReleaseExperimentRunnerTests(unittest.TestCase):
         self.assertEqual([item.to_dict() for item in first], [item.to_dict() for item in second])
         self.assertEqual(before, generation.candles_by_interval["15m"])
 
+    def test_runner_does_not_use_an_hourly_close_before_it_is_available(self):
+        generation, windows = _synthetic_generation_and_windows()
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        observed_contexts = []
+
+        def capture_context(_candles, context, **_kwargs):
+            observed_contexts.append(context)
+            return _backtest_result(10_000.0, pnl=None)
+
+        with patch("mu_strategy.experiments.release_candidate.run_backtest", side_effect=capture_context):
+            run_release_experiment(
+                generation,
+                config=config,
+                windows=windows,
+                assumptions=_assumptions(),
+            )
+
+        self.assertEqual(3, len(observed_contexts))
+        for context in observed_contexts:
+            self.assertTrue(context)
+            self.assertEqual({"yellow"}, set(context.values()))
+
     def test_runner_rejects_assumption_or_window_mismatch(self):
         generation, windows = _synthetic_generation_and_windows()
         config = baseline_strategy_group("MU-USDT-SWAP").config

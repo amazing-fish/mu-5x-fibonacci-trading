@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from mu_strategy.commands.promote_strategy_release import (
     LiveScmReview,
+    LiveScmPullRequest,
     ScmReviewVerificationError,
     approval_statement,
     capture_verified_approval,
@@ -56,6 +57,7 @@ class StrategyRuleIdentityTests(unittest.TestCase):
         self.assertEqual(1, group.rule.semantic_version)
         self.assertEqual("buy", group.rule.side)
         self.assertEqual("limit", group.rule.order_type)
+        self.assertEqual(group.rule, strategy_rule_descriptor("second_pullback_limit_8"))
 
     def test_rule_catalog_covers_default_groups_and_rejects_duplicate_ids(self):
         groups = default_strategy_groups("MU-USDT-SWAP")
@@ -207,8 +209,9 @@ class PromotionVerificationTests(unittest.TestCase):
     def test_live_independent_review_is_captured_with_reproducible_snapshot(self):
         candidate = _candidate()
         provider = Mock()
-        provider.current_actor_id.return_value = "release-author"
         live = _live_review(candidate)
+        pull_request = _live_pull_request(candidate)
+        provider.fetch_pull_request.return_value = pull_request
         provider.fetch_review.return_value = live
 
         approval = capture_verified_approval(
@@ -222,6 +225,7 @@ class PromotionVerificationTests(unittest.TestCase):
         self.assertEqual(ReleaseDecision.APPROVED, approval.decision)
         self.assertEqual(candidate.candidate_fingerprint, approval.candidate_fingerprint)
         self.assertEqual(live.reviewer_id, approval.review_snapshot.reviewer_id)
+        self.assertEqual(pull_request.author_id, approval.review_snapshot.author_id)
         self.assertEqual(
             approval.review_snapshot,
             ScmReviewSnapshotV1.from_dict(approval.review_snapshot.to_dict()),
@@ -231,13 +235,18 @@ class PromotionVerificationTests(unittest.TestCase):
             pull_request_number=live.pull_request_number,
             review_record_id=live.review_record_id,
         )
+        provider.fetch_pull_request.assert_called_once_with(
+            repository=live.repository,
+            pull_request_number=live.pull_request_number,
+        )
 
     def test_missing_self_or_mismatched_live_review_is_rejected(self):
         candidate = _candidate()
         valid = _live_review(candidate)
+        pull_request = _live_pull_request(candidate)
         invalid_records = (
             None,
-            replace(valid, reviewer_id="release-author"),
+            replace(valid, reviewer_id=pull_request.author_id),
             replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
             replace(valid, decision=ReleaseDecision.REJECTED),
             replace(valid, repository="other/repository"),
@@ -246,7 +255,7 @@ class PromotionVerificationTests(unittest.TestCase):
         for record in invalid_records:
             with self.subTest(record=record):
                 provider = Mock()
-                provider.current_actor_id.return_value = "release-author"
+                provider.fetch_pull_request.return_value = pull_request
                 provider.fetch_review.return_value = record
                 with self.assertRaises(ScmReviewVerificationError):
                     capture_verified_approval(
@@ -257,11 +266,35 @@ class PromotionVerificationTests(unittest.TestCase):
                         provider=provider,
                     )
 
+        provider = Mock()
+        provider.fetch_pull_request.return_value = replace(pull_request, commit_shas=("b" * 40,))
+        provider.fetch_review.return_value = valid
+        with self.assertRaisesRegex(ScmReviewVerificationError, "evaluated commit"):
+            capture_verified_approval(
+                candidate,
+                repository=valid.repository,
+                pull_request_number=valid.pull_request_number,
+                review_record_id=valid.review_record_id,
+                provider=provider,
+            )
+
+        provider = Mock()
+        with self.assertRaisesRegex(ScmReviewVerificationError, "trusted repository"):
+            capture_verified_approval(
+                candidate,
+                repository="attacker/fork",
+                pull_request_number=valid.pull_request_number,
+                review_record_id=valid.review_record_id,
+                provider=provider,
+            )
+        provider.fetch_pull_request.assert_not_called()
+        provider.fetch_review.assert_not_called()
+
     def test_promotion_writes_only_the_canonical_content_addressed_release(self):
         candidate = _candidate()
         live = _live_review(candidate)
         provider = Mock()
-        provider.current_actor_id.return_value = "release-author"
+        provider.fetch_pull_request.return_value = _live_pull_request(candidate)
         provider.fetch_review.return_value = live
 
         with TemporaryDirectory() as tmp:
@@ -472,6 +505,15 @@ def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
         decision=ReleaseDecision.APPROVED,
         statement=approval_statement(candidate),
         review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
+    )
+
+
+def _live_pull_request(candidate: StrategyReleaseCandidateV1) -> LiveScmPullRequest:
+    return LiveScmPullRequest(
+        repository="amazing-fish/mu-5x-fibonacci-trading",
+        pull_request_number=45,
+        author_id="release-author",
+        commit_shas=(candidate.evaluated_code_commit_sha, "c" * 40),
     )
 
 

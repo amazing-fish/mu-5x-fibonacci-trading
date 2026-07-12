@@ -55,9 +55,6 @@ _STRATEGY_RULE_DESCRIPTORS = {
     "direct_next_open": StrategyRuleDescriptor(
         "mu.direct_next_open.long_limit.v1", "direct_next_open", 1, "buy", "limit"
     ),
-    "second_pullback_limit_8": StrategyRuleDescriptor(
-        "mu.second_pullback_limit_8.long_limit.v1", "second_pullback_limit_8", 1, "buy", "limit"
-    ),
     "baseline_half_protect": StrategyRuleDescriptor(
         "mu.baseline_half_protect.long_limit.v1", "baseline_half_protect", 1, "buy", "limit"
     ),
@@ -102,10 +99,13 @@ _STRATEGY_RULE_DESCRIPTORS = {
     ),
 }
 
+_STRATEGY_RULE_ALIASES = {"second_pullback_limit_8": "baseline"}
+
 
 def strategy_rule_descriptor(strategy_name: str) -> StrategyRuleDescriptor:
+    canonical_name = _STRATEGY_RULE_ALIASES.get(strategy_name, strategy_name)
     try:
-        return _STRATEGY_RULE_DESCRIPTORS[strategy_name]
+        return _STRATEGY_RULE_DESCRIPTORS[canonical_name]
     except KeyError as exc:
         raise ValueError(f"strategy has no registered rule identity: {strategy_name}") from exc
 
