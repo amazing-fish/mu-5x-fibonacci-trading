@@ -4,7 +4,13 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+from mu_strategy.commands.build_strategy_release_candidate import (
+    CandidateGenerationRequest,
+    GitState,
+    build_strategy_release_candidate,
+)
 
 from mu_strategy.experiments.release_candidate import (
     HistoricalTrustedGeneration,
@@ -20,6 +26,8 @@ from mu_strategy.research.strategy_releases import (
     ExperimentWindowRole,
     FillModel,
     PartialFillModel,
+    StrategyConfigPayloadV1,
+    StrategyReleaseCandidateV1,
     TrustedExperimentDatasetV1,
 )
 from mu_strategy.strategies.registry import baseline_strategy_group
@@ -173,6 +181,90 @@ class ReleaseExperimentRunnerTests(unittest.TestCase):
             run_release_experiment(generation, config=config, windows=shifted, assumptions=_assumptions())
 
 
+class CandidateGenerationTests(unittest.TestCase):
+    def test_generation_rejects_dirty_or_non_exact_git_state(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+
+        for git_state, message in (
+            (GitState(head_sha=exact_sha, is_clean=False), "clean"),
+            (GitState(head_sha="2" * 40, is_clean=True), "exact"),
+        ):
+            with self.subTest(message=message), TemporaryDirectory() as tmp:
+                reader = Mock()
+                request = _candidate_request(Path(tmp), windows, exact_sha)
+                with self.assertRaisesRegex(ValueError, message):
+                    build_strategy_release_candidate(
+                        request,
+                        git_state_provider=lambda _root, state=git_state: state,
+                        generation_reader=reader,
+                    )
+                reader.read.assert_not_called()
+
+    def test_generation_uses_registry_identity_and_writes_canonical_ignored_output(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+        reader = Mock()
+        reader.read.return_value = generation
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request = _candidate_request(root, windows, exact_sha)
+            candidate, output_path = build_strategy_release_candidate(
+                request,
+                git_state_provider=lambda _root: GitState(head_sha=exact_sha, is_clean=True),
+                generation_reader=reader,
+            )
+
+            group = baseline_strategy_group(request.symbol)
+            self.assertEqual(group.rule.strategy_rule_id, candidate.strategy_rule_id)
+            self.assertEqual(group.name, candidate.strategy_name)
+            self.assertEqual(
+                StrategyConfigPayloadV1.from_config(group.config).to_dict(),
+                candidate.strategy_config.to_dict(),
+            )
+            self.assertEqual(
+                root / "data" / "strategy-release-candidates" / f"{candidate.candidate_fingerprint}.json",
+                output_path,
+            )
+            self.assertIn(
+                "data/strategy-release-candidates/",
+                (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines(),
+            )
+            reloaded = StrategyReleaseCandidateV1.from_dict(
+                json.loads(output_path.read_text(encoding="utf-8"))
+            )
+            self.assertEqual(candidate.to_dict(), reloaded.to_dict())
+            self.assertEqual(
+                json.dumps(candidate.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+                output_path.read_text(encoding="utf-8"),
+            )
+            reader.read.assert_called_once_with(request.run_id, request.symbol)
+
+    def test_generation_has_no_current_refresh_provider_or_broker_side_effects(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+        reader = Mock()
+        reader.read.return_value = generation
+
+        with TemporaryDirectory() as tmp, \
+            patch("mu_strategy.market_data.trusted_data.store.TrustedDataStore._read_current_manifest") as current, \
+            patch("mu_strategy.market_data.trusted_data.refresh.refresh_with_okx_provider") as refresh, \
+            patch("mu_strategy.market_data.trusted_data.refresh.OKXMarketDataProvider.fetch_history") as fetch, \
+            patch("mu_strategy.live.okx.OKXRestClient.get_balance") as private_read, \
+            patch("mu_strategy.live.okx.OKXRestClient.set_leverage") as leverage, \
+            patch("mu_strategy.live.okx.OKXRestClient.place_demo_order") as submit, \
+            patch("mu_strategy.live.okx.OKXRestClient.cancel_order") as cancel:
+            build_strategy_release_candidate(
+                _candidate_request(Path(tmp), windows, exact_sha),
+                git_state_provider=lambda _root: GitState(head_sha=exact_sha, is_clean=True),
+                generation_reader=reader,
+            )
+
+        for prohibited in (current, refresh, fetch, private_read, leverage, submit, cancel):
+            prohibited.assert_not_called()
+
+
 def _copy_generation(root: Path) -> Path:
     data_dir = root / "data" / "live"
     target = data_dir / "generations" / TRACKED_RUN_ID
@@ -189,6 +281,21 @@ def _assumptions() -> BacktestAssumptionsV1:
         fill_model=FillModel.DETERMINISTIC_OHLC,
         slippage_bps="0",
         partial_fill_model=PartialFillModel.NONE,
+    )
+
+
+def _candidate_request(
+    repository_root: Path,
+    windows: tuple[ExperimentWindow, ...],
+    evaluated_code_commit_sha: str,
+) -> CandidateGenerationRequest:
+    return CandidateGenerationRequest(
+        repository_root=repository_root,
+        data_dir=repository_root / "data" / "live",
+        run_id="a" * 32,
+        symbol="MU-USDT-SWAP",
+        evaluated_code_commit_sha=evaluated_code_commit_sha,
+        windows=windows,
     )
 
 
