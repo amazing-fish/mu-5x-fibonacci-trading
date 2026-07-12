@@ -54,7 +54,7 @@ candidate_fingerprint=<64 lowercase hex>
 evaluated_code_commit_sha=<40 lowercase hex>
 ```
 
-Missing, deleted, dismissed, self-authored, or mismatched review evidence fails closed. Promotion reads the authoritative GraphQL review node and rejects `includesCreatedEdit=true`, so a summary edited after submission cannot be presented as the original approval bytes. Only after live verification does promotion capture the SCM coordinates and canonical snapshot, construct the content-addressed release, and atomically write `config/strategy-releases/<strategy_release_id>.json`.
+Missing, deleted, dismissed, self-authored, or mismatched review evidence fails closed. Promotion reads the authoritative GraphQL review node and rejects either `lastEditedAt != null` or `includesCreatedEdit=true`, so any edited summary cannot be presented as the original approval bytes. Only after live verification does promotion capture the SCM coordinates and canonical snapshot, construct the content-addressed release, and atomically write `config/strategy-releases/<strategy_release_id>.json`.
 
 Authenticity and integrity remain separate. Promotion establishes authenticity by querying SCM and checking reviewer independence. Runtime does not contact SCM; it verifies the embedded snapshot digest and all duplicated bindings. A digest alone is not treated as proof of reviewer identity.
 

@@ -39,6 +39,7 @@ class LiveScmReview:
     statement: str
     review_url: str
     includes_created_edit: bool
+    last_edited_at_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,8 @@ def capture_verified_approval(
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
     if live.includes_created_edit:
         raise ScmReviewVerificationError("SCM review statement was edited after creation")
+    if live.last_edited_at_ms is not None:
+        raise ScmReviewVerificationError("SCM review statement has a last-edited timestamp")
     if live.statement != approval_statement(candidate):
         raise ScmReviewVerificationError("SCM review statement does not bind the exact candidate and implementation")
 
@@ -252,6 +255,7 @@ class GitHubCliScmReviewProvider:
             statement=_required_text(payload, "body"),
             review_url=_required_text(payload, "url"),
             includes_created_edit=_required_bool(payload, "includesCreatedEdit"),
+            last_edited_at_ms=_optional_datetime_ms(payload, "lastEditedAt"),
         )
 
     @staticmethod
@@ -295,6 +299,7 @@ class GitHubCliScmReviewProvider:
               submittedAt
               url
               includesCreatedEdit
+              lastEditedAt
               author { login }
             }
           }
@@ -341,6 +346,18 @@ def _optional_actor_login(payload: object) -> str | None:
     if not isinstance(payload, dict):
         raise ScmReviewVerificationError("SCM commit actor must be an object or null")
     return _required_text(payload, "login")
+
+
+def _optional_datetime_ms(payload: dict, field_name: str) -> int | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ScmReviewVerificationError(f"SCM {field_name} must be an ISO timestamp or null")
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError as exc:
+        raise ScmReviewVerificationError(f"SCM {field_name} must be an ISO timestamp or null") from exc
 
 
 def _atomic_write_text(path: Path, text: str) -> None:

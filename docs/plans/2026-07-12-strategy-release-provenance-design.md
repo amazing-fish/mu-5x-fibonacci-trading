@@ -98,7 +98,7 @@ Approval is a detached statement over exactly one `candidate_fingerprint`. Its c
 
 The approval statement cannot approve a different candidate or implementation commit, omit the reviewer/record/time/reference/statement, or use a free-text status. Integrity and authenticity are separate boundaries:
 
-- the promotion gate queries or otherwise verifies the trusted live SCM PR/review record, proves that its reviewer is independent from the PR author and the evaluated commit's mapped author/committer identities, checks the exact candidate fingerprint and implementation commit, then captures its coordinates, canonical snapshot, and hash; missing commit identity fails closed;
+- the promotion gate queries or otherwise verifies the trusted live SCM PR/review record, proves that its reviewer is independent from the PR author and the evaluated commit's mapped author/committer identities, rejects any non-null review `lastEditedAt` or creation-edit flag, checks the exact candidate fingerprint and implementation commit, then captures its coordinates, canonical snapshot, and hash; missing commit identity fails closed;
 - the runtime reader parses the embedded snapshot, recomputes its digest, and verifies every duplicated identity, but does not claim that a bare digest cryptographically authenticates a reviewer;
 - authenticity comes from repository review/merge provenance at promotion time. Offline cryptographic signatures and a trusted-key infrastructure are intentionally outside R0.
 

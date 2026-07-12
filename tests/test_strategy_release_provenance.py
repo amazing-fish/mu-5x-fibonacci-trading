@@ -265,6 +265,7 @@ class PromotionVerificationTests(unittest.TestCase):
             replace(valid, reviewer_id=pull_request.commits[0].author_id),
             replace(valid, reviewer_id=pull_request.commits[0].committer_id),
             replace(valid, includes_created_edit=True),
+            replace(valid, last_edited_at_ms=1_700_100_000_001),
             replace(valid, statement=approval_statement(_candidate(evaluated_code_commit_sha="b" * 40))),
             replace(valid, decision=ReleaseDecision.REJECTED),
             replace(valid, repository="other/repository"),
@@ -547,6 +548,7 @@ def _live_review(candidate: StrategyReleaseCandidateV1) -> LiveScmReview:
         statement=approval_statement(candidate),
         review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
         includes_created_edit=False,
+        last_edited_at_ms=None,
     )
 
 
