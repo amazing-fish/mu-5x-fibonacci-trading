@@ -45,17 +45,31 @@ Ran 2 tests ... FAILED (failures=2)
 
 - Make `mu_strategy.core.market_context` expose each close-derived 1h regime at `open_time_ms + 1h`.
 - Pass canonical 1h candle timestamps from release experiments instead of shifting them at the caller.
+- Build ordinary walk-forward and monthly Fibonacci contexts once from the complete supplied history, then select each report partition's 15m keys. Reporting partitions no longer discard the last completed regime or restart its indicator history.
 - Keep one temporal contract for CLI, visualization, scanner, ordinary walk-forward, and release experiments.
 
 No strategy configuration, trusted data, fill model, Demo mutation, or Production execution behavior is changed.
+
+The pinned release protocol remains an explicit cold-start exception: it excludes pre-window context by contract and does not reuse ordinary report-partition state.
+
+## Review round 1
+
+Cloud review identified that the ordinary walk-forward and monthly Fibonacci callers sliced 1h inputs at each report boundary. After close visibility moved into the core owner, the slice omitted the previously completed regime and reset EMA/MACD history, producing a false initial `yellow` state.
+
+- Red: two behavioral tests compared each partition with the canonical full-history context and failed with `green -> yellow` mismatches (`exit 1`, two failures).
+- Green: both callers now reuse the canonical causal context and select their partition's 15m keys; the same two tests pass (`exit 0`).
+- Failure-mode sweep: every `build_hourly_context` caller was inspected. These were the only ordinary reporting partitions that rebuilt context from a truncated 1h slice. The release-candidate slice is not changed because its documented protocol requires independent cold starts and rejects pre-window state.
+- Fallback analysis: no fallback branch or compatibility mode was added; the repository-specific fallback checker is absent.
 
 ## Verification
 
 - Red: the two market-context boundary tests failed before the implementation change with two expected assertion mismatches (`exit 1`).
 - Focused: `python -m unittest tests.test_market_context tests.test_strategy_release_candidate.ReleaseExperimentRunnerTests -v` passed all 10 tests (`exit 0`).
 - Affected surfaces: `python -m unittest tests.test_market_context tests.test_strategy_release_candidate tests.test_walk_forward tests.test_entry_scanner tests.test_visualize tests.test_backtest -v` passed all 72 tests (`exit 0`).
+- Review-affected surfaces: `python -m unittest tests.test_walk_forward tests.test_fibonacci_pullback tests.test_market_context tests.test_strategy_release_candidate -v` passed all 34 tests (`exit 0`).
 - Real-path exercise: a deterministic exponential rise followed by an hourly collapse kept the prior `green` state during the open hour and exposed `red` exactly at that candle's close (`exit 0`, no mocks).
-- Full suite: `PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 python -m unittest discover -s tests` passed all 468 tests in 11.064 seconds (`exit 0`).
+- Feature gate: real no-mock walk-forward and Fibonacci horizon runs completed from synthetic candles with one 96-bar walk-forward window and one monthly Fibonacci result (`exit 0`).
+- Full suite: `PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 python -m unittest discover -s tests` passed all 469 tests in 8.335 seconds (`exit 0`).
 - Diff hygiene: `git diff --check` completed with no errors (`exit 0`).
 
 ## Rollback

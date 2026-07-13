@@ -161,7 +161,6 @@ def run_fibonacci_horizon_backtests(
     full_context = build_hourly_context(ordered_15m, ordered_1h)
     monthly_segments = split_by_utc_month(ordered_15m)
     interval_15m = _infer_interval_ms(ordered_15m)
-    interval_1h = _infer_interval_ms(ordered_1h)
 
     results: list[FibonacciHorizonBacktest] = []
     for hours in horizons_hours:
@@ -175,12 +174,7 @@ def run_fibonacci_horizon_backtests(
                 continue
             start_time_ms = segment[0].open_time_ms
             end_time_ms = segment[-1].open_time_ms + interval_15m
-            hourly_segment = [
-                bar
-                for bar in ordered_1h
-                if _overlaps_range(bar.open_time_ms, interval_1h, start_time_ms, end_time_ms)
-            ]
-            context = build_hourly_context(segment, hourly_segment)
+            context = {bar.open_time_ms: full_context[bar.open_time_ms] for bar in segment}
             result = run_backtest(segment, context, config=config)
             monthly_results.append(
                 MonthlyBacktest(
@@ -531,12 +525,6 @@ def _infer_interval_ms(candles: list[Candle]) -> int:
         if candles[index].open_time_ms > candles[index - 1].open_time_ms
     ]
     return min(diffs) if diffs else 0
-
-
-def _overlaps_range(open_time_ms: int, interval_ms: int, start_time_ms: int, end_time_ms: int) -> bool:
-    if interval_ms <= 0:
-        return start_time_ms <= open_time_ms < end_time_ms
-    return open_time_ms < end_time_ms and open_time_ms + interval_ms > start_time_ms
 
 
 def _best_month(months: list[MonthlyBacktest]) -> MonthlyBacktest | None:
