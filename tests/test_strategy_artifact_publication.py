@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread, current_thread
 from unittest.mock import Mock, patch
 
 from mu_strategy.research.strategy_artifact_publication import (
@@ -88,6 +89,155 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
 
             self.assertEqual("conflict", path.read_text(encoding="utf-8"))
             self.assertTrue(marker.exists())
+
+    def test_concurrent_identical_first_publish_with_different_parent_lineage_is_idempotent(self):
+        from mu_strategy.research import strategy_artifact_publication as publication
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "one" / "two" / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            witness = strategy_artifact_commit_witness_path(path)
+            directories_ready = Event()
+            second_counted_parents = Event()
+            first_committed = Event()
+            original_create = publication._create_parent_directories
+            original_write = publication._write_bytes_durably
+            successes: list[str] = []
+            failures: list[tuple[str, BaseException]] = []
+
+            def coordinate_parent_discovery(parent: Path) -> tuple[Path, ...]:
+                created = original_create(parent)
+                if current_thread().name == "publisher-a":
+                    directories_ready.set()
+                    if not second_counted_parents.wait(5):
+                        raise RuntimeError("publisher B did not inspect created parents")
+                else:
+                    second_counted_parents.set()
+                return created
+
+            def delay_second_pending_write(
+                subject: Path,
+                content: bytes,
+                *,
+                exclusive: bool,
+            ) -> None:
+                if current_thread().name == "publisher-b" and subject == marker:
+                    if not first_committed.wait(5):
+                        raise RuntimeError("publisher A did not commit")
+                original_write(subject, content, exclusive=exclusive)
+
+            def run_publisher(name: str) -> None:
+                try:
+                    publish_strategy_artifact(path, "payload")
+                    successes.append(name)
+                except BaseException as exc:
+                    failures.append((name, exc))
+                finally:
+                    if name == "publisher-a":
+                        first_committed.set()
+
+            with patch.object(
+                publication,
+                "_create_parent_directories",
+                side_effect=coordinate_parent_discovery,
+            ), patch.object(
+                publication,
+                "_write_bytes_durably",
+                side_effect=delay_second_pending_write,
+            ):
+                first = Thread(target=run_publisher, args=("publisher-a",), name="publisher-a")
+                second = Thread(target=run_publisher, args=("publisher-b",), name="publisher-b")
+                first.start()
+                self.assertTrue(directories_ready.wait(5))
+                second.start()
+                first.join(10)
+                second.join(10)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual([], failures)
+            self.assertEqual(["publisher-a", "publisher-b"], sorted(successes))
+            self.assertFalse(marker.exists())
+            self.assertTrue(witness.exists())
+            self.assertEqual("payload", read_strategy_artifact_text(path))
+
+    def test_non_regular_final_metadata_blocks_publish_recovery_and_read(self):
+        operations = (
+            ("publish", lambda path: publish_strategy_artifact(path, "payload")),
+            ("recover", lambda path: recover_strategy_artifact(path, "payload")),
+            ("read", read_strategy_artifact_text),
+        )
+        original_lstat = Path.lstat
+
+        for name, operation in operations:
+            with self.subTest(operation=name), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "artifact.json"
+                path.write_text("payload", encoding="utf-8")
+
+                def report_final_symlink(subject: Path):
+                    if subject == path:
+                        return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                    return original_lstat(subject)
+
+                with patch.object(Path, "lstat", new=report_final_symlink), patch(
+                    "mu_strategy.research.strategy_artifact_publication._fsync_directory"
+                ):
+                    with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                        operation(path)
+
+    def test_posix_final_symlink_is_never_accepted_as_immutable_artifact(self):
+        operations = (
+            ("publish", lambda path: publish_strategy_artifact(path, "payload")),
+            ("recover", lambda path: recover_strategy_artifact(path, "payload")),
+            ("read", read_strategy_artifact_text),
+        )
+
+        for name, operation in operations:
+            with self.subTest(operation=name), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                target = root / "mutable-target.json"
+                target.write_text("payload", encoding="utf-8")
+                path = root / "artifact.json"
+                try:
+                    path.symlink_to(target)
+                except (NotImplementedError, OSError) as exc:
+                    self.skipTest(f"artifact symlinks are unavailable: {exc}")
+
+                with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                    with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                        operation(path)
+
+    def test_final_install_collision_requires_regular_artifact_metadata(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            original_link = os.link
+            original_lstat = Path.lstat
+
+            def create_final_collision(source: Path, destination: Path) -> None:
+                if Path(destination) == path:
+                    path.write_text("payload", encoding="utf-8")
+                    raise FileExistsError("final artifact appeared concurrently")
+                original_link(source, destination)
+
+            def report_colliding_final_symlink(subject: Path):
+                if subject == path and path.exists():
+                    return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                return original_lstat(subject)
+
+            with patch.object(os, "link", side_effect=create_final_collision), patch.object(
+                Path,
+                "lstat",
+                new=report_colliding_final_symlink,
+            ), patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    publish_strategy_artifact(path, "payload")
+
+            self.assertTrue(path.exists())
+            self.assertTrue(marker.exists())
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
 
     def test_short_write_fails_before_publication(self):
         handle = Mock()
@@ -461,19 +611,12 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             with self.assertRaises(StrategyArtifactRecoveryRequiredError):
                 read_strategy_artifact_text(path)
 
-            recovered_files: list[Path] = []
             recovered_directories: list[Path] = []
             with patch(
-                "mu_strategy.research.strategy_artifact_publication._fsync_file",
-                side_effect=lambda subject: recovered_files.append(subject),
-            ), patch(
                 "mu_strategy.research.strategy_artifact_publication._fsync_directory",
                 side_effect=lambda directory: recovered_directories.append(directory),
             ):
                 recover_strategy_artifact(path, "payload")
-            # The pending record is now synced through its verified regular-file
-            # handle; the generic helper remains only for the final artifact.
-            self.assertEqual([path], recovered_files)
             self.assertEqual(
                 [path.parent, path.parent, path.parent, path.parent],
                 recovered_directories,
@@ -916,19 +1059,25 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                         operation(path, "payload")
 
     def test_read_checks_pending_marker_both_before_and_after_read(self):
+        from mu_strategy.research import strategy_artifact_publication as publication
+
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "artifact.json"
             path.write_text("payload", encoding="utf-8")
             marker = strategy_artifact_pending_marker_path(path)
 
-            original_read_text = Path.read_text
+            original_read_text = publication._read_regular_artifact_text
 
             def create_marker_during_read(subject: Path, *args, **kwargs):
                 text = original_read_text(subject, *args, **kwargs)
                 marker.write_text("pending", encoding="utf-8")
                 return text
 
-            with patch.object(Path, "read_text", new=create_marker_during_read):
+            with patch.object(
+                publication,
+                "_read_regular_artifact_text",
+                side_effect=create_marker_during_read,
+            ):
                 with self.assertRaises(StrategyArtifactRecoveryRequiredError):
                     read_strategy_artifact_text(path)
 

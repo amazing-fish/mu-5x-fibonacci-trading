@@ -726,6 +726,29 @@ class StrictStrategyReleaseResolverTests(unittest.TestCase):
                             expected_symbol=candidate.dataset.symbol,
                         )
 
+    def test_non_regular_release_artifact_is_unresolvable(self):
+        candidate = _candidate()
+        release = StrategyReleaseV1.create(candidate=candidate, approval=_approval(candidate))
+        original_lstat = Path.lstat
+
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            path = release_dir / f"{release.strategy_release_id}.json"
+            path.write_text(canonical_json(release.to_dict()), encoding="utf-8")
+
+            def report_release_symlink(subject: Path):
+                if subject == path:
+                    return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                return original_lstat(subject)
+
+            with patch.object(Path, "lstat", new=report_release_symlink):
+                with self.assertRaisesRegex(StrategyReleaseResolutionError, "regular file"):
+                    StrictStrategyReleaseResolver(release_dir).resolve(
+                        release.strategy_release_id,
+                        expected_rule_id=candidate.strategy_rule_id,
+                        expected_symbol=candidate.dataset.symbol,
+                    )
+
     def test_self_consistent_untrusted_approval_snapshots_fail_closed(self):
         candidate = _candidate()
         release = StrategyReleaseV1.create(candidate=candidate, approval=_approval(candidate))

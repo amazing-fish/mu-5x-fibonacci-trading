@@ -62,7 +62,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
                     "strategy artifact has an unresolved pending publication"
                 )
             _fsync_publication_record(witness_path, label="commit witness")
-            _fsync_file(artifact_path)
+            _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
             _require_committed_artifact(
                 artifact_path,
@@ -79,9 +79,8 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             raise StrategyArtifactRecoveryRequiredError(
                 "strategy artifact has an unresolved pending publication"
             )
-        if artifact_path.exists():
-            _require_identical_artifact(artifact_path, encoded)
-            _fsync_file(artifact_path)
+        if _path_entry_exists(artifact_path):
+            _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
             return
 
@@ -104,11 +103,19 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             _fsync_directory(artifact_path.parent)
             raise
         _fsync_directory(artifact_path.parent)
+        if _publication_record_exists(witness_path, label="commit witness"):
+            _finish_publication_against_concurrent_commit(
+                artifact_path,
+                expected=encoded,
+                marker_path=marker_path,
+                marker_bytes=marker_bytes,
+                witness_path=witness_path,
+            )
+            return
         _fsync_created_directory_entries(created_directories)
 
-        if artifact_path.exists():
-            _require_identical_artifact(artifact_path, encoded)
-            _fsync_file(artifact_path)
+        if _path_entry_exists(artifact_path):
+            _require_identical_artifact(artifact_path, encoded, fsync=True)
         else:
             _install_final_without_overwrite(
                 temporary_path,
@@ -116,6 +123,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
                 expected=encoded,
             )
         _fsync_directory(artifact_path.parent)
+        _require_identical_artifact(artifact_path, encoded, fsync=True)
         _establish_commit_witness(
             marker_path,
             witness_path,
@@ -158,7 +166,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
                 witness_path=witness_path,
             )
             _fsync_publication_record(witness_path, label="commit witness")
-            _fsync_file(artifact_path)
+            _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
             _require_committed_artifact(
                 artifact_path,
@@ -197,9 +205,8 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             fsync=True,
         )
         _fsync_directory(artifact_path.parent)
-        if artifact_path.exists():
-            _require_identical_artifact(artifact_path, encoded)
-            _fsync_file(artifact_path)
+        if _path_entry_exists(artifact_path):
+            _require_identical_artifact(artifact_path, encoded, fsync=True)
         else:
             temporary_path = artifact_path.with_name(
                 f".{artifact_path.name}.{uuid.uuid4().hex}.tmp"
@@ -214,6 +221,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
                 expected=encoded,
             )
         _fsync_directory(artifact_path.parent)
+        _require_identical_artifact(artifact_path, encoded, fsync=True)
         _establish_commit_witness(
             marker_path,
             witness_path,
@@ -248,7 +256,7 @@ def read_strategy_artifact_text(path: Path) -> str:
     _reject_pending_marker(marker_path)
     if _publication_record_exists(witness_path, label="commit witness"):
         witness = _read_publication_record(witness_path, label="commit witness")
-        text = artifact_path.read_text(encoding="utf-8")
+        text = _read_regular_artifact_text(artifact_path)
         _require_record_content(witness, text.encode("utf-8"), label="commit witness")
         if not _publication_record_exists(witness_path, label="commit witness"):
             raise StrategyArtifactRecoveryRequiredError(
@@ -261,7 +269,7 @@ def read_strategy_artifact_text(path: Path) -> str:
         _reject_pending_marker(marker_path)
         return text
 
-    text = artifact_path.read_text(encoding="utf-8")
+    text = _read_regular_artifact_text(artifact_path)
     if _publication_record_exists(witness_path, label="commit witness"):
         raise StrategyArtifactRecoveryRequiredError(
             "strategy artifact publication state changed during read"
@@ -284,10 +292,75 @@ def _require_committed_artifact(
     marker_path: Path,
     witness_path: Path,
 ) -> None:
-    witness = _read_publication_record(witness_path, label="commit witness")
-    _require_record_content(witness, expected, label="commit witness")
+    witness, committed_bytes = _read_committed_artifact(
+        artifact_path,
+        witness_path=witness_path,
+    )
+    if committed_bytes != expected:
+        raise StrategyArtifactConflictError(
+            "immutable strategy artifact path already contains different content"
+        )
     _require_matching_pending_record(marker_path, witness)
-    _require_identical_artifact(artifact_path, expected)
+
+
+def _read_committed_artifact(
+    artifact_path: Path,
+    *,
+    witness_path: Path,
+) -> tuple[dict[str, Any], bytes]:
+    witness = _read_publication_record(witness_path, label="commit witness")
+    committed_bytes = _read_regular_artifact_bytes(artifact_path)
+    _require_record_content(witness, committed_bytes, label="commit witness")
+    return witness, committed_bytes
+
+
+def _finish_publication_against_concurrent_commit(
+    artifact_path: Path,
+    *,
+    expected: bytes,
+    marker_path: Path,
+    marker_bytes: bytes,
+    witness_path: Path,
+) -> None:
+    _read_regular_publication_record_bytes(
+        marker_path,
+        label="pending marker",
+        expected=marker_bytes,
+        fsync=True,
+    )
+    witness, committed_bytes = _read_committed_artifact(
+        artifact_path,
+        witness_path=witness_path,
+    )
+    _fsync_publication_record(witness_path, label="commit witness")
+    _read_regular_artifact_bytes(
+        artifact_path,
+        expected=committed_bytes,
+        fsync=True,
+    )
+    _fsync_directory(artifact_path.parent)
+    current_witness, current_bytes = _read_committed_artifact(
+        artifact_path,
+        witness_path=witness_path,
+    )
+    if current_witness != witness or current_bytes != committed_bytes:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact concurrent commit changed during verification"
+        )
+    _read_regular_publication_record_bytes(
+        marker_path,
+        label="pending marker",
+        expected=marker_bytes,
+    )
+    _remove_pending_marker_durably(
+        marker_path,
+        witness_path=witness_path,
+        parent=artifact_path.parent,
+    )
+    if committed_bytes != expected:
+        raise StrategyArtifactConflictError(
+            "immutable strategy artifact path already contains different content"
+        )
 
 
 def _require_matching_pending_record(
@@ -315,11 +388,8 @@ def _require_record_content(
         )
 
 
-def _require_identical_artifact(path: Path, expected: bytes) -> None:
-    if path.read_bytes() != expected:
-        raise StrategyArtifactConflictError(
-            "immutable strategy artifact path already contains different content"
-        )
+def _require_identical_artifact(path: Path, expected: bytes, *, fsync: bool = False) -> None:
+    _read_regular_artifact_bytes(path, expected=expected, fsync=fsync)
 
 
 def _install_final_without_overwrite(
@@ -333,8 +403,7 @@ def _install_final_without_overwrite(
     try:
         os.link(temporary_path, artifact_path)
     except FileExistsError:
-        _require_identical_artifact(artifact_path, expected)
-        _fsync_file(artifact_path)
+        _require_identical_artifact(artifact_path, expected, fsync=True)
 
 
 def _publication_record_bytes(content: bytes, *, created_parent_count: int) -> bytes:
@@ -359,7 +428,7 @@ def _publication_record_exists(record_path: Path, *, label: str) -> bool:
         raise StrategyArtifactRecoveryRequiredError(
             f"strategy artifact {label} cannot be inspected"
         ) from exc
-    _require_regular_publication_record(record_status, label=label)
+    _require_regular_file(record_status, label=label)
     return True
 
 
@@ -371,11 +440,54 @@ def _read_regular_publication_record_bytes(
     fsync: bool = False,
 ) -> bytes:
     try:
-        path_status = record_path.lstat()
-        _require_regular_publication_record(path_status, label=label)
-        with record_path.open("r+b" if fsync else "rb") as handle:
+        return _read_identity_checked_regular_bytes(
+            record_path,
+            label=label,
+            expected=expected,
+            fsync=fsync,
+        )
+    except FileNotFoundError as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            f"strategy artifact {label} cannot be read safely"
+        ) from exc
+
+
+def _read_regular_artifact_bytes(
+    artifact_path: Path,
+    *,
+    expected: bytes | None = None,
+    fsync: bool = False,
+) -> bytes:
+    return _read_identity_checked_regular_bytes(
+        artifact_path,
+        label="final artifact",
+        expected=expected,
+        fsync=fsync,
+    )
+
+
+def _read_regular_artifact_text(artifact_path: Path) -> str:
+    try:
+        return _read_regular_artifact_bytes(artifact_path).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact final artifact is not valid UTF-8"
+        ) from exc
+
+
+def _read_identity_checked_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+    expected: bytes | None,
+    fsync: bool,
+) -> bytes:
+    try:
+        path_status = path.lstat()
+        _require_regular_file(path_status, label=label)
+        with path.open("r+b" if fsync else "rb") as handle:
             opened_status = os.fstat(handle.fileno())
-            _require_regular_publication_record(opened_status, label=label)
+            _require_regular_file(opened_status, label=label)
             if not os.path.samestat(path_status, opened_status):
                 raise StrategyArtifactRecoveryRequiredError(
                     f"strategy artifact {label} changed before read"
@@ -383,18 +495,20 @@ def _read_regular_publication_record_bytes(
             content = handle.read()
             if expected is not None and content != expected:
                 raise StrategyArtifactConflictError(
-                    f"strategy artifact {label} does not match the expected record"
+                    f"strategy artifact {label} does not match the expected bytes"
                 )
             if fsync:
                 os.fsync(handle.fileno())
-        current_status = record_path.lstat()
-        _require_regular_publication_record(current_status, label=label)
+        current_status = path.lstat()
+        _require_regular_file(current_status, label=label)
         if not os.path.samestat(opened_status, current_status):
             raise StrategyArtifactRecoveryRequiredError(
                 f"strategy artifact {label} changed during read"
             )
         return content
     except StrategyArtifactPublicationError:
+        raise
+    except FileNotFoundError:
         raise
     except OSError as exc:
         raise StrategyArtifactRecoveryRequiredError(
@@ -406,8 +520,8 @@ def _fsync_publication_record(record_path: Path, *, label: str) -> None:
     _read_regular_publication_record_bytes(record_path, label=label, fsync=True)
 
 
-def _require_regular_publication_record(record_status: os.stat_result, *, label: str) -> None:
-    if not stat.S_ISREG(record_status.st_mode):
+def _require_regular_file(file_status: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISREG(file_status.st_mode):
         raise StrategyArtifactRecoveryRequiredError(
             f"strategy artifact {label} is not a regular file"
         )
@@ -479,11 +593,6 @@ def _unlink_owned_file_best_effort(path: Path, *, expected_status: os.stat_resul
             path.unlink()
     except OSError:
         pass
-
-
-def _fsync_file(path: Path) -> None:
-    with path.open("r+b") as handle:
-        os.fsync(handle.fileno())
 
 
 def _create_parent_directories(parent: Path) -> tuple[Path, ...]:
