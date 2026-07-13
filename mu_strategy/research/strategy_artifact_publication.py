@@ -208,9 +208,13 @@ def recover_strategy_artifact(
             raise StrategyArtifactConflictError(
                 "pending strategy artifact publication belongs to different content"
             )
-        _created_directories_from_count(
+        created_directories = _created_directories_from_count(
             artifact_path.parent,
             marker["created_parent_count"],
+        )
+        _require_anchor_covers_created_directories(
+            created_directories,
+            anchor=resolved_anchor,
         )
         marker_bytes = _publication_record_bytes(
             encoded,
@@ -663,6 +667,28 @@ def _created_directories_from_count(parent: Path, count: int) -> tuple[Path, ...
             )
         directory = ancestor
     return tuple(created_directories)
+
+
+def _require_anchor_covers_created_directories(
+    created_directories: tuple[Path, ...],
+    *,
+    anchor: Path,
+) -> None:
+    if not created_directories:
+        return
+    try:
+        first_preexisting_parent = created_directories[-1].parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact recorded parent lineage cannot be resolved"
+        ) from exc
+    if (
+        first_preexisting_parent != anchor
+        and anchor not in first_preexisting_parent.parents
+    ):
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact durability anchor is inside the recorded parent lineage"
+        )
 
 
 def _resolve_durability_anchor(artifact_path: Path, durability_anchor: Path) -> Path:

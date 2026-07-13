@@ -145,18 +145,9 @@ def _candidate_publication_durability_anchor(
     resolved_parent = output_path.parent.resolve(strict=False)
     if resolved_parent == resolved_root or resolved_root in resolved_parent.parents:
         return resolved_root
-    try:
-        external_parent = output_path.parent.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise StrategyArtifactPublicationError(
-            "external candidate output with missing parents requires an explicit "
-            "publication durability anchor"
-        ) from exc
-    if not external_parent.is_dir():
-        raise StrategyArtifactPublicationError(
-            "external candidate output parent must be a directory"
-        )
-    return external_parent
+    raise StrategyArtifactPublicationError(
+        "external candidate output requires an explicit publication durability anchor"
+    )
 
 
 def read_git_state(repository_root: Path) -> GitState:

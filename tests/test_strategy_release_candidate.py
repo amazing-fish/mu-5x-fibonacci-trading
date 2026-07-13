@@ -25,6 +25,10 @@ from mu_strategy.experiments.release_candidate import (
 )
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import BacktestResult, Candle, Trade
+from mu_strategy.research.strategy_artifact_publication import (
+    StrategyArtifactPublicationError,
+    strategy_artifact_pending_marker_path,
+)
 from mu_strategy.research.strategy_releases import (
     BacktestAssumptionsV1,
     ExperimentWindow,
@@ -400,8 +404,26 @@ class CandidateGenerationTests(unittest.TestCase):
         with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as output_tmp:
             repository_root = Path(repo_tmp)
             external_root = Path(output_tmp)
+            omitted_anchor_path = external_root / "candidate-without-anchor.json"
+            with self.assertRaisesRegex(
+                StrategyArtifactPublicationError,
+                "external candidate output requires an explicit",
+            ):
+                build_strategy_release_candidate(
+                    replace(
+                        _candidate_request(repository_root, windows, exact_sha),
+                        output_path=omitted_anchor_path,
+                    ),
+                    git_state_provider=lambda _root: GitState(
+                        head_sha=exact_sha,
+                        is_clean=True,
+                    ),
+                    generation_reader=reader,
+                )
+            self.assertFalse(omitted_anchor_path.exists())
+
             for name, output_path, explicit_anchor in (
-                ("existing-parent", external_root / "candidate.json", None),
+                ("existing-parent", external_root / "candidate.json", external_root),
                 (
                     "nested-parent",
                     external_root / "missing" / "nested" / "candidate.json",
@@ -425,6 +447,76 @@ class CandidateGenerationTests(unittest.TestCase):
 
                     self.assertEqual(output_path, actual_path)
                     self.assertTrue(actual_path.is_file())
+
+    def test_external_recovery_cannot_omit_the_original_durability_anchor(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+        reader = Mock()
+        reader.read.return_value = generation
+
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as output_tmp:
+            repository_root = Path(repo_tmp)
+            external_root = Path(output_tmp)
+            output_path = external_root / "missing" / "nested" / "candidate.json"
+            request = replace(
+                _candidate_request(repository_root, windows, exact_sha),
+                output_path=output_path,
+                publication_durability_anchor=external_root,
+            )
+            directory_fsync_calls = 0
+
+            def fail_first_ancestor_flush(_directory: Path) -> None:
+                nonlocal directory_fsync_calls
+                directory_fsync_calls += 1
+                if directory_fsync_calls == 2:
+                    raise OSError("ancestor fsync failed")
+
+            with patch(
+                "mu_strategy.research.strategy_artifact_publication._fsync_directory",
+                side_effect=fail_first_ancestor_flush,
+            ):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    build_strategy_release_candidate(
+                        request,
+                        git_state_provider=lambda _root: GitState(
+                            head_sha=exact_sha,
+                            is_clean=True,
+                        ),
+                        generation_reader=reader,
+                    )
+
+            marker = strategy_artifact_pending_marker_path(output_path)
+            self.assertTrue(marker.exists())
+            omitted_anchor_request = replace(
+                request,
+                publication_durability_anchor=None,
+            )
+            with self.assertRaisesRegex(
+                StrategyArtifactPublicationError,
+                "external candidate output requires an explicit",
+            ):
+                build_strategy_release_candidate(
+                    omitted_anchor_request,
+                    git_state_provider=lambda _root: GitState(
+                        head_sha=exact_sha,
+                        is_clean=True,
+                    ),
+                    generation_reader=reader,
+                    recover_publication=True,
+                )
+            self.assertTrue(marker.exists())
+
+            _candidate, recovered_path = build_strategy_release_candidate(
+                request,
+                git_state_provider=lambda _root: GitState(
+                    head_sha=exact_sha,
+                    is_clean=True,
+                ),
+                generation_reader=reader,
+                recover_publication=True,
+            )
+            self.assertEqual(output_path, recovered_path)
+            self.assertFalse(marker.exists())
 
     def test_cli_recovery_flag_selects_explicit_recovery(self):
         candidate = Mock(candidate_fingerprint="candidate", result_fingerprint="result")

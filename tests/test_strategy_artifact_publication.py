@@ -732,6 +732,16 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 _recover_strategy_artifact(path, "payload")
             self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
+            with self.assertRaisesRegex(
+                StrategyArtifactRecoveryRequiredError,
+                "inside the recorded parent lineage",
+            ):
+                _recover_strategy_artifact(
+                    path,
+                    "payload",
+                    durability_anchor=path.parent,
+                )
+            self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
             recovered_flushes: list[Path] = []
             with patch(
                 "mu_strategy.research.strategy_artifact_publication._fsync_directory",
