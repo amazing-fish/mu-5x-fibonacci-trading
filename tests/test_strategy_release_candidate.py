@@ -385,7 +385,11 @@ class CandidateGenerationTests(unittest.TestCase):
                     recover_publication=recover,
                 )
 
-                publish.assert_called_once_with(output_path, canonical_json(candidate.to_dict()))
+                publish.assert_called_once_with(
+                    output_path,
+                    canonical_json(candidate.to_dict()),
+                    durability_anchor=request.repository_root,
+                )
 
     def test_cli_recovery_flag_selects_explicit_recovery(self):
         candidate = Mock(candidate_fingerprint="candidate", result_fingerprint="result")

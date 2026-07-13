@@ -106,9 +106,17 @@ def build_strategy_release_candidate(
     )
     encoded = canonical_json(candidate.to_dict())
     if recover_publication:
-        recover_strategy_artifact(output_path, encoded)
+        recover_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=request.repository_root,
+        )
     else:
-        publish_strategy_artifact(output_path, encoded)
+        publish_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=request.repository_root,
+        )
     return candidate, output_path
 
 

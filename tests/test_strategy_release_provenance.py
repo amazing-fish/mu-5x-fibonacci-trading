@@ -628,7 +628,11 @@ class PromotionVerificationTests(unittest.TestCase):
                         recover_publication=recover,
                     )
 
-                publish.assert_called_once_with(output_path, canonical_json(release.to_dict()))
+                publish.assert_called_once_with(
+                    output_path,
+                    canonical_json(release.to_dict()),
+                    durability_anchor=(root / "releases").parent,
+                )
 
     def test_cli_recovery_flag_selects_explicit_recovery(self):
         release = Mock(strategy_release_id="sr1_" + "1" * 64)

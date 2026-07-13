@@ -39,10 +39,19 @@ def strategy_artifact_commit_witness_path(path: Path) -> Path:
     return artifact_path.with_name(f".{artifact_path.name}.publication-committed")
 
 
-def publish_strategy_artifact(path: Path, text: str) -> None:
-    """Publish immutable strategy artifact bytes and return only after a durable commit."""
+def publish_strategy_artifact(
+    path: Path,
+    text: str,
+    *,
+    durability_anchor: Path | None = None,
+) -> None:
+    """Publish immutable bytes, creating parents only beneath a durable anchor."""
 
     artifact_path = Path(path)
+    resolved_anchor = _resolve_durability_anchor(
+        artifact_path,
+        durability_anchor or artifact_path.parent,
+    )
     encoded = text.encode("utf-8")
     marker_path = strategy_artifact_pending_marker_path(artifact_path)
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
@@ -64,6 +73,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             _fsync_publication_record(witness_path, label="commit witness")
             _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
+            _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
             _require_committed_artifact(
                 artifact_path,
                 expected=encoded,
@@ -82,6 +92,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
         if _path_entry_exists(artifact_path):
             _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
+            _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
             return
 
         temporary_path = artifact_path.with_name(
@@ -103,6 +114,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             _fsync_directory(artifact_path.parent)
             raise
         _fsync_directory(artifact_path.parent)
+        _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
         if _publication_record_exists(witness_path, label="commit witness"):
             _finish_publication_against_concurrent_commit(
                 artifact_path,
@@ -112,8 +124,6 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
                 witness_path=witness_path,
             )
             return
-        _fsync_created_directory_entries(created_directories)
-
         if _path_entry_exists(artifact_path):
             _require_identical_artifact(artifact_path, encoded, fsync=True)
         else:
@@ -149,10 +159,19 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
                 pass
 
 
-def recover_strategy_artifact(path: Path, text: str) -> None:
+def recover_strategy_artifact(
+    path: Path,
+    text: str,
+    *,
+    durability_anchor: Path | None = None,
+) -> None:
     """Explicitly complete a failed publication after verifying its exact bytes."""
 
     artifact_path = Path(path)
+    resolved_anchor = _resolve_durability_anchor(
+        artifact_path,
+        durability_anchor or artifact_path.parent,
+    )
     encoded = text.encode("utf-8")
     marker_path = strategy_artifact_pending_marker_path(artifact_path)
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
@@ -168,6 +187,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             _fsync_publication_record(witness_path, label="commit witness")
             _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
+            _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
             _require_committed_artifact(
                 artifact_path,
                 expected=encoded,
@@ -181,7 +201,11 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             )
             return
         if not _publication_record_exists(marker_path, label="pending marker"):
-            publish_strategy_artifact(artifact_path, text)
+            publish_strategy_artifact(
+                artifact_path,
+                text,
+                durability_anchor=resolved_anchor,
+            )
             return
 
         marker = _read_publication_record(marker_path, label="pending marker")
@@ -190,7 +214,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             raise StrategyArtifactConflictError(
                 "pending strategy artifact publication belongs to different content"
             )
-        created_directories = _created_directories_from_count(
+        _created_directories_from_count(
             artifact_path.parent,
             marker["created_parent_count"],
         )
@@ -205,6 +229,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             fsync=True,
         )
         _fsync_directory(artifact_path.parent)
+        _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
         if _path_entry_exists(artifact_path):
             _require_identical_artifact(artifact_path, encoded, fsync=True)
         else:
@@ -213,7 +238,6 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             )
             _write_bytes_durably(temporary_path, encoded, exclusive=True)
 
-        _fsync_created_directory_entries(created_directories)
         if temporary_path is not None:
             _install_final_without_overwrite(
                 temporary_path,
@@ -626,9 +650,39 @@ def _created_directories_from_count(parent: Path, count: int) -> tuple[Path, ...
     return tuple(created_directories)
 
 
-def _fsync_created_directory_entries(created_directories: tuple[Path, ...]) -> None:
-    for directory in created_directories:
+def _resolve_durability_anchor(artifact_path: Path, durability_anchor: Path) -> Path:
+    try:
+        resolved_anchor = Path(durability_anchor).resolve(strict=True)
+        resolved_parent = artifact_path.parent.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise StrategyArtifactPublicationError(
+            "strategy artifact durability anchor cannot be resolved"
+        ) from exc
+    if not resolved_anchor.is_dir():
+        raise StrategyArtifactPublicationError(
+            "strategy artifact durability anchor must be an existing directory"
+        )
+    if resolved_parent != resolved_anchor and resolved_anchor not in resolved_parent.parents:
+        raise StrategyArtifactPublicationError(
+            "strategy artifact durability anchor must contain the artifact path"
+        )
+    return resolved_anchor
+
+
+def _fsync_directory_entries_to_anchor(parent: Path, anchor: Path) -> None:
+    try:
+        directory = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact parent directory chain cannot be resolved"
+        ) from exc
+    if directory != anchor and anchor not in directory.parents:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact parent directory escaped its durability anchor"
+        )
+    while directory != anchor:
         _fsync_directory(directory.parent)
+        directory = directory.parent
 
 
 def _establish_commit_witness(

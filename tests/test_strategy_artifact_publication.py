@@ -32,7 +32,11 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 "mu_strategy.research.strategy_artifact_publication._fsync_directory",
                 side_effect=lambda directory: flushed_directories.append(directory),
             ):
-                publish_strategy_artifact(path, '{"value":1}')
+                publish_strategy_artifact(
+                    path,
+                    '{"value":1}',
+                    durability_anchor=root,
+                )
 
             self.assertEqual('{"value":1}', path.read_text(encoding="utf-8"))
             self.assertFalse(strategy_artifact_pending_marker_path(path).exists())
@@ -49,6 +53,36 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 flushed_directories,
             )
             self.assertEqual([], list(path.parent.glob(f".{path.name}.*.tmp")))
+
+    def test_parent_creation_without_an_existing_durability_anchor_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "one" / "two" / "artifact.json"
+
+            with self.assertRaisesRegex(
+                StrategyArtifactPublicationError,
+                "durability anchor cannot be resolved",
+            ):
+                publish_strategy_artifact(path, "payload")
+
+            self.assertFalse((root / "one").exists())
+
+    def test_durability_anchor_must_contain_the_artifact_path(self):
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as unrelated:
+            root = Path(tmp)
+            path = root / "artifact.json"
+
+            with self.assertRaisesRegex(
+                StrategyArtifactPublicationError,
+                "durability anchor must contain",
+            ):
+                publish_strategy_artifact(
+                    path,
+                    "payload",
+                    durability_anchor=Path(unrelated),
+                )
+
+            self.assertFalse(path.exists())
 
     def test_identical_republish_is_idempotent_and_different_content_conflicts(self):
         with TemporaryDirectory() as tmp:
@@ -129,7 +163,11 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
 
             def run_publisher(name: str) -> None:
                 try:
-                    publish_strategy_artifact(path, "payload")
+                    publish_strategy_artifact(
+                        path,
+                        "payload",
+                        durability_anchor=root,
+                    )
                     successes.append(name)
                 except BaseException as exc:
                     failures.append((name, exc))
@@ -160,6 +198,87 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             self.assertEqual(["publisher-a", "publisher-b"], sorted(successes))
             self.assertFalse(marker.exists())
             self.assertTrue(witness.exists())
+            self.assertEqual("payload", read_strategy_artifact_text(path))
+
+    def test_observer_flushes_shared_lineage_before_committing_first(self):
+        from mu_strategy.research import strategy_artifact_publication as publication
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "one" / "two" / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            creator_made_directories = Event()
+            observer_committed = Event()
+            original_create = publication._create_parent_directories
+            successes: list[str] = []
+            failures: list[tuple[str, BaseException]] = []
+            flushed_directories: list[tuple[str, Path]] = []
+
+            def pause_parent_creator(parent: Path) -> tuple[Path, ...]:
+                created = original_create(parent)
+                if current_thread().name == "publisher-creator":
+                    creator_made_directories.set()
+                    if not observer_committed.wait(5):
+                        raise RuntimeError("observer did not commit")
+                return created
+
+            def record_directory_fsync(directory: Path) -> None:
+                flushed_directories.append((current_thread().name, directory))
+
+            def run_publisher(name: str) -> None:
+                try:
+                    publish_strategy_artifact(
+                        path,
+                        "payload",
+                        durability_anchor=root,
+                    )
+                    successes.append(name)
+                except BaseException as exc:
+                    failures.append((name, exc))
+                finally:
+                    if name == "publisher-observer":
+                        observer_committed.set()
+
+            with patch.object(
+                publication,
+                "_create_parent_directories",
+                side_effect=pause_parent_creator,
+            ), patch.object(
+                publication,
+                "_fsync_directory",
+                side_effect=record_directory_fsync,
+            ):
+                creator = Thread(
+                    target=run_publisher,
+                    args=("publisher-creator",),
+                    name="publisher-creator",
+                )
+                observer = Thread(
+                    target=run_publisher,
+                    args=("publisher-observer",),
+                    name="publisher-observer",
+                )
+                creator.start()
+                self.assertTrue(creator_made_directories.wait(5))
+                observer.start()
+                creator.join(10)
+                observer.join(10)
+
+            self.assertFalse(creator.is_alive())
+            self.assertFalse(observer.is_alive())
+            self.assertEqual([], failures)
+            self.assertEqual(
+                ["publisher-creator", "publisher-observer"],
+                sorted(successes),
+            )
+            observer_flushes = {
+                directory
+                for publisher, directory in flushed_directories
+                if publisher == "publisher-observer"
+            }
+            self.assertIn(root / "one", observer_flushes)
+            self.assertIn(root, observer_flushes)
+            self.assertFalse(marker.exists())
             self.assertEqual("payload", read_strategy_artifact_text(path))
 
     def test_non_regular_final_metadata_blocks_publish_recovery_and_read(self):
@@ -564,7 +683,11 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 side_effect=fail_first_created_parent_flush,
             ):
                 with self.assertRaises(StrategyArtifactPublicationError):
-                    publish_strategy_artifact(path, "payload")
+                    publish_strategy_artifact(
+                        path,
+                        "payload",
+                        durability_anchor=root,
+                    )
 
             self.assertFalse(path.exists())
             self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
@@ -573,7 +696,11 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 "mu_strategy.research.strategy_artifact_publication._fsync_directory",
                 side_effect=lambda directory: recovered_flushes.append(directory),
             ):
-                recover_strategy_artifact(path, "payload")
+                recover_strategy_artifact(
+                    path,
+                    "payload",
+                    durability_anchor=root,
+                )
             self.assertEqual(
                 [
                     path.parent,

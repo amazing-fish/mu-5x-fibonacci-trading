@@ -200,9 +200,17 @@ def promote_strategy_release(
     output_path = release_dir / f"{release.strategy_release_id}.json"
     encoded = canonical_json(release.to_dict())
     if recover_publication:
-        recover_strategy_artifact(output_path, encoded)
+        recover_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=release_dir.parent,
+        )
     else:
-        publish_strategy_artifact(output_path, encoded)
+        publish_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=release_dir.parent,
+        )
     return release, output_path
 
 
