@@ -420,7 +420,9 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 side_effect=lambda directory: recovered_directories.append(directory),
             ):
                 recover_strategy_artifact(path, "payload")
-            self.assertEqual([marker, path], recovered_files)
+            # The pending record is now synced through its verified regular-file
+            # handle; the generic helper remains only for the final artifact.
+            self.assertEqual([path], recovered_files)
             self.assertEqual(
                 [path.parent, path.parent, path.parent, path.parent],
                 recovered_directories,
@@ -777,6 +779,90 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             with patch.object(Path, "lstat", new=report_witness_symlink):
                 with self.assertRaises(StrategyArtifactRecoveryRequiredError):
                     read_strategy_artifact_text(path)
+
+    def test_witness_install_collision_requires_regular_sidecar_metadata(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            witness = strategy_artifact_commit_witness_path(path)
+            original_link = os.link
+            original_lstat = Path.lstat
+
+            def create_witness_collision(source: Path, destination: Path) -> None:
+                if Path(destination) == witness:
+                    witness.write_bytes(marker.read_bytes())
+                    raise FileExistsError("witness appeared concurrently")
+                original_link(source, destination)
+
+            def report_colliding_witness_symlink(subject: Path):
+                if subject == witness and witness.exists():
+                    return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                return original_lstat(subject)
+
+            with patch.object(os, "link", side_effect=create_witness_collision), patch.object(
+                Path,
+                "lstat",
+                new=report_colliding_witness_symlink,
+            ), patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    publish_strategy_artifact(path, "payload")
+
+            self.assertTrue(path.exists())
+            self.assertTrue(marker.exists())
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
+    def test_posix_witness_symlink_install_collision_fails_closed(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            witness = strategy_artifact_commit_witness_path(path)
+            original_link = os.link
+
+            def create_witness_symlink(source: Path, destination: Path) -> None:
+                if Path(destination) == witness:
+                    try:
+                        witness.symlink_to(marker)
+                    except (NotImplementedError, OSError) as exc:
+                        self.skipTest(f"sidecar symlinks are unavailable: {exc}")
+                original_link(source, destination)
+
+            with patch.object(os, "link", side_effect=create_witness_symlink), patch(
+                "mu_strategy.research.strategy_artifact_publication._fsync_directory"
+            ):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    publish_strategy_artifact(path, "payload")
+
+            self.assertTrue(path.exists())
+            self.assertTrue(marker.exists())
+            self.assertTrue(witness.is_symlink())
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
+    def test_existing_witness_swap_before_fsync_blocks_publish_and_recovery(self):
+        for operation in (publish_strategy_artifact, recover_strategy_artifact):
+            with self.subTest(operation=operation.__name__), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "artifact.json"
+                with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                    publish_strategy_artifact(path, "payload")
+
+                witness = strategy_artifact_commit_witness_path(path)
+                original_lstat = Path.lstat
+                witness_lstat_calls = 0
+
+                def replace_witness_after_validation(subject: Path):
+                    nonlocal witness_lstat_calls
+                    if subject == witness:
+                        witness_lstat_calls += 1
+                        if witness_lstat_calls >= 4:
+                            return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                    return original_lstat(subject)
+
+                with patch.object(Path, "lstat", new=replace_witness_after_validation), patch(
+                    "mu_strategy.research.strategy_artifact_publication._fsync_directory"
+                ):
+                    with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                        operation(path, "payload")
 
     def test_read_checks_pending_marker_both_before_and_after_read(self):
         with TemporaryDirectory() as tmp:

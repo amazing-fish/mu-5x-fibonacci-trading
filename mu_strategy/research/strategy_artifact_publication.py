@@ -61,9 +61,19 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
                 raise StrategyArtifactRecoveryRequiredError(
                     "strategy artifact has an unresolved pending publication"
                 )
-            _fsync_file(witness_path)
+            _fsync_publication_record(witness_path, label="commit witness")
             _fsync_file(artifact_path)
             _fsync_directory(artifact_path.parent)
+            _require_committed_artifact(
+                artifact_path,
+                expected=encoded,
+                marker_path=marker_path,
+                witness_path=witness_path,
+            )
+            if _publication_record_exists(marker_path, label="pending marker"):
+                raise StrategyArtifactRecoveryRequiredError(
+                    "strategy artifact has an unresolved pending publication"
+                )
             return
         if _publication_record_exists(marker_path, label="pending marker"):
             raise StrategyArtifactRecoveryRequiredError(
@@ -144,9 +154,15 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
                 marker_path=marker_path,
                 witness_path=witness_path,
             )
-            _fsync_file(witness_path)
+            _fsync_publication_record(witness_path, label="commit witness")
             _fsync_file(artifact_path)
             _fsync_directory(artifact_path.parent)
+            _require_committed_artifact(
+                artifact_path,
+                expected=encoded,
+                marker_path=marker_path,
+                witness_path=witness_path,
+            )
             _remove_pending_marker_durably(
                 marker_path,
                 witness_path=witness_path,
@@ -171,7 +187,12 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
             encoded,
             created_parent_count=marker["created_parent_count"],
         )
-        _fsync_file(marker_path)
+        _read_regular_publication_record_bytes(
+            marker_path,
+            label="pending marker",
+            expected=marker_bytes,
+            fsync=True,
+        )
         _fsync_directory(artifact_path.parent)
         if artifact_path.exists():
             _require_identical_artifact(artifact_path, encoded)
@@ -339,11 +360,17 @@ def _publication_record_exists(record_path: Path, *, label: str) -> bool:
     return True
 
 
-def _read_regular_publication_record_bytes(record_path: Path, *, label: str) -> bytes:
+def _read_regular_publication_record_bytes(
+    record_path: Path,
+    *,
+    label: str,
+    expected: bytes | None = None,
+    fsync: bool = False,
+) -> bytes:
     try:
         path_status = record_path.lstat()
         _require_regular_publication_record(path_status, label=label)
-        with record_path.open("rb") as handle:
+        with record_path.open("r+b" if fsync else "rb") as handle:
             opened_status = os.fstat(handle.fileno())
             _require_regular_publication_record(opened_status, label=label)
             if not os.path.samestat(path_status, opened_status):
@@ -351,6 +378,12 @@ def _read_regular_publication_record_bytes(record_path: Path, *, label: str) -> 
                     f"strategy artifact {label} changed before read"
                 )
             content = handle.read()
+            if expected is not None and content != expected:
+                raise StrategyArtifactConflictError(
+                    f"strategy artifact {label} does not match the expected record"
+                )
+            if fsync:
+                os.fsync(handle.fileno())
         current_status = record_path.lstat()
         _require_regular_publication_record(current_status, label=label)
         if not os.path.samestat(opened_status, current_status):
@@ -358,12 +391,16 @@ def _read_regular_publication_record_bytes(record_path: Path, *, label: str) -> 
                 f"strategy artifact {label} changed during read"
             )
         return content
-    except StrategyArtifactRecoveryRequiredError:
+    except StrategyArtifactPublicationError:
         raise
     except OSError as exc:
         raise StrategyArtifactRecoveryRequiredError(
             f"strategy artifact {label} cannot be read safely"
         ) from exc
+
+
+def _fsync_publication_record(record_path: Path, *, label: str) -> None:
+    _read_regular_publication_record_bytes(record_path, label=label, fsync=True)
 
 
 def _require_regular_publication_record(record_status: os.stat_result, *, label: str) -> None:
@@ -475,8 +512,12 @@ def _establish_commit_witness(
         os.link(marker_path, witness_path)
         created_witness = True
     except FileExistsError:
-        _require_identical_artifact(witness_path, marker_bytes)
-        _fsync_file(witness_path)
+        _read_regular_publication_record_bytes(
+            witness_path,
+            label="commit witness",
+            expected=marker_bytes,
+            fsync=True,
+        )
     try:
         _fsync_directory(parent)
     except OSError:
@@ -487,6 +528,12 @@ def _establish_commit_witness(
             except OSError:
                 pass
         raise
+    _read_regular_publication_record_bytes(
+        witness_path,
+        label="commit witness",
+        expected=marker_bytes,
+        fsync=True,
+    )
 
 
 def _remove_pending_marker_durably(
@@ -536,7 +583,10 @@ def _restore_pending_marker_best_effort(
                 try:
                     _write_bytes_durably(
                         marker_path,
-                        witness_path.read_bytes(),
+                        _read_regular_publication_record_bytes(
+                            witness_path,
+                            label="commit witness",
+                        ),
                         exclusive=True,
                     )
                 except FileExistsError:
