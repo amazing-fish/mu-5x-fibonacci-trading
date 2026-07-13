@@ -5,6 +5,9 @@ from mu_strategy.models import Candle
 from mu_strategy.strategy import one_hour_regime
 
 
+_HOUR_MS = 3_600_000
+
+
 def build_hourly_context(candles_15m: list[Candle], candles_1h: list[Candle]) -> dict[int, str]:
     if not candles_1h:
         return {bar.open_time_ms: "yellow" for bar in candles_15m}
@@ -18,7 +21,8 @@ def build_hourly_context(candles_15m: list[Candle], candles_1h: list[Candle]) ->
     for index, candle in enumerate(candles_1h):
         previous_hist = hist_values[index - 1] if index > 0 else hist_values[index]
         state = one_hour_regime(candle.close, ema21_values[index], rsi_values[index], hist_values[index], previous_hist)
-        hourly_states.append((candle.open_time_ms, state))
+        # Close-derived regime information is usable only after the hourly candle closes.
+        hourly_states.append((candle.open_time_ms + _HOUR_MS, state))
 
     context: dict[int, str] = {}
     cursor = 0

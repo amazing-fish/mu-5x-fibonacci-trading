@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
 from types import MappingProxyType
@@ -163,15 +163,11 @@ def run_release_experiment(
         segment_15m = [
             candle for candle in candles_15m if window.start_ms <= candle.open_time_ms < window.end_ms
         ]
-        source_1h = [
+        segment_1h = [
             candle
             for candle in candles_1h
             if window.start_ms <= candle.open_time_ms
             and candle.open_time_ms + hourly_interval_ms <= window.end_ms
-        ]
-        segment_1h = [
-            replace(candle, open_time_ms=candle.open_time_ms + hourly_interval_ms)
-            for candle in source_1h
         ]
         if not segment_15m or not segment_1h:
             raise ValueError(f"experiment window {window.role.value} has no required candles")

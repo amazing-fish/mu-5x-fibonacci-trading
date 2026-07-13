@@ -55,7 +55,7 @@ Rules:
 
 Package: `mu_strategy.core`
 
-`core.market_context.build_hourly_context` owns the pure mapping from 1h regime calculations to 15m candle timestamps. CLI, entry scanning, and visualization depend on this core function; `mu_strategy.cli` re-exports it for compatibility with existing callers.
+`core.market_context.build_hourly_context` owns the pure mapping from 1h regime calculations to 15m candle timestamps. A regime derived from a 1h candle close becomes visible at `open_time_ms + 1h`, never at the candle open; callers pass canonical candle timestamps and do not compensate by rewriting them. CLI, entry scanning, visualization, ordinary walk-forward, and release experiments depend on this core function; `mu_strategy.cli` re-exports it for compatibility with existing callers.
 
 ## Strategies
 

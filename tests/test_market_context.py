@@ -15,13 +15,14 @@ class MarketContextTests(unittest.TestCase):
 
         self.assertEqual({0: "yellow", 900_000: "yellow"}, context)
 
-    def test_hourly_state_propagates_forward_to_15m_candles(self):
+    def test_hourly_state_becomes_visible_only_after_candle_close(self):
         module = self._market_context_module()
         candles_15m = [
             _candle(0, 100),
             _candle(900_000, 101),
             _candle(3_600_000, 102),
             _candle(4_500_000, 103),
+            _candle(7_200_000, 104),
         ]
         candles_1h = [_candle(0, 100), _candle(3_600_000, 102)]
 
@@ -33,10 +34,11 @@ class MarketContextTests(unittest.TestCase):
 
         self.assertEqual(
             {
-                0: "green",
-                900_000: "green",
-                3_600_000: "red",
-                4_500_000: "red",
+                0: "yellow",
+                900_000: "yellow",
+                3_600_000: "green",
+                4_500_000: "green",
+                7_200_000: "red",
             },
             context,
         )
@@ -56,7 +58,7 @@ class MarketContextTests(unittest.TestCase):
                     with patch.object(module, "one_hour_regime", return_value="green"):
                         context = module.build_hourly_context(candles_15m, candles_1h)
 
-        self.assertEqual({0: "yellow", 900_000: "yellow", 1_800_000: "green"}, context)
+        self.assertEqual({0: "yellow", 900_000: "yellow", 1_800_000: "yellow"}, context)
 
     def test_cli_reexports_the_core_implementation(self):
         core_build_hourly_context = self._build_hourly_context()

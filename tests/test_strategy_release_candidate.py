@@ -180,6 +180,29 @@ class ReleaseExperimentRunnerTests(unittest.TestCase):
             self.assertTrue(context)
             self.assertEqual({"yellow"}, set(context.values()))
 
+    def test_runner_uses_the_core_hourly_close_visibility_boundary_once(self):
+        generation, windows = _synthetic_generation_and_windows(hours_per_window=2)
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        observed_contexts = []
+
+        def capture_context(_candles, context, **_kwargs):
+            observed_contexts.append(context)
+            return _backtest_result(10_000.0, pnl=None)
+
+        with patch("mu_strategy.core.market_context.one_hour_regime", return_value="green"):
+            with patch("mu_strategy.experiments.release_candidate.run_backtest", side_effect=capture_context):
+                run_release_experiment(
+                    generation,
+                    config=config,
+                    windows=windows,
+                    assumptions=_assumptions(),
+                )
+
+        self.assertEqual(3, len(observed_contexts))
+        for window, context in zip(windows, observed_contexts, strict=True):
+            self.assertEqual("yellow", context[window.start_ms])
+            self.assertEqual("green", context[window.start_ms + 3_600_000])
+
     def test_runner_rejects_assumption_or_window_mismatch(self):
         generation, windows = _synthetic_generation_and_windows()
         config = baseline_strategy_group("MU-USDT-SWAP").config
