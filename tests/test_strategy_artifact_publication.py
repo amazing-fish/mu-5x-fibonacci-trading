@@ -13,12 +13,38 @@ from mu_strategy.research.strategy_artifact_publication import (
     StrategyArtifactConflictError,
     StrategyArtifactPublicationError,
     StrategyArtifactRecoveryRequiredError,
-    publish_strategy_artifact,
+    publish_strategy_artifact as _publish_strategy_artifact,
     read_strategy_artifact_text,
-    recover_strategy_artifact,
+    recover_strategy_artifact as _recover_strategy_artifact,
     strategy_artifact_commit_witness_path,
     strategy_artifact_pending_marker_path,
 )
+
+
+def publish_strategy_artifact(
+    path: Path,
+    text: str,
+    *,
+    durability_anchor: Path | None = None,
+) -> None:
+    _publish_strategy_artifact(
+        path,
+        text,
+        durability_anchor=durability_anchor or Path(path).parent,
+    )
+
+
+def recover_strategy_artifact(
+    path: Path,
+    text: str,
+    *,
+    durability_anchor: Path | None = None,
+) -> None:
+    _recover_strategy_artifact(
+        path,
+        text,
+        durability_anchor=durability_anchor or Path(path).parent,
+    )
 
 
 class StrategyArtifactPublicationTests(unittest.TestCase):
@@ -39,6 +65,7 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 )
 
             self.assertEqual('{"value":1}', path.read_text(encoding="utf-8"))
+            self.assertEqual(1, path.stat().st_nlink)
             self.assertFalse(strategy_artifact_pending_marker_path(path).exists())
             self.assertTrue(strategy_artifact_commit_witness_path(path).exists())
             self.assertEqual(
@@ -66,6 +93,17 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 publish_strategy_artifact(path, "payload")
 
             self.assertFalse((root / "one").exists())
+
+    def test_authoritative_publication_and_recovery_require_an_explicit_anchor(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+
+            with self.assertRaises(TypeError):
+                _publish_strategy_artifact(path, "payload")
+            with self.assertRaises(TypeError):
+                _recover_strategy_artifact(path, "payload")
+
+            self.assertFalse(path.exists())
 
     def test_durability_anchor_must_contain_the_artifact_path(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as unrelated:
@@ -586,7 +624,7 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                     "from mu_strategy.research.strategy_artifact_publication import "
                     "recover_strategy_artifact, read_strategy_artifact_text",
                     "path = Path(sys.argv[1])",
-                    "recover_strategy_artifact(path, 'payload')",
+                    "recover_strategy_artifact(path, 'payload', durability_anchor=path.parent)",
                     "raise SystemExit(0 if read_strategy_artifact_text(path) == 'payload' else 1)",
                 )
             )
@@ -690,6 +728,9 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                     )
 
             self.assertFalse(path.exists())
+            self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
+            with self.assertRaises(TypeError):
+                _recover_strategy_artifact(path, "payload")
             self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
             recovered_flushes: list[Path] = []
             with patch(
@@ -1215,6 +1256,59 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             path.with_name(f".{path.name}.leftover.tmp").write_text("partial", encoding="utf-8")
 
             self.assertEqual("committed", read_strategy_artifact_text(path))
+
+    def test_hard_linked_legacy_final_is_never_adopted_or_read(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alias = root / "alias.json"
+            path = root / "artifact.json"
+            alias.write_text("payload", encoding="utf-8")
+            os.link(alias, path)
+
+            with self.assertRaisesRegex(
+                StrategyArtifactRecoveryRequiredError,
+                "multiple hard links",
+            ):
+                publish_strategy_artifact(path, "payload")
+
+            self.assertFalse(strategy_artifact_commit_witness_path(path).exists())
+            alias.write_text("mutated", encoding="utf-8")
+            with self.assertRaisesRegex(
+                StrategyArtifactRecoveryRequiredError,
+                "multiple hard links",
+            ):
+                read_strategy_artifact_text(path)
+
+    def test_linked_temporary_retirement_failure_keeps_a_pending_barrier(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "artifact.json"
+            original_unlink = Path.unlink
+
+            def fail_temporary_retirement(subject: Path, *args, **kwargs):
+                if subject.name.startswith(f".{path.name}.") and subject.suffix == ".tmp":
+                    raise OSError("temporary alias unlink failed")
+                return original_unlink(subject, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=fail_temporary_retirement):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    publish_strategy_artifact(path, "payload")
+
+            temporary_paths = list(root.glob(f".{path.name}.*.tmp"))
+            self.assertEqual(1, len(temporary_paths))
+            self.assertEqual(2, path.stat().st_nlink)
+            self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
+            temporary_paths[0].unlink()
+            recover_strategy_artifact(
+                path,
+                "payload",
+                durability_anchor=root,
+            )
+            self.assertEqual(1, path.stat().st_nlink)
+            self.assertEqual("payload", read_strategy_artifact_text(path))
 
     def test_publication_has_no_trusted_data_private_api_or_broker_mutation_side_effects(self):
         with TemporaryDirectory() as tmp, patch(

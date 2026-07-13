@@ -574,6 +574,34 @@ class PromotionVerificationTests(unittest.TestCase):
                 StrategyReleaseV1.from_dict(json.loads(output_path.read_text(encoding="utf-8"))),
             )
 
+    def test_promotion_preserves_nested_custom_release_dir_with_common_anchor(self):
+        candidate = _candidate()
+        live = _live_review(candidate)
+        provider = Mock()
+        provider.fetch_pull_request.return_value = _live_pull_request(candidate)
+        provider.fetch_review.return_value = live
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path = root / "candidate.json"
+            candidate_path.write_text(canonical_json(candidate.to_dict()), encoding="utf-8")
+            release_dir = root / "missing" / "nested-releases"
+
+            release, output_path = promote_strategy_release(
+                candidate_path,
+                release_dir=release_dir,
+                repository=live.repository,
+                pull_request_number=live.pull_request_number,
+                review_record_id=live.review_record_id,
+                provider=provider,
+            )
+
+            self.assertEqual(
+                release_dir / f"{release.strategy_release_id}.json",
+                output_path,
+            )
+            self.assertTrue(output_path.is_file())
+
     def test_promotion_rejects_pending_candidate_before_scm_lookup(self):
         candidate = _candidate()
         provider = Mock()
@@ -636,6 +664,7 @@ class PromotionVerificationTests(unittest.TestCase):
 
     def test_cli_recovery_flag_selects_explicit_recovery(self):
         release = Mock(strategy_release_id="sr1_" + "1" * 64)
+        durability_anchor = Path("durable-root")
         with patch(
             "mu_strategy.commands.promote_strategy_release.promote_strategy_release",
             return_value=(release, Path("release.json")),
@@ -650,12 +679,18 @@ class PromotionVerificationTests(unittest.TestCase):
                     "46",
                     "--review-record-id",
                     "1",
+                    "--publication-durability-anchor",
+                    str(durability_anchor),
                     "--recover-publication",
                 ]
             )
 
         self.assertEqual(0, exit_code)
         self.assertTrue(promote.call_args.kwargs["recover_publication"])
+        self.assertEqual(
+            durability_anchor,
+            promote.call_args.kwargs["publication_durability_anchor"],
+        )
 
 
 class StrictStrategyReleaseResolverTests(unittest.TestCase):

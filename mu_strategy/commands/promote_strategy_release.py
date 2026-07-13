@@ -175,6 +175,7 @@ def promote_strategy_release(
     pull_request_number: int,
     review_record_id: str,
     provider: ScmReviewProvider,
+    publication_durability_anchor: Path | None = None,
     recover_publication: bool = False,
 ) -> tuple[StrategyReleaseV1, Path]:
     try:
@@ -198,20 +199,33 @@ def promote_strategy_release(
     )
     release = StrategyReleaseV1.create(candidate=candidate, approval=approval)
     output_path = release_dir / f"{release.strategy_release_id}.json"
+    durability_anchor = publication_durability_anchor or _promotion_durability_anchor(
+        candidate_path,
+        release_dir,
+    )
     encoded = canonical_json(release.to_dict())
     if recover_publication:
         recover_strategy_artifact(
             output_path,
             encoded,
-            durability_anchor=release_dir.parent,
+            durability_anchor=durability_anchor,
         )
     else:
         publish_strategy_artifact(
             output_path,
             encoded,
-            durability_anchor=release_dir.parent,
+            durability_anchor=durability_anchor,
         )
     return release, output_path
+
+
+def _promotion_durability_anchor(candidate_path: Path, release_dir: Path) -> Path:
+    candidate_parent = candidate_path.parent.resolve(strict=True)
+    release_parent = release_dir.parent.resolve(strict=False)
+    for ancestor in (candidate_parent, *candidate_parent.parents):
+        if release_parent == ancestor or ancestor in release_parent.parents:
+            return ancestor
+    return release_dir.parent
 
 
 class GitHubCliScmReviewProvider:
@@ -400,6 +414,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-record-id", required=True)
     parser.add_argument("--release-dir", type=Path, default=Path("config/strategy-releases"))
     parser.add_argument(
+        "--publication-durability-anchor",
+        type=Path,
+        help="existing ancestor that makes a custom release directory chain durable",
+    )
+    parser.add_argument(
         "--recover-publication",
         action="store_true",
         help="explicitly recover a matching pending release publication",
@@ -416,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         pull_request_number=args.pull_request_number,
         review_record_id=args.review_record_id,
         provider=GitHubCliScmReviewProvider(),
+        publication_durability_anchor=args.publication_durability_anchor,
         recover_publication=args.recover_publication,
     )
     print(f"strategy_release_id={release.strategy_release_id}")

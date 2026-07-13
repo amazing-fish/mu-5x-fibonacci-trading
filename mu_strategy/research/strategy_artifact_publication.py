@@ -43,15 +43,12 @@ def publish_strategy_artifact(
     path: Path,
     text: str,
     *,
-    durability_anchor: Path | None = None,
+    durability_anchor: Path,
 ) -> None:
     """Publish immutable bytes, creating parents only beneath a durable anchor."""
 
     artifact_path = Path(path)
-    resolved_anchor = _resolve_durability_anchor(
-        artifact_path,
-        durability_anchor or artifact_path.parent,
-    )
+    resolved_anchor = _resolve_durability_anchor(artifact_path, durability_anchor)
     encoded = text.encode("utf-8")
     marker_path = strategy_artifact_pending_marker_path(artifact_path)
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
@@ -163,15 +160,12 @@ def recover_strategy_artifact(
     path: Path,
     text: str,
     *,
-    durability_anchor: Path | None = None,
+    durability_anchor: Path,
 ) -> None:
     """Explicitly complete a failed publication after verifying its exact bytes."""
 
     artifact_path = Path(path)
-    resolved_anchor = _resolve_durability_anchor(
-        artifact_path,
-        durability_anchor or artifact_path.parent,
-    )
+    resolved_anchor = _resolve_durability_anchor(artifact_path, durability_anchor)
     encoded = text.encode("utf-8")
     marker_path = strategy_artifact_pending_marker_path(artifact_path)
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
@@ -424,10 +418,15 @@ def _install_final_without_overwrite(
 ) -> None:
     # A hard-link install is atomic but, unlike os.replace, cannot overwrite a
     # conflicting immutable identity that appears after the preflight check.
+    # The linked temporary name must be retired before the final inode can be
+    # accepted as immutable; the caller's following directory fsync commits
+    # both the final install and temporary-name removal.
     try:
         os.link(temporary_path, artifact_path)
     except FileExistsError:
         _require_identical_artifact(artifact_path, expected, fsync=True)
+    else:
+        temporary_path.unlink()
 
 
 def _publication_record_bytes(content: bytes, *, created_parent_count: int) -> bytes:
@@ -469,6 +468,7 @@ def _read_regular_publication_record_bytes(
             label=label,
             expected=expected,
             fsync=fsync,
+            require_single_link=False,
         )
     except FileNotFoundError as exc:
         raise StrategyArtifactRecoveryRequiredError(
@@ -487,6 +487,7 @@ def _read_regular_artifact_bytes(
         label="final artifact",
         expected=expected,
         fsync=fsync,
+        require_single_link=True,
     )
 
 
@@ -505,13 +506,18 @@ def _read_identity_checked_regular_bytes(
     label: str,
     expected: bytes | None,
     fsync: bool,
+    require_single_link: bool,
 ) -> bytes:
     try:
         path_status = path.lstat()
         _require_regular_file(path_status, label=label)
+        if require_single_link:
+            _require_single_link(path_status, label=label)
         with path.open("r+b" if fsync else "rb") as handle:
             opened_status = os.fstat(handle.fileno())
             _require_regular_file(opened_status, label=label)
+            if require_single_link:
+                _require_single_link(opened_status, label=label)
             if not os.path.samestat(path_status, opened_status):
                 raise StrategyArtifactRecoveryRequiredError(
                     f"strategy artifact {label} changed before read"
@@ -525,6 +531,8 @@ def _read_identity_checked_regular_bytes(
                 os.fsync(handle.fileno())
         current_status = path.lstat()
         _require_regular_file(current_status, label=label)
+        if require_single_link:
+            _require_single_link(current_status, label=label)
         if not os.path.samestat(opened_status, current_status):
             raise StrategyArtifactRecoveryRequiredError(
                 f"strategy artifact {label} changed during read"
@@ -548,6 +556,13 @@ def _require_regular_file(file_status: os.stat_result, *, label: str) -> None:
     if not stat.S_ISREG(file_status.st_mode):
         raise StrategyArtifactRecoveryRequiredError(
             f"strategy artifact {label} is not a regular file"
+        )
+
+
+def _require_single_link(file_status: os.stat_result, *, label: str) -> None:
+    if file_status.st_nlink != 1:
+        raise StrategyArtifactRecoveryRequiredError(
+            f"strategy artifact {label} has multiple hard links"
         )
 
 

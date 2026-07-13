@@ -391,8 +391,44 @@ class CandidateGenerationTests(unittest.TestCase):
                     durability_anchor=request.repository_root,
                 )
 
+    def test_custom_output_preserves_external_and_nested_paths_with_stable_anchors(self):
+        generation, windows = _synthetic_generation_and_windows()
+        exact_sha = "1" * 40
+        reader = Mock()
+        reader.read.return_value = generation
+
+        with TemporaryDirectory() as repo_tmp, TemporaryDirectory() as output_tmp:
+            repository_root = Path(repo_tmp)
+            external_root = Path(output_tmp)
+            for name, output_path, explicit_anchor in (
+                ("existing-parent", external_root / "candidate.json", None),
+                (
+                    "nested-parent",
+                    external_root / "missing" / "nested" / "candidate.json",
+                    external_root,
+                ),
+            ):
+                with self.subTest(name=name):
+                    request = replace(
+                        _candidate_request(repository_root, windows, exact_sha),
+                        output_path=output_path,
+                        publication_durability_anchor=explicit_anchor,
+                    )
+                    _candidate, actual_path = build_strategy_release_candidate(
+                        request,
+                        git_state_provider=lambda _root: GitState(
+                            head_sha=exact_sha,
+                            is_clean=True,
+                        ),
+                        generation_reader=reader,
+                    )
+
+                    self.assertEqual(output_path, actual_path)
+                    self.assertTrue(actual_path.is_file())
+
     def test_cli_recovery_flag_selects_explicit_recovery(self):
         candidate = Mock(candidate_fingerprint="candidate", result_fingerprint="result")
+        durability_anchor = Path.cwd().resolve()
         with patch(
             "mu_strategy.commands.build_strategy_release_candidate.build_strategy_release_candidate",
             return_value=(candidate, Path("candidate.json")),
@@ -413,12 +449,18 @@ class CandidateGenerationTests(unittest.TestCase):
                     "3",
                     "--oos-end-ms",
                     "4",
+                    "--publication-durability-anchor",
+                    str(durability_anchor),
                     "--recover-publication",
                 ]
             )
 
         self.assertEqual(0, exit_code)
         self.assertTrue(build.call_args.kwargs["recover_publication"])
+        self.assertEqual(
+            durability_anchor,
+            build.call_args.args[0].publication_durability_anchor,
+        )
 
 
 def _copy_generation(root: Path) -> Path:

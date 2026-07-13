@@ -23,6 +23,7 @@ from mu_strategy.research.strategy_releases import (
     StrategyReleaseCandidateV1,
 )
 from mu_strategy.research.strategy_artifact_publication import (
+    StrategyArtifactPublicationError,
     publish_strategy_artifact,
     recover_strategy_artifact,
 )
@@ -51,6 +52,7 @@ class CandidateGenerationRequest:
     evaluated_code_commit_sha: str
     windows: tuple[ExperimentWindow, ...]
     output_path: Path | None = None
+    publication_durability_anchor: Path | None = None
 
 
 def build_strategy_release_candidate(
@@ -66,6 +68,16 @@ def build_strategy_release_candidate(
         raise ValueError("candidate generation requires a clean worktree")
     if state.head_sha != request.evaluated_code_commit_sha:
         raise ValueError("current HEAD must exactly equal evaluated_code_commit_sha")
+
+    custom_durability_anchor = (
+        _candidate_publication_durability_anchor(
+            request.output_path,
+            repository_root=request.repository_root,
+            explicit_anchor=request.publication_durability_anchor,
+        )
+        if request.output_path is not None
+        else None
+    )
 
     group = baseline_strategy_group(request.symbol)
     config_payload = StrategyConfigPayloadV1.from_config(group.config)
@@ -104,20 +116,47 @@ def build_strategy_release_candidate(
         / "strategy-release-candidates"
         / f"{candidate.candidate_fingerprint}.json"
     )
+    durability_anchor = custom_durability_anchor or request.repository_root
     encoded = canonical_json(candidate.to_dict())
     if recover_publication:
         recover_strategy_artifact(
             output_path,
             encoded,
-            durability_anchor=request.repository_root,
+            durability_anchor=durability_anchor,
         )
     else:
         publish_strategy_artifact(
             output_path,
             encoded,
-            durability_anchor=request.repository_root,
+            durability_anchor=durability_anchor,
         )
     return candidate, output_path
+
+
+def _candidate_publication_durability_anchor(
+    output_path: Path,
+    *,
+    repository_root: Path,
+    explicit_anchor: Path | None,
+) -> Path:
+    if explicit_anchor is not None:
+        return explicit_anchor
+    resolved_root = repository_root.resolve(strict=True)
+    resolved_parent = output_path.parent.resolve(strict=False)
+    if resolved_parent == resolved_root or resolved_root in resolved_parent.parents:
+        return resolved_root
+    try:
+        external_parent = output_path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise StrategyArtifactPublicationError(
+            "external candidate output with missing parents requires an explicit "
+            "publication durability anchor"
+        ) from exc
+    if not external_parent.is_dir():
+        raise StrategyArtifactPublicationError(
+            "external candidate output parent must be a directory"
+        )
+    return external_parent
 
 
 def read_git_state(repository_root: Path) -> GitState:
@@ -152,6 +191,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--publication-durability-anchor",
+        type=Path,
+        help="existing ancestor that makes a custom output directory chain durable",
+    )
     parser.add_argument(
         "--recover-publication",
         action="store_true",
@@ -191,6 +235,11 @@ def main(argv: list[str] | None = None) -> int:
         evaluated_code_commit_sha=args.evaluated_code_commit_sha,
         windows=windows,
         output_path=args.output.resolve() if args.output else None,
+        publication_durability_anchor=(
+            args.publication_durability_anchor.resolve()
+            if args.publication_durability_anchor
+            else None
+        ),
     )
     candidate, output_path = build_strategy_release_candidate(
         request,
