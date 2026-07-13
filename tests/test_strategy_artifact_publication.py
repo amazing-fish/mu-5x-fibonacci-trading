@@ -95,7 +95,17 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
         handle.__exit__ = Mock(return_value=False)
         handle.write.return_value = 2
 
-        with TemporaryDirectory() as tmp, patch.object(Path, "open", return_value=handle):
+        handle.fileno.return_value = 123
+        fake_status = os.stat_result((stat.S_IFREG | 0o600,) + (0,) * 9)
+
+        with TemporaryDirectory() as tmp, patch.object(
+            Path,
+            "open",
+            return_value=handle,
+        ), patch(
+            "mu_strategy.research.strategy_artifact_publication.os.fstat",
+            return_value=fake_status,
+        ):
             path = Path(tmp) / "artifact.json"
             with self.assertRaises(StrategyArtifactPublicationError) as raised:
                 publish_strategy_artifact(path, "payload")
@@ -322,7 +332,7 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
             self.assertEqual(0, completed.returncode, completed.stderr)
             self.assertFalse(strategy_artifact_pending_marker_path(path).exists())
 
-    def test_marker_fsync_failure_leaves_recoverable_pending_state(self):
+    def test_marker_fsync_failure_removes_uncommitted_marker_and_allows_retry(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "artifact.json"
             fsync_calls = 0
@@ -341,9 +351,50 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                     publish_strategy_artifact(path, "payload")
 
             self.assertFalse(path.exists())
-            self.assertTrue(strategy_artifact_pending_marker_path(path).exists())
+            self.assertFalse(strategy_artifact_pending_marker_path(path).exists())
             with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
-                recover_strategy_artifact(path, "payload")
+                publish_strategy_artifact(path, "payload")
+            self.assertEqual("payload", read_strategy_artifact_text(path))
+
+    def test_partial_marker_write_is_removed_and_ordinary_retry_succeeds(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            original_open = Path.open
+
+            class ShortWriteHandle:
+                def __init__(self, handle):
+                    self._handle = handle
+
+                def __enter__(self):
+                    self._handle.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self._handle.__exit__(*args)
+
+                def write(self, content: bytes) -> int:
+                    return self._handle.write(content[:2])
+
+                def __getattr__(self, name: str):
+                    return getattr(self._handle, name)
+
+            def short_write_only_for_marker(subject: Path, *args, **kwargs):
+                handle = original_open(subject, *args, **kwargs)
+                if subject == marker:
+                    return ShortWriteHandle(handle)
+                return handle
+
+            with patch.object(Path, "open", new=short_write_only_for_marker), patch(
+                "mu_strategy.research.strategy_artifact_publication._fsync_directory"
+            ):
+                with self.assertRaises(StrategyArtifactPublicationError):
+                    publish_strategy_artifact(path, "payload")
+
+            self.assertFalse(path.exists())
+            self.assertFalse(marker.exists())
+            with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                publish_strategy_artifact(path, "payload")
             self.assertEqual("payload", read_strategy_artifact_text(path))
 
     def test_new_parent_fsync_failure_is_recovered_using_marker_lineage(self):

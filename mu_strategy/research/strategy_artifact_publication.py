@@ -100,6 +100,9 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             raise StrategyArtifactRecoveryRequiredError(
                 "strategy artifact publication is already pending"
             ) from exc
+        except OSError:
+            _fsync_directory(artifact_path.parent)
+            raise
         _fsync_directory(artifact_path.parent)
         _fsync_created_directory_entries(created_directories)
 
@@ -451,12 +454,31 @@ def _content_sha256(content: bytes) -> str:
 
 def _write_bytes_durably(path: Path, content: bytes, *, exclusive: bool) -> None:
     mode = "xb" if exclusive else "wb"
-    with path.open(mode) as handle:
-        written = handle.write(content)
-        if written != len(content):
-            raise OSError(f"short strategy artifact write: {written}/{len(content)} bytes")
-        handle.flush()
-        os.fsync(handle.fileno())
+    created_status: os.stat_result | None = None
+    try:
+        with path.open(mode) as handle:
+            created_status = os.fstat(handle.fileno())
+            written = handle.write(content)
+            if written != len(content):
+                raise OSError(f"short strategy artifact write: {written}/{len(content)} bytes")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        if exclusive and created_status is not None:
+            _unlink_owned_file_best_effort(path, expected_status=created_status)
+        raise
+
+
+def _unlink_owned_file_best_effort(path: Path, *, expected_status: os.stat_result) -> None:
+    try:
+        current_status = path.lstat()
+        if stat.S_ISREG(current_status.st_mode) and os.path.samestat(
+            expected_status,
+            current_status,
+        ):
+            path.unlink()
+    except OSError:
+        pass
 
 
 def _fsync_file(path: Path) -> None:
