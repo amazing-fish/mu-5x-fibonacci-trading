@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.strategy import default_strategy_groups, StrategyConfig
 from mu_strategy.experiments.walk_forward import (
@@ -15,6 +16,8 @@ from mu_strategy.experiments.walk_forward import (
 
 
 DAY_MS = 86_400_000
+HOUR_MS = 3_600_000
+QUARTER_HOUR_MS = 900_000
 
 
 class WalkForwardTests(unittest.TestCase):
@@ -129,24 +132,20 @@ class WalkForwardTests(unittest.TestCase):
         self.assertIn("-5.00%", html)
         self.assertNotIn("-20.83%", html)
 
-    def test_walk_forward_context_includes_hour_covering_segment_start(self):
-        candles_15m = [
-            Candle(900_000, 100, 101, 99, 100.5, 1000),
-            Candle(1_800_000, 101, 102, 100, 101.5, 1000),
-            Candle(2_700_000, 102, 103, 101, 102.5, 1000),
-            Candle(3_600_000, 103, 104, 102, 103.5, 1000),
-        ]
+    def test_walk_forward_partitions_preserve_canonical_hourly_context(self):
+        candles_15m = [_priced_candle(index * QUARTER_HOUR_MS, 200.0) for index in range(96)]
         candles_1h = [
-            Candle(0, 100, 101, 99, 100.5, 1000),
-            Candle(3_600_000, 101, 102, 100, 101.5, 1000),
+            _priced_candle((index - 40) * HOUR_MS, 100.0 * (1.02**index))
+            for index in range(64)
         ]
-        captured_hourly_segments: list[list[int]] = []
+        canonical_context = build_hourly_context(candles_15m, candles_1h)
+        captured_contexts: list[dict[int, str]] = []
 
-        def fake_context(segment, hourly_segment):
-            captured_hourly_segments.append([bar.open_time_ms for bar in hourly_segment])
-            return {bar.open_time_ms: "yellow" for bar in segment}
+        def capture_context(_segment, context, *, config):
+            captured_contexts.append(context)
+            return BacktestResult(10_000.0, 10_000.0, [], [])
 
-        with patch("mu_strategy.experiments.walk_forward.build_hourly_context", side_effect=fake_context):
+        with patch("mu_strategy.experiments.walk_forward.run_backtest", side_effect=capture_context):
             results = run_walk_forward_backtests(
                 candles_15m,
                 candles_1h,
@@ -156,12 +155,17 @@ class WalkForwardTests(unittest.TestCase):
             )
 
         self.assertEqual(1, len(results))
-        self.assertEqual([0, 3_600_000], captured_hourly_segments[0])
+        self.assertEqual("green", canonical_context[0])
+        self.assertEqual([canonical_context], captured_contexts)
 
 
 def _candle(day: int) -> Candle:
     price = 100 + day
     return Candle(day * DAY_MS, price, price + 1, price - 1, price + 0.5, 1000)
+
+
+def _priced_candle(open_time_ms: int, price: float) -> Candle:
+    return Candle(open_time_ms, price, price, price, price, 1000)
 
 
 if __name__ == "__main__":

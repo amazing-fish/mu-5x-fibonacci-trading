@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.experiments.fibonacci_pullback import (
     AssetFibonacciBacktest,
     FibonacciHorizonBacktest,
@@ -18,6 +19,8 @@ from mu_strategy.strategy import StrategyConfig
 
 
 DAY_MS = 86_400_000
+HOUR_MS = 3_600_000
+QUARTER_HOUR_MS = 900_000
 
 
 class FibonacciPullbackExperimentTests(unittest.TestCase):
@@ -76,6 +79,34 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
         self.assertEqual([8, 12], [result.fib_lookback_bars for result in results])
         self.assertEqual([8, 8, 8, 12, 12, 12], seen_lookbacks)
         self.assertEqual(["2026-01", "2026-02"], [month.month for month in results[0].monthly_results])
+
+    def test_monthly_partitions_preserve_canonical_hourly_context(self):
+        month_start = 1_769_904_000_000  # 2026-02-01 00:00 UTC
+        candles_15m = [
+            _priced_candle(month_start, 200.0),
+            _priced_candle(month_start + QUARTER_HOUR_MS, 200.0),
+        ]
+        candles_1h = [
+            _priced_candle(month_start + ((index - 40) * HOUR_MS), 100.0 * (1.02**index))
+            for index in range(41)
+        ]
+        canonical_context = build_hourly_context(candles_15m, candles_1h)
+        captured_contexts: list[dict[int, str]] = []
+
+        def capture_context(_segment, context, *, config):
+            captured_contexts.append(context)
+            return BacktestResult(10_000.0, 10_000.0, [], [])
+
+        with patch("mu_strategy.experiments.fibonacci_pullback.run_backtest", side_effect=capture_context):
+            run_fibonacci_horizon_backtests(
+                candles_15m,
+                candles_1h,
+                base_config=StrategyConfig(),
+                horizons_hours=[2],
+            )
+
+        self.assertEqual("green", canonical_context[month_start])
+        self.assertEqual([canonical_context, canonical_context], captured_contexts)
 
     def test_report_contains_horizon_summary_and_monthly_analysis(self):
         horizon_result = FibonacciHorizonBacktest(
@@ -173,6 +204,10 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
 
 def _candle(open_time_ms: int) -> Candle:
     return Candle(open_time_ms, 100, 101, 99, 100.5, 1000)
+
+
+def _priced_candle(open_time_ms: int, price: float) -> Candle:
+    return Candle(open_time_ms, price, price, price, price, 1000)
 
 
 def _horizon(hours: int, total_return_pct: float) -> FibonacciHorizonBacktest:
