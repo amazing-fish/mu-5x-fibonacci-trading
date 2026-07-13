@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -23,6 +21,10 @@ from mu_strategy.research.strategy_releases import (
     SelectionReasonCode,
     StrategyConfigPayloadV1,
     StrategyReleaseCandidateV1,
+)
+from mu_strategy.research.strategy_artifact_publication import (
+    publish_strategy_artifact,
+    recover_strategy_artifact,
 )
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -56,6 +58,7 @@ def build_strategy_release_candidate(
     *,
     git_state_provider: GitStateProvider | None = None,
     generation_reader: GenerationReader | None = None,
+    recover_publication: bool = False,
 ) -> tuple[StrategyReleaseCandidateV1, Path]:
     provider = git_state_provider or read_git_state
     state = provider(request.repository_root)
@@ -101,7 +104,11 @@ def build_strategy_release_candidate(
         / "strategy-release-candidates"
         / f"{candidate.candidate_fingerprint}.json"
     )
-    _atomic_write_text(output_path, canonical_json(candidate.to_dict()))
+    encoded = canonical_json(candidate.to_dict())
+    if recover_publication:
+        recover_strategy_artifact(output_path, encoded)
+    else:
+        publish_strategy_artifact(output_path, encoded)
     return candidate, output_path
 
 
@@ -125,19 +132,6 @@ def _run_git(repository_root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build a non-promoted strategy release candidate.")
     parser.add_argument("--run-id", required=True)
@@ -150,6 +144,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--recover-publication",
+        action="store_true",
+        help="explicitly recover a matching pending candidate publication",
+    )
     return parser
 
 
@@ -185,7 +184,10 @@ def main(argv: list[str] | None = None) -> int:
         windows=windows,
         output_path=args.output.resolve() if args.output else None,
     )
-    candidate, output_path = build_strategy_release_candidate(request)
+    candidate, output_path = build_strategy_release_candidate(
+        request,
+        recover_publication=args.recover_publication,
+    )
     print(f"candidate_fingerprint={candidate.candidate_fingerprint}")
     print(f"result_fingerprint={candidate.result_fingerprint}")
     print(f"output_path={output_path}")

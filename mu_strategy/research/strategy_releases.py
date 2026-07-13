@@ -10,6 +10,10 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from mu_strategy.canonical import canonical_sha256
+from mu_strategy.research.strategy_artifact_publication import (
+    StrategyArtifactPublicationError,
+    read_strategy_artifact_text,
+)
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig
 
 
@@ -1041,11 +1045,17 @@ class StrictStrategyReleaseResolver:
 
         path = self._release_dir / f"{strategy_release_id}.json"
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(read_strategy_artifact_text(path))
             release = StrategyReleaseV1.from_dict(payload)
         except FileNotFoundError as exc:
             raise StrategyReleaseResolutionError(f"strategy release not found: {strategy_release_id}") from exc
-        except (OSError, json.JSONDecodeError, StrategyReleaseSchemaError, ValueError) as exc:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            StrategyReleaseSchemaError,
+            StrategyArtifactPublicationError,
+            ValueError,
+        ) as exc:
             raise StrategyReleaseResolutionError(f"invalid strategy release {strategy_release_id}: {exc}") from exc
 
         if release.strategy_release_id != strategy_release_id:

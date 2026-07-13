@@ -1,7 +1,9 @@
 import inspect
+import io
 import json
 import math
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import fields, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,9 +17,13 @@ from mu_strategy.commands.promote_strategy_release import (
     ScmReviewVerificationError,
     approval_statement,
     capture_verified_approval,
+    main as promotion_main,
     promote_strategy_release,
 )
 from mu_strategy.canonical import canonical_json, canonical_sha256
+from mu_strategy.research.strategy_artifact_publication import (
+    strategy_artifact_pending_marker_path,
+)
 
 from mu_strategy.research.strategy_releases import (
     EXPERIMENT_PROTOCOL_ID,
@@ -565,6 +571,85 @@ class PromotionVerificationTests(unittest.TestCase):
                 StrategyReleaseV1.from_dict(json.loads(output_path.read_text(encoding="utf-8"))),
             )
 
+    def test_promotion_rejects_pending_candidate_before_scm_lookup(self):
+        candidate = _candidate()
+        provider = Mock()
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path = root / "candidate.json"
+            candidate_path.write_text(canonical_json(candidate.to_dict()), encoding="utf-8")
+            strategy_artifact_pending_marker_path(candidate_path).write_text(
+                "pending",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ScmReviewVerificationError, "pending"):
+                promote_strategy_release(
+                    candidate_path,
+                    release_dir=root / "releases",
+                    repository="amazing-fish/mu-5x-fibonacci-trading",
+                    pull_request_number=46,
+                    review_record_id="1",
+                    provider=provider,
+                )
+
+        provider.fetch_pull_request.assert_not_called()
+        provider.fetch_review.assert_not_called()
+
+    def test_promotion_uses_shared_publication_and_explicit_recovery(self):
+        candidate = _candidate()
+        live = _live_review(candidate)
+        provider = Mock()
+        provider.fetch_pull_request.return_value = _live_pull_request(candidate)
+        provider.fetch_review.return_value = live
+
+        for recover, publication_function in (
+            (False, "publish_strategy_artifact"),
+            (True, "recover_strategy_artifact"),
+        ):
+            with self.subTest(recover=recover), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                candidate_path = root / "candidate.json"
+                candidate_path.write_text(canonical_json(candidate.to_dict()), encoding="utf-8")
+                with patch(
+                    f"mu_strategy.commands.promote_strategy_release.{publication_function}"
+                ) as publish:
+                    release, output_path = promote_strategy_release(
+                        candidate_path,
+                        release_dir=root / "releases",
+                        repository=live.repository,
+                        pull_request_number=live.pull_request_number,
+                        review_record_id=live.review_record_id,
+                        provider=provider,
+                        recover_publication=recover,
+                    )
+
+                publish.assert_called_once_with(output_path, canonical_json(release.to_dict()))
+
+    def test_cli_recovery_flag_selects_explicit_recovery(self):
+        release = Mock(strategy_release_id="sr1_" + "1" * 64)
+        with patch(
+            "mu_strategy.commands.promote_strategy_release.promote_strategy_release",
+            return_value=(release, Path("release.json")),
+        ) as promote, redirect_stdout(io.StringIO()):
+            exit_code = promotion_main(
+                [
+                    "--candidate",
+                    "candidate.json",
+                    "--repository",
+                    "amazing-fish/mu-5x-fibonacci-trading",
+                    "--pull-request-number",
+                    "46",
+                    "--review-record-id",
+                    "1",
+                    "--recover-publication",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(promote.call_args.kwargs["recover_publication"])
+
 
 class StrictStrategyReleaseResolverTests(unittest.TestCase):
     def test_exact_release_resolves_without_git_registry_or_scm_lookup(self):
@@ -593,6 +678,22 @@ class StrictStrategyReleaseResolverTests(unittest.TestCase):
         self.assertEqual(inspect.Parameter.empty, parameters["expected_symbol"].default)
         self.assertNotIn("latest", dir(resolver))
         self.assertNotIn("by_name", dir(resolver))
+
+    def test_pending_publication_marker_makes_visible_release_unresolvable(self):
+        candidate = _candidate()
+        release = StrategyReleaseV1.create(candidate=candidate, approval=_approval(candidate))
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            path = release_dir / f"{release.strategy_release_id}.json"
+            path.write_text(canonical_json(release.to_dict()), encoding="utf-8")
+            strategy_artifact_pending_marker_path(path).write_text("pending", encoding="utf-8")
+
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "pending"):
+                StrictStrategyReleaseResolver(release_dir).resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                )
 
     def test_self_consistent_untrusted_approval_snapshots_fail_closed(self):
         candidate = _candidate()
