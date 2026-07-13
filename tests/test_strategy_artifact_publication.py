@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import subprocess
 import sys
 import unittest
@@ -692,6 +693,89 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 )
 
                 with self.assertRaises(StrategyArtifactPublicationError):
+                    read_strategy_artifact_text(path)
+
+    def test_dangling_pending_and_witness_entries_fail_closed(self):
+        for sidecar_factory in (
+            strategy_artifact_pending_marker_path,
+            strategy_artifact_commit_witness_path,
+        ):
+            with self.subTest(sidecar=sidecar_factory.__name__), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "artifact.json"
+                path.write_text("payload", encoding="utf-8")
+                sidecar = sidecar_factory(path)
+                try:
+                    sidecar.symlink_to(root / "missing-publication-record")
+                except (NotImplementedError, OSError) as exc:
+                    self.skipTest(f"sidecar symlinks are unavailable: {exc}")
+
+                with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                    read_strategy_artifact_text(path)
+
+    def test_sidecar_directory_entries_use_lstat_not_target_existence(self):
+        original_lstat = Path.lstat
+
+        for sidecar_factory in (
+            strategy_artifact_pending_marker_path,
+            strategy_artifact_commit_witness_path,
+        ):
+            with self.subTest(sidecar=sidecar_factory.__name__), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "artifact.json"
+                path.write_text("payload", encoding="utf-8")
+                sidecar = sidecar_factory(path)
+
+                def report_dangling_symlink(subject: Path):
+                    if subject == sidecar:
+                        return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                    return original_lstat(subject)
+
+                with patch.object(Path, "lstat", new=report_dangling_symlink):
+                    with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                        read_strategy_artifact_text(path)
+
+    def test_valid_record_symlinks_are_not_accepted_as_sidecars(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "artifact.json"
+            with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                publish_strategy_artifact(path, "payload")
+
+            witness = strategy_artifact_commit_witness_path(path)
+            record_target = root / "publication-record.json"
+            record_target.write_bytes(witness.read_bytes())
+
+            witness.unlink()
+            try:
+                witness.symlink_to(record_target)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"sidecar symlinks are unavailable: {exc}")
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
+            witness.unlink()
+            witness.write_bytes(record_target.read_bytes())
+            marker = strategy_artifact_pending_marker_path(path)
+            marker.symlink_to(record_target)
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                recover_strategy_artifact(path, "payload")
+
+    def test_lstat_rejects_valid_sidecar_content_behind_symlink_metadata(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            with patch("mu_strategy.research.strategy_artifact_publication._fsync_directory"):
+                publish_strategy_artifact(path, "payload")
+
+            witness = strategy_artifact_commit_witness_path(path)
+            original_lstat = Path.lstat
+
+            def report_witness_symlink(subject: Path):
+                if subject == witness:
+                    return os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+                return original_lstat(subject)
+
+            with patch.object(Path, "lstat", new=report_witness_symlink):
+                with self.assertRaises(StrategyArtifactRecoveryRequiredError):
                     read_strategy_artifact_text(path)
 
     def test_read_checks_pending_marker_both_before_and_after_read(self):

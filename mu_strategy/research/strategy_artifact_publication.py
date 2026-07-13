@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -49,14 +50,14 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
 
     try:
         created_directories = _create_parent_directories(artifact_path.parent)
-        if witness_path.exists():
+        if _publication_record_exists(witness_path, label="commit witness"):
             _require_committed_artifact(
                 artifact_path,
                 expected=encoded,
                 marker_path=marker_path,
                 witness_path=witness_path,
             )
-            if marker_path.exists():
+            if _publication_record_exists(marker_path, label="pending marker"):
                 raise StrategyArtifactRecoveryRequiredError(
                     "strategy artifact has an unresolved pending publication"
                 )
@@ -64,7 +65,7 @@ def publish_strategy_artifact(path: Path, text: str) -> None:
             _fsync_file(artifact_path)
             _fsync_directory(artifact_path.parent)
             return
-        if marker_path.exists():
+        if _publication_record_exists(marker_path, label="pending marker"):
             raise StrategyArtifactRecoveryRequiredError(
                 "strategy artifact has an unresolved pending publication"
             )
@@ -136,7 +137,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
     temporary_path: Path | None = None
     try:
-        if witness_path.exists():
+        if _publication_record_exists(witness_path, label="commit witness"):
             _require_committed_artifact(
                 artifact_path,
                 expected=encoded,
@@ -152,7 +153,7 @@ def recover_strategy_artifact(path: Path, text: str) -> None:
                 parent=artifact_path.parent,
             )
             return
-        if not marker_path.exists():
+        if not _publication_record_exists(marker_path, label="pending marker"):
             publish_strategy_artifact(artifact_path, text)
             return
 
@@ -221,11 +222,11 @@ def read_strategy_artifact_text(path: Path) -> str:
     marker_path = strategy_artifact_pending_marker_path(artifact_path)
     witness_path = strategy_artifact_commit_witness_path(artifact_path)
     _reject_pending_marker(marker_path)
-    if witness_path.exists():
+    if _publication_record_exists(witness_path, label="commit witness"):
         witness = _read_publication_record(witness_path, label="commit witness")
         text = artifact_path.read_text(encoding="utf-8")
         _require_record_content(witness, text.encode("utf-8"), label="commit witness")
-        if not witness_path.exists():
+        if not _publication_record_exists(witness_path, label="commit witness"):
             raise StrategyArtifactRecoveryRequiredError(
                 "strategy artifact commit witness changed during read"
             )
@@ -237,7 +238,7 @@ def read_strategy_artifact_text(path: Path) -> str:
         return text
 
     text = artifact_path.read_text(encoding="utf-8")
-    if witness_path.exists():
+    if _publication_record_exists(witness_path, label="commit witness"):
         raise StrategyArtifactRecoveryRequiredError(
             "strategy artifact publication state changed during read"
         )
@@ -246,7 +247,7 @@ def read_strategy_artifact_text(path: Path) -> str:
 
 
 def _reject_pending_marker(marker_path: Path) -> None:
-    if marker_path.exists():
+    if _publication_record_exists(marker_path, label="pending marker"):
         raise StrategyArtifactRecoveryRequiredError(
             "strategy artifact has an unresolved pending publication"
         )
@@ -269,7 +270,7 @@ def _require_matching_pending_record(
     marker_path: Path,
     witness: dict[str, Any],
 ) -> None:
-    if not marker_path.exists():
+    if not _publication_record_exists(marker_path, label="pending marker"):
         return
     pending = _read_publication_record(marker_path, label="pending marker")
     if pending != witness:
@@ -325,9 +326,67 @@ def _publication_record_bytes(content: bytes, *, created_parent_count: int) -> b
     ).encode("utf-8")
 
 
-def _read_publication_record(record_path: Path, *, label: str) -> dict[str, Any]:
+def _publication_record_exists(record_path: Path, *, label: str) -> bool:
     try:
-        payload = json.loads(record_path.read_text(encoding="utf-8"))
+        record_status = record_path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            f"strategy artifact {label} cannot be inspected"
+        ) from exc
+    _require_regular_publication_record(record_status, label=label)
+    return True
+
+
+def _read_regular_publication_record_bytes(record_path: Path, *, label: str) -> bytes:
+    try:
+        path_status = record_path.lstat()
+        _require_regular_publication_record(path_status, label=label)
+        with record_path.open("rb") as handle:
+            opened_status = os.fstat(handle.fileno())
+            _require_regular_publication_record(opened_status, label=label)
+            if not os.path.samestat(path_status, opened_status):
+                raise StrategyArtifactRecoveryRequiredError(
+                    f"strategy artifact {label} changed before read"
+                )
+            content = handle.read()
+        current_status = record_path.lstat()
+        _require_regular_publication_record(current_status, label=label)
+        if not os.path.samestat(opened_status, current_status):
+            raise StrategyArtifactRecoveryRequiredError(
+                f"strategy artifact {label} changed during read"
+            )
+        return content
+    except StrategyArtifactRecoveryRequiredError:
+        raise
+    except OSError as exc:
+        raise StrategyArtifactRecoveryRequiredError(
+            f"strategy artifact {label} cannot be read safely"
+        ) from exc
+
+
+def _require_regular_publication_record(record_status: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISREG(record_status.st_mode):
+        raise StrategyArtifactRecoveryRequiredError(
+            f"strategy artifact {label} is not a regular file"
+        )
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _read_publication_record(record_path: Path, *, label: str) -> dict[str, Any]:
+    record_bytes = _read_regular_publication_record_bytes(record_path, label=label)
+    try:
+        payload = json.loads(record_bytes.decode("utf-8"))
         if not isinstance(payload, dict) or set(payload) != _PUBLICATION_RECORD_FIELDS:
             raise ValueError(f"{label} fields do not match the strategy publication schema")
         if payload.get("schema_version") != _PUBLICATION_RECORD_SCHEMA_VERSION:
@@ -343,7 +402,7 @@ def _read_publication_record(record_path: Path, *, label: str) -> dict[str, Any]
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ValueError("pending marker created_parent_count is invalid")
         return payload
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise StrategyArtifactRecoveryRequiredError(
             f"strategy artifact {label} is invalid"
         ) from exc
@@ -436,7 +495,7 @@ def _remove_pending_marker_durably(
     witness_path: Path,
     parent: Path,
 ) -> None:
-    if not marker_path.exists():
+    if not _publication_record_exists(marker_path, label="pending marker"):
         return
     try:
         marker_path.unlink(missing_ok=True)
@@ -447,7 +506,7 @@ def _remove_pending_marker_durably(
             witness_path=witness_path,
             parent=parent,
         )
-        if marker_path.exists():
+        if _publication_record_exists(marker_path, label="pending marker"):
             raise
         try:
             _fsync_directory(parent)
@@ -457,7 +516,7 @@ def _remove_pending_marker_durably(
             # but unlink remains visible, raising would expose committed evidence
             # behind an error. A restart may conservatively resurrect the matching
             # pending record, in which case normal recovery removes it.
-            if marker_path.exists():
+            if _publication_record_exists(marker_path, label="pending marker"):
                 raise
 
 
@@ -468,7 +527,7 @@ def _restore_pending_marker_best_effort(
     parent: Path,
 ) -> None:
     try:
-        if not marker_path.exists():
+        if not _path_entry_exists(marker_path):
             try:
                 os.link(witness_path, marker_path)
             except FileExistsError:
