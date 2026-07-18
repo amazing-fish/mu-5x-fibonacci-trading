@@ -1,0 +1,30 @@
+name: Python contract tests
+
+on:
+  pull_request:
+    branches:
+      - research/mu-strategy-groups
+  push:
+    branches:
+      - research/mu-strategy-groups
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run contract tests
+        run: python -B -m unittest discover -s tests
