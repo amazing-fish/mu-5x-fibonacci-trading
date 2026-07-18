@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
@@ -23,6 +21,11 @@ from mu_strategy.research.strategy_releases import (
     SelectionReasonCode,
     StrategyConfigPayloadV1,
     StrategyReleaseCandidateV1,
+)
+from mu_strategy.research.strategy_artifact_publication import (
+    StrategyArtifactPublicationError,
+    publish_strategy_artifact,
+    recover_strategy_artifact,
 )
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -49,6 +52,7 @@ class CandidateGenerationRequest:
     evaluated_code_commit_sha: str
     windows: tuple[ExperimentWindow, ...]
     output_path: Path | None = None
+    publication_durability_anchor: Path | None = None
 
 
 def build_strategy_release_candidate(
@@ -56,6 +60,7 @@ def build_strategy_release_candidate(
     *,
     git_state_provider: GitStateProvider | None = None,
     generation_reader: GenerationReader | None = None,
+    recover_publication: bool = False,
 ) -> tuple[StrategyReleaseCandidateV1, Path]:
     provider = git_state_provider or read_git_state
     state = provider(request.repository_root)
@@ -63,6 +68,16 @@ def build_strategy_release_candidate(
         raise ValueError("candidate generation requires a clean worktree")
     if state.head_sha != request.evaluated_code_commit_sha:
         raise ValueError("current HEAD must exactly equal evaluated_code_commit_sha")
+
+    custom_durability_anchor = (
+        _candidate_publication_durability_anchor(
+            request.output_path,
+            repository_root=request.repository_root,
+            explicit_anchor=request.publication_durability_anchor,
+        )
+        if request.output_path is not None
+        else None
+    )
 
     group = baseline_strategy_group(request.symbol)
     config_payload = StrategyConfigPayloadV1.from_config(group.config)
@@ -101,8 +116,38 @@ def build_strategy_release_candidate(
         / "strategy-release-candidates"
         / f"{candidate.candidate_fingerprint}.json"
     )
-    _atomic_write_text(output_path, canonical_json(candidate.to_dict()))
+    durability_anchor = custom_durability_anchor or request.repository_root
+    encoded = canonical_json(candidate.to_dict())
+    if recover_publication:
+        recover_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=durability_anchor,
+        )
+    else:
+        publish_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=durability_anchor,
+        )
     return candidate, output_path
+
+
+def _candidate_publication_durability_anchor(
+    output_path: Path,
+    *,
+    repository_root: Path,
+    explicit_anchor: Path | None,
+) -> Path:
+    if explicit_anchor is not None:
+        return explicit_anchor
+    resolved_root = repository_root.resolve(strict=True)
+    resolved_parent = output_path.parent.resolve(strict=False)
+    if resolved_parent == resolved_root or resolved_root in resolved_parent.parents:
+        return resolved_root
+    raise StrategyArtifactPublicationError(
+        "external candidate output requires an explicit publication durability anchor"
+    )
 
 
 def read_git_state(repository_root: Path) -> GitState:
@@ -125,19 +170,6 @@ def _run_git(repository_root: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build a non-promoted strategy release candidate.")
     parser.add_argument("--run-id", required=True)
@@ -150,6 +182,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository-root", type=Path, default=Path.cwd())
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--publication-durability-anchor",
+        type=Path,
+        help="existing ancestor that makes a custom output directory chain durable",
+    )
+    parser.add_argument(
+        "--recover-publication",
+        action="store_true",
+        help="explicitly recover a matching pending candidate publication",
+    )
     return parser
 
 
@@ -184,8 +226,16 @@ def main(argv: list[str] | None = None) -> int:
         evaluated_code_commit_sha=args.evaluated_code_commit_sha,
         windows=windows,
         output_path=args.output.resolve() if args.output else None,
+        publication_durability_anchor=(
+            args.publication_durability_anchor.resolve()
+            if args.publication_durability_anchor
+            else None
+        ),
     )
-    candidate, output_path = build_strategy_release_candidate(request)
+    candidate, output_path = build_strategy_release_candidate(
+        request,
+        recover_publication=args.recover_publication,
+    )
     print(f"candidate_fingerprint={candidate.candidate_fingerprint}")
     print(f"result_fingerprint={candidate.result_fingerprint}")
     print(f"output_path={output_path}")

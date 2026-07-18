@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
 from mu_strategy.canonical import canonical_json
+from mu_strategy.research.strategy_artifact_publication import (
+    StrategyArtifactPublicationError,
+    publish_strategy_artifact,
+    read_strategy_artifact_text,
+    recover_strategy_artifact,
+)
 from mu_strategy.research.strategy_releases import (
     ReleaseDecision,
     ScmReviewSnapshotV1,
@@ -171,12 +175,20 @@ def promote_strategy_release(
     pull_request_number: int,
     review_record_id: str,
     provider: ScmReviewProvider,
+    publication_durability_anchor: Path | None = None,
+    recover_publication: bool = False,
 ) -> tuple[StrategyReleaseV1, Path]:
     try:
         candidate = StrategyReleaseCandidateV1.from_dict(
-            json.loads(candidate_path.read_text(encoding="utf-8"))
+            json.loads(read_strategy_artifact_text(candidate_path))
         )
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        StrategyArtifactPublicationError,
+    ) as exc:
         raise ScmReviewVerificationError(f"invalid candidate artifact: {exc}") from exc
     approval = capture_verified_approval(
         candidate,
@@ -187,8 +199,33 @@ def promote_strategy_release(
     )
     release = StrategyReleaseV1.create(candidate=candidate, approval=approval)
     output_path = release_dir / f"{release.strategy_release_id}.json"
-    _atomic_write_text(output_path, canonical_json(release.to_dict()))
+    durability_anchor = publication_durability_anchor or _promotion_durability_anchor(
+        candidate_path,
+        release_dir,
+    )
+    encoded = canonical_json(release.to_dict())
+    if recover_publication:
+        recover_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=durability_anchor,
+        )
+    else:
+        publish_strategy_artifact(
+            output_path,
+            encoded,
+            durability_anchor=durability_anchor,
+        )
     return release, output_path
+
+
+def _promotion_durability_anchor(candidate_path: Path, release_dir: Path) -> Path:
+    candidate_parent = candidate_path.parent.resolve(strict=True)
+    release_parent = release_dir.parent.resolve(strict=False)
+    for ancestor in (candidate_parent, *candidate_parent.parents):
+        if release_parent == ancestor or ancestor in release_parent.parents:
+            return ancestor
+    return release_dir.parent
 
 
 class GitHubCliScmReviewProvider:
@@ -369,19 +406,6 @@ def _required_nullable_datetime_ms(payload: dict, field_name: str) -> int | None
         raise ScmReviewVerificationError(f"SCM {field_name} must be an ISO timestamp or null") from exc
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Promote a reviewed strategy release candidate.")
     parser.add_argument("--candidate", required=True, type=Path)
@@ -389,6 +413,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pull-request-number", required=True, type=int)
     parser.add_argument("--review-record-id", required=True)
     parser.add_argument("--release-dir", type=Path, default=Path("config/strategy-releases"))
+    parser.add_argument(
+        "--publication-durability-anchor",
+        type=Path,
+        help="existing ancestor that makes a custom release directory chain durable",
+    )
+    parser.add_argument(
+        "--recover-publication",
+        action="store_true",
+        help="explicitly recover a matching pending release publication",
+    )
     return parser
 
 
@@ -401,6 +435,8 @@ def main(argv: list[str] | None = None) -> int:
         pull_request_number=args.pull_request_number,
         review_record_id=args.review_record_id,
         provider=GitHubCliScmReviewProvider(),
+        publication_durability_anchor=args.publication_durability_anchor,
+        recover_publication=args.recover_publication,
     )
     print(f"strategy_release_id={release.strategy_release_id}")
     print(f"output_path={output_path}")
