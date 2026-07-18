@@ -172,7 +172,7 @@ def recover_strategy_artifact(
     temporary_path: Path | None = None
     try:
         if _publication_record_exists(witness_path, label="commit witness"):
-            _require_committed_artifact(
+            _require_recoverable_committed_artifact(
                 artifact_path,
                 expected=encoded,
                 marker_path=marker_path,
@@ -182,7 +182,7 @@ def recover_strategy_artifact(
             _require_identical_artifact(artifact_path, encoded, fsync=True)
             _fsync_directory(artifact_path.parent)
             _fsync_directory_entries_to_anchor(artifact_path.parent, resolved_anchor)
-            _require_committed_artifact(
+            _require_recoverable_committed_artifact(
                 artifact_path,
                 expected=encoded,
                 marker_path=marker_path,
@@ -325,6 +325,24 @@ def _require_committed_artifact(
     _require_matching_pending_record(marker_path, witness)
 
 
+def _require_recoverable_committed_artifact(
+    artifact_path: Path,
+    *,
+    expected: bytes,
+    marker_path: Path,
+    witness_path: Path,
+) -> None:
+    witness, committed_bytes = _read_committed_artifact(
+        artifact_path,
+        witness_path=witness_path,
+    )
+    if committed_bytes != expected:
+        raise StrategyArtifactConflictError(
+            "immutable strategy artifact path already contains different content"
+        )
+    _require_matching_pending_content(marker_path, witness)
+
+
 def _read_committed_artifact(
     artifact_path: Path,
     *,
@@ -395,6 +413,19 @@ def _require_matching_pending_record(
     if pending != witness:
         raise StrategyArtifactRecoveryRequiredError(
             "strategy artifact pending marker does not match the commit witness"
+        )
+
+
+def _require_matching_pending_content(
+    marker_path: Path,
+    witness: dict[str, Any],
+) -> None:
+    if not _publication_record_exists(marker_path, label="pending marker"):
+        return
+    pending = _read_publication_record(marker_path, label="pending marker")
+    if pending["content_sha256"] != witness["content_sha256"]:
+        raise StrategyArtifactRecoveryRequiredError(
+            "strategy artifact pending marker content does not match the commit witness"
         )
 
 

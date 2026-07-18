@@ -1003,6 +1003,63 @@ class StrategyArtifactPublicationTests(unittest.TestCase):
                 recover_strategy_artifact(path, "payload")
             self.assertEqual("payload", read_strategy_artifact_text(path))
 
+    def test_recovery_retires_same_content_pending_marker_with_different_parent_lineage(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "one" / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+            witness = strategy_artifact_commit_witness_path(path)
+
+            publish_strategy_artifact(path, "payload", durability_anchor=root)
+            witness_record = json.loads(witness.read_text(encoding="utf-8"))
+            self.assertEqual(1, witness_record["created_parent_count"])
+            pending_record = {**witness_record, "created_parent_count": 0}
+            marker.write_text(
+                json.dumps(
+                    pending_record,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
+            recover_strategy_artifact(path, "payload", durability_anchor=root)
+
+            self.assertFalse(marker.exists())
+            self.assertTrue(witness.exists())
+            self.assertEqual("payload", read_strategy_artifact_text(path))
+
+    def test_recovery_rejects_committed_witness_with_different_pending_content(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "artifact.json"
+            marker = strategy_artifact_pending_marker_path(path)
+
+            publish_strategy_artifact(path, "payload")
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "content_sha256": "0" * 64,
+                        "created_parent_count": 0,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                recover_strategy_artifact(path, "payload")
+
+            self.assertTrue(marker.exists())
+            with self.assertRaises(StrategyArtifactRecoveryRequiredError):
+                read_strategy_artifact_text(path)
+
     def test_recovery_rejects_malformed_or_mismatched_pending_state(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "artifact.json"
