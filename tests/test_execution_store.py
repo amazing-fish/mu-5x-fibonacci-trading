@@ -390,6 +390,7 @@ class SQLiteExecutionStoreIntentTests(_SQLiteExecutionFixture, unittest.TestCase
             "CREATE TRIGGER erase_audit AFTER INSERT ON audit_events "
             "BEGIN DELETE FROM audit_events WHERE event_id = NEW.event_id; END",
             "CREATE VIEW mutable_intent_ids AS SELECT intent_id FROM intents",
+            "CREATE INDEX unexpected_intent_action ON intents(business_action_id)",
         )
         for index, statement in enumerate(schema_objects):
             with self.subTest(statement=statement), TemporaryDirectory() as tmp:
@@ -404,6 +405,19 @@ class SQLiteExecutionStoreIntentTests(_SQLiteExecutionFixture, unittest.TestCase
 
                 with self.assertRaisesRegex(ExecutionStoreSchemaError, "schema objects"):
                     SQLiteExecutionStore(path)
+
+    def test_version_zero_database_with_view_refuses_first_open(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "execution.sqlite3"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("CREATE VIEW unrelated_view AS SELECT 1 AS value")
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaisesRegex(ExecutionStoreSchemaError, "schema objects"):
+                SQLiteExecutionStore(path)
 
     def test_corrupt_action_selection_binding_fails_closed(self):
         with TemporaryDirectory() as tmp:

@@ -562,17 +562,20 @@ class SQLiteExecutionStore:
     def _initialize(self) -> None:
         with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            table_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-                ).fetchone()[0]
-            )
-            if version == 0 and table_count == 0:
+            user_objects = connection.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+            if version == 0:
+                if user_objects:
+                    raise ExecutionStoreSchemaError(
+                        "execution store contains unknown persistent schema objects"
+                    )
                 with self._transaction(connection=connection):
                     for statement in _SCHEMA_STATEMENTS:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {EXECUTION_STORE_SCHEMA_VERSION}")
-                return
+                version = EXECUTION_STORE_SCHEMA_VERSION
             if version != EXECUTION_STORE_SCHEMA_VERSION:
                 raise ExecutionStoreSchemaError(
                     f"unsupported execution store schema version: {version}"
