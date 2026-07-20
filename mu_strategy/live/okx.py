@@ -15,6 +15,8 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Callable
 
+from mu_strategy.execution.instruments import OKXInstrumentSpec
+
 
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
@@ -95,38 +97,6 @@ class DemoOrderRequest:
         if self.reduce_only is not None:
             body["reduceOnly"] = self.reduce_only
         return body
-
-
-@dataclass(frozen=True)
-class OKXInstrumentSpec:
-    inst_id: str
-    tick_size: Decimal
-    lot_size: Decimal
-    contract_value: Decimal
-
-    @classmethod
-    def from_row(cls, row: Mapping[str, Any]) -> "OKXInstrumentSpec":
-        return cls(
-            inst_id=str(row["instId"]),
-            tick_size=Decimal(str(row["tickSz"])),
-            lot_size=Decimal(str(row["lotSz"])),
-            contract_value=Decimal(str(row.get("ctVal", "1"))),
-        )
-
-    def price_to_string(self, price: float | str | Decimal) -> str:
-        return _decimal_to_string(_floor_to_step(Decimal(str(price)), self.tick_size))
-
-    def size_to_string(self, size: float | str | Decimal) -> str:
-        return _decimal_to_string(_floor_to_step(Decimal(str(size)), self.lot_size))
-
-    def size_for_notional(self, notional_usdt: float | str | Decimal, *, price: float | str | Decimal) -> str:
-        price_value = Decimal(str(price))
-        if price_value <= 0:
-            raise ValueError("price must be positive")
-        if self.contract_value <= 0:
-            raise ValueError("contract_value must be positive")
-        raw_size = Decimal(str(notional_usdt)) / (price_value * self.contract_value)
-        return self.size_to_string(raw_size)
 
 
 Transport = Callable[[str, str], dict[str, Any]]
