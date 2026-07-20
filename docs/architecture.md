@@ -9,6 +9,16 @@ created: 2026-06-14
 
 This project is organized as a research-first trading strategy workbench. It also contains a guarded OKX Demo application layer. Production live trading is not implemented.
 
+## Filesystem durability
+
+Module: `mu_strategy.fs_durability`
+
+`fsync_directory()` is the single owner of the POSIX directory-fsync and Windows directory-handle `FlushFileBuffers` implementation. Open, flush, close, and unsupported-platform failures raise `OSError`; callers may wrap that failure in their own domain error, but they may not silently claim durability.
+
+This low-level module does not define a publication commit point or recovery protocol. Trusted-generation publication, Stage 0 observation append logs, and immutable strategy-release publication still decide independently which file and directory entries must be durable, in what order, and how a failed or ambiguous write is recovered.
+
+Trusted-generation publication keeps atomic replacement of `current.json` as its commit point. File and directory-sync failures before that replacement still fail publication. If the replacement succeeds but syncing its parent directory fails, the new complete pointer is already visible, so the writer reports `current_pointer_directory_sync_failed` as an explicit publication warning instead of returning a false rollback/failure result. A restart after that warning may observe either the previous complete pointer or the new complete pointer; trusted readers continue to validate whichever generation the pointer names.
+
 ## Data
 
 Package: `mu_strategy.market_data`

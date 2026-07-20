@@ -3,13 +3,16 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.cache import CSV_FIELDS
 from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
@@ -20,6 +23,12 @@ from mu_strategy.market_data.trusted_data.contracts import (
 from mu_strategy.models import Candle
 
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_LOGGER = logging.getLogger(__name__)
+# Keep post-commit warnings structured without allowing -Werror to turn them into false failures.
+_CURRENT_POINTER_WARNING_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "trusted_current_pointer_warning_sink",
+    default=None,
+)
 
 
 @dataclass(frozen=True)
@@ -195,7 +204,18 @@ class TrustedDataStore:
             "manifest": f"generations/{generation_id}/manifest.json",
         }
         self.current_path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(self.current_path, json.dumps(pointer, ensure_ascii=False, indent=2, sort_keys=True))
+        sync_error = _atomic_write_text(
+            self.current_path,
+            json.dumps(pointer, ensure_ascii=False, indent=2, sort_keys=True),
+            return_post_replace_directory_sync_error=True,
+        )
+        if sync_error is not None:
+            message = f"current_pointer_directory_sync_failed: {type(sync_error).__name__}: {sync_error}"
+            warning_sink = _CURRENT_POINTER_WARNING_SINK.get()
+            if warning_sink is None:
+                _LOGGER.warning(message)
+            else:
+                warning_sink(message)
         return self.current_path
 
     def commit_generation_publication(
@@ -205,12 +225,17 @@ class TrustedDataStore:
         run_log_payload: dict[str, Any],
     ) -> tuple[str, ...]:
         self.write_generation_manifest(generation_id, manifest)
-        self.replace_current(generation_id)
+        publication_warnings = []
+        warning_sink_token = _CURRENT_POINTER_WARNING_SINK.set(publication_warnings.append)
+        try:
+            self.replace_current(generation_id)
+        finally:
+            _CURRENT_POINTER_WARNING_SINK.reset(warning_sink_token)
         try:
             self.append_run_log(run_log_payload)
         except Exception as exc:
-            return (f"audit_log_append_failed: {exc}",)
-        return ()
+            publication_warnings.append(f"audit_log_append_failed: {exc}")
+        return tuple(publication_warnings)
 
     def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str) -> Path:
         source_file = Path(source_file)
@@ -237,14 +262,25 @@ def candles_content_sha256(candles: list[Candle]) -> str:
     return digest.hexdigest()
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    return_post_replace_directory_sync_error: bool = False,
+) -> OSError | None:
     tmp_path = _tmp_path(path)
     try:
         with tmp_path.open("w", encoding="utf-8") as handle:
             handle.write(text)
             _flush_and_fsync(handle)
         os.replace(tmp_path, path)
-        _fsync_directory(path.parent)
+        try:
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            if return_post_replace_directory_sync_error:
+                return exc
+            raise
+        return None
     finally:
         _cleanup_tmp(tmp_path)
 
@@ -255,23 +291,7 @@ def _tmp_path(path: Path) -> Path:
 
 def _flush_and_fsync(handle) -> None:
     handle.flush()
-    try:
-        os.fsync(handle.fileno())
-    except OSError:
-        pass
-
-
-def _fsync_directory(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    os.fsync(handle.fileno())
 
 
 def _cleanup_tmp(path: Path) -> None:
