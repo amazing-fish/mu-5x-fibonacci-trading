@@ -385,6 +385,26 @@ class SQLiteExecutionStoreIntentTests(_SQLiteExecutionFixture, unittest.TestCase
             with self.assertRaisesRegex(ExecutionStoreSchemaError, "schema definition"):
                 SQLiteExecutionStore(path)
 
+    def test_unknown_persistent_trigger_or_view_refuses_to_open(self):
+        schema_objects = (
+            "CREATE TRIGGER erase_audit AFTER INSERT ON audit_events "
+            "BEGIN DELETE FROM audit_events WHERE event_id = NEW.event_id; END",
+            "CREATE VIEW mutable_intent_ids AS SELECT intent_id FROM intents",
+        )
+        for index, statement in enumerate(schema_objects):
+            with self.subTest(statement=statement), TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"execution-{index}.sqlite3"
+                SQLiteExecutionStore(path)
+                connection = sqlite3.connect(path)
+                try:
+                    connection.execute(statement)
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                with self.assertRaisesRegex(ExecutionStoreSchemaError, "schema objects"):
+                    SQLiteExecutionStore(path)
+
     def test_corrupt_action_selection_binding_fails_closed(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "execution.sqlite3"

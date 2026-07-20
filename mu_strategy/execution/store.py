@@ -586,6 +586,15 @@ class SQLiteExecutionStore:
             }
             if actual != expected:
                 raise ExecutionStoreSchemaError("execution store schema tables are incomplete or unknown")
+            unexpected_objects = connection.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE type IN ('index', 'trigger', 'view') "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+            if unexpected_objects:
+                raise ExecutionStoreSchemaError(
+                    "execution store contains unknown persistent schema objects"
+                )
             definitions = {
                 row["name"]: _normalize_schema_sql(row["sql"])
                 for row in connection.execute(
