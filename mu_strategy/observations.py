@@ -12,6 +12,7 @@ from typing import Any, Mapping, Protocol
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
+from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
 
@@ -689,62 +690,6 @@ def _validate_observation_semantics(observation: Stage0Observation) -> None:
         raise ValueError("unsupported observation failure_code")
     if observation.outcome is not expected_outcome:
         raise ValueError("observation outcome does not match typed control fields")
-
-
-def _fsync_directory(directory: Path) -> None:
-    if os.name != "nt":
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        descriptor = os.open(directory, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        return
-
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    create_file = kernel32.CreateFileW
-    create_file.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    )
-    create_file.restype = wintypes.HANDLE
-    flush_file_buffers = kernel32.FlushFileBuffers
-    flush_file_buffers.argtypes = (wintypes.HANDLE,)
-    flush_file_buffers.restype = wintypes.BOOL
-    close_handle = kernel32.CloseHandle
-    close_handle.argtypes = (wintypes.HANDLE,)
-    close_handle.restype = wintypes.BOOL
-
-    generic_write = 0x40000000
-    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
-    open_existing = 3
-    file_flag_backup_semantics = 0x02000000
-    handle = create_file(
-        str(directory),
-        generic_write,
-        share_read_write_delete,
-        None,
-        open_existing,
-        file_flag_backup_semantics,
-        None,
-    )
-    if handle == ctypes.c_void_p(-1).value:
-        error = ctypes.get_last_error()
-        raise OSError(error, ctypes.FormatError(error), str(directory))
-    try:
-        if not flush_file_buffers(handle):
-            error = ctypes.get_last_error()
-            raise OSError(error, ctypes.FormatError(error), str(directory))
-    finally:
-        close_handle(handle)
 
 
 def _require_exact_fields(payload: dict[str, Any], expected: set[str], label: str) -> None:
