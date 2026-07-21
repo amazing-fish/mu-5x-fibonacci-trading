@@ -638,7 +638,9 @@ The v1 signal-lineage and business-action derivations are cross-schema contracts
 
 Before reservation, `intent.superseded` uses that same fence in one transaction: compare the expected selection version, prove the entire action remains mutation-unreserved, update the selected intent/fingerprint, increment the version, and append the supersession event. The first leverage/submit reservation compares the same version and selected fingerprint, flips the fence to mutation-reserved, creates the operation reservation, and appends the request event in one transaction. A supersession/reservation race has exactly one winner; the loser reloads the durable action state and fails closed.
 
-The storage technology remains open, but it must provide the action-selection fence, atomic unique reservation, and ordered append semantics. The current plain `ShadowExecutionLedger` JSONL alone does not satisfy this contract.
+The 30-C implementation uses Python's standard-library `sqlite3` with schema version 1. Callers must provide an explicit database path whose parent already exists; the store does not create directories or fall back to JSONL. Every connection requires WAL mode, `synchronous=FULL`, foreign-key enforcement, and a bounded busy timeout. Mutations use `BEGIN IMMEDIATE`, so immutable intent persistence, the action-selection compare-and-swap, unique mutation reservation, and ordered audit append share one commit or rollback together. Startup rejects unknown versions, missing or extra tables, and schema-definition drift. The current plain `ShadowExecutionLedger` JSONL remains a separate observation log and does not satisfy this contract.
+
+Reservation lifecycle state is persisted as a closed compare-and-swap transition set. `idempotency.reservation_state_changed` records the operation, mutation action, full key, and old/new states in the same transaction as the reservation update. This is local execution-control evidence only: 30-C imports no Broker or application layer and does not interpret transport responses.
 
 **Retry and restart.**
 
@@ -695,6 +697,7 @@ Correlation fields use a discriminated header union rather than optional common 
 | `confirmation.cancelled` | operator, time, typed cancellation code |
 | `confirmation.expired` | expiry and observation time |
 | `idempotency.reserved` | operation, mutation action ID, business action/order lineage, full key, broker client ID when applicable, selected intent fingerprint |
+| `idempotency.reservation_state_changed` | operation, mutation action ID, full key, and the closed old/new reservation states |
 | `broker.leverage.requested` | leverage key, symbol, leverage, margin mode, adapter/environment |
 | `broker.leverage.configured` | leverage key, configured/already-configured result, observed time |
 | `broker.leverage.rejected` | leverage key, broker code, sanitized response fingerprint |
@@ -911,7 +914,7 @@ These values are not current repository requirements:
 1. `N` consecutive dry-run days, minimum READY intent sample count, acceptable human disagreement rate, and required reviewer roles.
 2. Confirmation expiry formula. Intent expiry is already frozen to the scanner's exclusive `second_pullback_wait_bars * 15m` lifecycle boundary; confirmation lifetime remains a later policy decision.
 3. The authenticated operator identity mechanism and whether a second approver is required for production.
-4. The durable ledger implementation. The business-action selection fence, transactional unique reservation, and ordered append behavior are mandatory; the storage engine is not selected here.
+4. The operational ledger location and local filesystem provisioning policy. The repository implementation selects local SQLite schema v1 and requires an explicit path, but deployment ownership remains open.
 5. Exact retry limits/backoff for proven not-sent failures. Unknown outcomes never use that retry path.
 6. Production credential provider, configuration key names, release approver, and kill-switch operator.
 7. Whether and how `ExecutionDecision.EXECUTION_ACCEPTED` enters a future intent contract. V1 deliberately covers the existing scanner-generated limit-entry path only.
