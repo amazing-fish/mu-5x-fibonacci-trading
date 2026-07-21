@@ -811,6 +811,23 @@ class SQLiteExecutionStore:
             raise ExecutionStoreInvariantError(
                 "persisted action selection does not bind its selected intent"
             )
+        reservation_rows = connection.execute(
+            """
+            SELECT selected_intent_id, selected_intent_fingerprint
+            FROM reservations
+            WHERE environment = ? AND business_action_id = ?
+            """,
+            (selection.environment.value, selection.business_action_id),
+        ).fetchall()
+        if selection.mutation_reserved != bool(reservation_rows) or any(
+            row["selected_intent_id"] != selection.selected_intent_id
+            or row["selected_intent_fingerprint"]
+            != selection.selected_intent_fingerprint
+            for row in reservation_rows
+        ):
+            raise ExecutionStoreInvariantError(
+                "persisted reservation action-selection binding mismatch"
+            )
         return selection
 
     def _load_reservation_connection(

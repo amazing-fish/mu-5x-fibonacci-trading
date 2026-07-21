@@ -479,6 +479,106 @@ class SQLiteExecutionStoreIntentTests(_SQLiteExecutionFixture, unittest.TestCase
             self.assertEqual(1, len(store.read_events(self.intent.audit_correlation_id)))
 
 class SQLiteExecutionReservationTests(_SQLiteExecutionFixture, unittest.TestCase):
+    def test_action_selection_reservation_divergence_fails_closed(self):
+        corruptions = (
+            (
+                "cleared reservation fence",
+                "UPDATE action_selections SET mutation_reserved = 0",
+                (),
+            ),
+            (
+                "reservation bound to stale intent",
+                "UPDATE reservations "
+                "SET selected_intent_id = ?, selected_intent_fingerprint = ?",
+                (self.intent.intent_id, self.intent.intent_fingerprint),
+            ),
+            (
+                "reserved fence without reservation",
+                "DELETE FROM reservations",
+                (),
+            ),
+        )
+        for label, statement, parameters in corruptions:
+            with self.subTest(corruption=label), TemporaryDirectory() as tmp:
+                path = Path(tmp) / "execution.sqlite3"
+                store = SQLiteExecutionStore(path)
+                self._record(store, self.intent, "evt-created")
+                revision = self._revision("obs-selected", "4", 1_700_000_061_100)
+                self._record(store, revision, "evt-superseded")
+                store.reserve_mutation(
+                    revision,
+                    operation=MutationOperation.SUBMIT_ENTRY,
+                    mutation_action_id=submit_mutation_action_id(revision),
+                    order_lineage_id="ord1_" + "a" * 64,
+                    actor_kind=ActorKind.SYSTEM,
+                    actor_id="stage1-store",
+                    occurred_at_ms=1_700_000_061_200,
+                    event_id="evt-submit-reserved",
+                )
+                connection = sqlite3.connect(path)
+                try:
+                    connection.execute(statement, parameters)
+                    connection.commit()
+                finally:
+                    connection.close()
+
+                restarted = SQLiteExecutionStore(path)
+                with self.assertRaisesRegex(
+                    ExecutionStoreInvariantError,
+                    "reservation action-selection",
+                ):
+                    restarted.load_action_selection(
+                        revision.environment,
+                        revision.business_action_id,
+                    )
+
+    def test_cleared_reservation_fence_cannot_enable_intent_supersession(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "execution.sqlite3"
+            store = SQLiteExecutionStore(path)
+            self._record(store, self.intent, "evt-created")
+            store.reserve_mutation(
+                self.intent,
+                operation=MutationOperation.SUBMIT_ENTRY,
+                mutation_action_id=submit_mutation_action_id(self.intent),
+                order_lineage_id="ord1_" + "a" * 64,
+                actor_kind=ActorKind.SYSTEM,
+                actor_id="stage1-store",
+                occurred_at_ms=1_700_000_061_100,
+                event_id="evt-submit-reserved",
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE action_selections SET mutation_reserved = 0"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            revision = self._revision("obs-after-corruption", "4", 1_700_000_061_200)
+            with self.assertRaisesRegex(
+                ExecutionStoreInvariantError,
+                "reservation action-selection",
+            ):
+                store.record_intent(
+                    revision,
+                    source_scan_id="scan-after-corruption",
+                    actor_kind=ActorKind.SYSTEM,
+                    actor_id="stage1-store",
+                    occurred_at_ms=1_700_000_061_200,
+                    event_id="evt-after-corruption",
+                )
+
+            connection = sqlite3.connect(path)
+            try:
+                selected_intent_id = connection.execute(
+                    "SELECT selected_intent_id FROM action_selections"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(self.intent.intent_id, selected_intent_id)
+
     def test_submit_reservation_is_atomic_idempotent_and_restart_readable(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "execution.sqlite3"
