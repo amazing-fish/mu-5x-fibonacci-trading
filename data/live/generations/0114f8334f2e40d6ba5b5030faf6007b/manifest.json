@@ -1,0 +1,266 @@
+{
+  "attempt_status": "success",
+  "completed_at_ms": 1784917415163,
+  "cycle_error": null,
+  "diagnostics": {
+    "refresh_segments": [
+      {
+        "completed_at_ms": 1784917414400,
+        "elapsed_ms": 27543,
+        "error_type": null,
+        "existing_rows": 35257,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 5774,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "5m",
+        "message": null,
+        "output_rows": 41029,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917386857,
+        "symbol": "MU-USDT-SWAP"
+      },
+      {
+        "completed_at_ms": 1784917396011,
+        "elapsed_ms": 9152,
+        "error_type": null,
+        "existing_rows": 11752,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 1926,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "15m",
+        "message": null,
+        "output_rows": 13676,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917386859,
+        "symbol": "MU-USDT-SWAP"
+      },
+      {
+        "completed_at_ms": 1784917398286,
+        "elapsed_ms": 2275,
+        "error_type": null,
+        "existing_rows": 2938,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 483,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "1h",
+        "message": null,
+        "output_rows": 3419,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917396011,
+        "symbol": "MU-USDT-SWAP"
+      }
+    ],
+    "slowest_segments": [
+      {
+        "completed_at_ms": 1784917414400,
+        "elapsed_ms": 27543,
+        "error_type": null,
+        "existing_rows": 35257,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 5774,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "5m",
+        "message": null,
+        "output_rows": 41029,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917386857,
+        "symbol": "MU-USDT-SWAP"
+      },
+      {
+        "completed_at_ms": 1784917396011,
+        "elapsed_ms": 9152,
+        "error_type": null,
+        "existing_rows": 11752,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 1926,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "15m",
+        "message": null,
+        "output_rows": 13676,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917386859,
+        "symbol": "MU-USDT-SWAP"
+      },
+      {
+        "completed_at_ms": 1784917398286,
+        "elapsed_ms": 2275,
+        "error_type": null,
+        "existing_rows": 2938,
+        "fetch_mode": "incremental_reuse",
+        "fetch_reason": null,
+        "fetched_rows": 483,
+        "had_existing": true,
+        "health_reason": "ok",
+        "interval": "1h",
+        "message": null,
+        "output_rows": 3419,
+        "reused_prior_generation": true,
+        "started_at_ms": 1784917396011,
+        "symbol": "MU-USDT-SWAP"
+      }
+    ]
+  },
+  "effective_intervals": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "intervals": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "provider_failures": [],
+  "requested_intervals": [
+    "5m",
+    "15m",
+    "1h"
+  ],
+  "run_id": "0114f8334f2e40d6ba5b5030faf6007b",
+  "schema_version": 3,
+  "snapshot_usability": "usable",
+  "started_at_ms": 1784917386849,
+  "symbols": {
+    "MU-USDT-SWAP": {
+      "intervals": {
+        "15m": {
+          "availability": "available",
+          "content_sha256": "c3d5dbeaac4f660072b689ac95bfe057daf299c14df51e007ccce00d899b5af4",
+          "coverage_state": "partial_available_history",
+          "effective_days": 142.44791666666666,
+          "error_type": null,
+          "first_timestamp_ms": 1772608500000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "15m",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1784916000000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 13676,
+          "source_file": "okx/MU-USDT-SWAP/15m.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1784917414400,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=142.45"
+          ]
+        },
+        "1h": {
+          "availability": "available",
+          "content_sha256": "fdabb431da0ace81e6a7af01bcb300cae5d66ccaf6c4faa36d08bc25b8a46115",
+          "coverage_state": "partial_available_history",
+          "effective_days": 142.41666666666666,
+          "error_type": null,
+          "first_timestamp_ms": 1772607600000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "1h",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1784912400000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 3419,
+          "source_file": "okx/MU-USDT-SWAP/1h.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1784917414400,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=142.42"
+          ]
+        },
+        "5m": {
+          "availability": "available",
+          "content_sha256": "051b4dd49665be445ae0b85bdabd9b7dd98015b9442bb161c8965dd4db877432",
+          "coverage_state": "partial_available_history",
+          "effective_days": 142.45833333333334,
+          "error_type": null,
+          "first_timestamp_ms": 1772608500000,
+          "freshness": "fresh",
+          "integrity": "valid",
+          "interval": "5m",
+          "is_stale": false,
+          "is_valid": true,
+          "last_timestamp_ms": 1784916900000,
+          "message": null,
+          "reason": "ok",
+          "reasons": [
+            "ok"
+          ],
+          "requested_days": 180,
+          "rows": 41029,
+          "source_file": "okx/MU-USDT-SWAP/5m.csv",
+          "symbol": "MU-USDT-SWAP",
+          "updated_at_ms": 1784917414400,
+          "validation": {
+            "misaligned_timestamps": [],
+            "missing_in_built": [],
+            "missing_in_native": [],
+            "ok": true,
+            "reason": "ok",
+            "timestamp_gaps": [],
+            "value_mismatches": [],
+            "warnings": []
+          },
+          "warnings": [
+            "partial_available_history:requested_days=180:effective_days=142.46"
+          ]
+        }
+      },
+      "last": 0.0,
+      "source": "explicit",
+      "volume_ccy_24h": 0.0
+    }
+  },
+  "universes": {
+    "crypto_top": [
+      {
+        "inst_id": "MU-USDT-SWAP",
+        "last": 0.0,
+        "source": "explicit",
+        "volume_ccy_24h": 0.0
+      }
+    ],
+    "stock_token_top": []
+  },
+  "updated_at_ms": 1784917415163,
+  "warnings": []
+}
