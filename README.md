@@ -184,7 +184,13 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `baseline_yellow_wide`：baseline 入场 + `1h yellow` 宽止损。
 - `baseline_yellow_green_wide`：baseline 入场 + yellow/green 均宽止损。
 - `baseline_half_green_wide`：baseline 入场 + 半保护 + green 宽止损。
+- `baseline_delayed_tighten`：加仓后使用线性曲线渐进抬止损。
+- `baseline_delayed_tighten_slow_start`：加仓后使用慢启动曲线渐进抬止损。
+- `baseline_delayed_tighten_fast_start`：加仓后使用快启动曲线渐进抬止损，属于默认策略组。
+- `baseline_delayed_tighten_smooth`：加仓后使用平滑 S 曲线渐进抬止损。
 - `optimized_v2`：旧突破入场 + 首仓追价、信号 K 宽度、反向 Fibonacci 压力过滤。
+
+`mu_strategy.strategies.registry` 是策略名称、规则身份、构造方式、可选择状态、默认集合和兼容别名的唯一权威源。`second_pullback_limit_8` 继续作为 `baseline` 的兼容别名；新代码应直接使用 `baseline`。
 
 策略组可视化报告会按入场策略、加减仓策略、出场策略、过滤策略拆分展示，方便持续组合和消融回测。
 

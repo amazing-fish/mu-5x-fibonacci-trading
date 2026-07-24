@@ -73,7 +73,7 @@ Ordinary walk-forward and monthly Fibonacci partitions are reporting boundaries,
 
 Package: `mu_strategy.strategies`
 
-- `registry.py`: named strategy groups.
+- `registry.py`: authoritative strategy-group names, rule identities, construction, selection/default status, and compatibility aliases.
 - `components.py`: entry, position, exit, and filter labels.
 - `presets/mu.py`: MU strategy preset names.
 - `presets/fibonacci.py`: preferred Fibonacci lookback records by symbol.
