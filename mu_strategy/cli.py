@@ -8,7 +8,8 @@ from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.reporting import candle_sample_summary, render_markdown_report
-from mu_strategy.strategy import FEE_PROFILE_CHOICES, selected_strategy_groups, with_fee_profile
+from mu_strategy.strategies.registry import selected_strategy_groups
+from mu_strategy.strategy import FEE_PROFILE_CHOICES, with_fee_profile
 
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
