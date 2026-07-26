@@ -36,6 +36,7 @@ from mu_strategy.research.strategy_releases import (
     ExperimentWindowRole,
     FillModel,
     PartialFillModel,
+    ReleaseApprovalMode,
     ReleaseDecision,
     ScmReviewSnapshotV1,
     SelectionReasonCode,
@@ -155,6 +156,63 @@ class StrategyReleaseContractTests(unittest.TestCase):
         self.assertRegex(candidate.candidate_fingerprint, r"^[0-9a-f]{64}$")
         self.assertRegex(release.strategy_release_id, r"^sr1_[0-9a-f]{64}$")
         self.assertEqual(approval.review_snapshot.snapshot_sha256, approval.approval_snapshot_sha256)
+
+    def test_approval_mode_is_closed_required_and_strictly_parsed(self):
+        self.assertEqual(
+            (
+                ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+                ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+            ),
+            tuple(ReleaseApprovalMode),
+        )
+        candidate = _candidate()
+        valid_kwargs = _snapshot_kwargs(candidate)
+
+        missing_kwargs = dict(valid_kwargs)
+        missing_kwargs.pop("approval_mode")
+        with self.assertRaisesRegex(ValueError, "approval_mode"):
+            ScmReviewSnapshotV1.create(**missing_kwargs)
+
+        with self.assertRaisesRegex(ValueError, "approval_mode"):
+            ScmReviewSnapshotV1.create(
+                **{**valid_kwargs, "approval_mode": "future_approval_mode"}
+            )
+
+        valid_wire = _approval(candidate).review_snapshot.to_dict()
+        missing_wire = dict(valid_wire)
+        missing_wire.pop("approval_mode")
+        with self.assertRaisesRegex(StrategyReleaseSchemaError, "missing"):
+            ScmReviewSnapshotV1.from_dict(missing_wire)
+
+        with self.assertRaisesRegex(StrategyReleaseSchemaError, "approval"):
+            ScmReviewSnapshotV1.from_dict(
+                {**valid_wire, "approval_mode": "future_approval_mode"}
+            )
+
+    def test_approval_mode_changes_snapshot_and_release_identity(self):
+        candidate = _candidate()
+        independent = _approval(
+            candidate,
+            approval_mode=ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+        )
+        solo = _approval(
+            candidate,
+            approval_mode=ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+        )
+        independent_release = StrategyReleaseV1.create(
+            candidate=candidate,
+            approval=independent,
+        )
+        solo_release = StrategyReleaseV1.create(candidate=candidate, approval=solo)
+
+        self.assertNotEqual(
+            independent.review_snapshot.snapshot_sha256,
+            solo.review_snapshot.snapshot_sha256,
+        )
+        self.assertNotEqual(
+            independent_release.strategy_release_id,
+            solo_release.strategy_release_id,
+        )
 
     def test_candidate_identity_changes_for_each_control_dimension(self):
         base = _candidate()
@@ -445,6 +503,10 @@ class PromotionVerificationTests(unittest.TestCase):
         )
 
         self.assertEqual(ReleaseDecision.APPROVED, approval.decision)
+        self.assertEqual(
+            ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+            approval.review_snapshot.approval_mode,
+        )
         self.assertEqual(candidate.candidate_fingerprint, approval.candidate_fingerprint)
         self.assertEqual(live.reviewer_id, approval.review_snapshot.reviewer_id)
         self.assertEqual(
@@ -546,6 +608,124 @@ class PromotionVerificationTests(unittest.TestCase):
                         review_record_id=valid.review_record_id,
                         provider=provider,
                     )
+
+    def test_non_independence_review_gates_apply_under_both_modes(self):
+        candidate = _candidate()
+        valid = _live_review(candidate)
+        pull_request = _live_pull_request(candidate)
+        invalid_evidence = tuple(
+            (pull_request, record)
+            for record in (
+                None,
+                replace(valid, scm_provider="gitlab"),
+                replace(valid, includes_created_edit=True),
+                replace(valid, last_edited_at_ms=1_700_100_000_001),
+                replace(
+                    valid,
+                    statement=approval_statement(
+                        _candidate(evaluated_code_commit_sha="b" * 40)
+                    ),
+                ),
+                replace(valid, decision=ReleaseDecision.REJECTED),
+                replace(valid, repository="other/repository"),
+                replace(valid, review_url="https://attacker.invalid/review/1"),
+            )
+        ) + (
+            (replace(pull_request, author_id=""), valid),
+            (
+                replace(
+                    pull_request,
+                    commits=(
+                        LiveScmCommit(
+                            candidate.evaluated_code_commit_sha,
+                            None,
+                            "release-committer",
+                        ),
+                    ),
+                ),
+                valid,
+            ),
+            (
+                replace(
+                    pull_request,
+                    commits=(
+                        LiveScmCommit(
+                            candidate.evaluated_code_commit_sha,
+                            "release-author",
+                            None,
+                        ),
+                    ),
+                ),
+                valid,
+            ),
+        )
+
+        for approval_mode in ReleaseApprovalMode:
+            for invalid_pull_request, invalid_review in invalid_evidence:
+                with self.subTest(
+                    approval_mode=approval_mode,
+                    pull_request=invalid_pull_request,
+                    review=invalid_review,
+                ):
+                    provider = Mock()
+                    provider.fetch_pull_request.return_value = invalid_pull_request
+                    provider.fetch_review.return_value = invalid_review
+                    with self.assertRaises(ScmReviewVerificationError):
+                        capture_verified_approval(
+                            candidate,
+                            repository=valid.repository,
+                            pull_request_number=valid.pull_request_number,
+                            review_record_id=valid.review_record_id,
+                            provider=provider,
+                            approval_mode=approval_mode,
+                        )
+
+    def test_solo_maintainer_review_promotes_and_resolves(self):
+        candidate = _candidate()
+        maintainer_id = "sole-maintainer"
+        live = replace(_live_review(candidate), reviewer_id=maintainer_id)
+        pull_request = replace(
+            _live_pull_request(candidate),
+            author_id=maintainer_id,
+            commits=(
+                LiveScmCommit(
+                    candidate.evaluated_code_commit_sha,
+                    maintainer_id,
+                    maintainer_id,
+                ),
+            ),
+        )
+        provider = Mock()
+        provider.fetch_pull_request.return_value = pull_request
+        provider.fetch_review.return_value = live
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_path = root / "candidate.json"
+            release_dir = root / "releases"
+            candidate_path.write_text(canonical_json(candidate.to_dict()), encoding="utf-8")
+
+            release, output_path = promote_strategy_release(
+                candidate_path,
+                release_dir=release_dir,
+                repository=live.repository,
+                pull_request_number=live.pull_request_number,
+                review_record_id=live.review_record_id,
+                provider=provider,
+                approval_mode=ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+            )
+            restored = StrictStrategyReleaseResolver(release_dir).resolve(
+                release.strategy_release_id,
+                expected_rule_id=candidate.strategy_rule_id,
+                expected_symbol=candidate.dataset.symbol,
+            )
+
+        self.assertEqual(release, restored)
+        self.assertEqual(
+            ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+            release.approval.review_snapshot.approval_mode,
+        )
+        self.assertEqual(output_path.name, f"{release.strategy_release_id}.json")
 
     def test_promotion_writes_only_the_canonical_content_addressed_release(self):
         candidate = _candidate()
@@ -691,6 +871,37 @@ class PromotionVerificationTests(unittest.TestCase):
             durability_anchor,
             promote.call_args.kwargs["publication_durability_anchor"],
         )
+        self.assertEqual(
+            ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+            promote.call_args.kwargs["approval_mode"],
+        )
+
+    def test_cli_accepts_explicit_solo_maintainer_mode(self):
+        release = Mock(strategy_release_id="sr1_" + "1" * 64)
+        with patch(
+            "mu_strategy.commands.promote_strategy_release.promote_strategy_release",
+            return_value=(release, Path("release.json")),
+        ) as promote, redirect_stdout(io.StringIO()):
+            exit_code = promotion_main(
+                [
+                    "--candidate",
+                    "candidate.json",
+                    "--repository",
+                    "amazing-fish/mu-5x-fibonacci-trading",
+                    "--pull-request-number",
+                    "46",
+                    "--review-record-id",
+                    "1",
+                    "--approval-mode",
+                    ReleaseApprovalMode.SOLO_MAINTAINER_V1.value,
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(
+            ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+            promote.call_args.kwargs["approval_mode"],
+        )
 
 
 class StrictStrategyReleaseResolverTests(unittest.TestCase):
@@ -718,8 +929,109 @@ class StrictStrategyReleaseResolverTests(unittest.TestCase):
         self.assertEqual(inspect.Parameter.KEYWORD_ONLY, parameters["expected_rule_id"].kind)
         self.assertEqual(inspect.Parameter.empty, parameters["expected_rule_id"].default)
         self.assertEqual(inspect.Parameter.empty, parameters["expected_symbol"].default)
+        self.assertIsNone(parameters["required_approval_mode"].default)
         self.assertNotIn("latest", dir(resolver))
         self.assertNotIn("by_name", dir(resolver))
+
+    def test_resolver_can_require_an_exact_approval_mode(self):
+        candidate = _candidate()
+        release = StrategyReleaseV1.create(
+            candidate=candidate,
+            approval=_approval(
+                candidate,
+                approval_mode=ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+                reviewer_id="sole-maintainer",
+                author_id="sole-maintainer",
+            ),
+        )
+
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            (release_dir / f"{release.strategy_release_id}.json").write_text(
+                canonical_json(release.to_dict()),
+                encoding="utf-8",
+            )
+            resolver = StrictStrategyReleaseResolver(release_dir)
+
+            self.assertEqual(
+                release,
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                    required_approval_mode=ReleaseApprovalMode.SOLO_MAINTAINER_V1,
+                ),
+            )
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "approval mode"):
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                    required_approval_mode=ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+                )
+            with self.assertRaisesRegex(StrategyReleaseResolutionError, "approval mode"):
+                resolver.resolve(
+                    release.strategy_release_id,
+                    expected_rule_id=candidate.strategy_rule_id,
+                    expected_symbol=candidate.dataset.symbol,
+                    required_approval_mode="independent_review_v1",
+                )
+
+    def test_approval_mode_tampering_fails_snapshot_and_release_digests(self):
+        candidate = _candidate()
+
+        with TemporaryDirectory() as tmp:
+            release_dir = Path(tmp)
+            resolver = StrictStrategyReleaseResolver(release_dir)
+            for source_mode in ReleaseApprovalMode:
+                target_mode = (
+                    ReleaseApprovalMode.SOLO_MAINTAINER_V1
+                    if source_mode is ReleaseApprovalMode.INDEPENDENT_REVIEW_V1
+                    else ReleaseApprovalMode.INDEPENDENT_REVIEW_V1
+                )
+                release = StrategyReleaseV1.create(
+                    candidate=candidate,
+                    approval=_approval(candidate, approval_mode=source_mode),
+                )
+                path = release_dir / f"{release.strategy_release_id}.json"
+                tampered = release.to_dict()
+                snapshot = tampered["approval"]["review_snapshot"]
+                snapshot["approval_mode"] = target_mode.value
+                path.write_text(canonical_json(tampered), encoding="utf-8")
+
+                with self.subTest(source_mode=source_mode, verification="snapshot"):
+                    with self.assertRaisesRegex(
+                        StrategyReleaseResolutionError,
+                        "snapshot hash",
+                    ):
+                        resolver.resolve(
+                            release.strategy_release_id,
+                            expected_rule_id=candidate.strategy_rule_id,
+                            expected_symbol=candidate.dataset.symbol,
+                        )
+
+                snapshot["snapshot_sha256"] = canonical_sha256(
+                    {
+                        key: value
+                        for key, value in snapshot.items()
+                        if key != "snapshot_sha256"
+                    }
+                )
+                tampered["approval"]["approval_snapshot_sha256"] = snapshot[
+                    "snapshot_sha256"
+                ]
+                path.write_text(canonical_json(tampered), encoding="utf-8")
+
+                with self.subTest(source_mode=source_mode, verification="release"):
+                    with self.assertRaisesRegex(
+                        StrategyReleaseResolutionError,
+                        "strategy_release_id",
+                    ):
+                        resolver.resolve(
+                            release.strategy_release_id,
+                            expected_rule_id=candidate.strategy_rule_id,
+                            expected_symbol=candidate.dataset.symbol,
+                        )
 
     def test_pending_publication_marker_makes_visible_release_unresolvable(self):
         candidate = _candidate()
@@ -965,22 +1277,45 @@ def _approval(
     candidate: StrategyReleaseCandidateV1,
     *,
     decision: ReleaseDecision = ReleaseDecision.APPROVED,
+    approval_mode: ReleaseApprovalMode = ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+    reviewer_id: str = "independent-reviewer",
+    author_id: str = "release-author",
 ) -> StrategyReleaseApprovalV1:
     snapshot = ScmReviewSnapshotV1.create(
-        scm_provider="github",
-        repository="amazing-fish/mu-5x-fibonacci-trading",
-        pull_request_number=45,
-        review_record_id="1",
-        reviewer_id="independent-reviewer",
-        author_id="release-author",
-        reviewed_at_ms=1_700_100_000_000,
-        decision=decision,
-        candidate_fingerprint=candidate.candidate_fingerprint,
-        evaluated_code_commit_sha=candidate.evaluated_code_commit_sha,
-        statement=approval_statement(candidate),
-        review_url="https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
+        **_snapshot_kwargs(
+            candidate,
+            decision=decision,
+            approval_mode=approval_mode,
+            reviewer_id=reviewer_id,
+            author_id=author_id,
+        )
     )
     return StrategyReleaseApprovalV1.create(review_snapshot=snapshot)
+
+
+def _snapshot_kwargs(
+    candidate: StrategyReleaseCandidateV1,
+    *,
+    decision: ReleaseDecision = ReleaseDecision.APPROVED,
+    approval_mode: ReleaseApprovalMode = ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
+    reviewer_id: str = "independent-reviewer",
+    author_id: str = "release-author",
+) -> dict:
+    return {
+        "scm_provider": "github",
+        "repository": "amazing-fish/mu-5x-fibonacci-trading",
+        "pull_request_number": 45,
+        "review_record_id": "1",
+        "approval_mode": approval_mode,
+        "reviewer_id": reviewer_id,
+        "author_id": author_id,
+        "reviewed_at_ms": 1_700_100_000_000,
+        "decision": decision,
+        "candidate_fingerprint": candidate.candidate_fingerprint,
+        "evaluated_code_commit_sha": candidate.evaluated_code_commit_sha,
+        "statement": approval_statement(candidate),
+        "review_url": "https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/45#pullrequestreview-1",
+    }
 
 
 def _readdress_release_with_snapshot_updates(

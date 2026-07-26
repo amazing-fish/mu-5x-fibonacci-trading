@@ -293,6 +293,12 @@ class ReleaseDecision(str, Enum):
 
 
 @unique
+class ReleaseApprovalMode(str, Enum):
+    INDEPENDENT_REVIEW_V1 = "independent_review_v1"
+    SOLO_MAINTAINER_V1 = "solo_maintainer_v1"
+
+
+@unique
 class SelectionReasonCode(str, Enum):
     BASELINE_CONTINUITY = "baseline_continuity"
     REVALIDATED_BASELINE = "revalidated_baseline"
@@ -784,6 +790,7 @@ class ScmReviewSnapshotV1:
     repository: str
     pull_request_number: int
     review_record_id: str
+    approval_mode: ReleaseApprovalMode
     reviewer_id: str
     author_id: str
     reviewed_at_ms: int
@@ -798,6 +805,8 @@ class ScmReviewSnapshotV1:
     def __post_init__(self) -> None:
         if self.schema_version != STRATEGY_RELEASE_SCHEMA_VERSION:
             raise ValueError("unsupported SCM review snapshot schema_version")
+        if not isinstance(self.approval_mode, ReleaseApprovalMode):
+            raise ValueError("SCM review approval_mode is not supported")
         for field_name in ("scm_provider", "repository", "review_record_id", "reviewer_id", "author_id", "statement"):
             if not getattr(self, field_name):
                 raise ValueError(f"SCM review {field_name} is required")
@@ -815,7 +824,10 @@ class ScmReviewSnapshotV1:
             raise ValueError("review candidate fingerprint must be SHA-256")
         if not _GIT_SHA_PATTERN.fullmatch(self.evaluated_code_commit_sha):
             raise ValueError("review implementation commit must be full SHA-1")
-        if self.reviewer_id.casefold() == self.author_id.casefold():
+        if (
+            self.approval_mode is ReleaseApprovalMode.INDEPENDENT_REVIEW_V1
+            and self.reviewer_id.casefold() == self.author_id.casefold()
+        ):
             raise ValueError("SCM reviewer must be independent from captured author")
         expected_statement = strategy_release_approval_statement(
             self.candidate_fingerprint,
@@ -834,6 +846,8 @@ class ScmReviewSnapshotV1:
 
     @classmethod
     def create(cls, **kwargs: Any) -> "ScmReviewSnapshotV1":
+        if not isinstance(kwargs.get("approval_mode"), ReleaseApprovalMode):
+            raise ValueError("SCM review approval_mode is required and must be supported")
         payload = _scm_snapshot_payload(schema_version=STRATEGY_RELEASE_SCHEMA_VERSION, **kwargs)
         return cls(snapshot_sha256=canonical_sha256(payload), **kwargs)
 
@@ -844,6 +858,7 @@ class ScmReviewSnapshotV1:
             repository=self.repository,
             pull_request_number=self.pull_request_number,
             review_record_id=self.review_record_id,
+            approval_mode=self.approval_mode,
             reviewer_id=self.reviewer_id,
             author_id=self.author_id,
             reviewed_at_ms=self.reviewed_at_ms,
@@ -865,6 +880,7 @@ class ScmReviewSnapshotV1:
             "repository",
             "pull_request_number",
             "review_record_id",
+            "approval_mode",
             "reviewer_id",
             "author_id",
             "reviewed_at_ms",
@@ -883,6 +899,7 @@ class ScmReviewSnapshotV1:
                 repository=_required_text(payload, "repository"),
                 pull_request_number=_required_int(payload, "pull_request_number"),
                 review_record_id=_required_text(payload, "review_record_id"),
+                approval_mode=ReleaseApprovalMode(payload["approval_mode"]),
                 reviewer_id=_required_text(payload, "reviewer_id"),
                 author_id=_required_text(payload, "author_id"),
                 reviewed_at_ms=_required_int(payload, "reviewed_at_ms"),
@@ -1035,6 +1052,7 @@ class StrictStrategyReleaseResolver:
         *,
         expected_rule_id: str,
         expected_symbol: str,
+        required_approval_mode: ReleaseApprovalMode | None = None,
     ) -> StrategyReleaseV1:
         if not isinstance(strategy_release_id, str) or not _RELEASE_ID_PATTERN.fullmatch(strategy_release_id):
             raise StrategyReleaseResolutionError("strategy_release_id has invalid format")
@@ -1042,6 +1060,8 @@ class StrictStrategyReleaseResolver:
             raise StrategyReleaseResolutionError("expected rule ID is required")
         if not expected_symbol:
             raise StrategyReleaseResolutionError("expected symbol is required")
+        if required_approval_mode is not None and not isinstance(required_approval_mode, ReleaseApprovalMode):
+            raise StrategyReleaseResolutionError("required approval mode is not supported")
 
         path = self._release_dir / f"{strategy_release_id}.json"
         try:
@@ -1060,6 +1080,11 @@ class StrictStrategyReleaseResolver:
 
         if release.strategy_release_id != strategy_release_id:
             raise StrategyReleaseResolutionError("strategy release path does not match content identity")
+        if (
+            required_approval_mode is not None
+            and release.approval.review_snapshot.approval_mode is not required_approval_mode
+        ):
+            raise StrategyReleaseResolutionError("strategy release approval mode does not match required mode")
         if release.candidate.strategy_rule_id != expected_rule_id:
             raise StrategyReleaseResolutionError("strategy release rule does not match expected rule")
         if (
@@ -1111,6 +1136,7 @@ def _scm_snapshot_payload(*, schema_version: int, decision: ReleaseDecision, **k
         "repository": kwargs["repository"],
         "pull_request_number": kwargs["pull_request_number"],
         "review_record_id": kwargs["review_record_id"],
+        "approval_mode": kwargs["approval_mode"].value,
         "reviewer_id": kwargs["reviewer_id"],
         "author_id": kwargs["author_id"],
         "reviewed_at_ms": kwargs["reviewed_at_ms"],
