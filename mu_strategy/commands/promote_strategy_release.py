@@ -135,9 +135,10 @@ def capture_verified_approval(
         raise ScmReviewVerificationError("SCM review coordinates do not match the requested record")
     if not pull_request.author_id:
         raise ScmReviewVerificationError("SCM pull request author identity is incomplete")
+    if live.reviewer_id.casefold() == pull_request.author_id.casefold():
+        raise ScmReviewVerificationError("SCM pull request author cannot approve their own pull request")
     if approval_mode is ReleaseApprovalMode.INDEPENDENT_REVIEW_V1:
         authors = {
-            pull_request.author_id.casefold(),
             evaluated_commit.author_id.casefold(),
             evaluated_commit.committer_id.casefold(),
         }

@@ -618,6 +618,7 @@ class PromotionVerificationTests(unittest.TestCase):
             for record in (
                 None,
                 replace(valid, scm_provider="gitlab"),
+                replace(valid, reviewer_id=pull_request.author_id),
                 replace(valid, includes_created_edit=True),
                 replace(valid, last_edited_at_ms=1_700_100_000_001),
                 replace(
@@ -686,7 +687,7 @@ class PromotionVerificationTests(unittest.TestCase):
         live = replace(_live_review(candidate), reviewer_id=maintainer_id)
         pull_request = replace(
             _live_pull_request(candidate),
-            author_id=maintainer_id,
+            author_id="automation-pr-author",
             commits=(
                 LiveScmCommit(
                     candidate.evaluated_code_commit_sha,

@@ -53,9 +53,9 @@ python -m mu_strategy.commands.build_strategy_release_candidate `
 Promotion queries the trusted live PR, evaluated commit identity, and review record. The PR must contain the evaluated commit, and missing PR or commit identity fails closed. The required `approval_mode` is recorded inside the immutable review snapshot:
 
 - `independent_review_v1` requires the reviewer to differ from the PR author and the evaluated commit's mapped GitHub author and committer. This is the CLI default.
-- `solo_maintainer_v1` permits those identities to match. It must be selected explicitly with `--approval-mode solo_maintainer_v1` and carries no independent-review guarantee.
+- `solo_maintainer_v1` permits the reviewer to match the evaluated commit's mapped author and committer. It must be selected explicitly with `--approval-mode solo_maintainer_v1` and carries no independent-review guarantee. GitHub does not permit a PR author to approve their own PR, so the attainable single-maintainer workflow requires a separately authenticated automation or bot actor to open the PR while the maintainer submits the canonical `APPROVED` review.
 
-Solo mode relaxes only the identity-separation check. Under both modes, the live decision must be `APPROVED`, and the review body must equal these canonical bytes with the exact candidate and evaluated SHA:
+Solo mode relaxes only reviewer separation from the evaluated commit author/committer. Under both modes, the reviewer must differ from the PR author, the live decision must be `APPROVED`, and the review body must equal these canonical bytes with the exact candidate and evaluated SHA:
 
 ```text
 APPROVED_STRATEGY_RELEASE_V1
