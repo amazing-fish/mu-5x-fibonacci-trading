@@ -304,7 +304,10 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             self.assertEqual(["MU-USDT-SWAP"], [item["inst_id"] for item in manifest["universes"]["stock_token_top"]])
             from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
-            self.assertTrue(TrustedDataStore(data_dir=data_dir).generation_cache_path(manifest["run_id"], "BTC-USDT-SWAP", "5m").exists())
+            source_file = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["storage"]["segments"][0][
+                "source_file"
+            ]
+            self.assertTrue((data_dir / source_file).exists())
             self.assertTrue(manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["is_valid"])
 
             html = render_data_health_dashboard(json.loads(manifest_path.read_text(encoding="utf-8")))
@@ -670,8 +673,10 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             )
             current = json.loads((data_dir / "current.json").read_text(encoding="utf-8"))
             manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
-            healthy_exists = _generation_cache_path(data_dir, run.run_id, "ETH-USDT-SWAP", "5m").exists()
-            failed_exists = _generation_cache_path(data_dir, run.run_id, "BTC-USDT-SWAP", "5m").exists()
+            healthy_segments = manifest["symbols"]["ETH-USDT-SWAP"]["intervals"]["5m"]["storage"]["segments"]
+            failed_segments = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["5m"]["storage"]["segments"]
+            healthy_exists = bool(healthy_segments) and (data_dir / healthy_segments[0]["source_file"]).exists()
+            failed_exists = bool(failed_segments)
 
         self.assertGreaterEqual(provider.max_active, 2)
         self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
@@ -850,7 +855,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                     "integrity": "valid",
                     "freshness": "fresh",
                     "reasons": ["ok"],
-                    "rows": 999,
+                    "rows": len(candles),
                     "first_timestamp_ms": candles[0].open_time_ms,
                     "last_timestamp_ms": candles[-1].open_time_ms,
                     "updated_at_ms": 3 * DAY_MS,

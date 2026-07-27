@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -30,6 +32,11 @@ class RefreshAttemptStatus(Enum):
     SUCCESS = "success"
     DEGRADED = "degraded"
     FAILED = "failed"
+
+
+class TrustedStorageLayout(Enum):
+    FLAT_CSV_V1 = "flat_csv_v1"
+    SEGMENTED_CSV_V1 = "segmented_csv_v1"
 
 
 class SnapshotUsability(Enum):
@@ -96,6 +103,44 @@ class DatasetKey:
 
     def tuple(self) -> tuple[str, str]:
         return (self.symbol, self.interval)
+
+
+@dataclass(frozen=True)
+class SegmentReference:
+    segment_id: str
+    source_file: Path
+    start_row: int
+    rows: int
+    first_timestamp_ms: int
+    last_timestamp_ms: int
+    content_sha256: str
+    closed: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "segment_id": self.segment_id,
+            "source_file": self.source_file.as_posix(),
+            "start_row": self.start_row,
+            "rows": self.rows,
+            "first_timestamp_ms": self.first_timestamp_ms,
+            "last_timestamp_ms": self.last_timestamp_ms,
+            "content_sha256": self.content_sha256,
+            "closed": self.closed,
+        }
+
+
+@dataclass(frozen=True)
+class DatasetStorage:
+    layout: TrustedStorageLayout
+    source_root: Path
+    segments: tuple[SegmentReference, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "layout": self.layout.value,
+            "source_root": self.source_root.as_posix(),
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
 
 
 @dataclass(frozen=True)
@@ -285,9 +330,11 @@ class TrustedManifestSnapshot:
     effective_intervals: tuple[str, ...]
     universe_snapshot: UniverseSnapshot
     datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
+    storage_by_dataset: dict[tuple[str, str], DatasetStorage] = field(default_factory=dict)
     provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
+    imported_from_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -384,16 +431,24 @@ class RefreshRun:
     effective_intervals: tuple[str, ...]
     universe_snapshot: UniverseSnapshot
     datasets: dict[tuple[str, str], DatasetHealth] = field(default_factory=dict)
+    storage_by_dataset: dict[tuple[str, str], DatasetStorage] = field(default_factory=dict)
     provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
     refresh_segments: tuple[RefreshSegmentDiagnostics, ...] = ()
+    imported_from_run_id: str | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
         for (symbol, interval), health in self.datasets.items():
             symbol_payload = symbols.setdefault(symbol, {"intervals": {}})
-            symbol_payload["intervals"][interval] = health.to_dict()
+            storage = self.storage_by_dataset.get((symbol, interval))
+            if storage is None:
+                raise ManifestSchemaError(f"schema-v4 manifest dataset has no storage contract: {symbol}/{interval}")
+            health_payload = health.to_dict()
+            health_payload.pop("source_file", None)
+            health_payload["storage"] = storage.to_dict()
+            symbol_payload["intervals"][interval] = health_payload
         for item in [*self.universe_snapshot.crypto_top, *self.universe_snapshot.stock_token_top]:
             inst_id = item.get("inst_id")
             if not inst_id:
@@ -403,7 +458,8 @@ class RefreshRun:
             symbols[str(inst_id)]["last"] = item.get("last")
             symbols[str(inst_id)]["volume_ccy_24h"] = item.get("volume_ccy_24h")
         payload = {
-            "schema_version": 3,
+            "schema_version": 4,
+            "storage_layout": TrustedStorageLayout.SEGMENTED_CSV_V1.value,
             "run_id": self.run_id,
             "attempt_status": self.attempt_status.value,
             "snapshot_usability": self.snapshot_usability.value,
@@ -419,6 +475,8 @@ class RefreshRun:
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
+        if self.imported_from_run_id is not None:
+            payload["imported_from_run_id"] = self.imported_from_run_id
         diagnostics = refresh_run_diagnostics_payload(self)
         if diagnostics:
             payload["diagnostics"] = diagnostics
@@ -536,10 +594,11 @@ class TrustedBundle:
 def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManifestSnapshot:
     schema_version = payload.get("schema_version")
     if not _is_int(schema_version):
-        raise ManifestSchemaError("manifest schema_version must be integer v3")
-    if int(schema_version) != 3:
+        raise ManifestSchemaError("manifest schema_version must be integer v3 or v4")
+    if int(schema_version) not in (3, 4):
         raise ManifestSchemaError(f"unsupported manifest schema_version: {schema_version}")
 
+    schema_version = int(schema_version)
     run_id = _required_str(payload, "run_id")
     attempt_status = _required_enum(payload, "attempt_status", RefreshAttemptStatus)
     snapshot_usability = _required_enum(payload, "snapshot_usability", SnapshotUsability)
@@ -547,8 +606,27 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
     effective_intervals = _required_str_tuple(payload, "effective_intervals")
     symbols = _required_dict(payload, "symbols")
     universes = _required_dict(payload, "universes")
+    if schema_version == 3:
+        if "storage_layout" in payload:
+            raise ManifestSchemaError("schema-v3 manifest cannot declare storage_layout")
+        datasets = _datasets_from_symbols(symbols)
+        storage_by_dataset = {
+            key: DatasetStorage(
+                layout=TrustedStorageLayout.FLAT_CSV_V1,
+                source_root=health.source_file,
+            )
+            for key, health in datasets.items()
+        }
+        imported_from_run_id = None
+    else:
+        layout = _required_str(payload, "storage_layout")
+        if layout != TrustedStorageLayout.SEGMENTED_CSV_V1.value:
+            raise ManifestSchemaError(f"unsupported manifest storage_layout: {layout}")
+        datasets, storage_by_dataset = _segmented_datasets_from_symbols(symbols)
+        imported_from_run_id = _optional_non_empty_str(payload, "imported_from_run_id")
+
     snapshot = TrustedManifestSnapshot(
-        schema_version=3,
+        schema_version=schema_version,
         run_id=run_id,
         attempt_status=attempt_status,
         snapshot_usability=snapshot_usability,
@@ -557,10 +635,12 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
         requested_intervals=requested_intervals,
         effective_intervals=effective_intervals,
         universe_snapshot=_universe_snapshot_from_dict(universes),
-        datasets=_datasets_from_symbols(symbols),
+        datasets=datasets,
+        storage_by_dataset=storage_by_dataset,
         provider_failures=_provider_failures(payload.get("provider_failures") or ()),
         warnings=_optional_str_tuple(payload, "warnings"),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
+        imported_from_run_id=imported_from_run_id,
     )
     _validate_manifest_snapshot(snapshot)
     return snapshot
@@ -623,6 +703,140 @@ def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> d
     return datasets
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_UTC_MONTH_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+_SEGMENT_REFERENCE_FIELDS = frozenset(
+    {
+        "segment_id",
+        "source_file",
+        "start_row",
+        "rows",
+        "first_timestamp_ms",
+        "last_timestamp_ms",
+        "content_sha256",
+        "closed",
+    }
+)
+_DATASET_STORAGE_FIELDS = frozenset({"layout", "source_root", "segments"})
+
+
+def utc_month_segment_id(open_time_ms: int) -> str:
+    if not _is_int(open_time_ms):
+        raise ValueError("open_time_ms must be an integer")
+    try:
+        instant = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError) as exc:
+        raise ValueError("open_time_ms is outside the supported UTC datetime range") from exc
+    return f"{instant.year:04d}-{instant.month:02d}"
+
+
+def _segmented_datasets_from_symbols(
+    symbols: dict[str, Any],
+) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], DatasetStorage]]:
+    datasets: dict[tuple[str, str], DatasetHealth] = {}
+    storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
+    for symbol, symbol_payload in symbols.items():
+        if not isinstance(symbol_payload, dict):
+            raise ManifestSchemaError("manifest symbols entries must be objects")
+        intervals = symbol_payload.get("intervals") or {}
+        if not isinstance(intervals, dict):
+            raise ManifestSchemaError("manifest interval entries must be objects")
+        for interval, payload in intervals.items():
+            if not isinstance(payload, dict):
+                raise ManifestSchemaError("manifest dataset health entries must be objects")
+            if "source_file" in payload:
+                raise ManifestSchemaError("schema-v4 dataset must use storage instead of source_file")
+            storage = _dataset_storage_from_dict(str(symbol), str(interval), payload.get("storage"))
+            health_payload = dict(payload)
+            health_payload.pop("storage", None)
+            health_payload["source_file"] = storage.source_root.as_posix()
+            health = DatasetHealth.from_dict(str(symbol), str(interval), health_payload, strict=True)
+            key = health.key.tuple()
+            datasets[key] = health
+            storage_by_dataset[key] = storage
+    return datasets, storage_by_dataset
+
+
+def _dataset_storage_from_dict(symbol: str, interval: str, payload: Any) -> DatasetStorage:
+    if not isinstance(payload, dict):
+        raise ManifestSchemaError("schema-v4 dataset storage must be object")
+    if set(payload) != _DATASET_STORAGE_FIELDS:
+        raise ManifestSchemaError("schema-v4 dataset storage fields are invalid")
+    layout = payload.get("layout")
+    if layout != TrustedStorageLayout.SEGMENTED_CSV_V1.value:
+        raise ManifestSchemaError(f"unsupported dataset storage layout: {layout}")
+    source_root_value = payload.get("source_root")
+    if not isinstance(source_root_value, str) or not source_root_value:
+        raise ManifestSchemaError("schema-v4 dataset source_root must be non-empty string")
+    expected_root = Path("segments") / "okx" / symbol / interval
+    source_root = Path(source_root_value)
+    if source_root.as_posix() != expected_root.as_posix():
+        raise ManifestSchemaError("schema-v4 dataset source_root must equal segments/okx/<symbol>/<interval>")
+    segment_payloads = payload.get("segments")
+    if not isinstance(segment_payloads, list):
+        raise ManifestSchemaError("schema-v4 dataset segments must be array")
+    segments = tuple(
+        _segment_reference_from_dict(symbol, interval, item)
+        for item in segment_payloads
+    )
+    return DatasetStorage(
+        layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+        source_root=source_root,
+        segments=segments,
+    )
+
+
+def _segment_reference_from_dict(symbol: str, interval: str, payload: Any) -> SegmentReference:
+    if not isinstance(payload, dict):
+        raise ManifestSchemaError("schema-v4 segment reference must be object")
+    if set(payload) != _SEGMENT_REFERENCE_FIELDS:
+        raise ManifestSchemaError("schema-v4 segment reference fields are invalid")
+    segment_id = payload.get("segment_id")
+    if not isinstance(segment_id, str) or not _UTC_MONTH_RE.fullmatch(segment_id):
+        raise ManifestSchemaError("schema-v4 segment_id must be UTC YYYY-MM")
+    expected_source = Path("segments") / "okx" / symbol / interval / f"{segment_id}.csv"
+    source_file_value = payload.get("source_file")
+    if not isinstance(source_file_value, str) or Path(source_file_value).as_posix() != expected_source.as_posix():
+        raise ManifestSchemaError(
+            "schema-v4 segment source_file must equal segments/okx/<symbol>/<interval>/<YYYY-MM>.csv"
+        )
+    rows = payload.get("rows")
+    start_row = payload.get("start_row")
+    first_timestamp_ms = payload.get("first_timestamp_ms")
+    last_timestamp_ms = payload.get("last_timestamp_ms")
+    content_sha256 = payload.get("content_sha256")
+    closed = payload.get("closed")
+    if not _is_int(start_row) or int(start_row) < 0:
+        raise ManifestSchemaError("schema-v4 segment start_row must be non-negative integer")
+    if not _is_int(rows) or int(rows) <= 0:
+        raise ManifestSchemaError("schema-v4 segment rows must be positive integer")
+    if not _is_int(first_timestamp_ms) or not _is_int(last_timestamp_ms):
+        raise ManifestSchemaError("schema-v4 segment timestamp bounds must be integers")
+    if int(first_timestamp_ms) > int(last_timestamp_ms):
+        raise ManifestSchemaError("schema-v4 segment timestamp range is inverted")
+    try:
+        first_segment_id = utc_month_segment_id(int(first_timestamp_ms))
+        last_segment_id = utc_month_segment_id(int(last_timestamp_ms))
+    except ValueError as exc:
+        raise ManifestSchemaError(str(exc)) from exc
+    if first_segment_id != segment_id or last_segment_id != segment_id:
+        raise ManifestSchemaError("schema-v4 segment timestamp bounds must belong to segment_id")
+    if not isinstance(content_sha256, str) or not _SHA256_RE.fullmatch(content_sha256):
+        raise ManifestSchemaError("schema-v4 segment content_sha256 must be lowercase SHA-256")
+    if not isinstance(closed, bool):
+        raise ManifestSchemaError("schema-v4 segment closed must be boolean")
+    return SegmentReference(
+        segment_id=segment_id,
+        source_file=expected_source,
+        start_row=int(start_row),
+        rows=int(rows),
+        first_timestamp_ms=int(first_timestamp_ms),
+        last_timestamp_ms=int(last_timestamp_ms),
+        content_sha256=content_sha256,
+        closed=closed,
+    )
+
+
 def _validate_dataset_health(health: DatasetHealth) -> None:
     if health.rows < 0:
         raise ManifestSchemaError("manifest dataset rows must be non-negative")
@@ -663,6 +877,43 @@ def _validate_manifest_snapshot(snapshot: TrustedManifestSnapshot) -> None:
             for interval in snapshot.effective_intervals:
                 if (inst_id, interval) not in snapshot.datasets:
                     raise ManifestSchemaError("usable manifest catalog is incomplete for canonical universe")
+    if set(snapshot.datasets) != set(snapshot.storage_by_dataset):
+        raise ManifestSchemaError("manifest storage contracts must match dataset keys")
+    for key, health in snapshot.datasets.items():
+        storage = snapshot.storage_by_dataset[key]
+        if snapshot.schema_version == 3:
+            if storage.layout is not TrustedStorageLayout.FLAT_CSV_V1 or storage.segments:
+                raise ManifestSchemaError("schema-v3 dataset must use flat_csv_v1 without segment references")
+            continue
+        if storage.layout is not TrustedStorageLayout.SEGMENTED_CSV_V1:
+            raise ManifestSchemaError("schema-v4 dataset must use segmented_csv_v1")
+        _validate_segmented_dataset_storage(health, storage)
+
+
+def _validate_segmented_dataset_storage(health: DatasetHealth, storage: DatasetStorage) -> None:
+    segments = storage.segments
+    if health.integrity is IntegrityState.VALID and not segments:
+        raise ManifestSchemaError("valid schema-v4 dataset must reference segments")
+    if health.availability is AvailabilityState.MISSING and segments:
+        raise ManifestSchemaError("missing schema-v4 dataset cannot reference segments")
+    if not segments:
+        return
+    segment_ids = tuple(segment.segment_id for segment in segments)
+    if segment_ids != tuple(sorted(segment_ids)) or len(segment_ids) != len(set(segment_ids)):
+        raise ManifestSchemaError("schema-v4 segment references must be unique and strictly ordered")
+    if any(not segment.closed for segment in segments[:-1]) or segments[-1].closed:
+        raise ManifestSchemaError("schema-v4 references must close every segment except the trailing segment")
+    previous_last: int | None = None
+    for segment in segments:
+        if previous_last is not None and segment.first_timestamp_ms <= previous_last:
+            raise ManifestSchemaError("schema-v4 segment timestamp ranges must be strictly ordered")
+        previous_last = segment.last_timestamp_ms
+    if sum(segment.rows for segment in segments) != health.rows:
+        raise ManifestSchemaError("schema-v4 segment rows must equal dataset rows")
+    if segments[0].first_timestamp_ms != health.first_timestamp_ms:
+        raise ManifestSchemaError("schema-v4 first segment timestamp must equal dataset first timestamp")
+    if segments[-1].last_timestamp_ms != health.last_timestamp_ms:
+        raise ManifestSchemaError("schema-v4 last segment timestamp must equal dataset last timestamp")
 
 
 def _universe_snapshot_from_dict(payload: dict[str, Any]) -> UniverseSnapshot:
@@ -722,6 +973,15 @@ def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) for item in value):
         raise ManifestSchemaError(f"manifest {key} entries must be strings")
     return tuple(value)
+
+
+def _optional_non_empty_str(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ManifestSchemaError(f"manifest {key} must be non-empty string when present")
+    return value
 
 
 def _required_enum(payload: dict[str, Any], key: str, enum_type):

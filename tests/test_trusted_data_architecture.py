@@ -689,6 +689,12 @@ class TrustedDataRefreshTests(unittest.TestCase):
             ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             history_fetcher=lambda symbol, interval, *, days: history[interval],
         )
+
+        def unchanged_incremental(symbol, interval, *, since_time_ms):
+            provider.incremental_calls.append((symbol, interval, since_time_ms))
+            return []
+
+        provider.fetch_incremental = unchanged_incremental
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)

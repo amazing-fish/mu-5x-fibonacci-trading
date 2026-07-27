@@ -99,6 +99,7 @@ def evaluate_candle_bundle(
     retain_invalid_candles_for_reasons: tuple[HealthReason, ...] = (),
     allow_timestamp_gap_built_native_inputs: bool = False,
     raise_os_errors: bool = False,
+    raise_exceptions: tuple[type[Exception], ...] = (),
 ) -> DatasetEvaluationResult:
     raw_candles_by_interval = {
         interval: seeds_by_interval[interval].candles
@@ -189,7 +190,7 @@ def evaluate_candle_bundle(
             health_by_key[key] = health
             candles_by_key[key] = normalized if health.integrity == IntegrityState.VALID else []
         except Exception as exc:
-            if raise_os_errors and isinstance(exc, OSError):
+            if (raise_os_errors and isinstance(exc, OSError)) or isinstance(exc, raise_exceptions):
                 raise
             failure_candles = candles
             reason = seed.exception_reason or HealthReason.REFRESH_FAILED

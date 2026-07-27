@@ -640,12 +640,15 @@ def _run(
         AvailabilityState,
         DatasetHealth,
         DatasetKey,
+        DatasetStorage,
         FreshnessState,
         HealthReason,
         IntegrityState,
         RefreshAttemptStatus,
         RefreshRun,
+        SegmentReference,
         SnapshotUsability,
+        TrustedStorageLayout,
         UniverseSnapshot,
         derive_snapshot_usability,
     )
@@ -670,6 +673,24 @@ def _run(
         source_file=Path("data/live/okx/BTC-USDT-SWAP/5m.csv"),
     )
     datasets = {("BTC-USDT-SWAP", "5m"): health}
+    storage_by_dataset = {
+        ("BTC-USDT-SWAP", "5m"): DatasetStorage(
+            layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+            source_root=Path("segments/okx/BTC-USDT-SWAP/5m"),
+            segments=(
+                SegmentReference(
+                    segment_id="1970-01",
+                    source_file=Path("segments/okx/BTC-USDT-SWAP/5m/1970-01.csv"),
+                    start_row=0,
+                    rows=1,
+                    first_timestamp_ms=0,
+                    last_timestamp_ms=0,
+                    content_sha256="0" * 64,
+                    closed=False,
+                ),
+            ),
+        )
+    }
     return RefreshRun(
         run_id=run_id,
         attempt_status=attempt_status,
@@ -682,6 +703,7 @@ def _run(
             crypto_top=({"inst_id": "BTC-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"},)
         ),
         datasets=datasets,
+        storage_by_dataset=storage_by_dataset,
         cycle_error=cycle_error,
     )
 

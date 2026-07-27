@@ -117,7 +117,14 @@ class LoadTrustedBundle:
                 continue
             published_health_by_interval[interval] = manifest_health
             try:
-                candles = self.store.read_csv(path) if path.exists() else []
+                candles = self.store.read_generation_dataset(
+                    manifest,
+                    symbol=resolved.inst_id,
+                    interval=interval,
+                    generation_root=context.generation_root,
+                    generation_id=context.generation_id,
+                    verify_logical=False,
+                )
             except Exception as exc:
                 seeds_by_interval[interval] = DatasetEvaluationSeed(
                     key=DatasetKey(resolved.inst_id, interval),
@@ -220,10 +227,13 @@ class LoadTrustedBundle:
     ) -> Path:
         if manifest_health is None:
             return self._default_dataset_path(symbol, interval, context)
-        expected = self.store.generation_source_file(symbol, interval)
-        if manifest_health.source_file.as_posix() != expected.as_posix():
-            raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
-        return self.store.generation_cache_path(context.generation_id, symbol, interval)
+        return self.store.dataset_path(
+            context.manifest,
+            symbol=symbol,
+            interval=interval,
+            generation_root=context.generation_root,
+            generation_id=context.generation_id,
+        )
 
     def _default_dataset_path(self, symbol: str, interval: str, context: TrustedLoadContext) -> Path:
         return self.store.generation_cache_path(context.generation_id, symbol, interval)
@@ -260,6 +270,15 @@ def _verify_manifest_bound_content(
     if manifest_health.integrity != IntegrityState.VALID:
         return cache_health
     actual_hash = candles_content_sha256(cached_candles)
+    if len(cached_candles) != manifest_health.rows:
+        return replace(
+            cache_health,
+            integrity=IntegrityState.INVALID,
+            freshness=FreshnessState.STALE,
+            reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
+            content_sha256=actual_hash,
+            message="manifest dataset row count does not match cached candles",
+        )
     if not expected_hash:
         return replace(
             cache_health,

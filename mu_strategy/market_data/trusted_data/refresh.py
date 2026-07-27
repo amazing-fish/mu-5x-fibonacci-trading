@@ -14,9 +14,11 @@ from mu_strategy.market_data.trusted_data.contracts import (
     Clock,
     DatasetHealth,
     DatasetKey,
+    DatasetStorage,
     FreshnessState,
     HealthReason,
     IntegrityState,
+    ManifestSchemaError,
     RefreshSegmentDiagnostics,
     RefreshRun,
     RefreshAttemptStatus,
@@ -26,7 +28,12 @@ from mu_strategy.market_data.trusted_data.contracts import (
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
+from mu_strategy.market_data.trusted_data.store import (
+    SegmentCorrectionError,
+    TrustedDataStore,
+    candles_content_sha256,
+    validate_storage_segment,
+)
 from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
@@ -192,6 +199,7 @@ class RefreshTrustedMarketData:
             return run
 
         datasets: dict[tuple[str, str], DatasetHealth] = {}
+        storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         refresh_segments_by_key: dict[tuple[str, str], RefreshSegmentDiagnostics] = {}
         symbols = tuple(
@@ -213,7 +221,7 @@ class RefreshTrustedMarketData:
             }
             for key, candidate in candidates.items():
                 refresh_segments_by_key[key] = candidate.diagnostics
-            symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
+            symbol_datasets, symbol_candles, symbol_storage = self._materialize_symbol_bundle(
                 symbol=symbol,
                 intervals=plan.effective_intervals,
                 candidates=candidates,
@@ -224,6 +232,7 @@ class RefreshTrustedMarketData:
                 if key in refresh_segments_by_key:
                     refresh_segments_by_key[key] = refresh_segments_by_key[key].with_health(health)
             datasets.update(symbol_datasets)
+            storage_by_dataset.update(symbol_storage)
             candles_by_key.update(symbol_candles)
 
         warnings: list[str] = []
@@ -244,6 +253,7 @@ class RefreshTrustedMarketData:
             effective_intervals=plan.effective_intervals,
             universe_snapshot=universe,
             datasets=datasets,
+            storage_by_dataset=storage_by_dataset,
             provider_failures=provider_failures,
             warnings=tuple(warnings),
             refresh_segments=tuple(refresh_segments_by_key.values()),
@@ -307,8 +317,8 @@ class RefreshTrustedMarketData:
         previous_manifest,
     ) -> DatasetRefreshCandidate:
         started_at_ms = self.clock.now_ms()
-        path = self.store.generation_cache_path(run_id, symbol, interval)
-        source_file = self.store.generation_source_file(symbol, interval)
+        path = self.store.data_dir / self.store.segment_source_root(symbol, interval)
+        source_file = self.store.segment_source_root(symbol, interval)
         existing: list[Candle] = []
         try:
             existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval, days=days) or []
@@ -429,7 +439,11 @@ class RefreshTrustedMarketData:
         candidates: dict[tuple[str, str], DatasetRefreshCandidate],
         days: int,
         now_ms: int,
-    ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], list[Candle]]]:
+    ) -> tuple[
+        dict[tuple[str, str], DatasetHealth],
+        dict[tuple[str, str], list[Candle]],
+        dict[tuple[str, str], DatasetStorage],
+    ]:
         seeds_by_interval = {
             interval: DatasetEvaluationSeed(
                 key=candidates[(symbol, interval)].key,
@@ -453,11 +467,15 @@ class RefreshTrustedMarketData:
             for interval in intervals
         }
 
+        storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
+
         def write_valid_dataset(interval: str, seed: DatasetEvaluationSeed, candles: list[Candle]) -> str:
             candidate = candidates[(symbol, interval)]
-            if candidate.path.exists():
-                raise FileExistsError(f"generation dataset already exists: {candidate.path}")
-            self.store.write_csv(candles, candidate.path)
+            storage_by_dataset[(symbol, interval)] = self.store.write_segmented_dataset(
+                candles,
+                symbol=symbol,
+                interval=interval,
+            )
             return candles_content_sha256(candles)
 
         result = evaluate_candle_bundle(
@@ -471,8 +489,14 @@ class RefreshTrustedMarketData:
             retain_invalid_candles_for_reasons=(HealthReason.TIMESTAMP_GAP,),
             allow_timestamp_gap_built_native_inputs=True,
             raise_os_errors=True,
+            raise_exceptions=(ManifestSchemaError, SegmentCorrectionError),
         )
-        return result.health_by_key, result.candles_by_key
+        for interval in intervals:
+            storage_by_dataset.setdefault(
+                (symbol, interval),
+                self.store.empty_segmented_storage(symbol, interval),
+            )
+        return result.health_by_key, result.candles_by_key, storage_by_dataset
 
     def _persist_run(self, run: RefreshRun) -> RefreshRun:
         publication_warnings = self.store.commit_generation_publication(
@@ -484,36 +508,27 @@ class RefreshTrustedMarketData:
             return run
         return replace(run, warnings=(*run.warnings, *publication_warnings))
 
-    def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
-        if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:
-            return None
-        health = manifest_result.snapshot.datasets.get((symbol, interval))
-        if health is None:
-            return None
-        try:
-            return self.store.resolve_source_file(
-                health.source_file,
-                generation_root=manifest_result.generation_root,
-                generation_id=manifest_result.generation_id,
-            )
-        except Exception:
-            return None
-
     def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str, *, days: int) -> list[Candle] | None:
-        if not manifest_result.ok or manifest_result.snapshot is None:
+        if (
+            not manifest_result.ok
+            or manifest_result.snapshot is None
+            or manifest_result.generation_root is None
+            or manifest_result.generation_id is None
+        ):
             return None
         health = manifest_result.snapshot.datasets.get((symbol, interval))
         if health is None or not _is_reusable_prior_health(health):
             return None
-        previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
-        if previous_path is None or not previous_path.exists():
-            return None
         try:
-            cached = self.store.read_csv(previous_path)
+            cached = self.store.read_generation_dataset(
+                manifest_result.snapshot,
+                symbol=symbol,
+                interval=interval,
+                generation_root=manifest_result.generation_root,
+                generation_id=manifest_result.generation_id,
+            )
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
-        if candles_content_sha256(cached) != health.content_sha256:
-            return None
         coverage = assess_requested_coverage(
             cached,
             interval=interval,

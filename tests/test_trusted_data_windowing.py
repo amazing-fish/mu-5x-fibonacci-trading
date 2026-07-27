@@ -70,9 +70,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                 )
             )
 
-            persisted_five = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "5m"))
-            persisted_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
-            persisted_1h = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "1h"))
+            persisted_five = _read_generation_dataset(store, run.run_id, SYMBOL, "5m")
+            persisted_15m = _read_generation_dataset(store, run.run_id, SYMBOL, "15m")
+            persisted_1h = _read_generation_dataset(store, run.run_id, SYMBOL, "1h")
 
         self.assertEqual(DAY_MS + ONE_HOUR_MS, persisted_15m[0].open_time_ms)
         self.assertEqual(DAY_MS + ONE_HOUR_MS, persisted_1h[0].open_time_ms)
@@ -107,9 +107,9 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                     now_ms=five_end,
                 )
             )
-            persisted_five = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "5m"))
-            persisted_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
-            persisted_1h = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "1h"))
+            persisted_five = _read_generation_dataset(store, run.run_id, SYMBOL, "5m")
+            persisted_15m = _read_generation_dataset(store, run.run_id, SYMBOL, "15m")
+            persisted_1h = _read_generation_dataset(store, run.run_id, SYMBOL, "1h")
 
         self.assertTrue(run.datasets[(SYMBOL, "15m")].validation.ok)
         self.assertTrue(run.datasets[(SYMBOL, "1h")].validation.ok)
@@ -389,8 +389,8 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
                     now_ms=first_end,
                 )
             )
-            first_15m = store.read_csv(store.generation_cache_path(run.run_id, SYMBOL, "15m"))
-            second_15m = store.read_csv(store.generation_cache_path(run.run_id, SECOND_SYMBOL, "15m"))
+            first_15m = _read_generation_dataset(store, run.run_id, SYMBOL, "15m")
+            second_15m = _read_generation_dataset(store, run.run_id, SECOND_SYMBOL, "15m")
 
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
@@ -493,10 +493,23 @@ def _assert_health_matches_csv(self, store, run, symbol: str, intervals: tuple[s
     for interval in intervals:
         with self.subTest(symbol=symbol, interval=interval):
             health = run.datasets[(symbol, interval)]
-            csv_rows = store.read_csv(store.generation_cache_path(run.run_id, symbol, interval))
+            csv_rows = _read_generation_dataset(store, run.run_id, symbol, interval)
             self.assertEqual(len(csv_rows), health.rows)
             self.assertEqual(csv_rows[0].open_time_ms, health.first_timestamp_ms)
             self.assertEqual(csv_rows[-1].open_time_ms, health.last_timestamp_ms)
+
+
+def _read_generation_dataset(store, run_id: str, symbol: str, interval: str) -> list[Candle]:
+    result = store.read_generation_manifest(run_id)
+    if not result.ok or result.snapshot is None or result.generation_root is None:
+        raise AssertionError(result)
+    return store.read_generation_dataset(
+        result.snapshot,
+        symbol=symbol,
+        interval=interval,
+        generation_root=result.generation_root,
+        generation_id=run_id,
+    )
 
 
 class _Provider:

@@ -55,10 +55,14 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         self.assertFalse((data_dir / "manifest.json").exists())
         self.assertFalse((data_dir / "okx").exists())
         self.assertEqual("run-cold", manifest["run_id"])
-        self.assertEqual("okx/BTC-USDT-SWAP/15m.csv", manifest["symbols"][SYMBOL]["intervals"]["15m"]["source_file"])
+        self.assertEqual(4, manifest["schema_version"])
+        self.assertEqual("segmented_csv_v1", manifest["storage_layout"])
+        storage = manifest["symbols"][SYMBOL]["intervals"]["15m"]["storage"]
+        self.assertEqual("segments/okx/BTC-USDT-SWAP/15m", storage["source_root"])
+        self.assertEqual(["1970-01"], [segment["segment_id"] for segment in storage["segments"]])
         self.assertEqual("run-cold", bundle.run_id)
         self.assertTrue(bundle.trust_decision.allowed)
-        self.assertEqual(data_dir / "generations" / "run-cold" / "okx" / SYMBOL / "15m.csv", bundle.files_by_interval["15m"])
+        self.assertEqual(data_dir / "segments" / "okx" / SYMBOL / "15m", bundle.files_by_interval["15m"])
 
     def test_storage_segments_reject_path_attacks_without_changing_current(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -160,21 +164,22 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             refresher = RefreshTrustedMarketData(store, StaticProvider())
             request = dict(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             refresher.execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
-            old_path = data_dir / "generations" / "run-old" / "okx" / SYMBOL / "5m.csv"
+            old_path = data_dir / "segments" / "okx" / SYMBOL / "5m" / "1970-01.csv"
             old_bytes = old_path.read_bytes()
 
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-new"))
-            new_path = data_dir / "generations" / "run-new" / "okx" / SYMBOL / "5m.csv"
+            new_bytes = old_path.read_bytes()
             bundle = LoadTrustedBundle(store).execute(
                 LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_700_000),
                 observe_only_policy(),
             )
 
             self.assertEqual("run-new", read_current(data_dir)["generation_id"])
-            self.assertEqual(old_bytes, old_path.read_bytes())
-            self.assertNotEqual(old_bytes, new_path.read_bytes())
+            self.assertTrue(new_bytes.startswith(old_bytes))
+            self.assertGreater(len(new_bytes), len(old_bytes))
             self.assertEqual("run-new", bundle.run_id)
-            self.assertEqual(new_path, bundle.files_by_interval["5m"])
+            self.assertEqual(old_path.parent, bundle.files_by_interval["5m"])
+            self.assertFalse(any((data_dir / "generations").rglob("*.csv")))
 
     def test_csv_storage_failure_keeps_old_current_generation(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -190,10 +195,10 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             original_write_csv = store.write_csv
             calls = []
 
-            def fail_after_first(candles, path):
+            def fail_after_first(candles, path, **kwargs):
                 calls.append(path)
                 if len(calls) == 1:
-                    return original_write_csv(candles, path)
+                    return original_write_csv(candles, path, **kwargs)
                 raise OSError("disk full")
 
             with patch.object(store, "write_csv", side_effect=fail_after_first):
@@ -316,7 +321,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             loader = LoadTrustedBundle(store)
             old_context = loader.open_context(now_ms=86_400_000)
-            RefreshTrustedMarketData(store, StaticProvider(offset=10)).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-new"))
+            RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-new"))
 
             old_bundle = loader.execute(
                 LoadTrustedBundleQuery(SYMBOL, intervals=("5m", "15m"), days=1),
@@ -329,9 +334,11 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             )
 
         self.assertEqual("run-old", old_bundle.run_id)
-        self.assertTrue(all("run-old" in str(path) for path in old_bundle.files_by_interval.values()))
+        self.assertEqual(288, len(old_bundle.candles_by_interval["5m"]))
+        self.assertEqual(96, len(old_bundle.candles_by_interval["15m"]))
         self.assertEqual("run-new", new_bundle.run_id)
-        self.assertTrue(all("run-new" in str(path) for path in new_bundle.files_by_interval.values()))
+        self.assertEqual(289, len(new_bundle.candles_by_interval["5m"]))
+        self.assertEqual(97, len(new_bundle.candles_by_interval["15m"]))
 
     def test_malformed_current_or_missing_generation_fail_closed_without_flat_fallback(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
@@ -532,7 +539,8 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             self.assertEqual(flat_csv_before, (data_dir / "okx" / SYMBOL / "5m.csv").read_bytes())
             self.assertEqual("run-next", read_current(data_dir)["generation_id"])
             manifest = generation_manifest(data_dir, "run-next")
-            self.assertEqual(3, manifest["schema_version"])
+            self.assertEqual(4, manifest["schema_version"])
+            self.assertEqual("segmented_csv_v1", manifest["storage_layout"])
             self.assertTrue((data_dir / "generations" / "run-next" / "manifest.json").exists())
 
     def test_publication_order_is_csv_manifest_current_then_audit_log(self):
@@ -609,7 +617,9 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
                     run_id="run-good",
                 )
             )
-            csv_path = current_generation_dir(data_dir) / "okx" / SYMBOL / "5m.csv"
+            manifest = generation_manifest(data_dir, "run-good")
+            source_file = manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0]["source_file"]
+            csv_path = data_dir / source_file
             csv_path.write_text(csv_path.read_text(encoding="utf-8").replace("100.0", "100.5", 1), encoding="utf-8")
             bundle = LoadTrustedBundle(store).execute(
                 LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=86_400_000),
@@ -617,7 +627,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             )
 
         self.assertFalse(bundle.trust_decision.allowed)
-        self.assertEqual(HealthReason.CACHE_CONTENT_MISMATCH, bundle.trust_decision.reason)
+        self.assertEqual(HealthReason.CACHE_READ_FAILED, bundle.trust_decision.reason)
 
     def test_flat_layout_is_blocked_read_only_and_next_refresh_creates_generation(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason

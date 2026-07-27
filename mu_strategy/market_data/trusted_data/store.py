@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import json
@@ -7,6 +8,7 @@ import logging
 import os
 import re
 import uuid
+from bisect import bisect_left
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,10 +17,17 @@ from typing import Any, Callable
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.cache import CSV_FIELDS
 from mu_strategy.market_data.trusted_data.contracts import (
+    AvailabilityState,
+    DatasetHealth,
+    DatasetStorage,
     HealthReason,
+    IntegrityState,
     ManifestSchemaError,
+    SegmentReference,
     TrustedManifestSnapshot,
+    TrustedStorageLayout,
     trusted_manifest_snapshot_from_dict,
+    utc_month_segment_id,
 )
 from mu_strategy.models import Candle
 
@@ -47,6 +56,10 @@ class ManifestReadResult:
         return self.snapshot is not None and self.reason is None
 
 
+class SegmentCorrectionError(RuntimeError):
+    pass
+
+
 class TrustedDataStore:
     def __init__(self, *, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -58,6 +71,10 @@ class TrustedDataStore:
     @property
     def generations_dir(self) -> Path:
         return self.data_dir / "generations"
+
+    @property
+    def segments_dir(self) -> Path:
+        return self.data_dir / "segments"
 
     @property
     def run_log_path(self) -> Path:
@@ -78,6 +95,19 @@ class TrustedDataStore:
     def generation_cache_path(self, generation_id: str, symbol: str, interval: str) -> Path:
         return self.generation_root(generation_id) / self.generation_source_file(symbol, interval)
 
+    def segment_source_root(self, symbol: str, interval: str) -> Path:
+        symbol = validate_storage_segment(symbol, field="symbol")
+        interval = validate_storage_segment(interval, field="interval")
+        return Path("segments") / "okx" / symbol / interval
+
+    def segment_source_file(self, symbol: str, interval: str, segment_id: str) -> Path:
+        if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", segment_id):
+            raise ValueError("segment_id must be UTC YYYY-MM")
+        return self.segment_source_root(symbol, interval) / f"{segment_id}.csv"
+
+    def segment_path(self, symbol: str, interval: str, segment_id: str) -> Path:
+        return self.data_dir / self.segment_source_file(symbol, interval, segment_id)
+
     def prepare_generation(self, generation_id: str) -> Path:
         root = self.generation_root(generation_id)
         if root.exists():
@@ -87,11 +117,9 @@ class TrustedDataStore:
         return root
 
     def read_csv(self, path: Path) -> list[Candle]:
-        with Path(path).open("r", newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            return [Candle.from_csv_row(row) for row in reader]
+        return self._read_csv_slice(path, start_row=0, rows=None, require_eof=True)
 
-    def write_csv(self, candles: list[Candle], path: Path) -> None:
+    def write_csv(self, candles: list[Candle], path: Path, *, required_prefix: bytes | None = None) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = _tmp_path(path)
@@ -102,10 +130,235 @@ class TrustedDataStore:
                 for candle in candles:
                     writer.writerow(candle.to_csv_row())
                 _flush_and_fsync(handle)
+            if required_prefix is not None:
+                candidate_bytes = tmp_path.read_bytes()
+                if not candidate_bytes.startswith(required_prefix):
+                    raise SegmentCorrectionError("growing segment must preserve its existing byte prefix")
             os.replace(tmp_path, path)
             _fsync_directory(path.parent)
         finally:
             _cleanup_tmp(tmp_path)
+
+    def empty_segmented_storage(self, symbol: str, interval: str) -> DatasetStorage:
+        return DatasetStorage(
+            layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+            source_root=self.segment_source_root(symbol, interval),
+        )
+
+    def write_segmented_dataset(
+        self,
+        candles: list[Candle],
+        *,
+        symbol: str,
+        interval: str,
+    ) -> DatasetStorage:
+        source_root = self.segment_source_root(symbol, interval)
+        if not candles:
+            return DatasetStorage(
+                layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+                source_root=source_root,
+            )
+        partitions = _partition_candles_by_utc_month(candles)
+        references: list[SegmentReference] = []
+        segment_items = list(partitions.items())
+        for index, (segment_id, segment_candles) in enumerate(segment_items):
+            path = self.segment_path(symbol, interval, segment_id)
+            closed = index < len(segment_items) - 1
+            start_row = 0
+            physical_rows = len(segment_candles)
+            if path.exists():
+                existing_bytes = path.read_bytes()
+                existing = self.read_csv(path)
+                _validate_segment_candles(existing, segment_id=segment_id)
+                existing_timestamps = [candle.open_time_ms for candle in existing]
+                start_row = bisect_left(existing_timestamps, segment_candles[0].open_time_ms)
+                if start_row < len(existing) and existing[start_row].open_time_ms == segment_candles[0].open_time_ms:
+                    shared_rows = min(len(existing) - start_row, len(segment_candles))
+                elif start_row == len(existing):
+                    shared_rows = 0
+                else:
+                    raise SegmentCorrectionError(
+                        f"trusted segment cannot insert or prepend rows: {symbol}/{interval}/{segment_id}"
+                    )
+                if not _canonical_candles_equal(
+                    existing[start_row : start_row + shared_rows],
+                    segment_candles[:shared_rows],
+                ):
+                    raise SegmentCorrectionError(
+                        f"historical correction would rewrite trusted segment: {symbol}/{interval}/{segment_id}"
+                    )
+                if len(segment_candles) > shared_rows:
+                    if self._has_later_segment(symbol, interval, segment_id):
+                        raise SegmentCorrectionError(
+                            f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
+                        )
+                    combined = [*existing, *segment_candles[shared_rows:]]
+                    self.write_csv(combined, path, required_prefix=existing_bytes)
+                    physical_rows = len(combined)
+                else:
+                    physical_rows = len(existing)
+            else:
+                self.write_csv(segment_candles, path)
+            if closed and start_row + len(segment_candles) != physical_rows:
+                raise SegmentCorrectionError(
+                    f"closed trusted segment reference must reach physical EOF: {symbol}/{interval}/{segment_id}"
+                )
+            references.append(
+                SegmentReference(
+                    segment_id=segment_id,
+                    source_file=self.segment_source_file(symbol, interval, segment_id),
+                    start_row=start_row,
+                    rows=len(segment_candles),
+                    first_timestamp_ms=segment_candles[0].open_time_ms,
+                    last_timestamp_ms=segment_candles[-1].open_time_ms,
+                    content_sha256=candles_content_sha256(segment_candles),
+                    closed=closed,
+                )
+            )
+        return DatasetStorage(
+            layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+            source_root=source_root,
+            segments=tuple(references),
+        )
+
+    def _has_later_segment(self, symbol: str, interval: str, segment_id: str) -> bool:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        if not segment_dir.exists():
+            return False
+        return any(
+            candidate.stem > segment_id
+            for candidate in segment_dir.glob("*.csv")
+            if re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", candidate.stem)
+        )
+
+    def read_generation_dataset(
+        self,
+        snapshot: TrustedManifestSnapshot,
+        *,
+        symbol: str,
+        interval: str,
+        generation_root: Path,
+        generation_id: str,
+        verify_logical: bool = True,
+    ) -> list[Candle]:
+        key = (symbol, interval)
+        health = snapshot.datasets.get(key)
+        storage = snapshot.storage_by_dataset.get(key)
+        if health is None or storage is None:
+            raise ManifestSchemaError(f"trusted manifest is missing dataset storage: {symbol}/{interval}")
+        if storage.layout is TrustedStorageLayout.FLAT_CSV_V1:
+            path = self.resolve_source_file(
+                health.source_file,
+                generation_root=generation_root,
+                generation_id=generation_id,
+            )
+            candles = self.read_csv(path)
+        elif storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
+            candles = self._read_segmented_dataset(health, storage, symbol=symbol, interval=interval)
+        else:
+            raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
+        if verify_logical:
+            _validate_dataset_candles(candles, health, symbol=symbol, interval=interval)
+        return candles
+
+    def dataset_path(
+        self,
+        snapshot: TrustedManifestSnapshot,
+        *,
+        symbol: str,
+        interval: str,
+        generation_root: Path,
+        generation_id: str,
+    ) -> Path:
+        key = (symbol, interval)
+        health = snapshot.datasets.get(key)
+        storage = snapshot.storage_by_dataset.get(key)
+        if health is None or storage is None:
+            return generation_root / self.generation_source_file(symbol, interval)
+        if storage.layout is TrustedStorageLayout.FLAT_CSV_V1:
+            self.resolve_source_file(
+                health.source_file,
+                generation_root=generation_root,
+                generation_id=generation_id,
+            )
+            return generation_root / health.source_file
+        if storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
+            expected = self.segment_source_root(symbol, interval)
+            if storage.source_root.as_posix() != expected.as_posix():
+                raise ManifestSchemaError("schema-v4 dataset source_root does not match dataset key")
+            return self.data_dir / expected
+        raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
+
+    def _read_csv_slice(
+        self,
+        path: Path,
+        *,
+        start_row: int,
+        rows: int | None,
+        require_eof: bool,
+    ) -> list[Candle]:
+        candles: list[Candle] = []
+        with Path(path).open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != CSV_FIELDS:
+                raise ManifestSchemaError("trusted CSV header must exactly match CSV_FIELDS")
+            for _ in range(start_row):
+                try:
+                    row = next(reader)
+                except StopIteration as exc:
+                    raise ManifestSchemaError(
+                        "trusted segment has fewer prefix rows than its manifest start_row"
+                    ) from exc
+                _candle_from_strict_csv_row(row)
+            while rows is None or len(candles) < rows:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    break
+                candles.append(_candle_from_strict_csv_row(row))
+            if rows is not None and len(candles) != rows:
+                raise ManifestSchemaError("trusted segment has fewer rows than its manifest reference")
+            if require_eof:
+                try:
+                    next(reader)
+                except StopIteration:
+                    pass
+                else:
+                    raise ManifestSchemaError("closed trusted segment has unreferenced extra rows")
+        return candles
+
+    def _read_segmented_dataset(
+        self,
+        health: DatasetHealth,
+        storage: DatasetStorage,
+        *,
+        symbol: str,
+        interval: str,
+    ) -> list[Candle]:
+        expected_root = self.segment_source_root(symbol, interval)
+        if storage.source_root.as_posix() != expected_root.as_posix():
+            raise ManifestSchemaError("schema-v4 dataset source_root does not match dataset key")
+        candles: list[Candle] = []
+        for reference in storage.segments:
+            expected_source = self.segment_source_file(symbol, interval, reference.segment_id)
+            if reference.source_file.as_posix() != expected_source.as_posix():
+                raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
+            path = self.data_dir / expected_source
+            segment_candles = self._read_csv_slice(
+                path,
+                start_row=reference.start_row,
+                rows=reference.rows,
+                require_eof=reference.closed,
+            )
+            _validate_segment_candles(segment_candles, segment_id=reference.segment_id)
+            if segment_candles[0].open_time_ms != reference.first_timestamp_ms:
+                raise ManifestSchemaError("trusted segment first timestamp does not match manifest")
+            if segment_candles[-1].open_time_ms != reference.last_timestamp_ms:
+                raise ManifestSchemaError("trusted segment last timestamp does not match manifest")
+            if candles_content_sha256(segment_candles) != reference.content_sha256:
+                raise ManifestSchemaError("trusted segment content SHA-256 mismatch")
+            candles.extend(segment_candles)
+        return candles
 
     def read_manifest(self) -> ManifestReadResult:
         if not self.current_path.exists():
@@ -173,7 +426,7 @@ class TrustedDataStore:
             if generation_id is not None:
                 if snapshot.run_id != generation_id:
                     raise ManifestSchemaError("generation manifest run_id must match current generation_id")
-                _validate_generation_source_files(snapshot, generation_root)
+                _validate_generation_storage(snapshot, generation_root)
         except Exception as exc:
             return ManifestReadResult(None, payload, HealthReason.MALFORMED_MANIFEST, type(exc).__name__, str(exc), generation_root=generation_root, generation_id=generation_id, manifest_path=path)
         return ManifestReadResult(snapshot, payload, generation_root=generation_root, generation_id=generation_id, manifest_path=path)
@@ -225,6 +478,7 @@ class TrustedDataStore:
         run_log_payload: dict[str, Any],
     ) -> tuple[str, ...]:
         self.write_generation_manifest(generation_id, manifest)
+        self.verify_generation(generation_id)
         publication_warnings = []
         warning_sink_token = _CURRENT_POINTER_WARNING_SINK.set(publication_warnings.append)
         try:
@@ -240,6 +494,133 @@ class TrustedDataStore:
     def resolve_source_file(self, source_file: Path, *, generation_root: Path, generation_id: str) -> Path:
         source_file = Path(source_file)
         return _resolve_generation_source_file(source_file, generation_root)
+
+    def read_generation_manifest(self, generation_id: str) -> ManifestReadResult:
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
+        root = self.generation_root(generation_id)
+        return self._read_manifest_file(
+            self.generation_manifest_path(generation_id),
+            generation_root=root,
+            generation_id=generation_id,
+        )
+
+    def verify_generation(self, generation_id: str) -> ManifestReadResult:
+        result = self.read_generation_manifest(generation_id)
+        if (
+            not result.ok
+            or result.snapshot is None
+            or result.generation_root is None
+            or result.generation_id is None
+        ):
+            detail = result.message or (
+                result.reason.value if result.reason is not None else "generation manifest is invalid"
+            )
+            raise ManifestSchemaError(detail)
+        for symbol, interval in result.snapshot.datasets:
+            self.read_generation_dataset(
+                result.snapshot,
+                symbol=symbol,
+                interval=interval,
+                generation_root=result.generation_root,
+                generation_id=result.generation_id,
+            )
+        return result
+
+    def import_flat_generation(
+        self,
+        source_generation_id: str,
+        target_generation_id: str,
+        *,
+        publish: bool = False,
+    ) -> ManifestReadResult:
+        source_generation_id = validate_storage_segment(source_generation_id, field="source_generation_id")
+        target_generation_id = validate_storage_segment(target_generation_id, field="target_generation_id")
+        if source_generation_id == target_generation_id:
+            raise ValueError("flat import target_generation_id must differ from source_generation_id")
+        source_result = self.read_generation_manifest(source_generation_id)
+        if not source_result.ok or source_result.snapshot is None or source_result.payload is None:
+            detail = source_result.message or (
+                source_result.reason.value if source_result.reason is not None else "source manifest is invalid"
+            )
+            raise ManifestSchemaError(f"flat import source generation is invalid: {detail}")
+        source_snapshot = source_result.snapshot
+        if source_snapshot.schema_version != 3:
+            raise ManifestSchemaError("flat import source must be schema v3")
+
+        self.prepare_generation(target_generation_id)
+        symbols_payload: dict[str, dict[str, Any]] = {}
+        for symbol, symbol_entry in (source_result.payload.get("symbols") or {}).items():
+            copied_symbol_entry = {
+                key: copy.deepcopy(value)
+                for key, value in symbol_entry.items()
+                if key != "intervals"
+            }
+            copied_symbol_entry["intervals"] = {}
+            symbols_payload[str(symbol)] = copied_symbol_entry
+
+        imported_candles: dict[tuple[str, str], list[Candle]] = {}
+        for (symbol, interval), health in source_snapshot.datasets.items():
+            candles = self.read_generation_dataset(
+                source_snapshot,
+                symbol=symbol,
+                interval=interval,
+                generation_root=source_result.generation_root or self.generation_root(source_generation_id),
+                generation_id=source_generation_id,
+            )
+            storage = self.write_segmented_dataset(candles, symbol=symbol, interval=interval)
+            health_payload = health.to_dict()
+            health_payload.pop("source_file", None)
+            health_payload["storage"] = storage.to_dict()
+            symbols_payload.setdefault(symbol, {"intervals": {}})["intervals"][interval] = health_payload
+            imported_candles[(symbol, interval)] = candles
+
+        manifest = {
+            key: copy.deepcopy(value)
+            for key, value in source_result.payload.items()
+            if key not in {"schema_version", "storage_layout", "run_id", "symbols", "imported_from_run_id"}
+        }
+        manifest.update(
+            {
+                "schema_version": 4,
+                "storage_layout": TrustedStorageLayout.SEGMENTED_CSV_V1.value,
+                "run_id": target_generation_id,
+                "symbols": symbols_payload,
+                "imported_from_run_id": source_generation_id,
+            }
+        )
+        self.write_generation_manifest(target_generation_id, manifest)
+        target_result = self.verify_generation(target_generation_id)
+        for key, source_candles in imported_candles.items():
+            imported = self.read_generation_dataset(
+                target_result.snapshot,
+                symbol=key[0],
+                interval=key[1],
+                generation_root=target_result.generation_root or self.generation_root(target_generation_id),
+                generation_id=target_generation_id,
+            )
+            if imported != source_candles:
+                raise ManifestSchemaError(f"flat import candle round trip mismatch: {key[0]}/{key[1]}")
+            if candles_content_sha256(imported) != source_snapshot.datasets[key].content_sha256:
+                raise ManifestSchemaError(f"flat import logical SHA-256 mismatch: {key[0]}/{key[1]}")
+        if publish:
+            self.commit_generation_publication(
+                target_generation_id,
+                manifest,
+                {
+                    "run_id": target_generation_id,
+                    "attempt_status": source_snapshot.attempt_status.value,
+                    "snapshot_usability": source_snapshot.snapshot_usability.value,
+                    "started_at_ms": source_snapshot.started_at_ms,
+                    "completed_at_ms": source_snapshot.completed_at_ms,
+                    "symbol_count": len({symbol for symbol, _ in source_snapshot.datasets}),
+                    "invalid_count": sum(1 for health in source_snapshot.datasets.values() if not health.is_usable),
+                    "provider_failures": [dict(value) for value in source_snapshot.provider_failures],
+                    "warnings": list(source_snapshot.warnings),
+                    "cycle_error": source_snapshot.cycle_error,
+                    "imported_from_run_id": source_generation_id,
+                },
+            )
+        return target_result
 
     def append_run_log(self, payload: dict[str, Any]) -> Path:
         path = self.run_log_path
@@ -314,12 +695,99 @@ def _resolve_generation_source_file(source_file: Path, generation_root: Path) ->
     return resolved
 
 
-def _validate_generation_source_files(snapshot: TrustedManifestSnapshot, generation_root: Path) -> None:
-    for health in snapshot.datasets.values():
-        expected = Path("okx") / validate_storage_segment(health.key.symbol, field="symbol") / f"{validate_storage_segment(health.key.interval, field='interval')}.csv"
-        if health.source_file.as_posix() != expected.as_posix():
-            raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
-        _resolve_generation_source_file(health.source_file, generation_root)
+def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_root: Path) -> None:
+    for key, health in snapshot.datasets.items():
+        symbol = validate_storage_segment(health.key.symbol, field="symbol")
+        interval = validate_storage_segment(health.key.interval, field="interval")
+        storage = snapshot.storage_by_dataset.get(key)
+        if storage is None:
+            raise ManifestSchemaError("generation manifest dataset storage is missing")
+        if storage.layout is TrustedStorageLayout.FLAT_CSV_V1:
+            expected = Path("okx") / symbol / f"{interval}.csv"
+            if health.source_file.as_posix() != expected.as_posix():
+                raise ManifestSchemaError("generation manifest source_file must equal okx/<symbol>/<interval>.csv")
+            _resolve_generation_source_file(health.source_file, generation_root)
+            continue
+        if storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
+            expected_root = Path("segments") / "okx" / symbol / interval
+            if storage.source_root.as_posix() != expected_root.as_posix():
+                raise ManifestSchemaError(
+                    "schema-v4 dataset source_root must equal segments/okx/<symbol>/<interval>"
+                )
+            for reference in storage.segments:
+                expected_source = expected_root / f"{reference.segment_id}.csv"
+                if reference.source_file.as_posix() != expected_source.as_posix():
+                    raise ManifestSchemaError(
+                        "schema-v4 segment source_file must match symbol/interval/segment_id"
+                    )
+            continue
+        raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
+
+
+def _partition_candles_by_utc_month(candles: list[Candle]) -> dict[str, list[Candle]]:
+    partitions: dict[str, list[Candle]] = {}
+    previous_timestamp: int | None = None
+    previous_segment_id: str | None = None
+    for candle in candles:
+        if previous_timestamp is not None and candle.open_time_ms <= previous_timestamp:
+            raise ManifestSchemaError("trusted dataset candles must be strictly ordered")
+        segment_id = utc_month_segment_id(candle.open_time_ms)
+        if previous_segment_id is not None and segment_id < previous_segment_id:
+            raise ManifestSchemaError("trusted dataset UTC month segments must be ordered")
+        partitions.setdefault(segment_id, []).append(candle)
+        previous_timestamp = candle.open_time_ms
+        previous_segment_id = segment_id
+    return partitions
+
+
+def _validate_segment_candles(candles: list[Candle], *, segment_id: str) -> None:
+    if not candles:
+        raise ManifestSchemaError("trusted segment cannot be empty")
+    previous_timestamp: int | None = None
+    for candle in candles:
+        if utc_month_segment_id(candle.open_time_ms) != segment_id:
+            raise ManifestSchemaError("trusted segment candle belongs to a different UTC month")
+        if previous_timestamp is not None and candle.open_time_ms <= previous_timestamp:
+            raise ManifestSchemaError("trusted segment candles must be strictly ordered")
+        previous_timestamp = candle.open_time_ms
+
+
+def _validate_dataset_candles(
+    candles: list[Candle],
+    health: DatasetHealth,
+    *,
+    symbol: str,
+    interval: str,
+) -> None:
+    if health.integrity is not IntegrityState.VALID:
+        return
+    if health.availability is AvailabilityState.AVAILABLE and not candles:
+        raise ManifestSchemaError(f"trusted dataset is empty: {symbol}/{interval}")
+    if len(candles) != health.rows:
+        raise ManifestSchemaError(f"trusted dataset row count mismatch: {symbol}/{interval}")
+    if not candles:
+        return
+    if candles[0].open_time_ms != health.first_timestamp_ms:
+        raise ManifestSchemaError(f"trusted dataset first timestamp mismatch: {symbol}/{interval}")
+    if candles[-1].open_time_ms != health.last_timestamp_ms:
+        raise ManifestSchemaError(f"trusted dataset last timestamp mismatch: {symbol}/{interval}")
+    if not health.content_sha256:
+        raise ManifestSchemaError(f"trusted dataset has no content SHA-256: {symbol}/{interval}")
+    if candles_content_sha256(candles) != health.content_sha256:
+        raise ManifestSchemaError(f"trusted dataset content SHA-256 mismatch: {symbol}/{interval}")
+
+
+def _candle_from_strict_csv_row(row: dict[str | None, str | list[str] | None]) -> Candle:
+    if None in row or any(row.get(field) is None for field in CSV_FIELDS):
+        raise ManifestSchemaError("trusted CSV row does not match CSV_FIELDS")
+    return Candle.from_csv_row({field: str(row[field]) for field in CSV_FIELDS})
+
+
+def _canonical_candles_equal(left: list[Candle], right: list[Candle]) -> bool:
+    return len(left) == len(right) and all(
+        left_candle.to_csv_row() == right_candle.to_csv_row()
+        for left_candle, right_candle in zip(left, right)
+    )
 
 
 def validate_storage_segment(value: str, *, field: str) -> str:
