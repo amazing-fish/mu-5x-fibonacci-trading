@@ -16,6 +16,7 @@ from mu_strategy.research.strategy_artifact_publication import (
     recover_strategy_artifact,
 )
 from mu_strategy.research.strategy_releases import (
+    ReleaseApprovalMode,
     ReleaseDecision,
     ScmReviewSnapshotV1,
     STRATEGY_RELEASE_SCM_REPOSITORY,
@@ -94,7 +95,10 @@ def capture_verified_approval(
     pull_request_number: int,
     review_record_id: str,
     provider: ScmReviewProvider,
+    approval_mode: ReleaseApprovalMode = ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
 ) -> StrategyReleaseApprovalV1:
+    if not isinstance(approval_mode, ReleaseApprovalMode):
+        raise ScmReviewVerificationError("approval mode is not supported")
     if repository != TRUSTED_SCM_REPOSITORY:
         raise ScmReviewVerificationError("promotion requires the trusted repository")
     pull_request = provider.fetch_pull_request(
@@ -130,14 +134,16 @@ def capture_verified_approval(
     ):
         raise ScmReviewVerificationError("SCM review coordinates do not match the requested record")
     if not pull_request.author_id:
-        raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
-    authors = {
-        pull_request.author_id.casefold(),
-        evaluated_commit.author_id.casefold(),
-        evaluated_commit.committer_id.casefold(),
-    }
-    if live.reviewer_id.casefold() in authors:
-        raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
+        raise ScmReviewVerificationError("SCM pull request author identity is incomplete")
+    if live.reviewer_id.casefold() == pull_request.author_id.casefold():
+        raise ScmReviewVerificationError("SCM pull request author cannot approve their own pull request")
+    if approval_mode is ReleaseApprovalMode.INDEPENDENT_REVIEW_V1:
+        authors = {
+            evaluated_commit.author_id.casefold(),
+            evaluated_commit.committer_id.casefold(),
+        }
+        if live.reviewer_id.casefold() in authors:
+            raise ScmReviewVerificationError("SCM reviewer must be independent from the release author")
     if live.decision is not ReleaseDecision.APPROVED:
         raise ScmReviewVerificationError("SCM review decision is not APPROVED")
     if live.includes_created_edit:
@@ -153,6 +159,7 @@ def capture_verified_approval(
             repository=live.repository,
             pull_request_number=live.pull_request_number,
             review_record_id=live.review_record_id,
+            approval_mode=approval_mode,
             reviewer_id=live.reviewer_id,
             author_id=evaluated_commit.author_id,
             reviewed_at_ms=live.reviewed_at_ms,
@@ -175,6 +182,7 @@ def promote_strategy_release(
     pull_request_number: int,
     review_record_id: str,
     provider: ScmReviewProvider,
+    approval_mode: ReleaseApprovalMode = ReleaseApprovalMode.INDEPENDENT_REVIEW_V1,
     publication_durability_anchor: Path | None = None,
     recover_publication: bool = False,
 ) -> tuple[StrategyReleaseV1, Path]:
@@ -196,6 +204,7 @@ def promote_strategy_release(
         pull_request_number=pull_request_number,
         review_record_id=review_record_id,
         provider=provider,
+        approval_mode=approval_mode,
     )
     release = StrategyReleaseV1.create(candidate=candidate, approval=approval)
     output_path = release_dir / f"{release.strategy_release_id}.json"
@@ -412,6 +421,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pull-request-number", required=True, type=int)
     parser.add_argument("--review-record-id", required=True)
+    parser.add_argument(
+        "--approval-mode",
+        choices=tuple(mode.value for mode in ReleaseApprovalMode),
+        default=ReleaseApprovalMode.INDEPENDENT_REVIEW_V1.value,
+    )
     parser.add_argument("--release-dir", type=Path, default=Path("config/strategy-releases"))
     parser.add_argument(
         "--publication-durability-anchor",
@@ -435,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
         pull_request_number=args.pull_request_number,
         review_record_id=args.review_record_id,
         provider=GitHubCliScmReviewProvider(),
+        approval_mode=ReleaseApprovalMode(args.approval_mode),
         publication_durability_anchor=args.publication_durability_anchor,
         recover_publication=args.recover_publication,
     )
