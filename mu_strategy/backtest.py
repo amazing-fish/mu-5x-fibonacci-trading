@@ -8,9 +8,15 @@ from mu_strategy.strategy import (
     StrategyConfig,
     is_preferred_us_cash_window,
     nearest_fib_retest_level,
-    recent_higher_low,
     should_enter_long,
     should_execute_entry,
+)
+from mu_strategy.strategies.position_rules import (
+    PositionFillSnapshot,
+    PositionStateSnapshot,
+    decide_pyramid_add,
+    resolved_stop_tightening,
+    tighten_stop,
 )
 
 
@@ -265,14 +271,6 @@ def _buy_limit_fill_price(candle: Candle, limit_price: float) -> float | None:
     return limit_price
 
 
-def _buy_stop_fill_price(candle: Candle, trigger_price: float) -> float | None:
-    if candle.high < trigger_price:
-        return None
-    if candle.open > trigger_price:
-        return candle.open
-    return trigger_price
-
-
 def _sell_stop_fill_price(candle: Candle, stop_price: float) -> float | None:
     if candle.low > stop_price:
         return None
@@ -304,25 +302,28 @@ def _maybe_add(
     equity: float,
     config: StrategyConfig,
 ) -> None:
-    next_stage = position.max_stage + 1
-    if next_stage > len(config.margin_steps):
-        return
-    if not is_preferred_us_cash_window(candle.open_time_ms, config):
-        return
-    threshold = config.add_thresholds[next_stage - 2]
-    trigger_price = position.entry_anchor * (1 + threshold)
-    fill_price = _buy_stop_fill_price(candle, trigger_price)
-    if fill_price is None:
-        return
-    if rsi_values[index] < config.rsi_add_floor or hist_values[index] < hist_values[index - 1]:
-        return
     regime = hourly_context.get(candle.open_time_ms, "yellow")
-    if next_stage >= 3 and regime != config.full_size_regime:
+    decision = decide_pyramid_add(
+        _position_snapshot(position),
+        candle,
+        rsi_value=rsi_values[index],
+        macd_hist=hist_values[index],
+        previous_macd_hist=hist_values[index - 1],
+        regime=regime,
+        config=config,
+    )
+    if not decision.should_add:
         return
 
-    fill = _make_fill(candle.open_time_ms, fill_price, config.margin_steps[next_stage - 1], equity, config)
+    fill = _make_fill(
+        candle.open_time_ms,
+        decision.fill_price,
+        decision.margin_fraction,
+        equity,
+        config,
+    )
     position.fills.append(fill)
-    position.max_stage = next_stage
+    position.max_stage = decision.stage
 
 
 def _tighten_stop(
@@ -333,181 +334,39 @@ def _tighten_stop(
     regime: str,
     config: StrategyConfig,
 ) -> None:
-    initial_stop = position.initial_stop_price or position.stop_price
-    first_entry = position.fills[0].price
-    mode = _resolved_stop_tightening(regime, config)
-
-    if mode == "baseline":
-        _tighten_stop_baseline(position, index, candles, config)
-        return
-
-    if mode == "half_protect":
-        _tighten_stop_half_protect(position, index, candles, config, initial_stop, first_entry)
-        return
-
-    if mode == "wide":
-        _tighten_stop_green_wide(position, index, candles, config, initial_stop, first_entry)
-        return
-
-    if mode == "delayed_baseline":
-        _tighten_stop_delayed_baseline(position, index, candles, config)
-        return
-
-    raise ValueError(f"unsupported stop_tightening: {mode}")
-
-
-def _resolved_stop_tightening(regime: str, config: StrategyConfig) -> str:
-    if regime == "yellow" and config.yellow_stop_tightening is not None:
-        return config.yellow_stop_tightening
-    if regime == "green" and config.green_stop_tightening is not None:
-        return config.green_stop_tightening
-
-    if config.stop_tightening == "green_wide":
-        return "wide" if regime == "green" else "baseline"
-    if config.stop_tightening == "half_protect_green_wide":
-        return "wide" if regime == "green" else "half_protect"
-    return config.stop_tightening
-
-
-def _tighten_stop_baseline(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-) -> None:
-    if position.max_stage >= 2:
-        position.stop_price = max(position.stop_price, position.fills[0].price)
-    if position.max_stage >= 3:
-        position.stop_price = max(position.stop_price, position.entry_price)
-    if position.max_stage >= 4:
-        higher_low = recent_higher_low(candles, index)
-        if higher_low:
-            position.stop_price = max(position.stop_price, higher_low * (1 - config.stop_buffer_pct))
-
-
-def _tighten_stop_half_protect(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-    initial_stop: float,
-    first_entry: float,
-) -> None:
-    if position.max_stage >= 2:
-        position.stop_price = max(position.stop_price, (initial_stop + first_entry) / 2)
-    if position.max_stage >= 3:
-        position.stop_price = max(position.stop_price, first_entry)
-    if position.max_stage >= 4:
-        higher_low = recent_higher_low(candles, index)
-        if higher_low:
-            position.stop_price = max(position.stop_price, position.entry_price, higher_low * (1 - config.stop_buffer_pct))
-
-
-def _tighten_stop_green_wide(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-    initial_stop: float,
-    first_entry: float,
-) -> None:
-    if position.max_stage >= 2:
-        position.stop_price = max(position.stop_price, (initial_stop + first_entry) / 2)
-    if position.max_stage >= 3:
-        position.stop_price = max(position.stop_price, first_entry)
-    if position.max_stage >= 4:
-        higher_low = recent_higher_low(candles, index)
-        if higher_low:
-            position.stop_price = max(position.stop_price, first_entry, higher_low * (1 - config.green_wide_stop_buffer_pct))
-
-
-def _tighten_stop_delayed_baseline(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-) -> None:
-    if position.stop_transition_fill_count != len(position.fills):
+    if (
+        resolved_stop_tightening(regime, config) == "delayed_baseline"
+        and position.stop_transition_fill_count != len(position.fills)
+    ):
         position.stop_transition_fill_count = len(position.fills)
         position.stop_transition_start = position.stop_price
-    progress = _apply_stop_transition_curve(
-        _stop_transition_progress(position, index, candles, config),
-        config.stop_transition_curve,
+    position.stop_price = tighten_stop(
+        _position_snapshot(position),
+        candle,
+        index=index,
+        candles=candles,
+        regime=regime,
+        config=config,
     )
-    start = position.stop_transition_start or _previous_baseline_stop_target(position)
-    target = _baseline_stop_target(position, index, candles, config)
-    transitioned = _interpolate(start, target, progress)
-    position.stop_price = max(position.stop_price, transitioned)
 
 
-def _stop_transition_progress(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-) -> float:
-    if config.stop_transition_bars <= 0:
-        return 1.0
-    fill_index = _fill_index(candles, position.fills[-1].time_ms)
-    elapsed = max(0, index - fill_index)
-    return min(1.0, elapsed / config.stop_transition_bars)
-
-
-def _apply_stop_transition_curve(progress: float, curve: str) -> float:
-    if curve == "linear":
-        return progress
-    if curve == "slow_start":
-        return progress * progress
-    if curve == "fast_start":
-        return 1 - ((1 - progress) * (1 - progress))
-    if curve == "smooth":
-        return (3 * progress * progress) - (2 * progress * progress * progress)
-    raise ValueError(f"unsupported stop_transition_curve: {curve}")
-
-
-def _fill_index(candles: list[Candle], fill_time_ms: int) -> int:
-    for index, candle in enumerate(candles):
-        if candle.open_time_ms == fill_time_ms:
-            return index
-    return 0
-
-
-def _baseline_stop_target(
-    position: OpenPosition,
-    index: int,
-    candles: list[Candle],
-    config: StrategyConfig,
-) -> float:
-    target = position.initial_stop_price or position.stop_price
-    if position.max_stage >= 2:
-        target = max(target, position.fills[0].price)
-    if position.max_stage >= 3:
-        target = max(target, position.entry_price)
-    if position.max_stage >= 4:
-        higher_low = recent_higher_low(candles, index)
-        if higher_low:
-            target = max(target, higher_low * (1 - config.stop_buffer_pct))
-    return target
-
-
-def _previous_baseline_stop_target(position: OpenPosition) -> float:
-    initial_stop = position.initial_stop_price or position.stop_price
-    if position.max_stage <= 2:
-        return initial_stop
-    if position.max_stage == 3:
-        return position.fills[0].price
-    return _fills_entry_price(position.fills[:-1])
-
-
-def _fills_entry_price(fills: list[Fill]) -> float:
-    units = sum(fill.units for fill in fills)
-    if not units:
-        return 0.0
-    return sum(fill.price * fill.units for fill in fills) / units
-
-
-def _interpolate(start: float, target: float, progress: float) -> float:
-    return start + ((target - start) * progress)
+def _position_snapshot(position: OpenPosition) -> PositionStateSnapshot:
+    return PositionStateSnapshot(
+        fills=tuple(
+            PositionFillSnapshot(
+                time_ms=fill.time_ms,
+                price=fill.price,
+                units=fill.units,
+            )
+            for fill in position.fills
+        ),
+        stop_price=position.stop_price,
+        entry_anchor=position.entry_anchor,
+        initial_stop_price=position.initial_stop_price,
+        max_stage=position.max_stage,
+        stop_transition_fill_count=position.stop_transition_fill_count,
+        stop_transition_start=position.stop_transition_start,
+    )
 
 
 def _marked_equity(equity: float, position: OpenPosition | None, mark_price: float) -> float:
