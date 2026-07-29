@@ -12,18 +12,9 @@ __all__ = [
     "PositionFillSnapshot",
     "PositionStateSnapshot",
     "PyramidAddDecision",
-    "apply_stop_transition_curve",
-    "baseline_stop_target",
+    "StopTighteningOutcome",
     "decide_pyramid_add",
-    "interpolate",
-    "previous_baseline_stop_target",
-    "resolved_stop_tightening",
-    "stop_transition_progress",
     "tighten_stop",
-    "tighten_stop_baseline",
-    "tighten_stop_delayed_baseline",
-    "tighten_stop_green_wide",
-    "tighten_stop_half_protect",
 ]
 
 
@@ -39,8 +30,7 @@ class PositionStateSnapshot:
     """Immutable inputs for one exit or pyramid-add evaluation.
 
     The transition fields identify the stop anchor for the current fill count.
-    A caller that performs an add owns advancing that bookkeeping before its
-    next delayed-stop evaluation.
+    ``tighten_stop`` returns their next values with the stop-price decision.
     """
 
     fills: tuple[PositionFillSnapshot, ...]
@@ -72,6 +62,13 @@ class PyramidAddDecision:
             raise ValueError("add decision requires stage, fill_price, and margin_fraction")
         if not self.should_add and any(value is not None for value in details):
             raise ValueError("no-add decision cannot contain fill details")
+
+
+@dataclass(frozen=True)
+class StopTighteningOutcome:
+    stop_price: float
+    transition_fill_count: int
+    transition_start: float
 
 
 def decide_pyramid_add(
@@ -124,17 +121,19 @@ def tighten_stop(
     candles: Sequence[Candle],
     regime: str,
     config: StrategyConfig,
-) -> float:
+) -> StopTighteningOutcome:
     if index < 0 or index >= len(candles) or candles[index].open_time_ms != candle.open_time_ms:
         raise ValueError("current candle must match candles[index]")
     initial_stop = position.initial_stop_price or position.stop_price
     first_entry = position.fills[0].price
-    mode = resolved_stop_tightening(regime, config)
+    mode = _resolved_stop_tightening(regime, config)
+    transition_fill_count = position.stop_transition_fill_count
+    transition_start = position.stop_transition_start
 
     if mode == "baseline":
-        return tighten_stop_baseline(position, index=index, candles=candles, config=config)
-    if mode == "half_protect":
-        return tighten_stop_half_protect(
+        stop_price = _tighten_stop_baseline(position, index=index, candles=candles, config=config)
+    elif mode == "half_protect":
+        stop_price = _tighten_stop_half_protect(
             position,
             index=index,
             candles=candles,
@@ -142,8 +141,8 @@ def tighten_stop(
             initial_stop=initial_stop,
             first_entry=first_entry,
         )
-    if mode == "wide":
-        return tighten_stop_green_wide(
+    elif mode == "wide":
+        stop_price = _tighten_stop_green_wide(
             position,
             index=index,
             candles=candles,
@@ -151,12 +150,28 @@ def tighten_stop(
             initial_stop=initial_stop,
             first_entry=first_entry,
         )
-    if mode == "delayed_baseline":
-        return tighten_stop_delayed_baseline(position, index=index, candles=candles, config=config)
-    raise ValueError(f"unsupported stop_tightening: {mode}")
+    elif mode == "delayed_baseline":
+        if transition_fill_count != len(position.fills):
+            transition_fill_count = len(position.fills)
+            transition_start = position.stop_price
+        stop_price = _tighten_stop_delayed_baseline(
+            position,
+            index=index,
+            candles=candles,
+            config=config,
+            transition_start=transition_start,
+        )
+    else:
+        raise ValueError(f"unsupported stop_tightening: {mode}")
+
+    return StopTighteningOutcome(
+        stop_price=stop_price,
+        transition_fill_count=transition_fill_count,
+        transition_start=transition_start,
+    )
 
 
-def resolved_stop_tightening(regime: str, config: StrategyConfig) -> str:
+def _resolved_stop_tightening(regime: str, config: StrategyConfig) -> str:
     if regime == "yellow" and config.yellow_stop_tightening is not None:
         return config.yellow_stop_tightening
     if regime == "green" and config.green_stop_tightening is not None:
@@ -169,7 +184,7 @@ def resolved_stop_tightening(regime: str, config: StrategyConfig) -> str:
     return config.stop_tightening
 
 
-def tighten_stop_baseline(
+def _tighten_stop_baseline(
     position: PositionStateSnapshot,
     *,
     index: int,
@@ -188,7 +203,7 @@ def tighten_stop_baseline(
     return stop_price
 
 
-def tighten_stop_half_protect(
+def _tighten_stop_half_protect(
     position: PositionStateSnapshot,
     *,
     index: int,
@@ -209,7 +224,7 @@ def tighten_stop_half_protect(
     return stop_price
 
 
-def tighten_stop_green_wide(
+def _tighten_stop_green_wide(
     position: PositionStateSnapshot,
     *,
     index: int,
@@ -234,27 +249,25 @@ def tighten_stop_green_wide(
     return stop_price
 
 
-def tighten_stop_delayed_baseline(
+def _tighten_stop_delayed_baseline(
     position: PositionStateSnapshot,
     *,
     index: int,
     candles: Sequence[Candle],
     config: StrategyConfig,
+    transition_start: float,
 ) -> float:
-    transition_start = position.stop_transition_start
-    if position.stop_transition_fill_count != len(position.fills):
-        transition_start = position.stop_price
-    progress = apply_stop_transition_curve(
-        stop_transition_progress(position, index=index, candles=candles, config=config),
+    progress = _apply_stop_transition_curve(
+        _stop_transition_progress(position, index=index, candles=candles, config=config),
         config.stop_transition_curve,
     )
-    start = transition_start or previous_baseline_stop_target(position)
-    target = baseline_stop_target(position, index=index, candles=candles, config=config)
-    transitioned = interpolate(start, target, progress)
+    start = transition_start or _previous_baseline_stop_target(position)
+    target = _baseline_stop_target(position, index=index, candles=candles, config=config)
+    transitioned = _interpolate(start, target, progress)
     return max(position.stop_price, transitioned)
 
 
-def stop_transition_progress(
+def _stop_transition_progress(
     position: PositionStateSnapshot,
     *,
     index: int,
@@ -268,7 +281,7 @@ def stop_transition_progress(
     return min(1.0, elapsed / config.stop_transition_bars)
 
 
-def apply_stop_transition_curve(progress: float, curve: str) -> float:
+def _apply_stop_transition_curve(progress: float, curve: str) -> float:
     if curve == "linear":
         return progress
     if curve == "slow_start":
@@ -280,7 +293,7 @@ def apply_stop_transition_curve(progress: float, curve: str) -> float:
     raise ValueError(f"unsupported stop_transition_curve: {curve}")
 
 
-def baseline_stop_target(
+def _baseline_stop_target(
     position: PositionStateSnapshot,
     *,
     index: int,
@@ -299,7 +312,7 @@ def baseline_stop_target(
     return target
 
 
-def previous_baseline_stop_target(position: PositionStateSnapshot) -> float:
+def _previous_baseline_stop_target(position: PositionStateSnapshot) -> float:
     initial_stop = position.initial_stop_price or position.stop_price
     if position.max_stage <= 2:
         return initial_stop
@@ -308,7 +321,7 @@ def previous_baseline_stop_target(position: PositionStateSnapshot) -> float:
     return _fills_entry_price(position.fills[:-1])
 
 
-def interpolate(start: float, target: float, progress: float) -> float:
+def _interpolate(start: float, target: float, progress: float) -> float:
     return start + ((target - start) * progress)
 
 
@@ -316,7 +329,7 @@ def _fill_index(candles: Sequence[Candle], fill_time_ms: int) -> int:
     for index, candle in enumerate(candles):
         if candle.open_time_ms == fill_time_ms:
             return index
-    return 0
+    raise ValueError(f"fill timestamp {fill_time_ms} is not present in candles")
 
 
 def _fills_entry_price(fills: tuple[PositionFillSnapshot, ...]) -> float:

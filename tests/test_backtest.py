@@ -1,3 +1,6 @@
+import ast
+import inspect
+import textwrap
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -284,6 +287,27 @@ class BacktestTests(unittest.TestCase):
 
         _tighten_stop(position, candles[5], 5, candles, "green", config)
         self.assertAlmostEqual(100, position.stop_price)
+
+    def test_stop_adapter_delegates_transition_state_machine_to_shared_entry_point(self):
+        source = textwrap.dedent(inspect.getsource(_tighten_stop))
+        tree = ast.parse(source)
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        mode_literals = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in {"baseline", "half_protect", "wide", "delayed_baseline"}
+        }
+
+        self.assertEqual(1, calls.count("tighten_stop"))
+        self.assertNotIn("resolved_stop_tightening", calls)
+        self.assertEqual(set(), mode_literals)
+        self.assertFalse(any(isinstance(node, (ast.If, ast.Compare)) for node in ast.walk(tree)))
 
     def test_delayed_baseline_non_linear_curves_change_transition_speed(self):
         first_candle = candle(0, 100, 101, 99, 100)

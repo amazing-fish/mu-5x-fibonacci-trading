@@ -15,7 +15,6 @@ from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
     PositionStateSnapshot,
     decide_pyramid_add,
-    resolved_stop_tightening,
     tighten_stop,
 )
 
@@ -334,13 +333,7 @@ def _tighten_stop(
     regime: str,
     config: StrategyConfig,
 ) -> None:
-    if (
-        resolved_stop_tightening(regime, config) == "delayed_baseline"
-        and position.stop_transition_fill_count != len(position.fills)
-    ):
-        position.stop_transition_fill_count = len(position.fills)
-        position.stop_transition_start = position.stop_price
-    position.stop_price = tighten_stop(
+    outcome = tighten_stop(
         _position_snapshot(position),
         candle,
         index=index,
@@ -348,6 +341,9 @@ def _tighten_stop(
         regime=regime,
         config=config,
     )
+    position.stop_price = outcome.stop_price
+    position.stop_transition_fill_count = outcome.transition_fill_count
+    position.stop_transition_start = outcome.transition_start
 
 
 def _position_snapshot(position: OpenPosition) -> PositionStateSnapshot:

@@ -2,15 +2,14 @@ import copy
 import unittest
 from dataclasses import asdict
 
+import mu_strategy.strategies.position_rules as position_rules
 from mu_strategy.backtest import run_backtest
 from mu_strategy.models import Candle
 from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
     PositionStateSnapshot,
-    apply_stop_transition_curve,
+    StopTighteningOutcome,
     decide_pyramid_add,
-    resolved_stop_tightening,
-    stop_transition_progress,
     tighten_stop,
 )
 from mu_strategy.strategy import StrategyConfig
@@ -149,7 +148,7 @@ class ExitRuleTests(unittest.TestCase):
                         stop_price=stop_price,
                         max_stage=stage,
                     )
-                    next_stop = tighten_stop(
+                    outcome = tighten_stop(
                         state,
                         candles[4],
                         index=4,
@@ -157,6 +156,7 @@ class ExitRuleTests(unittest.TestCase):
                         regime="green",
                         config=config,
                     )
+                    next_stop = outcome.stop_price
                     self.assertGreaterEqual(next_stop, stop_price)
                     actual_sequence.append(next_stop)
                     stop_price = next_stop
@@ -164,18 +164,28 @@ class ExitRuleTests(unittest.TestCase):
                 self.assertEqual(expected_sequence, actual_sequence)
 
     def test_regime_dispatch_and_explicit_overrides(self):
+        candles = [
+            candle(0, 111, 112, 110, 111),
+            candle(1, 112, 113, 111, 112),
+            candle(2, 113, 114, 112, 113),
+            candle(3, 114, 115, 113, 114),
+            candle(4, 115, 116, 114, 115),
+        ]
+        state = position_snapshot((100, 102, 104, 106), max_stage=4)
+        baseline_or_half_protect = 110 * (1 - 0.0005)
+        wide = 110 * (1 - 0.01)
         cases = (
-            (StrategyConfig(stop_tightening="green_wide"), "yellow", "baseline"),
-            (StrategyConfig(stop_tightening="green_wide"), "green", "wide"),
+            (StrategyConfig(stop_tightening="green_wide"), "yellow", baseline_or_half_protect),
+            (StrategyConfig(stop_tightening="green_wide"), "green", wide),
             (
                 StrategyConfig(stop_tightening="half_protect_green_wide"),
                 "yellow",
-                "half_protect",
+                baseline_or_half_protect,
             ),
             (
                 StrategyConfig(stop_tightening="half_protect_green_wide"),
                 "green",
-                "wide",
+                wide,
             ),
             (
                 StrategyConfig(
@@ -183,7 +193,7 @@ class ExitRuleTests(unittest.TestCase):
                     yellow_stop_tightening="wide",
                 ),
                 "yellow",
-                "wide",
+                wide,
             ),
             (
                 StrategyConfig(
@@ -191,32 +201,228 @@ class ExitRuleTests(unittest.TestCase):
                     green_stop_tightening="baseline",
                 ),
                 "green",
-                "baseline",
+                baseline_or_half_protect,
             ),
         )
 
         for config, regime, expected in cases:
             with self.subTest(regime=regime, expected=expected):
-                self.assertEqual(expected, resolved_stop_tightening(regime, config))
+                outcome = tighten_stop(
+                    state,
+                    candles[4],
+                    index=4,
+                    candles=candles,
+                    regime=regime,
+                    config=config,
+                )
+                self.assertAlmostEqual(expected, outcome.stop_price)
 
     def test_transition_curves_and_non_positive_bar_short_circuit(self):
-        self.assertEqual(0.5, apply_stop_transition_curve(0.5, "linear"))
-        self.assertEqual(0.25, apply_stop_transition_curve(0.5, "slow_start"))
-        self.assertEqual(0.75, apply_stop_transition_curve(0.5, "fast_start"))
-        self.assertEqual(0.5, apply_stop_transition_curve(0.5, "smooth"))
-
-        state = position_snapshot((100, 102), max_stage=2)
-        for bars in (0, -1):
-            with self.subTest(bars=bars):
-                self.assertEqual(
-                    1.0,
-                    stop_transition_progress(
-                        state,
-                        index=1,
-                        candles=[],
-                        config=StrategyConfig(stop_transition_bars=bars),
+        candles = [
+            candle(0, 100, 101, 99, 100),
+            candle(1, 101, 103, 100, 102),
+            candle(2, 102, 104, 101, 103),
+            candle(3, 103, 105, 102, 104),
+        ]
+        state = position_snapshot(
+            (100, 102),
+            max_stage=2,
+            stop_transition_fill_count=2,
+            stop_transition_start=98,
+        )
+        expected_stops = {
+            "linear": 99,
+            "slow_start": 98.5,
+            "fast_start": 99.5,
+            "smooth": 99,
+        }
+        for curve, expected_stop in expected_stops.items():
+            with self.subTest(curve=curve):
+                outcome = tighten_stop(
+                    state,
+                    candles[3],
+                    index=3,
+                    candles=candles,
+                    regime="green",
+                    config=StrategyConfig(
+                        stop_tightening="delayed_baseline",
+                        stop_transition_bars=4,
+                        stop_transition_curve=curve,
                     ),
                 )
+                self.assertAlmostEqual(expected_stop, outcome.stop_price)
+
+        for bars in (0, -1):
+            with self.subTest(bars=bars):
+                outcome = tighten_stop(
+                    state,
+                    candles[3],
+                    index=3,
+                    candles=candles,
+                    regime="green",
+                    config=StrategyConfig(
+                        stop_tightening="delayed_baseline",
+                        stop_transition_bars=bars,
+                    ),
+                )
+                self.assertEqual(
+                    100,
+                    outcome.stop_price,
+                )
+
+    def test_live_snapshot_missing_entry_bar_fails_closed(self):
+        state = PositionStateSnapshot(
+            fills=(PositionFillSnapshot(time_ms=0, price=100, units=1),),
+            stop_price=98,
+            entry_anchor=100,
+            initial_stop_price=98,
+            max_stage=1,
+        )
+        bounded_window = [
+            candle(8, 108, 109, 107, 108),
+            candle(9, 109, 110, 108, 109),
+        ]
+
+        outcome = None
+        with self.assertRaisesRegex(ValueError, "fill timestamp 0 is not present") as raised:
+            outcome = tighten_stop(
+                state,
+                bounded_window[1],
+                index=1,
+                candles=bounded_window,
+                regime="green",
+                config=StrategyConfig(stop_tightening="delayed_baseline"),
+            )
+
+        self.assertIs(ValueError, raised.exception.__class__)
+        self.assertIsNone(outcome)
+
+    def test_live_caller_carries_delayed_transition_only_with_public_outcome(self):
+        config = StrategyConfig(
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=4,
+            stop_transition_curve="linear",
+        )
+        candles = [
+            candle(index, 100 + index, 101 + index, 99 + index, 100 + index)
+            for index in range(6)
+        ]
+        state = position_snapshot((100, 102), max_stage=2)
+        actual_stops = []
+
+        for index in range(1, 6):
+            outcome = tighten_stop(
+                state,
+                candles[index],
+                index=index,
+                candles=candles,
+                regime="green",
+                config=config,
+            )
+            self.assertIsInstance(outcome, StopTighteningOutcome)
+            actual_stops.append(outcome.stop_price)
+            state = PositionStateSnapshot(
+                fills=state.fills,
+                stop_price=outcome.stop_price,
+                entry_anchor=state.entry_anchor,
+                initial_stop_price=state.initial_stop_price,
+                max_stage=state.max_stage,
+                stop_transition_fill_count=outcome.transition_fill_count,
+                stop_transition_start=outcome.transition_start,
+            )
+
+        self.assertEqual([98, 98.5, 99, 99.5, 100], actual_stops)
+        self.assertLess(actual_stops[0], actual_stops[-1])
+
+    def test_delayed_transition_bookkeeping_reanchors_across_two_adds(self):
+        config = StrategyConfig(
+            stop_tightening="delayed_baseline",
+            stop_transition_bars=4,
+            stop_transition_curve="linear",
+        )
+        candles = [
+            candle(index, 100 + index, 101 + index, 99 + index, 100 + index)
+            for index in range(6)
+        ]
+        first_fill = PositionFillSnapshot(time_ms=candles[0].open_time_ms, price=100, units=1)
+        state_after_first_add = PositionStateSnapshot(
+            fills=(
+                first_fill,
+                PositionFillSnapshot(time_ms=candles[1].open_time_ms, price=102, units=1),
+            ),
+            stop_price=98,
+            entry_anchor=100,
+            initial_stop_price=98,
+            max_stage=2,
+            stop_transition_fill_count=1,
+            stop_transition_start=98,
+        )
+
+        first_add_outcome = tighten_stop(
+            state_after_first_add,
+            candles[1],
+            index=1,
+            candles=candles,
+            regime="green",
+            config=config,
+        )
+        self.assertEqual(2, first_add_outcome.transition_fill_count)
+        self.assertEqual(98, first_add_outcome.transition_start)
+
+        state_before_second_add = PositionStateSnapshot(
+            fills=state_after_first_add.fills,
+            stop_price=first_add_outcome.stop_price,
+            entry_anchor=state_after_first_add.entry_anchor,
+            initial_stop_price=state_after_first_add.initial_stop_price,
+            max_stage=state_after_first_add.max_stage,
+            stop_transition_fill_count=first_add_outcome.transition_fill_count,
+            stop_transition_start=first_add_outcome.transition_start,
+        )
+        progressed_outcome = tighten_stop(
+            state_before_second_add,
+            candles[3],
+            index=3,
+            candles=candles,
+            regime="green",
+            config=config,
+        )
+        self.assertEqual(99, progressed_outcome.stop_price)
+
+        state_after_second_add = PositionStateSnapshot(
+            fills=state_before_second_add.fills
+            + (PositionFillSnapshot(time_ms=candles[3].open_time_ms, price=104, units=1),),
+            stop_price=progressed_outcome.stop_price,
+            entry_anchor=state_before_second_add.entry_anchor,
+            initial_stop_price=state_before_second_add.initial_stop_price,
+            max_stage=3,
+            stop_transition_fill_count=progressed_outcome.transition_fill_count,
+            stop_transition_start=progressed_outcome.transition_start,
+        )
+        second_add_outcome = tighten_stop(
+            state_after_second_add,
+            candles[3],
+            index=3,
+            candles=candles,
+            regime="green",
+            config=config,
+        )
+
+        self.assertEqual(3, second_add_outcome.transition_fill_count)
+        self.assertEqual(progressed_outcome.stop_price, second_add_outcome.transition_start)
+        self.assertEqual(progressed_outcome.stop_price, second_add_outcome.stop_price)
+
+    def test_public_surface_contains_only_decision_contract(self):
+        self.assertEqual(
+            [
+                "PositionFillSnapshot",
+                "PositionStateSnapshot",
+                "PyramidAddDecision",
+                "StopTighteningOutcome",
+                "decide_pyramid_add",
+                "tighten_stop",
+            ],
+            position_rules.__all__,
+        )
 
     def test_exit_and_add_rules_do_not_mutate_snapshot_or_nested_fills(self):
         state = position_snapshot((100, 102), max_stage=2)
@@ -262,7 +468,17 @@ class ExitRuleTests(unittest.TestCase):
                 config=StrategyConfig(stop_tightening="future_mode"),
             )
         with self.assertRaisesRegex(ValueError, "unsupported stop_transition_curve"):
-            apply_stop_transition_curve(0.5, "future_curve")
+            tighten_stop(
+                state,
+                current,
+                index=1,
+                candles=[candle(0, 100, 101, 99, 100), current],
+                regime="green",
+                config=StrategyConfig(
+                    stop_tightening="delayed_baseline",
+                    stop_transition_curve="future_curve",
+                ),
+            )
 
 
 class PyramidAddRuleTests(unittest.TestCase):
@@ -318,30 +534,6 @@ class PyramidAddRuleTests(unittest.TestCase):
         for name, state, overrides in cases:
             with self.subTest(gate=name):
                 self.assertFalse(self.decide(state, **overrides).should_add)
-
-    def test_shared_contract_has_no_backtest_open_position_dependency(self):
-        state = PositionStateSnapshot(
-            fills=(PositionFillSnapshot(time_ms=0, price=100, units=1),),
-            stop_price=98,
-            entry_anchor=100,
-            initial_stop_price=98,
-            max_stage=1,
-        )
-
-        next_stop = tighten_stop(
-            state,
-            self.current,
-            index=1,
-            candles=[candle(0, 100, 101, 99, 100), self.current],
-            regime="green",
-            config=self.config,
-        )
-        decision = self.decide(state)
-
-        self.assertEqual(98, next_stop)
-        self.assertTrue(decision.should_add)
-        self.assertEqual("mu_strategy.strategies.position_rules", type(state).__module__)
-
 
 if __name__ == "__main__":
     unittest.main()
