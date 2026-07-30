@@ -207,8 +207,8 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertIsNone(contexts[0])
             self.assertEqual("old-run", contexts[1].generation_id)
-            self.assertIn("generations\\old-run", report)
-            self.assertNotIn("generations\\new-run", report)
+            self.assertIn(str(Path("generations") / "old-run"), report)
+            self.assertNotIn(str(Path("generations") / "new-run"), report)
 
     def test_main_fails_closed_without_trusted_publication_and_writes_no_report(self):
         from mu_strategy.experiments import fibonacci_pullback
