@@ -10,6 +10,7 @@ from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
+from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -118,25 +119,51 @@ def run_asset_fibonacci_backtest(
     horizons_hours: range | list[int],
     data_dir: Path | None = None,
 ) -> AssetFibonacciBacktest:
+    result, _ = _run_asset_fibonacci_backtest(
+        asset,
+        days=days,
+        strategy_name=strategy_name,
+        fee_profile=fee_profile,
+        horizons_hours=horizons_hours,
+        data_dir=data_dir or Path("data/live"),
+        context=None,
+    )
+    return result
+
+
+def _run_asset_fibonacci_backtest(
+    asset: AssetSpec,
+    *,
+    days: int,
+    strategy_name: str,
+    fee_profile: str,
+    horizons_hours: range | list[int],
+    data_dir: Path,
+    context: TrustedLoadContext | None,
+) -> tuple[AssetFibonacciBacktest, TrustedLoadContext]:
     groups = selected_strategy_groups(asset.symbol, [strategy_name])
     if len(groups) != 1:
         raise ValueError("strategy_name must resolve to exactly one strategy group")
     base_config = with_fee_profile(groups[0].config, fee_profile)
-    candles_15m, candles_1h, file_15m, file_1h = _load_trusted_candles(
+    candles_15m, candles_1h, file_15m, file_1h, loaded_context = _load_trusted_candles(
         asset.symbol,
         days=days,
-        data_dir=data_dir or Path("data/live"),
+        data_dir=data_dir,
         source=asset.source,
+        context=context,
     )
-    return AssetFibonacciBacktest(
-        asset=asset,
-        horizon_results=run_fibonacci_horizon_backtests(
-            candles_15m,
-            candles_1h,
-            base_config=base_config,
-            horizons_hours=horizons_hours,
+    return (
+        AssetFibonacciBacktest(
+            asset=asset,
+            horizon_results=run_fibonacci_horizon_backtests(
+                candles_15m,
+                candles_1h,
+                base_config=base_config,
+                horizons_hours=horizons_hours,
+            ),
+            data_files=[file_15m, file_1h],
         ),
-        data_files=[file_15m, file_1h],
+        loaded_context,
     )
 
 
@@ -442,17 +469,19 @@ def main() -> None:
         for value in args.asset:
             asset_values.extend(item.strip() for item in value.split(",") if item.strip())
         try:
-            asset_results = [
-                run_asset_fibonacci_backtest(
+            asset_results: list[AssetFibonacciBacktest] = []
+            trusted_context: TrustedLoadContext | None = None
+            for value in asset_values:
+                asset_result, trusted_context = _run_asset_fibonacci_backtest(
                     resolve_asset(value),
                     days=args.days,
                     strategy_name=args.strategy,
                     fee_profile=args.fee_profile,
                     horizons_hours=horizons,
-                    data_dir=args.data_dir,
+                    data_dir=args.data_dir or Path("data/live"),
+                    context=trusted_context,
                 )
-                for value in asset_values
-            ]
+                asset_results.append(asset_result)
         except ValueError as exc:
             parser.error(str(exc))
         report = render_multi_asset_report(
@@ -473,11 +502,12 @@ def main() -> None:
     base_config = with_fee_profile(groups[0].config, args.fee_profile)
 
     try:
-        candles_15m, candles_1h, file_15m, file_1h = _load_trusted_candles(
+        candles_15m, candles_1h, file_15m, file_1h, _ = _load_trusted_candles(
             args.symbol,
             days=args.days,
             data_dir=args.data_dir or Path("data/live"),
             source="okx",
+            context=None,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -506,7 +536,8 @@ def _load_trusted_candles(
     days: int,
     data_dir: Path,
     source: str,
-) -> tuple[list[Candle], list[Candle], Path, Path]:
+    context: TrustedLoadContext | None,
+) -> tuple[list[Candle], list[Candle], Path, Path, TrustedLoadContext]:
     if source != "okx":
         raise ValueError(f"trusted data layer supports OKX sources only; got source {source!r}")
     bundle = refresh_trusted_candle_bundle(
@@ -515,15 +546,19 @@ def _load_trusted_candles(
         days=days,
         data_dir=data_dir,
         refresh=False,
+        context=context,
     )
     status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
     if status_error:
         raise ValueError(status_error)
+    if bundle.load_context is None:
+        raise ValueError("trusted data blocked: load context missing")
     return (
         bundle.candles_by_interval["15m"],
         bundle.candles_by_interval["1h"],
         bundle.files_by_interval["15m"],
         bundle.files_by_interval["1h"],
+        bundle.load_context,
     )
 
 

@@ -22,9 +22,13 @@ from mu_strategy.experiments.fibonacci_pullback import (
     split_by_utc_month,
 )
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.strategy import StrategyConfig
-from tests.factories.trusted_publication import write_generation_publication
+from tests.factories.trusted_publication import (
+    write_generation_manifest_and_caches,
+    write_generation_publication,
+)
 
 
 DAY_MS = 86_400_000
@@ -128,6 +132,83 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("多标的 Fibonacci 回调 2h-2h 请求 1d 回测", report)
             self.assertIn("MU-USDT-SWAP / okx", report)
+
+    def test_multi_asset_main_pins_one_generation_when_current_pointer_changes(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        now_ms = DAY_MS
+        symbols = ("MU-USDT-SWAP", "BTC-USDT-SWAP")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "trusted"
+            report_path = root / "multi-asset.md"
+            write_generation_manifest_and_caches(
+                data_dir,
+                symbol=symbols[0],
+                days=1,
+                run_id="old-run",
+                universe_symbols=(symbols[0],),
+            )
+            for run_id, symbol in (
+                ("old-run", symbols[1]),
+                ("new-run", symbols[0]),
+                ("new-run", symbols[1]),
+            ):
+                write_generation_manifest_and_caches(
+                    data_dir,
+                    symbol=symbol,
+                    days=1,
+                    run_id=run_id,
+                    universe_symbols=symbols,
+                )
+            store = TrustedDataStore(data_dir=data_dir)
+            store.replace_current("old-run")
+            contexts = []
+
+            def load_then_advance_pointer(symbol, **kwargs):
+                contexts.append(kwargs["context"])
+                bundle = refresh_trusted_candle_bundle(symbol, **kwargs)
+                if len(contexts) == 1:
+                    store.replace_current("new-run")
+                return bundle
+
+            argv = [
+                "mu_strategy.experiments.fibonacci_pullback",
+                "--asset",
+                "MU",
+                "--asset",
+                "BTC",
+                "--days",
+                "1",
+                "--min-hour",
+                "2",
+                "--max-hour",
+                "2",
+                "--strategy",
+                "baseline",
+                "--data-dir",
+                str(data_dir),
+                "--multi-report",
+                str(report_path),
+            ]
+            with _blocked_market_data_paths("mu_strategy.experiments.fibonacci_pullback"):
+                with patch(
+                    "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms",
+                    return_value=now_ms,
+                ):
+                    with patch(
+                        "mu_strategy.experiments.fibonacci_pullback.refresh_trusted_candle_bundle",
+                        side_effect=load_then_advance_pointer,
+                    ):
+                        with patch("sys.argv", argv):
+                            with patch("sys.stdout", new_callable=io.StringIO):
+                                fibonacci_pullback.main()
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIsNone(contexts[0])
+            self.assertEqual("old-run", contexts[1].generation_id)
+            self.assertIn("generations\\old-run", report)
+            self.assertNotIn("generations\\new-run", report)
 
     def test_main_fails_closed_without_trusted_publication_and_writes_no_report(self):
         from mu_strategy.experiments import fibonacci_pullback
