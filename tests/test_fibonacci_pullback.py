@@ -1,4 +1,10 @@
+import io
+import inspect
+import os
 import unittest
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.core.market_context import build_hourly_context
@@ -11,11 +17,14 @@ from mu_strategy.experiments.fibonacci_pullback import (
     render_fibonacci_pullback_report,
     render_multi_asset_report,
     resolve_asset,
+    run_asset_fibonacci_backtest,
     run_fibonacci_horizon_backtests,
     split_by_utc_month,
 )
+from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.strategy import StrategyConfig
+from tests.factories.trusted_publication import write_generation_publication
 
 
 DAY_MS = 86_400_000
@@ -24,6 +33,178 @@ QUARTER_HOUR_MS = 900_000
 
 
 class FibonacciPullbackExperimentTests(unittest.TestCase):
+    def test_main_is_cache_only_and_defaults_to_trusted_live_store(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        now_ms = 20 * DAY_MS
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "live"
+            report_path = root / "fibonacci.md"
+            write_generation_publication(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                start_ms=now_ms - DAY_MS,
+                end_ms=now_ms,
+            )
+            argv = [
+                "mu_strategy.experiments.fibonacci_pullback",
+                "--days",
+                "1",
+                "--min-hour",
+                "2",
+                "--max-hour",
+                "2",
+                "--strategy",
+                "baseline",
+                "--report",
+                str(report_path),
+            ]
+            original_cwd = Path.cwd()
+            os.chdir(root)
+            try:
+                with _blocked_market_data_paths("mu_strategy.experiments.fibonacci_pullback"):
+                    with patch(
+                        "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms",
+                        return_value=now_ms,
+                    ):
+                        with patch(
+                            "mu_strategy.experiments.fibonacci_pullback.refresh_trusted_candle_bundle",
+                            wraps=refresh_trusted_candle_bundle,
+                        ) as trusted_loader:
+                            with patch("sys.argv", argv):
+                                with patch("sys.stdout", new_callable=io.StringIO):
+                                    fibonacci_pullback.main()
+            finally:
+                os.chdir(original_cwd)
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Fibonacci 回调 2h-2h 请求 1d 月度回测", report)
+            self.assertIn("- source: okx", report)
+            self.assertEqual(("15m", "1h"), trusted_loader.call_args.kwargs["intervals"])
+            self.assertEqual(Path("data/live"), trusted_loader.call_args.kwargs["data_dir"])
+            self.assertFalse(trusted_loader.call_args.kwargs["refresh"])
+
+    def test_multi_asset_main_is_cache_only_and_preserves_report_structure(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        now_ms = 20 * DAY_MS
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "trusted"
+            report_path = root / "multi-asset.md"
+            write_generation_publication(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                start_ms=now_ms - DAY_MS,
+                end_ms=now_ms,
+            )
+            argv = [
+                "mu_strategy.experiments.fibonacci_pullback",
+                "--asset",
+                "MU",
+                "--days",
+                "1",
+                "--min-hour",
+                "2",
+                "--max-hour",
+                "2",
+                "--strategy",
+                "baseline",
+                "--data-dir",
+                str(data_dir),
+                "--multi-report",
+                str(report_path),
+            ]
+            with _blocked_market_data_paths("mu_strategy.experiments.fibonacci_pullback"):
+                with patch(
+                    "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms",
+                    return_value=now_ms,
+                ):
+                    with patch("sys.argv", argv):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            fibonacci_pullback.main()
+
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("多标的 Fibonacci 回调 2h-2h 请求 1d 回测", report)
+            self.assertIn("MU-USDT-SWAP / okx", report)
+
+    def test_main_fails_closed_without_trusted_publication_and_writes_no_report(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_path = root / "fibonacci.md"
+            argv = [
+                "mu_strategy.experiments.fibonacci_pullback",
+                "--days",
+                "1",
+                "--min-hour",
+                "2",
+                "--max-hour",
+                "2",
+                "--data-dir",
+                str(root / "missing"),
+                "--report",
+                str(report_path),
+            ]
+            with patch("sys.argv", argv):
+                with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(SystemExit) as raised:
+                        fibonacci_pullback.main()
+
+            self.assertNotEqual(0, raised.exception.code)
+            self.assertIn("trusted data blocked", stderr.getvalue())
+            self.assertFalse(report_path.exists())
+
+    def test_non_okx_asset_fails_closed_before_loading_or_writing_report(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        with TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "multi-asset.md"
+            argv = [
+                "mu_strategy.experiments.fibonacci_pullback",
+                "--asset",
+                "ETHUSDT",
+                "--days",
+                "1",
+                "--data-dir",
+                str(Path(tmp) / "trusted"),
+                "--multi-report",
+                str(report_path),
+            ]
+            with patch(
+                "mu_strategy.experiments.fibonacci_pullback.refresh_trusted_candle_bundle",
+                side_effect=AssertionError("trusted load must not start for non-OKX source"),
+            ):
+                with patch("sys.argv", argv):
+                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        with self.assertRaises(SystemExit) as raised:
+                            fibonacci_pullback.main()
+
+            self.assertNotEqual(0, raised.exception.code)
+            self.assertIn("trusted data layer supports OKX sources only", stderr.getvalue())
+            self.assertFalse(report_path.exists())
+
+    def test_removed_legacy_cli_options_are_rejected(self):
+        from mu_strategy.experiments import fibonacci_pullback
+
+        for option in ("--refresh", "--source"):
+            with self.subTest(option=option):
+                argv = ["mu_strategy.experiments.fibonacci_pullback", option]
+                if option == "--source":
+                    argv.append("okx")
+                with patch("sys.argv", argv):
+                    with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        with self.assertRaises(SystemExit) as raised:
+                            fibonacci_pullback.main()
+
+                self.assertNotEqual(0, raised.exception.code)
+                self.assertIn("unrecognized arguments", stderr.getvalue())
+
+    def test_asset_backtest_api_no_longer_accepts_refresh(self):
+        self.assertNotIn("refresh", inspect.signature(run_asset_fibonacci_backtest).parameters)
+
     def test_horizon_hours_translate_to_15m_fib_lookback_bars(self):
         self.assertEqual(4, fib_lookback_bars(1))
         self.assertEqual(8, fib_lookback_bars(2))
@@ -236,6 +417,46 @@ def _horizon_with_month(
             )
         ],
     )
+
+
+@contextmanager
+def _blocked_market_data_paths(module_name: str):
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                f"{module_name}.cached_historical",
+                side_effect=AssertionError("legacy cache must not be used"),
+                create=True,
+            )
+        )
+        stack.enter_context(
+            patch(
+                f"{module_name}.refresh_candle_bundle",
+                side_effect=AssertionError("legacy bundle must not be used"),
+                create=True,
+            )
+        )
+        for target in (
+            "mu_strategy.market_data.cache.fetch_okx_historical",
+            "mu_strategy.market_data.cache.fetch_okx_incremental",
+            "mu_strategy.market_data.cache.fetch_historical",
+            "mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical",
+            "mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental",
+        ):
+            stack.enter_context(patch(target, side_effect=AssertionError("network must not be used")))
+        stack.enter_context(
+            patch(
+                "mu_strategy.market_data.cache.write_csv",
+                side_effect=AssertionError("cache write must not be used"),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "mu_strategy.market_data.trusted_data.store.TrustedDataStore.write_csv",
+                side_effect=AssertionError("trusted store write must not be used"),
+            )
+        )
+        yield
 
 
 if __name__ == "__main__":

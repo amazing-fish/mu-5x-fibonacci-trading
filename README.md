@@ -32,7 +32,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
 - `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、风险上限、`clOrdId` 幂等和小额限价单。
 
-兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`；其中 backtest 和 visualization 主入口默认只消费可信 OKX cache-only 数据。
+兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`；其中 backtest、visualization、walk-forward 和 Fibonacci experiment 主入口默认只消费可信 OKX cache-only 数据。
 
 ## 常用命令
 
@@ -62,12 +62,14 @@ python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-o
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\live\mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html
 ```
 
-主回测和可视化默认使用可信 OKX cache-only 数据。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存；需要先运行独立刷新命令发布当前 generation：
+主回测、可视化和普通实验入口默认使用可信 OKX cache-only 数据。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存；需要先运行独立刷新命令发布当前 generation：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 python -m mu_strategy.cli --days 14 --report reports\live\mu_okx_trusted_backtest.md
 python -m mu_strategy.visualize --days 14 --output reports\live\mu_okx_trusted_backtest.html
+python -m mu_strategy.walk_forward --window-days 14 --windows 2 --report reports\live\wf.md --html-report reports\live\wf.html
+python -m mu_strategy.experiments.fibonacci_pullback --days 60 --report reports\live\fib.md
 ```
 
 Fibonacci 参数扫描和 walk-forward 消融仍保留在 `mu_strategy.experiments`，但它们不是当前 trusted baseline 的标准验收链路。需要重新做参数研究时，先明确数据来源和输出目录，再把生成报告写到 `reports/live/` 或用户指定的 ignored 路径。
@@ -150,9 +152,9 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
 - 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
-- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization 和 demo 只走 cache-only load。
+- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization、walk-forward、Fibonacci experiment 和 demo 只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。
-- backtest 和 visualization 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；demo loop 的 `--refresh` 也会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
+- backtest、visualization、walk-forward 和 Fibonacci experiment 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；Fibonacci 的非 OKX `AssetSpec.source` 也会明确 fail-closed，demo loop 的 `--refresh` 同样会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...`、`python -m mu_strategy.walk_forward ...`、`python -m mu_strategy.experiments.fibonacci_pullback ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
 - 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。manifest 可以附带 backward-compatible optional `diagnostics.refresh_segments`，用于审计每个 symbol/interval 的 fetch mode、耗时、rows、reuse 和失败原因；trusted consumers 不依赖该字段，缺失时仍按 dataset health fail-closed。
 - `refresh_runs.jsonl` 和 `refresh_market_data` JSON 输出会暴露 per-symbol/per-interval diagnostics，包括 `refresh_segments`、最多 5 条 `slowest_segments`、失败/非 ok 的 `failed_segments`，以及按 symbol 汇总的 `blocking_symbols`。

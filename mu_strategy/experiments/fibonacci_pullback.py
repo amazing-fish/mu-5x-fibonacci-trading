@@ -8,7 +8,8 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
-from mu_strategy.data import cached_historical
+from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -16,6 +17,7 @@ from mu_strategy.strategies.registry import selected_strategy_groups
 
 
 DAY_MS = 86_400_000
+TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 @dataclass(frozen=True)
@@ -114,27 +116,16 @@ def run_asset_fibonacci_backtest(
     strategy_name: str,
     fee_profile: str,
     horizons_hours: range | list[int],
-    data_dir: Path = Path("data"),
-    refresh: bool = False,
+    data_dir: Path | None = None,
 ) -> AssetFibonacciBacktest:
     groups = selected_strategy_groups(asset.symbol, [strategy_name])
     if len(groups) != 1:
         raise ValueError("strategy_name must resolve to exactly one strategy group")
     base_config = with_fee_profile(groups[0].config, fee_profile)
-    candles_15m, file_15m = cached_historical(
+    candles_15m, candles_1h, file_15m, file_1h = _load_trusted_candles(
         asset.symbol,
-        "15m",
         days=days,
-        data_dir=data_dir,
-        refresh=refresh,
-        source=asset.source,
-    )
-    candles_1h, file_1h = cached_historical(
-        asset.symbol,
-        "1h",
-        days=days,
-        data_dir=data_dir,
-        refresh=refresh,
+        data_dir=data_dir or Path("data/live"),
         source=asset.source,
     )
     return AssetFibonacciBacktest(
@@ -426,12 +417,10 @@ def render_multi_asset_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest Fibonacci pullback lookback horizons by UTC month.")
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
-    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--min-hour", type=int, default=1)
     parser.add_argument("--max-hour", type=int, default=12)
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
     parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_fibonacci_pullback_1h_12h_180d.md"))
     parser.add_argument("--multi-report", type=Path, default=Path("reports/live/fibonacci_pullback_multi_asset_1h_12h_180d.md"))
     parser.add_argument("--asset", action="append", help="Asset alias for batch mode. Repeat or pass comma-separated values.")
@@ -452,18 +441,20 @@ def main() -> None:
         asset_values: list[str] = []
         for value in args.asset:
             asset_values.extend(item.strip() for item in value.split(",") if item.strip())
-        asset_results = [
-            run_asset_fibonacci_backtest(
-                resolve_asset(value),
-                days=args.days,
-                strategy_name=args.strategy,
-                fee_profile=args.fee_profile,
-                horizons_hours=horizons,
-                data_dir=args.data_dir,
-                refresh=args.refresh,
-            )
-            for value in asset_values
-        ]
+        try:
+            asset_results = [
+                run_asset_fibonacci_backtest(
+                    resolve_asset(value),
+                    days=args.days,
+                    strategy_name=args.strategy,
+                    fee_profile=args.fee_profile,
+                    horizons_hours=horizons,
+                    data_dir=args.data_dir,
+                )
+                for value in asset_values
+            ]
+        except ValueError as exc:
+            parser.error(str(exc))
         report = render_multi_asset_report(
             asset_results,
             days=args.days,
@@ -481,22 +472,15 @@ def main() -> None:
         parser.error("--strategy must resolve to exactly one strategy group")
     base_config = with_fee_profile(groups[0].config, args.fee_profile)
 
-    candles_15m, file_15m = cached_historical(
-        args.symbol,
-        "15m",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
-    candles_1h, file_1h = cached_historical(
-        args.symbol,
-        "1h",
-        days=args.days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
+    try:
+        candles_15m, candles_1h, file_15m, file_1h = _load_trusted_candles(
+            args.symbol,
+            days=args.days,
+            data_dir=args.data_dir or Path("data/live"),
+            source="okx",
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     results = run_fibonacci_horizon_backtests(
         candles_15m,
         candles_1h,
@@ -506,7 +490,7 @@ def main() -> None:
     report = render_fibonacci_pullback_report(
         results,
         symbol=args.symbol,
-        source=args.source,
+        source="okx",
         days=args.days,
         strategy_name=args.strategy,
         data_files=[file_15m, file_1h],
@@ -514,6 +498,33 @@ def main() -> None:
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")
     print(report)
+
+
+def _load_trusted_candles(
+    symbol: str,
+    *,
+    days: int,
+    data_dir: Path,
+    source: str,
+) -> tuple[list[Candle], list[Candle], Path, Path]:
+    if source != "okx":
+        raise ValueError(f"trusted data layer supports OKX sources only; got source {source!r}")
+    bundle = refresh_trusted_candle_bundle(
+        symbol,
+        intervals=TRUSTED_REQUESTED_INTERVALS,
+        days=days,
+        data_dir=data_dir,
+        refresh=False,
+    )
+    status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+    if status_error:
+        raise ValueError(status_error)
+    return (
+        bundle.candles_by_interval["15m"],
+        bundle.candles_by_interval["1h"],
+        bundle.files_by_interval["15m"],
+        bundle.files_by_interval["1h"],
+    )
 
 
 def _infer_interval_ms(candles: list[Candle]) -> int:
