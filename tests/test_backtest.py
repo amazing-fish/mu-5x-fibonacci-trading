@@ -1,3 +1,6 @@
+import ast
+import inspect
+import textwrap
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -157,13 +160,78 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(candles_15m[3].open_time_ms, result.trades[0].exit_time_ms)
         self.assertEqual(candles_15m[3].open, result.trades[0].exit_price)
 
+    def test_existing_stop_exits_before_same_candle_pyramid_trigger(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+        )
+        candles_15m = [
+            candle(0, 100, 102, 99, 101),
+            candle(1, 101, 102, 99, 101),
+            candle(2, 100, 101, 99, 100),
+            candle(3, 100, 103, 97, 102),
+            candle(4, 102, 103, 101, 102),
+        ]
+        hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
+
+        with patch("mu_strategy.backtest.nearest_fib_retest_level", return_value=100):
+            with patch("mu_strategy.backtest.rsi", return_value=[55] * len(candles_15m)):
+                with patch(
+                    "mu_strategy.backtest.macd",
+                    return_value=([0] * len(candles_15m), [0] * len(candles_15m), [0, 0.1, 0.2, 0.3, 0.4]),
+                ):
+                    result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
+
+        self.assertEqual(1, result.trade_count)
+        self.assertEqual(candles_15m[3].open_time_ms, result.trades[0].exit_time_ms)
+        self.assertEqual(98, result.trades[0].exit_price)
+        self.assertEqual(1, result.trades[0].max_stage)
+
+    def test_pyramid_add_precedes_same_candle_stop_tightening(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+        )
+        candles_15m = [
+            candle(0, 100, 102, 99, 101),
+            candle(1, 101, 102, 99, 101),
+            candle(2, 100, 101, 99, 100),
+            candle(3, 101, 103, 99, 102.5),
+            candle(4, 101, 102, 99.5, 100),
+            candle(5, 100, 101, 99, 100),
+        ]
+        hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
+
+        with patch("mu_strategy.backtest.nearest_fib_retest_level", return_value=100):
+            with patch("mu_strategy.backtest.rsi", return_value=[55] * len(candles_15m)):
+                with patch(
+                    "mu_strategy.backtest.macd",
+                    return_value=([0] * len(candles_15m), [0] * len(candles_15m), [0, 0.1, 0.2, 0.3, 0.4, 0.5]),
+                ):
+                    result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
+
+        self.assertEqual(1, result.trade_count)
+        self.assertEqual(2, result.trades[0].max_stage)
+        self.assertEqual(candles_15m[4].open_time_ms, result.trades[0].exit_time_ms)
+        self.assertEqual(100, result.trades[0].exit_price)
+
     def test_half_protect_green_wide_stop_does_not_jump_to_first_entry_cost(self):
         config = StrategyConfig(fee_rate=0, stop_tightening="half_protect_green_wide")
         first = _make_fill(0, 100, 0.2, 10_000, config)
         second = _make_fill(900_000, 102, 0.2, 10_000, config)
         position = OpenPosition([first, second], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=2)
+        current = candle(2, 102, 103, 101, 102.5)
 
-        _tighten_stop(position, candle(2, 102, 103, 101, 102.5), 2, [], "green", config)
+        _tighten_stop(
+            position,
+            current,
+            2,
+            [candle(0, 100, 101, 99, 100), candle(1, 101, 103, 100, 102), current],
+            "green",
+            config,
+        )
 
         self.assertAlmostEqual(99, position.stop_price)
         self.assertLess(position.stop_price, first.price)
@@ -190,9 +258,11 @@ class BacktestTests(unittest.TestCase):
             initial_stop_price=98,
             max_stage=2,
         )
+        current = candle(2, 102, 103, 101, 102.5)
+        candles = [candle(0, 100, 101, 99, 100), candle(1, 101, 103, 100, 102), current]
 
-        _tighten_stop(yellow_position, candle(2, 102, 103, 101, 102.5), 2, [], "yellow", config)
-        _tighten_stop(green_position, candle(2, 102, 103, 101, 102.5), 2, [], "green", config)
+        _tighten_stop(yellow_position, current, 2, candles, "yellow", config)
+        _tighten_stop(green_position, current, 2, candles, "green", config)
 
         self.assertAlmostEqual(99, yellow_position.stop_price)
         self.assertAlmostEqual(100, green_position.stop_price)
@@ -217,6 +287,27 @@ class BacktestTests(unittest.TestCase):
 
         _tighten_stop(position, candles[5], 5, candles, "green", config)
         self.assertAlmostEqual(100, position.stop_price)
+
+    def test_stop_adapter_delegates_transition_state_machine_to_shared_entry_point(self):
+        source = textwrap.dedent(inspect.getsource(_tighten_stop))
+        tree = ast.parse(source)
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        mode_literals = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in {"baseline", "half_protect", "wide", "delayed_baseline"}
+        }
+
+        self.assertEqual(1, calls.count("tighten_stop"))
+        self.assertNotIn("resolved_stop_tightening", calls)
+        self.assertEqual(set(), mode_literals)
+        self.assertFalse(any(isinstance(node, (ast.If, ast.Compare)) for node in ast.walk(tree)))
 
     def test_delayed_baseline_non_linear_curves_change_transition_speed(self):
         first_candle = candle(0, 100, 101, 99, 100)
