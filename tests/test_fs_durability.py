@@ -1,4 +1,5 @@
 import errno
+import json
 import unittest
 import warnings
 from pathlib import Path
@@ -234,6 +235,61 @@ class TrustedStoreDurabilityTests(unittest.TestCase):
             self.assertIn(
                 "current_pointer_directory_sync_failed: OSError: directory sync failed",
                 "\n".join(captured.output),
+            )
+
+    def test_commit_skips_reclamation_when_current_pointer_durability_is_unconfirmed(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+        from tests.factories.trusted_publication import write_generation_manifest_and_caches
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                run_id="run-old",
+            )
+            manifest = write_generation_manifest_and_caches(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                days=1,
+                run_id="run-new",
+            )
+            store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            store.replace_current("run-old")
+
+            def fail_current_pointer_directory(directory):
+                if Path(directory) == data_dir:
+                    raise OSError("directory sync failed")
+
+            with patch(
+                "mu_strategy.market_data.trusted_data.store._fsync_directory",
+                side_effect=fail_current_pointer_directory,
+            ):
+                publication_warnings = store.commit_generation_publication(
+                    "run-new",
+                    manifest,
+                    {"run_id": "run-new"},
+                )
+
+            self.assertEqual("run-new", store.read_manifest().generation_id)
+            self.assertTrue((data_dir / "generations" / "run-old").is_dir())
+            self.assertEqual((), store.last_reclamation_report.removed_ids)
+            self.assertEqual(
+                "CurrentPointerDurabilityUnconfirmed",
+                store.last_reclamation_report.failures[0].error_type,
+            )
+            self.assertTrue(
+                any("current_pointer_directory_sync_failed" in warning for warning in publication_warnings)
+            )
+            run_log = json.loads(store.run_log_path.read_text(encoding="utf-8"))
+            self.assertEqual([], run_log["reclamation"]["removed_ids"])
+            self.assertEqual(
+                "CurrentPointerDurabilityUnconfirmed",
+                run_log["reclamation"]["failures"][0]["error_type"],
             )
 
     def test_commit_reports_current_pointer_directory_sync_failure_as_warning(self):

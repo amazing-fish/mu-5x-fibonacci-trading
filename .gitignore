@@ -15,6 +15,7 @@ data/live/*
 data/live/generations/**
 !data/live/generations/*/
 !data/live/generations/*/manifest.json
+!data/live/generations/*/retention-pin.json
 !data/live/generations/*/okx/
 !data/live/generations/*/okx/*/
 !data/live/generations/*/okx/*/*.csv

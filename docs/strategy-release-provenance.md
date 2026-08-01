@@ -31,6 +31,7 @@ The first locally reviewed MU candidate uses:
 - candidate fingerprint `e9eb5a07017565a1d62f21c453c7bbfb7bfa885c92c4b340c713332ecb63f648`;
 - evaluated implementation SHA `b92985b2e9709bcd95effb84e77e7975f916c620`;
 - trusted generation `e702be27d2de4b2d92b12bf01c70d02d`;
+- tracked `retention-pin.json` for that generation, which keeps refresh reclamation from deleting the referenced evidence;
 - 7,048 / 2,352 / 2,348 `15m` candles in three hour-aligned cold-start windows;
 - byte-identical repeated candidate output.
 
