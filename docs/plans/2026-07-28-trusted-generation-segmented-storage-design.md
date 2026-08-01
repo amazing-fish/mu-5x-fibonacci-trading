@@ -158,6 +158,9 @@ window, and separately validates the complete pre-prune physical series for loca
 physical material. A physical-only failure marks that dataset invalid and skips its writer hook.
 If the physical `5m` base fails, dependent `15m`/`1h` hooks are also blocked because their
 built/native relationship cannot be proven from invalid base evidence.
+For a valid base, both logical health/hash material and writer input are limited to parent rows
+inside the complete `5m` comparison window; independently fetched native edge rows that were not
+compared never become canonical.
 Thirty-two days cover the complete UTC month containing any logical-window start. A later wider
 request can therefore move `start_row` earlier inside that stored month without prepending rows or
 changing an older manifest's offsets. Extra provider rows before the already stored physical prefix

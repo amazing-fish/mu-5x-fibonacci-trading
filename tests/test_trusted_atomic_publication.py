@@ -193,15 +193,14 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
             request = dict(requested_intervals=("15m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             RefreshTrustedMarketData(store, StaticProvider()).execute(RefreshTrustedMarketDataRequest(**request, run_id="run-old"))
             original_write_csv = store.write_csv
-            calls = []
+            failing_segment = store.segment_path(SYMBOL, "5m", "1970-01")
 
-            def fail_after_first(candles, path, **kwargs):
-                calls.append(path)
-                if len(calls) == 1:
-                    return original_write_csv(candles, path, **kwargs)
-                raise OSError("disk full")
+            def fail_segment_write(candles, path, **kwargs):
+                if path == failing_segment:
+                    raise OSError("disk full")
+                return original_write_csv(candles, path, **kwargs)
 
-            with patch.object(store, "write_csv", side_effect=fail_after_first):
+            with patch.object(store, "write_csv", side_effect=fail_segment_write):
                 with self.assertRaisesRegex(OSError, "disk full"):
                     RefreshTrustedMarketData(store, StaticProvider()).execute(
                         RefreshTrustedMarketDataRequest(**request, run_id="run-failed")
@@ -338,7 +337,7 @@ class TrustedAtomicPublicationTests(unittest.TestCase):
         self.assertEqual(96, len(old_bundle.candles_by_interval["15m"]))
         self.assertEqual("run-new", new_bundle.run_id)
         self.assertEqual(289, len(new_bundle.candles_by_interval["5m"]))
-        self.assertEqual(97, len(new_bundle.candles_by_interval["15m"]))
+        self.assertEqual(96, len(new_bundle.candles_by_interval["15m"]))
 
     def test_malformed_current_or_missing_generation_fail_closed_without_flat_fallback(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason

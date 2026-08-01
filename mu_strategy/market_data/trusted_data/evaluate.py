@@ -111,6 +111,16 @@ def evaluate_candle_bundle(
     )
     window_plan = resolve_shared_window(raw_candles_by_interval, days=days)
     pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
+    logical_five = pruned_candles_by_interval.get("5m") or []
+    if logical_five:
+        for interval in ("15m", "1h"):
+            if interval not in pruned_candles_by_interval:
+                continue
+            pruned_candles_by_interval[interval] = clip_parent_candles_to_complete_base_window(
+                pruned_candles_by_interval[interval],
+                base_candles=logical_five,
+                interval=interval,
+            )
     health_by_key: dict[tuple[str, str], DatasetHealth] = {}
     candles_by_key: dict[tuple[str, str], list[Candle]] = {}
 
@@ -317,12 +327,14 @@ def validate_physical_candle_bundle(
                 base_candles=five,
                 interval=interval,
             )
-            native = clip_parent_candles_to_complete_base_window(
-                normalized_by_interval.get(interval) or [],
+            native = normalized_by_interval.get(interval) or []
+            compared_native = clip_parent_candles_to_complete_base_window(
+                native,
                 base_candles=five,
                 interval=interval,
             )
-            report = validate_built_native_candles(built, native, interval=interval)
+            normalized_by_interval[interval] = compared_native
+            report = validate_built_native_candles(built, compared_native, interval=interval)
         validation_by_interval[interval] = report
     return normalized_by_interval, validation_by_interval
 

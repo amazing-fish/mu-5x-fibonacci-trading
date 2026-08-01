@@ -234,6 +234,50 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertTrue(store.segment_path(SYMBOL, "15m", "1970-01").exists())
             self.assertEqual(correct_fifteen, _read_exact_interval(store, RUN_B, "15m"))
 
+    def test_uncovered_native_edge_is_not_persisted_or_wedged_on_later_window_expansion(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        five = _window_candles(0, 2 * DAY_MS - STEP_MS)
+        correct_fifteen = aggregate_candles(five, interval="15m", ohlc_policy="okx_native")
+        edge_open = correct_fifteen[-1].close
+        bad_edge = Candle(2 * DAY_MS, edge_open, edge_open + 1.0, edge_open - 1.0, edge_open + 0.25, 1.0)
+        provider = MutableBundleProvider({"5m": five, "15m": [*correct_fifteen, bad_edge]})
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            first_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=2 * DAY_MS,
+                    run_id=RUN_A,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, first_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, first_run.snapshot_usability)
+            physical_fifteen = store.read_csv(store.segment_path(SYMBOL, "15m", "1970-01"))
+            self.assertNotIn(bad_edge.open_time_ms, {candle.open_time_ms for candle in physical_fifteen})
+
+            expanded_five = _window_candles(0, 2 * DAY_MS + 2 * STEP_MS)
+            expanded_fifteen = aggregate_candles(expanded_five, interval="15m", ohlc_policy="okx_native")
+            provider.rows_by_interval["5m"] = expanded_five
+            provider.rows_by_interval["15m"] = expanded_fifteen
+            second_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=2 * DAY_MS + 3 * STEP_MS,
+                    run_id=RUN_B,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, second_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
+            second_fifteen = _read_exact_interval(store, RUN_B, "15m")
+            self.assertEqual(expanded_fifteen[-len(second_fifteen) :], second_fifteen)
+
     def test_multi_cycle_growth_is_new_bytes_plus_metadata_and_closed_segment_is_unchanged(self):
         initial_rows = _candles_through(FEB_START_MS)
         provider = MutableHistoryProvider(initial_rows)
