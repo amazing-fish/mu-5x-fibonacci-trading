@@ -32,6 +32,7 @@ _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_RUN_LOG_MAX_LINES = 1_000
 _GENERATION_RETENTION_PIN = "retention-pin.json"
+_WINDOWS_MUTEX_SDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"
 _CURRENT_POINTER_DIRECTORY_SYNC_WARNING_PREFIX = "current_pointer_directory_sync_failed:"
 # Keep post-commit warnings structured without allowing -Werror to turn them into false failures.
 _CURRENT_POINTER_WARNING_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -81,7 +82,6 @@ class TrustedDataStore:
         self.retention_policy = retention_policy
         self.reclamation_dry_run = reclamation_dry_run
         self.last_reclamation_report: GenerationReclamationReport | None = None
-        self._refresh_lifecycle_lock = None
 
     @property
     def current_path(self) -> Path:
@@ -101,6 +101,14 @@ class TrustedDataStore:
             yield
             return
         with _trusted_store_lock(self.data_dir):
+            yield
+
+    @contextmanager
+    def refresh_lifecycle(self):
+        if self.retention_policy is None or not self.generations_dir.is_dir():
+            yield
+            return
+        with _trusted_store_lock(self.generations_dir):
             yield
 
     def generation_root(self, generation_id: str) -> Path:
@@ -153,40 +161,14 @@ class TrustedDataStore:
         finally:
             _cleanup_tmp(tmp_path)
 
-    def read_manifest(self, *, _snapshot_lock_held: bool = False) -> ManifestReadResult:
-        if self.retention_policy is not None and not _snapshot_lock_held:
-            self._acquire_refresh_lifecycle_lock()
-            try:
-                result = self._read_manifest_without_refresh_lock()
-            except BaseException:
-                self._release_refresh_lifecycle_lock()
-                raise
-            if not result.ok:
-                self._release_refresh_lifecycle_lock()
-            return result
-        return self._read_manifest_without_refresh_lock()
-
-    def _read_manifest_without_refresh_lock(self) -> ManifestReadResult:
+    def read_manifest(self) -> ManifestReadResult:
         if not self.current_path.exists():
             return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
         return self._read_current_manifest()
 
-    def _acquire_refresh_lifecycle_lock(self) -> None:
-        if self._refresh_lifecycle_lock is not None or not self.generations_dir.is_dir():
-            return
-        lifecycle_lock = _trusted_store_lock(self.generations_dir)
-        lifecycle_lock.__enter__()
-        self._refresh_lifecycle_lock = lifecycle_lock
-
-    def _release_refresh_lifecycle_lock(self) -> None:
-        lifecycle_lock = self._refresh_lifecycle_lock
-        self._refresh_lifecycle_lock = None
-        if lifecycle_lock is not None:
-            lifecycle_lock.__exit__(None, None, None)
-
     @contextmanager
     def _standalone_reclamation_lock(self):
-        if self._refresh_lifecycle_lock is not None or not self.generations_dir.is_dir():
+        if not self.generations_dir.is_dir():
             yield
             return
         with _trusted_store_lock(self.generations_dir):
@@ -305,15 +287,12 @@ class TrustedDataStore:
         run_log_payload: dict[str, Any],
     ) -> tuple[str, ...]:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with self.publication_snapshot_lock():
-                return self._commit_generation_publication_locked(
-                    generation_id,
-                    manifest,
-                    run_log_payload,
-                )
-        finally:
-            self._release_refresh_lifecycle_lock()
+        with self.publication_snapshot_lock():
+            return self._commit_generation_publication_locked(
+                generation_id,
+                manifest,
+                run_log_payload,
+            )
 
     def _commit_generation_publication_locked(
         self,
@@ -654,11 +633,45 @@ def _windows_named_mutex(data_dir: Path):
     kernel32.ReleaseMutex.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = (
+            ("nLength", wintypes.DWORD),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", wintypes.BOOL),
+        )
 
     mutex_name = _windows_store_mutex_name(data_dir)
-    handle = kernel32.CreateMutexW(None, False, mutex_name)
-    if not handle:
+    security_descriptor = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        _WINDOWS_MUTEX_SDDL,
+        1,
+        ctypes.byref(security_descriptor),
+        None,
+    ):
         raise ctypes.WinError(ctypes.get_last_error())
+    security_attributes = SecurityAttributes(
+        ctypes.sizeof(SecurityAttributes),
+        security_descriptor,
+        False,
+    )
+    try:
+        handle = kernel32.CreateMutexW(ctypes.byref(security_attributes), False, mutex_name)
+        create_error = ctypes.get_last_error()
+    finally:
+        kernel32.LocalFree(security_descriptor)
+    if not handle:
+        raise ctypes.WinError(create_error)
     wait_result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
     if wait_result not in {0x00000000, 0x00000080}:
         error = (

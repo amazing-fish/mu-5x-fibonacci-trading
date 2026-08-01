@@ -45,7 +45,7 @@ class _StaticProvider:
 
 class GenerationRetentionTests(unittest.TestCase):
     def test_windows_store_mutex_uses_cross_session_namespace_and_canonical_path(self):
-        from mu_strategy.market_data.trusted_data.store import _windows_store_mutex_name
+        from mu_strategy.market_data.trusted_data.store import _WINDOWS_MUTEX_SDDL, _windows_store_mutex_name
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp) / "live"
@@ -56,6 +56,10 @@ class GenerationRetentionTests(unittest.TestCase):
 
             self.assertTrue(direct.startswith("Global\\mu_strategy_trusted_store_"))
             self.assertEqual(direct, equivalent)
+            self.assertIn(";;;SY)", _WINDOWS_MUTEX_SDDL)
+            self.assertIn(";;;BA)", _WINDOWS_MUTEX_SDDL)
+            self.assertIn(";;;AU)", _WINDOWS_MUTEX_SDDL)
+            self.assertNotIn(";;;WD)", _WINDOWS_MUTEX_SDDL)
 
     def test_current_generation_survives_outside_keep_recent_window(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
@@ -316,6 +320,66 @@ class GenerationRetentionTests(unittest.TestCase):
                 "run-fast",
                 json.loads((data_dir / "current.json").read_text(encoding="utf-8"))["generation_id"],
             )
+
+    def test_refresh_lifecycle_lock_releases_after_prepublication_failure(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-existing",
+            )
+            policy = GenerationRetentionPolicy(keep_recent=1)
+            failing_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir, retention_policy=policy),
+                _ReuseOnlyProvider(),
+            )
+            with self.assertRaises(FileExistsError):
+                failing_refresh.execute(
+                    RefreshTrustedMarketDataRequest(
+                        requested_intervals=("5m",),
+                        days=1,
+                        symbols=(SYMBOL,),
+                        now_ms=DAY_MS,
+                        run_id="run-existing",
+                    )
+                )
+
+            succeeding_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir, retention_policy=policy),
+                _ReuseOnlyProvider(),
+            )
+            results = []
+            errors = []
+
+            def execute_succeeding_refresh():
+                try:
+                    results.append(
+                        succeeding_refresh.execute(
+                            RefreshTrustedMarketDataRequest(
+                                requested_intervals=("5m",),
+                                days=1,
+                                symbols=(SYMBOL,),
+                                now_ms=DAY_MS,
+                                run_id="run-next",
+                            )
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=execute_succeeding_refresh, daemon=True)
+            thread.start()
+            thread.join(10)
+
+            self.assertFalse(thread.is_alive(), "refresh lifecycle lock remained held after failure")
+            self.assertEqual([], errors)
+            self.assertEqual("run-next", results[0].run_id)
 
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore

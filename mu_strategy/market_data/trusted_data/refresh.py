@@ -158,6 +158,10 @@ class RefreshTrustedMarketData:
         self.clock = clock or SystemClock()
 
     def execute(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
+        with self.store.refresh_lifecycle():
+            return self._execute_in_refresh_lifecycle(request)
+
+    def _execute_in_refresh_lifecycle(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
         started_at_ms = _now_ms(request.now_ms, self.clock)
         plan = self.planner.plan(request.requested_intervals)
         for interval in plan.effective_intervals:
