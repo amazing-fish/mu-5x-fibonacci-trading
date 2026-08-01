@@ -150,7 +150,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 数据注意事项
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
-- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。
+- 每次可信刷新会在任何 history/incremental 请求前，以发布锁原子读取当前 manifest 和本轮所需的旧 CSV 字节，再基于该不可变快照增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization、walk-forward、Fibonacci experiment 和 demo 只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。

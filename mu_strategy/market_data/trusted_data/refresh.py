@@ -137,6 +137,13 @@ class DatasetRefreshCandidate:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class ReusablePriorDatasetSnapshot:
+    health: DatasetHealth
+    payload: bytes | None
+    error: Exception | None = None
+
+
 class ReusablePriorDatasetReadError(Exception):
     pass
 
@@ -163,7 +170,6 @@ class RefreshTrustedMarketData:
         for interval in plan.effective_intervals:
             validate_storage_segment(interval, field="interval")
         run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
-        previous_manifest = self.store.read_manifest()
         self.store.prepare_generation(run_id)
         try:
             universe = self._universe(request)
@@ -198,12 +204,16 @@ class RefreshTrustedMarketData:
             validate_storage_segment(str(ticker["inst_id"]), field="symbol")
             for ticker in _dedupe_tickers([*universe.crypto_top, *universe.stock_token_top])
         )
+        reusable_prior_datasets = self._snapshot_reusable_prior_datasets(
+            symbols=symbols,
+            intervals=plan.effective_intervals,
+        )
         candidates_by_key = self._fetch_dataset_candidates(
             symbols=symbols,
             intervals=plan.effective_intervals,
             days=request.days,
             run_id=run_id,
-            previous_manifest=previous_manifest,
+            reusable_prior_datasets=reusable_prior_datasets,
             max_concurrency=request.max_concurrency,
         )
         for symbol in symbols:
@@ -258,7 +268,7 @@ class RefreshTrustedMarketData:
         intervals: tuple[str, ...],
         days: int,
         run_id: str,
-        previous_manifest,
+        reusable_prior_datasets: dict[tuple[str, str], ReusablePriorDatasetSnapshot],
         max_concurrency: int,
     ) -> dict[tuple[str, str], DatasetRefreshCandidate]:
         tasks = tuple((symbol, interval) for symbol in symbols for interval in intervals)
@@ -269,7 +279,7 @@ class RefreshTrustedMarketData:
                 interval=interval,
                 days=days,
                 run_id=run_id,
-                previous_manifest=previous_manifest,
+                reusable_prior_datasets=reusable_prior_datasets,
             )
 
         if max_concurrency == 1:
@@ -304,14 +314,19 @@ class RefreshTrustedMarketData:
         interval: str,
         days: int,
         run_id: str,
-        previous_manifest,
+        reusable_prior_datasets: dict[tuple[str, str], ReusablePriorDatasetSnapshot],
     ) -> DatasetRefreshCandidate:
         started_at_ms = self.clock.now_ms()
         path = self.store.generation_cache_path(run_id, symbol, interval)
         source_file = self.store.generation_source_file(symbol, interval)
         existing: list[Candle] = []
         try:
-            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval, days=days) or []
+            existing = self._load_reusable_prior_candles(
+                reusable_prior_datasets,
+                symbol,
+                interval,
+                days=days,
+            ) or []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -499,19 +514,60 @@ class RefreshTrustedMarketData:
         except Exception:
             return None
 
-    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str, *, days: int) -> list[Candle] | None:
-        if not manifest_result.ok or manifest_result.snapshot is None:
+    def _snapshot_reusable_prior_datasets(
+        self,
+        *,
+        symbols: tuple[str, ...],
+        intervals: tuple[str, ...],
+    ) -> dict[tuple[str, str], ReusablePriorDatasetSnapshot]:
+        snapshots: dict[tuple[str, str], ReusablePriorDatasetSnapshot] = {}
+        with self.store.publication_snapshot_lock():
+            manifest_result = self.store.read_manifest()
+            if not manifest_result.ok or manifest_result.snapshot is None:
+                return snapshots
+            for symbol in symbols:
+                for interval in intervals:
+                    health = manifest_result.snapshot.datasets.get((symbol, interval))
+                    if health is None or not _is_reusable_prior_health(health):
+                        continue
+                    previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
+                    if previous_path is None or not previous_path.exists():
+                        continue
+                    try:
+                        payload = self.store.read_file_bytes(previous_path)
+                    except Exception as exc:
+                        snapshots[(symbol, interval)] = ReusablePriorDatasetSnapshot(
+                            health=health,
+                            payload=None,
+                            error=exc,
+                        )
+                    else:
+                        snapshots[(symbol, interval)] = ReusablePriorDatasetSnapshot(
+                            health=health,
+                            payload=payload,
+                        )
+        return snapshots
+
+    def _load_reusable_prior_candles(
+        self,
+        snapshots: dict[tuple[str, str], ReusablePriorDatasetSnapshot],
+        symbol: str,
+        interval: str,
+        *,
+        days: int,
+    ) -> list[Candle] | None:
+        snapshot = snapshots.get((symbol, interval))
+        if snapshot is None:
             return None
-        health = manifest_result.snapshot.datasets.get((symbol, interval))
-        if health is None or not _is_reusable_prior_health(health):
-            return None
-        previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
-        if previous_path is None or not previous_path.exists():
-            return None
+        if snapshot.error is not None:
+            raise ReusablePriorDatasetReadError from snapshot.error
+        if snapshot.payload is None:
+            raise AssertionError("reusable prior dataset snapshot must contain payload or error")
         try:
-            cached = self.store.read_csv(previous_path)
+            cached = self.store.read_csv_bytes(snapshot.payload)
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
+        health = snapshot.health
         if candles_content_sha256(cached) != health.content_sha256:
             return None
         coverage = assess_requested_coverage(

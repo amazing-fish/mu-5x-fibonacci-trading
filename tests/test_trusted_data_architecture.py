@@ -932,7 +932,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual({}, manifest["symbols"])
 
         class FailingReadStore(TrustedDataStore):
-            def read_csv(self, path):
+            def read_file_bytes(self, path):
                 raise OSError("disk offline")
 
         class FullHistoryProvider(RecordingProvider):
@@ -970,7 +970,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS
 
         class FailingReadStore(TrustedDataStore):
-            def read_csv(self, path):
+            def read_file_bytes(self, path):
                 raise OSError("disk offline")
 
         class FailingHistoryProvider(RecordingProvider):

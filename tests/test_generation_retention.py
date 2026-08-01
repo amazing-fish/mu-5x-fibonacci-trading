@@ -137,6 +137,120 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(run.refresh_segments[0].reused_prior_generation)
             self.assertEqual("incremental_reuse", run.refresh_segments[0].fetch_mode)
 
+    def test_refresh_reloads_and_snapshots_current_after_competing_universe_fetch(self):
+        from mu_strategy.market_data.trusted_data.contracts import SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            os.utime(data_dir / "generations" / "run-old", ns=(1_000_000_000, 1_000_000_000))
+            writer_store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+
+            class CompetingPublicationProvider(_ReuseOnlyProvider):
+                def fetch_tickers(self):
+                    competing = RefreshTrustedMarketData(writer_store, _StaticProvider()).execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id="run-new",
+                        )
+                    )
+                    self.assert_competing_usable = competing.snapshot_usability
+                    self.old_generation_exists = (data_dir / "generations" / "run-old").exists()
+                    return [{"instId": SYMBOL, "last": "100", "volCcy24h": "10"}]
+
+            provider = CompetingPublicationProvider()
+            run = RefreshTrustedMarketData(writer_store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=DAY_MS,
+                    run_id="run-outer",
+                )
+            )
+
+            self.assertEqual(SnapshotUsability.USABLE, provider.assert_competing_usable)
+            self.assertFalse(provider.old_generation_exists)
+            self.assertEqual([], provider.history_calls)
+            self.assertEqual(1, len(provider.incremental_calls))
+            self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+            self.assertTrue(run.refresh_segments[0].reused_prior_generation)
+            self.assertEqual("incremental_reuse", run.refresh_segments[0].fetch_mode)
+
+    def test_refresh_manifest_and_prior_bytes_share_one_lock_before_network_fetch(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            active = {"value": False}
+            test_case = self
+            original_read_manifest = store.read_manifest
+            original_read_file_bytes = store.read_file_bytes
+
+            @contextmanager
+            def recording_lock():
+                self.assertFalse(active["value"])
+                active["value"] = True
+                try:
+                    yield
+                finally:
+                    active["value"] = False
+
+            def read_manifest():
+                self.assertTrue(active["value"])
+                return original_read_manifest()
+
+            def read_file_bytes(path):
+                self.assertTrue(active["value"])
+                return original_read_file_bytes(path)
+
+            class LockAwareProvider(_ReuseOnlyProvider):
+                def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                    test_case.assertFalse(active["value"])
+                    return super().fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
+
+            provider = LockAwareProvider()
+            with patch.object(store, "publication_snapshot_lock", side_effect=recording_lock):
+                with patch.object(store, "read_manifest", side_effect=read_manifest):
+                    with patch.object(store, "read_file_bytes", side_effect=read_file_bytes):
+                        run = RefreshTrustedMarketData(store, provider).execute(
+                            RefreshTrustedMarketDataRequest(
+                                requested_intervals=("5m",),
+                                days=1,
+                                symbols=(SYMBOL,),
+                                now_ms=DAY_MS,
+                                run_id="run-after-snapshot",
+                            )
+                        )
+
+            self.assertTrue(run.refresh_segments[0].reused_prior_generation)
+            self.assertEqual("incremental_reuse", run.refresh_segments[0].fetch_mode)
+            self.assertFalse(active["value"])
+
     def test_open_load_context_survives_reclamation_of_its_generation(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import observe_only_policy
