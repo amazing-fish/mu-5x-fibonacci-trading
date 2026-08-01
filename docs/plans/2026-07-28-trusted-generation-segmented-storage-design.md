@@ -156,6 +156,8 @@ lookbehind days. The shared evaluator still applies the exact requested-days hea
 window, and separately validates the complete pre-prune physical series for local continuity and
 `5m -> 15m/1h` built/native equality before the segment writer receives it as unreferenced
 physical material. A physical-only failure marks that dataset invalid and skips its writer hook.
+If the physical `5m` base fails, dependent `15m`/`1h` hooks are also blocked because their
+built/native relationship cannot be proven from invalid base evidence.
 Thirty-two days cover the complete UTC month containing any logical-window start. A later wider
 request can therefore move `start_row` earlier inside that stored month without prepending rows or
 changing an older manifest's offsets. Extra provider rows before the already stored physical prefix
@@ -210,7 +212,8 @@ The write order is:
    including both logical-window and full physical-lookbehind local validation plus
    `5m -> 15m/1h` built/native comparison, before invoking any segment writer hook;
 2. create or atomically grow the required shared segment files under the dataset writer lock and
-   fsync every newly created directory ancestor plus the final file/directory state;
+   fsync every newly created directory ancestor plus the final file/directory state; every month
+   must remain exactly interval-contiguous across the existing-tail/new-suffix boundary;
 3. write and fsync `generations/<run_id>/manifest.json`;
 4. re-read and strictly validate that manifest and all storage references;
 5. atomically replace and directory-sync `current.json`;

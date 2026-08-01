@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.cache import CSV_FIELDS
+from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
     DatasetHealth,
@@ -250,6 +251,12 @@ class TrustedDataStore:
         source_files_by_segment: dict[str, Path] = {}
         first_logical_segment_id = next(iter(logical_partitions))
         for segment_id, candidate_rows in physical_partitions.items():
+            _validate_candidate_segment_continuity(
+                candidate_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+            )
             if (
                 import_generation_id is not None
                 and segment_id == first_logical_segment_id
@@ -296,6 +303,12 @@ class TrustedDataStore:
                         f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
                     )
                 combined = [*existing, *suffix]
+                _validate_candidate_segment_continuity(
+                    combined,
+                    symbol=symbol,
+                    interval=interval,
+                    segment_id=segment_id,
+                )
                 self.write_csv(combined, path, required_prefix=existing_bytes)
                 physical_rows_by_segment[segment_id] = combined
             else:
@@ -965,6 +978,21 @@ def _validate_segment_candles(candles: list[Candle], *, segment_id: str) -> None
         if previous_timestamp is not None and candle.open_time_ms <= previous_timestamp:
             raise ManifestSchemaError("trusted segment candles must be strictly ordered")
         previous_timestamp = candle.open_time_ms
+
+
+def _validate_candidate_segment_continuity(
+    candles: list[Candle],
+    *,
+    symbol: str,
+    interval: str,
+    segment_id: str,
+) -> None:
+    expected_interval_ms = interval_to_ms(interval)
+    for previous, current in zip(candles, candles[1:]):
+        if current.open_time_ms - previous.open_time_ms != expected_interval_ms:
+            raise SegmentCorrectionError(
+                f"trusted segment candidate contains a timestamp gap: {symbol}/{interval}/{segment_id}"
+            )
 
 
 def _validate_dataset_candles(

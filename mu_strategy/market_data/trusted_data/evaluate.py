@@ -292,6 +292,16 @@ def validate_physical_candle_bundle(
     base_report = validation_by_interval.get("5m")
     five = normalized_by_interval.get("5m") or []
     if base_report is None or not base_report.ok or not five:
+        if base_report is not None and not base_report.ok:
+            for interval in ("15m", "1h"):
+                native_report = validation_by_interval.get(interval)
+                if native_report is None or not native_report.ok:
+                    continue
+                validation_by_interval[interval] = ValidationReport(
+                    False,
+                    base_report.reason,
+                    warnings=("physical 5m validation failed; built/native validation is unavailable",),
+                )
         return normalized_by_interval, validation_by_interval
     for interval in ("15m", "1h"):
         native_report = validation_by_interval.get(interval)

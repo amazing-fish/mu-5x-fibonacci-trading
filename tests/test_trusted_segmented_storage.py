@@ -136,12 +136,13 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
         complete = _window_candles(0, 2 * DAY_MS - STEP_MS)
         missing_lookbehind = complete[:10] + complete[11:]
-        provider = MutableBundleProvider({"5m": missing_lookbehind})
+        complete_fifteen = aggregate_candles(complete, interval="15m", ohlc_policy="okx_native")
+        provider = MutableBundleProvider({"5m": missing_lookbehind, "15m": complete_fifteen})
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
             first_run = RefreshTrustedMarketData(store, provider).execute(
                 RefreshTrustedMarketDataRequest(
-                    requested_intervals=("5m",),
+                    requested_intervals=("15m",),
                     days=1,
                     symbols=(SYMBOL,),
                     now_ms=2 * DAY_MS,
@@ -152,14 +153,17 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertEqual(RefreshAttemptStatus.FAILED, first_run.attempt_status)
             self.assertEqual(SnapshotUsability.INVALID, first_run.snapshot_usability)
             self.assertEqual(HealthReason.TIMESTAMP_GAP, first_run.datasets[(SYMBOL, "5m")].primary_reason)
+            self.assertEqual(HealthReason.TIMESTAMP_GAP, first_run.datasets[(SYMBOL, "15m")].primary_reason)
             self.assertFalse(store.segment_path(SYMBOL, "5m", "1970-01").exists())
+            self.assertFalse(store.segment_path(SYMBOL, "15m", "1970-01").exists())
             first_manifest = store.read_generation_manifest(RUN_A).snapshot
             self.assertEqual((), first_manifest.storage_by_dataset[(SYMBOL, "5m")].segments)
+            self.assertEqual((), first_manifest.storage_by_dataset[(SYMBOL, "15m")].segments)
 
             provider.rows_by_interval["5m"] = complete
             second_run = RefreshTrustedMarketData(store, provider).execute(
                 RefreshTrustedMarketDataRequest(
-                    requested_intervals=("5m",),
+                    requested_intervals=("15m",),
                     days=1,
                     symbols=(SYMBOL,),
                     now_ms=2 * DAY_MS,
@@ -171,8 +175,11 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
             self.assertEqual(2, provider.history_calls.count("5m"))
             self.assertTrue(store.segment_path(SYMBOL, "5m", "1970-01").exists())
+            self.assertTrue(store.segment_path(SYMBOL, "15m", "1970-01").exists())
             second_rows = _read_exact(store, RUN_B)
             self.assertEqual(complete[-len(second_rows) :], second_rows)
+            second_fifteen = _read_exact_interval(store, RUN_B, "15m")
+            self.assertEqual(complete_fifteen[-len(second_fifteen) :], second_fifteen)
 
     def test_built_native_mismatch_does_not_write_segment_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -351,6 +358,20 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
         self.assertEqual(tuple(current_rows), current_historical.candles_by_interval["5m"])
         self.assertEqual(current_rows, current_bundle.candles_by_interval["5m"])
         self.assertEqual(RUN_B, current_bundle.run_id)
+
+    def test_gapped_suffix_cannot_extend_trailing_month(self):
+        initial_rows = _window_candles(0, STEP_MS)
+        gapped_suffix = _window_candles(3 * STEP_MS, 4 * STEP_MS)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(initial_rows, symbol=SYMBOL, interval="5m")
+            segment_path = store.segment_path(SYMBOL, "5m", "1970-01")
+            original_bytes = segment_path.read_bytes()
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "timestamp gap"):
+                store.write_segmented_dataset(gapped_suffix, symbol=SYMBOL, interval="5m")
+
+            self.assertEqual(original_bytes, segment_path.read_bytes())
 
     def test_closed_segment_historical_correction_fails_before_publication(self):
         initial_rows = _candles_through(FEB_START_MS)
