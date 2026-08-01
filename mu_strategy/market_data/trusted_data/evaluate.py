@@ -161,9 +161,6 @@ def evaluate_candle_bundle(
                 candles_by_key[key] = normalized if keep_invalid_candles else []
                 continue
 
-            content_sha256 = None
-            if on_validated_candles is not None:
-                content_sha256 = on_validated_candles(interval, seed, normalized)
             freshness = freshness_policy.assess(
                 now_ms=now_ms,
                 interval=interval,
@@ -182,7 +179,6 @@ def evaluate_candle_bundle(
                 validation=validation,
                 error_type=seed.error_type,
                 message=seed.message,
-                content_sha256=content_sha256,
                 warnings=seed.warnings,
             )
             if post_process_health is not None:
@@ -225,6 +221,42 @@ def evaluate_candle_bundle(
         days=days,
         window_end_time_ms=window_plan.end_time_ms,
     )
+    if on_validated_candles is not None:
+        for interval in intervals:
+            seed = seeds_by_interval[interval]
+            key = seed.key.tuple()
+            health = health_by_key.get(key)
+            candles = candles_by_key.get(key) or []
+            if (
+                health is None
+                or health.availability is not AvailabilityState.AVAILABLE
+                or health.integrity is not IntegrityState.VALID
+                or not candles
+            ):
+                continue
+            try:
+                content_sha256 = on_validated_candles(interval, seed, candles)
+            except Exception as exc:
+                if (raise_os_errors and isinstance(exc, OSError)) or isinstance(exc, raise_exceptions):
+                    raise
+                failure = exception_failure(exc)
+                health_by_key[key] = make_dataset_health(
+                    seed.key.symbol,
+                    interval,
+                    seed.source_file,
+                    candles,
+                    now_ms=now_ms,
+                    availability=AvailabilityState.AVAILABLE,
+                    integrity=IntegrityState.INVALID,
+                    freshness=FreshnessState.STALE,
+                    reason=seed.exception_reason or HealthReason.REFRESH_FAILED,
+                    error_type=failure["error_type"],
+                    message=failure["message"],
+                    warnings=seed.warnings,
+                )
+                candles_by_key[key] = []
+            else:
+                health_by_key[key] = replace(health, content_sha256=content_sha256)
     return DatasetEvaluationResult(health_by_key, candles_by_key, window_plan)
 
 

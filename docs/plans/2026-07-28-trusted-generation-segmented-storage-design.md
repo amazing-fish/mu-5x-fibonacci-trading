@@ -204,7 +204,8 @@ before publication never consults B's manifest and cannot mix A and B interval r
 
 The write order is:
 
-1. validate and materialize all candidate candle bundles through the existing shared evaluator;
+1. validate and materialize all candidate candle bundles through the existing shared evaluator,
+   including `5m -> 15m/1h` built/native comparison, before invoking any segment writer hook;
 2. create or atomically grow the required shared segment files under the dataset writer lock and
    fsync every newly created directory ancestor plus the final file/directory state;
 3. write and fsync `generations/<run_id>/manifest.json`;

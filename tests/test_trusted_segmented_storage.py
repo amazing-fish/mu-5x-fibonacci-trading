@@ -27,6 +27,7 @@ from mu_strategy.market_data.trusted_data.store import (
     TrustedDataStore,
     candles_content_sha256,
 )
+from mu_strategy.market_data.trusted_data.validation import aggregate_candles
 from mu_strategy.models import Candle
 from mu_strategy.market_data.utils import DAY_MS
 
@@ -82,6 +83,28 @@ class WindowedHistoryProvider:
         raise AssertionError("expanded logical window must use full history")
 
 
+class MutableBundleProvider:
+    def __init__(self, rows_by_interval: dict[str, list[Candle]]):
+        self.rows_by_interval = rows_by_interval
+        self.history_calls: list[str] = []
+        self.incremental_calls: list[str] = []
+
+    def fetch_tickers(self):
+        raise AssertionError("explicit symbol refresh must not fetch tickers")
+
+    def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
+        self.history_calls.append(interval)
+        return list(self.rows_by_interval[interval])
+
+    def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+        self.incremental_calls.append(interval)
+        return [
+            candle
+            for candle in self.rows_by_interval[interval]
+            if candle.open_time_ms >= since_time_ms
+        ]
+
+
 class UtcMonthPartitionTests(unittest.TestCase):
     def test_partition_key_is_utc_calendar_month_at_boundaries(self):
         cases = (
@@ -108,6 +131,59 @@ class UtcMonthPartitionTests(unittest.TestCase):
 
 
 class SegmentedRefreshBehaviorTests(unittest.TestCase):
+    def test_built_native_mismatch_does_not_write_segment_and_corrected_retry_succeeds(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        five = _window_candles(0, DAY_MS - STEP_MS)
+        correct_fifteen = aggregate_candles(five, interval="15m", ohlc_policy="okx_native")
+        mismatched_fifteen = list(correct_fifteen)
+        first = mismatched_fifteen[0]
+        mismatched_fifteen[0] = Candle(
+            first.open_time_ms,
+            first.open,
+            first.high + 1.0,
+            first.low,
+            first.close,
+            first.volume,
+        )
+        provider = MutableBundleProvider({"5m": five, "15m": mismatched_fifteen})
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            first_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=DAY_MS,
+                    run_id=RUN_A,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.DEGRADED, first_run.attempt_status)
+            self.assertEqual(SnapshotUsability.INVALID, first_run.snapshot_usability)
+            self.assertEqual(HealthReason.OHLCV_MISMATCH, first_run.datasets[(SYMBOL, "15m")].primary_reason)
+            self.assertFalse(store.segment_path(SYMBOL, "15m", "1970-01").exists())
+            first_manifest = store.read_generation_manifest(RUN_A).snapshot
+            self.assertEqual((), first_manifest.storage_by_dataset[(SYMBOL, "15m")].segments)
+
+            provider.rows_by_interval["15m"] = correct_fifteen
+            second_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=DAY_MS,
+                    run_id=RUN_B,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, second_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
+            self.assertIn("5m", provider.incremental_calls)
+            self.assertEqual(2, provider.history_calls.count("15m"))
+            self.assertTrue(store.segment_path(SYMBOL, "15m", "1970-01").exists())
+            self.assertEqual(correct_fifteen, _read_exact_interval(store, RUN_B, "15m"))
+
     def test_multi_cycle_growth_is_new_bytes_plus_metadata_and_closed_segment_is_unchanged(self):
         initial_rows = _candles_through(FEB_START_MS)
         provider = MutableHistoryProvider(initial_rows)
@@ -830,13 +906,17 @@ def _refresh_segment(store: TrustedDataStore, run_id: str) -> dict:
 
 
 def _read_exact(store: TrustedDataStore, run_id: str) -> list[Candle]:
+    return _read_exact_interval(store, run_id, "5m")
+
+
+def _read_exact_interval(store: TrustedDataStore, run_id: str, interval: str) -> list[Candle]:
     result = store.read_generation_manifest(run_id)
     if not result.ok or result.snapshot is None or result.generation_root is None:
         raise AssertionError(result)
     return store.read_generation_dataset(
         result.snapshot,
         symbol=SYMBOL,
-        interval="5m",
+        interval=interval,
         generation_root=result.generation_root,
         generation_id=run_id,
     )

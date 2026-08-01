@@ -174,7 +174,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 - `RefreshAttemptStatus` 表示 refresh attempt 健康：只有全量 usable 且无 provider/cache/validation failure 才是 `success`；mixed usable/unusable 是 `degraded`；zero usable 不论来自 provider failure、cache read failure、validation failure、coverage failure 或 content hash mismatch 都是 `failed`。
 - `SnapshotUsability` 表示 publication 是否可被消费者使用，由所有 `DatasetHealth` 的 availability/integrity/freshness 三轴推导；zero usable fail-closed 为 `invalid`，mixed usable/unusable 会按最严格 dataset 轴推导为 `stale` 或 `invalid`。
 - `DatasetHealth` 表示单个 `symbol/interval` 的 availability、integrity、freshness、reason、validation 和 `content_sha256`，refresh/load/dashboard 不各自重新定义全局状态。
-- malformed/unknown manifest、缺失或损坏 segment、row/hash 不一致都会 fail-closed；trading strict policy 下全部阻断消费。尝试改变已存 timestamp 的历史 candle 也会在 `current.json` 发布前 fail closed，不会改写证据。
+- malformed/unknown manifest、缺失或损坏 segment、row/hash 不一致都会 fail-closed；trading strict policy 下全部阻断消费。refresh 先完成整个 `5m/15m/1h` bundle 的局部与 built/native 交叉验证，再写任何对应共享 segment；无效 native 数据不会成为 canonical 物理证据。尝试改变已存 timestamp 的历史 candle 也会在 `current.json` 发布前 fail closed，不会改写证据。
 - generation reader 一次只 pin 一个 manifest；共享尾段后来增长时，旧 generation 仍只读取并验证自己的 `[start_row, start_row + rows)`。retention、pin policy、GC 和 deletion 不属于当前实现，任何 generation/segment 都不会自动删除。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。
