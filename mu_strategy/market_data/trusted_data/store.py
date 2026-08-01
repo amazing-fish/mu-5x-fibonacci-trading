@@ -798,6 +798,8 @@ def _windows_path_has_open_handle(path: Path) -> bool:
         error = ctypes.get_last_error()
         if error == 32:
             return True
+        if error in {2, 3}:
+            return False
         raise ctypes.WinError(error)
     if not kernel32.CloseHandle(handle):
         raise ctypes.WinError(ctypes.get_last_error())

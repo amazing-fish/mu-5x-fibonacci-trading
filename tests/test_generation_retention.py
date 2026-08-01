@@ -377,6 +377,36 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(opened_handles)
             self.assertTrue(all(handle.closed for handle in opened_handles))
 
+    def test_reclamation_treats_missing_manifest_dataset_as_unleased(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            store.generation_cache_path("run-old", SYMBOL, "1h").unlink()
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            os.utime(data_dir / "generations" / "run-old", ns=(1_000_000_000, 1_000_000_000))
+            os.utime(data_dir / "generations" / "run-current", ns=(2_000_000_000, 2_000_000_000))
+
+            report = store.reclaim_generations(GenerationRetentionPolicy(keep_recent=1))
+
+            self.assertEqual(("run-old",), report.removed_ids)
+            self.assertEqual((), report.failures)
+            self.assertFalse((data_dir / "generations" / "run-old").exists())
+
     def test_load_context_snapshot_blocks_publication_until_file_read_completes(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
