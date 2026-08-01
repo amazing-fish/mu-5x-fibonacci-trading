@@ -589,8 +589,7 @@ def _windows_named_mutex(data_dir: Path):
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
 
-    canonical_path = str(Path(data_dir).resolve()).casefold()
-    mutex_name = f"Local\\mu_strategy_trusted_store_{hashlib.sha256(canonical_path.encode('utf-8')).hexdigest()}"
+    mutex_name = _windows_store_mutex_name(data_dir)
     handle = kernel32.CreateMutexW(None, False, mutex_name)
     if not handle:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -618,6 +617,12 @@ def _windows_named_mutex(data_dir: Path):
             release_error = ctypes.WinError(ctypes.get_last_error())
         if release_error is not None and body_error is None:
             raise release_error
+
+
+def _windows_store_mutex_name(data_dir: Path) -> str:
+    canonical_path = str(Path(data_dir).resolve()).casefold()
+    digest = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
+    return f"Global\\mu_strategy_trusted_store_{digest}"
 
 
 def _atomic_write_text(

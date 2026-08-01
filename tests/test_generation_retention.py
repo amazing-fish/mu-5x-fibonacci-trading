@@ -44,6 +44,19 @@ class _StaticProvider:
 
 
 class GenerationRetentionTests(unittest.TestCase):
+    def test_windows_store_mutex_uses_cross_session_namespace_and_canonical_path(self):
+        from mu_strategy.market_data.trusted_data.store import _windows_store_mutex_name
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            data_dir.mkdir()
+
+            direct = _windows_store_mutex_name(data_dir)
+            equivalent = _windows_store_mutex_name(data_dir / ".")
+
+            self.assertTrue(direct.startswith("Global\\mu_strategy_trusted_store_"))
+            self.assertEqual(direct, equivalent)
+
     def test_current_generation_survives_outside_keep_recent_window(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
