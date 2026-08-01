@@ -158,6 +158,51 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(bundle.candles_by_interval["5m"])
             self.assertTrue(bundle.trust_decision.allowed)
 
+    def test_automatic_load_snapshots_only_required_datasets_and_extends_on_reuse(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            loader = LoadTrustedBundle(store)
+            read_paths = []
+            original_read_file_bytes = store.read_file_bytes
+
+            def record_read(path):
+                read_paths.append(path)
+                return original_read_file_bytes(path)
+
+            with patch.object(store, "read_file_bytes", side_effect=record_read):
+                bundle_5m = loader.execute(
+                    LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
+                    trading_strict_policy(),
+                )
+                bundle_1h = loader.execute(
+                    LoadTrustedBundleQuery(SYMBOL, intervals=("1h",), days=1, now_ms=DAY_MS),
+                    trading_strict_policy(),
+                    context=bundle_5m.load_context,
+                )
+
+            self.assertTrue(bundle_5m.trust_decision.allowed)
+            self.assertTrue(bundle_1h.trust_decision.allowed)
+            self.assertEqual(
+                [
+                    store.generation_cache_path("run-current", SYMBOL, "5m"),
+                    store.generation_cache_path("run-current", SYMBOL, "1h"),
+                ],
+                read_paths,
+            )
+            self.assertEqual(2, len(bundle_1h.load_context.dataset_file_snapshots))
+
     def test_load_context_snapshot_blocks_publication_until_file_read_completes(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
@@ -699,6 +744,7 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue((data_dir / "generations" / "run-next").is_dir())
 
     def test_reclamation_runs_after_current_pointer_and_before_run_log(self):
+        from mu_strategy.commands.refresh_market_data import classify_refresh_run
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
@@ -715,7 +761,7 @@ class GenerationRetentionTests(unittest.TestCase):
             with patch.object(store, "replace_current", side_effect=lambda *args, **kwargs: calls.append("current") or original_replace(*args, **kwargs)):
                 with patch.object(store, "_reclaim_generations_locked", side_effect=lambda *args, **kwargs: calls.append("reclamation") or original_reclaim(*args, **kwargs)):
                     with patch.object(store, "append_run_log", side_effect=lambda *args, **kwargs: calls.append("run_log") or original_append(*args, **kwargs)):
-                        RefreshTrustedMarketData(store, _StaticProvider()).execute(
+                        run = RefreshTrustedMarketData(store, _StaticProvider()).execute(
                             RefreshTrustedMarketDataRequest(
                                 requested_intervals=("5m",),
                                 days=1,
@@ -726,6 +772,8 @@ class GenerationRetentionTests(unittest.TestCase):
                         )
 
             self.assertEqual(["current", "reclamation", "run_log"], calls)
+            self.assertIs(run.reclamation, store.last_reclamation_report)
+            self.assertEqual(run.reclamation.to_dict(), classify_refresh_run(run).reclamation)
 
     def test_delete_failure_warns_without_failing_refresh_and_reaches_run_log(self):
         from mu_strategy.commands.refresh_market_data import main

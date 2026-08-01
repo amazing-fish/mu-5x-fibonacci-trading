@@ -184,7 +184,7 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
         retention_policy=GenerationRetentionPolicy(keep_recent=args.keep_generations),
         reclamation_dry_run=args.dry_run,
     )
-    run = RefreshTrustedMarketData(store).execute(
+    return RefreshTrustedMarketData(store).execute(
         RefreshTrustedMarketDataRequest(
             requested_intervals=intervals,
             days=args.days,
@@ -194,7 +194,6 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
             stock_token_config=args.stock_token_config,
         )
     )
-    return replace(run, reclamation=store.last_reclamation_report)
 
 
 def _write_dashboard_or_warning(manifest: dict[str, Any], html_output: Path | None) -> tuple[str, ...]:

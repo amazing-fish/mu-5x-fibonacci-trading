@@ -484,9 +484,11 @@ class RefreshTrustedMarketData:
             run.to_manifest(),
             run.run_log_payload(),
         )
-        if not publication_warnings:
-            return run
-        return replace(run, warnings=(*run.warnings, *publication_warnings))
+        return replace(
+            run,
+            warnings=(*run.warnings, *publication_warnings),
+            reclamation=self.store.last_reclamation_report,
+        )
 
     def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
         if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:

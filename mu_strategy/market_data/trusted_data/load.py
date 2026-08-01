@@ -18,6 +18,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     TrustedBundle,
     TrustedDatasetFileSnapshot,
     TrustedLoadContext,
+    TrustedManifestSnapshot,
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, VALIDATION_FAILURE_REASONS, evaluate_candle_bundle
@@ -69,8 +70,15 @@ class LoadTrustedBundle:
     ) -> TrustedBundle:
         resolved = resolve_okx_swap_symbol(query.symbol)
         plan = self.planner.plan(query.intervals)
+        required_keys = tuple(
+            DatasetKey(resolved.inst_id, interval)
+            for interval in plan.effective_intervals
+        )
         if context is None:
-            context, manifest_result = self._open_context_result(now_ms=query.now_ms)
+            context, manifest_result = self._open_context_result(
+                now_ms=query.now_ms,
+                dataset_keys=required_keys,
+            )
             if context is None:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
@@ -84,6 +92,8 @@ class LoadTrustedBundle:
                         manifest_result.message,
                     ),
                 )
+        elif context.dataset_file_snapshots is not None:
+            context = self._extend_context_snapshot(context, required_keys)
 
         manifest = context.manifest
         file_snapshots_by_key = None
@@ -218,14 +228,20 @@ class LoadTrustedBundle:
         self,
         *,
         now_ms: int | None = None,
+        dataset_keys: tuple[DatasetKey, ...] | None = None,
     ):
         observed_at_ms = int(now_ms) if now_ms is not None else None
         with self.store.publication_snapshot_lock():
-            return self._open_context_result_locked(observed_at_ms)
+            return self._open_context_result_locked(
+                observed_at_ms,
+                dataset_keys=dataset_keys,
+            )
 
     def _open_context_result_locked(
         self,
         observed_at_ms: int | None,
+        *,
+        dataset_keys: tuple[DatasetKey, ...] | None,
     ):
         manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
@@ -237,16 +253,64 @@ class LoadTrustedBundle:
                 error_type="ManifestSchemaError",
                 message="trusted manifest must be pinned to a generation",
             )
-        file_snapshots = []
-        for (symbol, interval), health in sorted(
-            manifest_result.snapshot.datasets.items(),
-            key=lambda item: item[0],
-        ):
-            path = self.store.generation_cache_path(
-                manifest_result.generation_id,
-                symbol,
-                interval,
+        file_snapshots = self._snapshot_dataset_files_locked(
+            manifest_result.snapshot,
+            manifest_result.generation_id,
+            dataset_keys=dataset_keys,
+        )
+        if observed_at_ms is None:
+            observed_at_ms = int(self.clock.now_ms())
+        return (
+            TrustedLoadContext(
+                manifest=manifest_result.snapshot,
+                observed_at_ms=observed_at_ms,
+                generation_root=manifest_result.generation_root or self.store.data_dir,
+                generation_id=manifest_result.generation_id,
+                dataset_file_snapshots=tuple(file_snapshots),
+            ),
+            manifest_result,
+        )
+
+    def _extend_context_snapshot(
+        self,
+        context: TrustedLoadContext,
+        required_keys: tuple[DatasetKey, ...],
+    ) -> TrustedLoadContext:
+        existing_snapshots = context.dataset_file_snapshots or ()
+        existing_keys = {snapshot.key for snapshot in existing_snapshots}
+        missing_keys = tuple(key for key in required_keys if key not in existing_keys)
+        if not missing_keys:
+            return context
+        with self.store.publication_snapshot_lock():
+            added_snapshots = self._snapshot_dataset_files_locked(
+                context.manifest,
+                context.generation_id,
+                dataset_keys=missing_keys,
             )
+        return replace(
+            context,
+            dataset_file_snapshots=(*existing_snapshots, *added_snapshots),
+        )
+
+    def _snapshot_dataset_files_locked(
+        self,
+        manifest: TrustedManifestSnapshot,
+        generation_id: str,
+        *,
+        dataset_keys: tuple[DatasetKey, ...] | None,
+    ) -> tuple[TrustedDatasetFileSnapshot, ...]:
+        if dataset_keys is None:
+            health_items = manifest.datasets.items()
+        else:
+            unique_keys = tuple(dict.fromkeys(dataset_keys))
+            health_items = (
+                (key.tuple(), manifest.datasets[key.tuple()])
+                for key in unique_keys
+                if key.tuple() in manifest.datasets
+            )
+        file_snapshots = []
+        for (symbol, interval), health in sorted(health_items, key=lambda item: item[0]):
+            path = self.store.generation_cache_path(generation_id, symbol, interval)
             try:
                 payload = self.store.read_file_bytes(path)
             except Exception as exc:
@@ -267,18 +331,7 @@ class LoadTrustedBundle:
                         payload=payload,
                     )
                 )
-        if observed_at_ms is None:
-            observed_at_ms = int(self.clock.now_ms())
-        return (
-            TrustedLoadContext(
-                manifest=manifest_result.snapshot,
-                observed_at_ms=observed_at_ms,
-                generation_root=manifest_result.generation_root or self.store.data_dir,
-                generation_id=manifest_result.generation_id,
-                dataset_file_snapshots=tuple(file_snapshots),
-            ),
-            manifest_result,
-        )
+        return tuple(file_snapshots)
 
     def _dataset_path(
         self,
