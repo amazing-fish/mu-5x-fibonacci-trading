@@ -205,8 +205,8 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
                                 fibonacci_pullback.main()
 
             report = report_path.read_text(encoding="utf-8")
-            self.assertIsNone(contexts[0])
-            self.assertEqual("old-run", contexts[1].generation_id)
+            self.assertEqual(["old-run", "old-run"], [context.generation_id for context in contexts])
+            self.assertIs(contexts[0], contexts[1])
             self.assertIn(str(Path("generations") / "old-run"), report)
             self.assertNotIn(str(Path("generations") / "new-run"), report)
 

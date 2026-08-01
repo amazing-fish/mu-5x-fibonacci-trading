@@ -70,7 +70,13 @@ class LoadTrustedBundle:
         resolved = resolve_okx_swap_symbol(query.symbol)
         plan = self.planner.plan(query.intervals)
         if context is None:
-            context, manifest_result = self._open_context_result(now_ms=query.now_ms)
+            context, manifest_result = self._open_context_result(
+                now_ms=query.now_ms,
+                dataset_keys=tuple(
+                    DatasetKey(resolved.inst_id, interval)
+                    for interval in plan.effective_intervals
+                ),
+            )
             if context is None:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
@@ -218,12 +224,21 @@ class LoadTrustedBundle:
         self,
         *,
         now_ms: int | None = None,
+        dataset_keys: tuple[DatasetKey, ...] | None = None,
     ):
         observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
         with self.store.publication_snapshot_lock():
-            return self._open_context_result_locked(observed_at_ms)
+            return self._open_context_result_locked(
+                observed_at_ms,
+                dataset_keys=dataset_keys,
+            )
 
-    def _open_context_result_locked(self, observed_at_ms: int):
+    def _open_context_result_locked(
+        self,
+        observed_at_ms: int,
+        *,
+        dataset_keys: tuple[DatasetKey, ...] | None,
+    ):
         manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None, manifest_result
@@ -236,10 +251,15 @@ class LoadTrustedBundle:
             )
         generation_root = manifest_result.generation_root or self.store.data_dir
         file_snapshots = []
-        for (symbol, interval), health in sorted(
-            manifest_result.snapshot.datasets.items(),
-            key=lambda item: item[0],
-        ):
+        if dataset_keys is None:
+            health_items = manifest_result.snapshot.datasets.items()
+        else:
+            health_items = (
+                (key.tuple(), manifest_result.snapshot.datasets[key.tuple()])
+                for key in dataset_keys
+                if key.tuple() in manifest_result.snapshot.datasets
+            )
+        for (symbol, interval), health in sorted(health_items, key=lambda item: item[0]):
             path = self.store.generation_cache_path(
                 manifest_result.generation_id,
                 symbol,

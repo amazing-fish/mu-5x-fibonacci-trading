@@ -9,7 +9,11 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.models import Candle
-from tests.factories.trusted_publication import range_candles, write_generation_publication
+from tests.factories.trusted_publication import (
+    range_candles,
+    write_generation_manifest_and_caches,
+    write_generation_publication,
+)
 
 
 DAY_MS = 86_400_000
@@ -288,6 +292,59 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual("run-old", old_bundle.run_id)
             self.assertTrue(old_bundle.trust_decision.allowed)
             self.assertTrue(old_bundle.candles_by_interval["5m"])
+
+    def test_automatic_load_context_snapshots_only_effective_query_datasets(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        other_symbol = "BTC-USDT-SWAP"
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            for index, symbol in enumerate((SYMBOL, other_symbol), start=1):
+                write_generation_manifest_and_caches(
+                    data_dir,
+                    symbol=symbol,
+                    days=1,
+                    run_id="run-current",
+                    universe_symbols=(SYMBOL, other_symbol)[:index],
+                )
+            loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir))
+
+            bundle = loader.execute(
+                LoadTrustedBundleQuery(
+                    SYMBOL,
+                    intervals=("15m", "1h"),
+                    days=1,
+                    now_ms=DAY_MS,
+                ),
+                observe_only_policy(),
+            )
+            automatic_keys = {
+                snapshot.key.tuple()
+                for snapshot in bundle.load_context.dataset_file_snapshots
+            }
+            explicit_context = loader.open_context(now_ms=DAY_MS)
+            explicit_keys = {
+                snapshot.key.tuple()
+                for snapshot in explicit_context.dataset_file_snapshots
+            }
+
+            self.assertEqual(
+                {(SYMBOL, "5m"), (SYMBOL, "15m"), (SYMBOL, "1h")},
+                automatic_keys,
+            )
+            self.assertEqual(
+                {
+                    (SYMBOL, "5m"),
+                    (SYMBOL, "15m"),
+                    (SYMBOL, "1h"),
+                    (other_symbol, "5m"),
+                    (other_symbol, "15m"),
+                    (other_symbol, "1h"),
+                },
+                explicit_keys,
+            )
 
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore

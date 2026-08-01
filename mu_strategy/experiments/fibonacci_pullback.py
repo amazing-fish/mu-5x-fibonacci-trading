@@ -11,6 +11,8 @@ from mu_strategy.cli import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext
+from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -469,20 +471,27 @@ def main() -> None:
         for value in args.asset:
             asset_values.extend(item.strip() for item in value.split(",") if item.strip())
         try:
+            assets = [resolve_asset(value) for value in asset_values]
+            for asset in assets:
+                if asset.source != "okx":
+                    raise ValueError(f"trusted data layer supports OKX sources only; got source {asset.source!r}")
             asset_results: list[AssetFibonacciBacktest] = []
-            trusted_context: TrustedLoadContext | None = None
-            for value in asset_values:
-                asset_result, trusted_context = _run_asset_fibonacci_backtest(
-                    resolve_asset(value),
+            data_dir = args.data_dir or Path("data/live")
+            trusted_context = LoadTrustedBundle(
+                TrustedDataStore(data_dir=data_dir)
+            ).open_context()
+            for asset in assets:
+                asset_result, _ = _run_asset_fibonacci_backtest(
+                    asset,
                     days=args.days,
                     strategy_name=args.strategy,
                     fee_profile=args.fee_profile,
                     horizons_hours=horizons,
-                    data_dir=args.data_dir or Path("data/live"),
+                    data_dir=data_dir,
                     context=trusted_context,
                 )
                 asset_results.append(asset_result)
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             parser.error(str(exc))
         report = render_multi_asset_report(
             asset_results,
