@@ -346,6 +346,69 @@ class GenerationRetentionTests(unittest.TestCase):
                 explicit_keys,
             )
 
+    def test_demo_context_snapshots_only_selected_universe_and_watchlist_datasets(self):
+        from mu_strategy.demo_trading import DemoTradingConfig, run_once
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        top_symbol = "BTC-USDT-SWAP"
+        unselected_symbol = "ETH-USDT-SWAP"
+        universe_symbols = (top_symbol, unselected_symbol)
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            publication_symbols = (*universe_symbols, SYMBOL)
+            for index, symbol in enumerate(publication_symbols):
+                write_generation_manifest_and_caches(
+                    data_dir,
+                    symbol=symbol,
+                    days=1,
+                    run_id="run-current",
+                    universe_symbols=universe_symbols if index == len(publication_symbols) - 1 else (),
+                )
+            original_read_file_bytes = TrustedDataStore.read_file_bytes
+
+            def execute_demo(universe_limit):
+                snapshot_paths = []
+
+                def recording_read_file_bytes(store, path):
+                    snapshot_paths.append(Path(path))
+                    return original_read_file_bytes(store, path)
+
+                with patch.object(TrustedDataStore, "read_file_bytes", recording_read_file_bytes):
+                    with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=DAY_MS):
+                        result = run_once(
+                            DemoTradingConfig(
+                                universe_limit=universe_limit,
+                                dry_run=True,
+                                data_dir=data_dir,
+                                days=1,
+                                watchlist_symbols=(SYMBOL,),
+                            ),
+                            broker=None,
+                        )
+                return result, snapshot_paths
+
+            result, snapshot_paths = execute_demo(1)
+
+            self.assertIsNone(result["universe_error"])
+            self.assertEqual([top_symbol, SYMBOL], [row["inst_id"] for row in result["universe"]])
+            self.assertEqual(
+                {
+                    (symbol, interval)
+                    for symbol in (top_symbol, SYMBOL)
+                    for interval in ("5m", "15m", "1h")
+                },
+                {(path.parent.name, path.stem) for path in snapshot_paths},
+            )
+            self.assertNotIn(unselected_symbol, {path.parent.name for path in snapshot_paths})
+
+            watchlist_result, watchlist_paths = execute_demo(0)
+            self.assertIsNone(watchlist_result["universe_error"])
+            self.assertEqual([SYMBOL], [row["inst_id"] for row in watchlist_result["universe"]])
+            self.assertEqual(
+                {(SYMBOL, interval) for interval in ("5m", "15m", "1h")},
+                {(path.parent.name, path.stem) for path in watchlist_paths},
+            )
+
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
@@ -425,18 +488,64 @@ class GenerationRetentionTests(unittest.TestCase):
 
             self.assertEqual(["current", "reclamation", "run_log"], calls)
 
-    def test_reclamation_skips_a_manifestless_in_progress_generation(self):
+    def test_reclamation_skips_active_manifestless_generation_then_reclaims_it_after_owner_exits(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             _write_plain_generation(data_dir, "run-old", b"old", mtime_ns=1_000_000_000)
             _write_plain_generation(data_dir, "run-current", b"current", mtime_ns=2_000_000_000)
-            _write_plain_generation(
+            _write_current_pointer(data_dir, "run-current")
+            context = multiprocessing.get_context("spawn")
+            owner_ready = context.Event()
+            release_owner = context.Event()
+            owner = context.Process(
+                target=_hold_generation_preparation,
+                args=(str(data_dir), "run-in-progress", owner_ready, release_owner),
+            )
+            owner.start()
+            try:
+                self.assertTrue(owner_ready.wait(10), "generation owner did not acquire its preparation lease")
+                active_report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                    GenerationRetentionPolicy(keep_recent=1)
+                )
+
+                self.assertEqual(("run-old",), active_report.removed_ids)
+                self.assertTrue((data_dir / "generations" / "run-in-progress").is_dir())
+            finally:
+                release_owner.set()
+                owner.join(10)
+                if owner.is_alive():
+                    owner.terminate()
+                    owner.join(10)
+            self.assertEqual(0, owner.exitcode)
+
+            abandoned_report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertEqual(("run-in-progress",), abandoned_report.candidate_ids)
+            self.assertEqual(("run-in-progress",), abandoned_report.removed_ids)
+            self.assertGreater(abandoned_report.bytes_reclaimed, len(b"partial"))
+            self.assertFalse((data_dir / "generations" / "run-in-progress").exists())
+
+    def test_reclamation_preserves_a_manifestless_current_generation(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            current = _write_plain_generation(
                 data_dir,
-                "run-in-progress",
-                b"partial",
-                mtime_ns=3_000_000_000,
+                "run-current",
+                b"current",
+                mtime_ns=1_000_000_000,
+                committed=False,
+            )
+            abandoned = _write_plain_generation(
+                data_dir,
+                "run-abandoned",
+                b"abandoned",
+                mtime_ns=2_000_000_000,
                 committed=False,
             )
             _write_current_pointer(data_dir, "run-current")
@@ -445,8 +554,10 @@ class GenerationRetentionTests(unittest.TestCase):
                 GenerationRetentionPolicy(keep_recent=1)
             )
 
-            self.assertEqual(("run-old",), report.removed_ids)
-            self.assertTrue((data_dir / "generations" / "run-in-progress").is_dir())
+            self.assertTrue(current.is_dir())
+            self.assertTrue(abandoned.is_dir())
+            self.assertEqual((), report.removed_ids)
+            self.assertEqual("run-current", report.failures[0].generation_id)
 
     def test_context_manifest_and_file_snapshot_share_one_store_lock(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
@@ -857,6 +968,17 @@ def _wait_for_store_lock(data_dir: str, attempting, acquired) -> None:
     attempting.set()
     with store.publication_snapshot_lock():
         acquired.set()
+
+
+def _hold_generation_preparation(data_dir: str, generation_id: str, ready, release) -> None:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    generation_root = store.prepare_generation(generation_id)
+    (generation_root / "partial.bin").write_bytes(b"partial")
+    ready.set()
+    if not release.wait(10):
+        raise TimeoutError("generation owner release timed out")
 
 
 if __name__ == "__main__":

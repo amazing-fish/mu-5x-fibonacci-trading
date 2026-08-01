@@ -13,14 +13,16 @@ from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRE
 from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bundle, trust_error_payload
 from mu_strategy.market_data.trusted_data.contracts import (
     Clock,
+    DatasetKey,
     FreshnessState,
     SystemClock,
     TrustedConsumerRefreshError,
     TrustedLoadContext,
+    TrustedManifestSnapshot,
     UniverseSnapshot,
 )
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
+from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
@@ -36,6 +38,7 @@ Scanner = Callable[..., EntryScanResult]
 BOT_CLIENT_ORDER_ID_PATTERN = re.compile(r"^OD[A-F0-9]{20}$")
 PENDING_ORDER_STATES = {"", "live", "partially_filled"}
 DEFAULT_WATCHLIST_SYMBOLS = ("MU-USDT-SWAP",)
+DEMO_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 @dataclass(frozen=True)
@@ -95,20 +98,32 @@ def run_once(
     account_context: dict[str, Any] = {}
     account_error: dict[str, str] | None = None
     trusted_context: TrustedLoadContext | None = None
+    trusted_loader = (
+        LoadTrustedBundle(TrustedDataStore(data_dir=config.data_dir))
+        if default_trusted_loader and not config.refresh
+        else None
+    )
 
-    if default_trusted_loader and not config.refresh:
+    if trusted_loader is not None and universe_provider is None:
         try:
-            trusted_context = LoadTrustedBundle(TrustedDataStore(data_dir=config.data_dir)).open_context()
+            trusted_context = trusted_loader.open_context(
+                dataset_key_selector=lambda manifest: _demo_context_dataset_keys(config, manifest)
+            )
         except Exception as exc:
             universe_error = _universe_load_error(exc)
 
     if config.dry_run:
         if universe_error is None:
             try:
-                tickers = _merge_watchlist_tickers(
+                selected_tickers = _merge_watchlist_tickers(
                     _load_universe(config, universe_provider, context=trusted_context),
                     config.watchlist_symbols,
                 )
+                if trusted_loader is not None and trusted_context is None:
+                    trusted_context = trusted_loader.open_context(
+                        dataset_keys=_demo_dataset_keys_for_tickers(selected_tickers)
+                    )
+                tickers = selected_tickers
             except Exception as exc:
                 universe_error = _universe_load_error(exc)
     else:
@@ -127,10 +142,15 @@ def run_once(
             open_position_inst_ids = _open_position_inst_ids(positions)
             if universe_error is None:
                 try:
-                    tickers = _merge_watchlist_tickers(
+                    selected_tickers = _merge_watchlist_tickers(
                         _load_universe(config, universe_provider, context=trusted_context),
                         config.watchlist_symbols,
                     )
+                    if trusted_loader is not None and trusted_context is None:
+                        trusted_context = trusted_loader.open_context(
+                            dataset_keys=_demo_dataset_keys_for_tickers(selected_tickers)
+                        )
+                    tickers = selected_tickers
                 except Exception as exc:
                     universe_error = _universe_load_error(exc)
     entry_eligible_inst_ids = {ticker.inst_id for ticker in tickers}
@@ -147,7 +167,7 @@ def run_once(
         data_error = None
         bundle = None
         result = None
-        requested_intervals = ("15m", "1h")
+        requested_intervals = DEMO_REQUESTED_INTERVALS
         try:
             loader_kwargs = {
                 "intervals": requested_intervals,
@@ -426,6 +446,29 @@ def _dedupe_manifest_tickers(tickers: list[OKXSwapTicker]) -> list[OKXSwapTicker
         deduped.append(ticker)
         seen.add(ticker.inst_id)
     return deduped
+
+
+def _demo_context_dataset_keys(
+    config: DemoTradingConfig,
+    manifest: TrustedManifestSnapshot,
+) -> tuple[DatasetKey, ...]:
+    tickers = _merge_watchlist_tickers(
+        _tickers_from_universe_snapshot(
+            manifest.universe_snapshot,
+            limit=validate_universe_limit(config.universe_limit),
+        ),
+        config.watchlist_symbols,
+    )
+    return _demo_dataset_keys_for_tickers(tickers)
+
+
+def _demo_dataset_keys_for_tickers(tickers: list[OKXSwapTicker]) -> tuple[DatasetKey, ...]:
+    effective_intervals = IntervalDependencyPlanner().plan(DEMO_REQUESTED_INTERVALS).effective_intervals
+    return tuple(
+        DatasetKey(ticker.inst_id, interval)
+        for ticker in tickers
+        for interval in effective_intervals
+    )
 
 
 def _load_universe(

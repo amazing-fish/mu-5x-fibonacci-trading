@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,6 +32,9 @@ from mu_strategy.models import Candle
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_RUN_LOG_MAX_LINES = 1_000
+_GENERATION_IN_PROGRESS_MARKER = ".in_progress"
+_LOCAL_GENERATION_MARKERS: set[str] = set()
+_LOCAL_GENERATION_MARKERS_LOCK = threading.Lock()
 _CURRENT_POINTER_DIRECTORY_SYNC_WARNING_PREFIX = "current_pointer_directory_sync_failed:"
 # Keep post-commit warnings structured without allowing -Werror to turn them into false failures.
 _CURRENT_POINTER_WARNING_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
@@ -80,6 +84,7 @@ class TrustedDataStore:
         self.retention_policy = retention_policy
         self.reclamation_dry_run = reclamation_dry_run
         self.last_reclamation_report: GenerationReclamationReport | None = None
+        self._generation_preparation_leases: dict[str, _GenerationPreparationLease] = {}
 
     @property
     def current_path(self) -> Path:
@@ -117,12 +122,39 @@ class TrustedDataStore:
         return self.generation_root(generation_id) / self.generation_source_file(symbol, interval)
 
     def prepare_generation(self, generation_id: str) -> Path:
-        root = self.generation_root(generation_id)
-        if root.exists():
-            raise FileExistsError(f"trusted generation already exists: {generation_id}")
-        root.mkdir(parents=True)
-        _fsync_directory(self.generations_dir)
-        return root
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        with _trusted_store_lock(self.data_dir):
+            root = self.generation_root(generation_id)
+            if root.exists():
+                raise FileExistsError(f"trusted generation already exists: {generation_id}")
+            root.mkdir(parents=True)
+            marker_path = root / _GENERATION_IN_PROGRESS_MARKER
+            lease = None
+            registered = False
+            try:
+                with marker_path.open("xb") as handle:
+                    handle.write(b"1\n")
+                    _flush_and_fsync(handle)
+                lease = _acquire_generation_preparation_lease(marker_path, blocking=True)
+                if lease is None:
+                    raise RuntimeError(f"failed to acquire generation preparation lease: {generation_id}")
+                _register_local_generation_marker(marker_path)
+                registered = True
+                self._generation_preparation_leases[generation_id] = lease
+                _fsync_directory(root)
+                _fsync_directory(self.generations_dir)
+            except BaseException:
+                self._generation_preparation_leases.pop(generation_id, None)
+                if lease is not None:
+                    try:
+                        lease.close()
+                    except OSError:
+                        pass
+                if registered:
+                    _unregister_local_generation_marker(marker_path)
+                raise
+            return root
 
     def read_csv(self, path: Path) -> list[Candle]:
         with Path(path).open("r", newline="", encoding="utf-8") as handle:
@@ -233,7 +265,22 @@ class TrustedDataStore:
         if not result.ok:
             message = result.message or (result.reason.value if result.reason is not None else "generation manifest is malformed")
             raise ManifestSchemaError(message)
+        self._finish_generation_preparation(generation_id)
         return path
+
+    def _finish_generation_preparation(self, generation_id: str) -> None:
+        lease = self._generation_preparation_leases.pop(generation_id, None)
+        if lease is None:
+            return
+        marker_path = self.generation_root(generation_id) / _GENERATION_IN_PROGRESS_MARKER
+        try:
+            lease.close()
+        finally:
+            _unregister_local_generation_marker(marker_path)
+        if marker_path.is_symlink() or not marker_path.is_file():
+            raise OSError(f"generation preparation marker must be a regular file: {generation_id}")
+        marker_path.unlink()
+        _fsync_directory(marker_path.parent)
 
     def replace_current(self, generation_id: str) -> Path:
         generation_id = validate_storage_segment(generation_id, field="generation_id")
@@ -381,21 +428,11 @@ class TrustedDataStore:
                 failures=tuple(failures),
             )
 
-        generations: list[tuple[Path, int]] = []
-        for entry in entries:
-            try:
-                target = self._validated_reclamation_target(entry)
-                manifest_path = target / "manifest.json"
-                if not manifest_path.exists():
-                    continue
-                if manifest_path.is_symlink() or not manifest_path.is_file():
-                    raise ValueError(f"trusted generation manifest must be a regular file: {target.name}")
-                generations.append((target, target.stat().st_mtime_ns))
-            except Exception as exc:
-                failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
-
         try:
             current_target = self._validated_reclamation_target(self.generations_dir / current_generation_id)
+            current_manifest_path = current_target / "manifest.json"
+            if current_manifest_path.is_symlink() or not current_manifest_path.is_file():
+                raise ValueError(f"current trusted generation manifest must be a regular file: {current_generation_id}")
         except Exception as exc:
             failures.append(GenerationReclamationFailure(current_generation_id, type(exc).__name__, str(exc)))
             return GenerationReclamationReport(
@@ -405,16 +442,43 @@ class TrustedDataStore:
                 failures=tuple(failures),
             )
 
-        ordered = [
-            path
-            for path, _ in sorted(
-                generations,
-                key=lambda item: (item[1], item[0].name),
-            )
-        ]
+        generations: list[tuple[Path, int]] = []
+        abandoned: list[tuple[Path, int]] = []
+        for entry in entries:
+            try:
+                target = self._validated_reclamation_target(entry)
+                manifest_path = target / "manifest.json"
+                if not manifest_path.exists():
+                    if self._manifestless_generation_is_active(target):
+                        continue
+                    abandoned.append((target, target.stat().st_mtime_ns))
+                    continue
+                if manifest_path.is_symlink() or not manifest_path.is_file():
+                    raise ValueError(f"trusted generation manifest must be a regular file: {target.name}")
+                generations.append((target, target.stat().st_mtime_ns))
+            except Exception as exc:
+                failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
+
+        ordered_generations = sorted(
+            generations,
+            key=lambda item: (item[1], item[0].name),
+        )
+        ordered = [path for path, _ in ordered_generations]
+        generation_mtimes = {path: mtime_ns for path, mtime_ns in ordered_generations}
         protected_ids = {path.name for path in ordered[-policy.keep_recent :]}
         protected_ids.add(current_target.name)
-        candidates = tuple(path for path in ordered if path.name not in protected_ids)
+        retention_candidates = [
+            (path, generation_mtimes[path])
+            for path in ordered
+            if path.name not in protected_ids
+        ]
+        candidates = tuple(
+            path
+            for path, _ in sorted(
+                (*abandoned, *retention_candidates),
+                key=lambda item: (item[1], item[0].name),
+            )
+        )
         sizes: dict[str, int] = {}
         for candidate in candidates:
             try:
@@ -466,6 +530,20 @@ class TrustedDataStore:
             failures=tuple(failures),
         )
 
+    def _manifestless_generation_is_active(self, generation_root: Path) -> bool:
+        marker_path = generation_root / _GENERATION_IN_PROGRESS_MARKER
+        if not marker_path.exists():
+            return False
+        if marker_path.is_symlink() or not marker_path.is_file():
+            raise ValueError(f"generation preparation marker must be a regular file: {generation_root.name}")
+        if _is_local_generation_marker(marker_path):
+            return True
+        lease = _acquire_generation_preparation_lease(marker_path, blocking=False)
+        if lease is None:
+            return True
+        lease.close()
+        return False
+
     def _current_generation_id_for_reclamation(self) -> str:
         pointer = json.loads(self.current_path.read_text(encoding="utf-8"))
         generation_id, _ = self._resolve_current_pointer(pointer)
@@ -483,6 +561,41 @@ class TrustedDataStore:
         if not resolved_target.is_dir():
             raise ValueError(f"trusted generation must be a directory: {generation_id}")
         return resolved_target
+
+
+class _GenerationPreparationLease:
+    def __init__(self, release: Callable[[], None]):
+        self._release = release
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._release()
+
+
+def _generation_marker_identity(marker_path: Path) -> str:
+    value = str(Path(marker_path).resolve())
+    return value.casefold() if os.name == "nt" else value
+
+
+def _register_local_generation_marker(marker_path: Path) -> None:
+    identity = _generation_marker_identity(marker_path)
+    with _LOCAL_GENERATION_MARKERS_LOCK:
+        _LOCAL_GENERATION_MARKERS.add(identity)
+
+
+def _unregister_local_generation_marker(marker_path: Path) -> None:
+    identity = _generation_marker_identity(marker_path)
+    with _LOCAL_GENERATION_MARKERS_LOCK:
+        _LOCAL_GENERATION_MARKERS.discard(identity)
+
+
+def _is_local_generation_marker(marker_path: Path) -> bool:
+    identity = _generation_marker_identity(marker_path)
+    with _LOCAL_GENERATION_MARKERS_LOCK:
+        return identity in _LOCAL_GENERATION_MARKERS
 
 
 def candles_content_sha256(candles: list[Candle]) -> str:
@@ -512,6 +625,82 @@ def _directory_file_bytes(root: Path) -> int:
         for name in file_names:
             total += (current / name).lstat().st_size
     return total
+
+
+def _acquire_generation_preparation_lease(
+    marker_path: Path,
+    *,
+    blocking: bool,
+) -> _GenerationPreparationLease | None:
+    marker_path = Path(marker_path)
+    if os.name == "posix":
+        import fcntl
+
+        handle = marker_path.open("r+b")
+        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(handle.fileno(), operation)
+        except BlockingIOError:
+            handle.close()
+            return None
+        except BaseException:
+            handle.close()
+            raise
+
+        def release() -> None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+        return _GenerationPreparationLease(release)
+    if os.name == "nt":
+        return _acquire_windows_generation_preparation_lease(marker_path, blocking=blocking)
+    raise OSError(errno.ENOTSUP, f"generation preparation locking is unsupported on platform: {os.name}")
+
+
+def _acquire_windows_generation_preparation_lease(
+    marker_path: Path,
+    *,
+    blocking: bool,
+) -> _GenerationPreparationLease | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    canonical_path = str(marker_path.resolve()).casefold()
+    mutex_name = f"Local\\mu_strategy_generation_{hashlib.sha256(canonical_path.encode('utf-8')).hexdigest()}"
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    wait_result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF if blocking else 0)
+    if wait_result == 0x00000102:
+        kernel32.CloseHandle(handle)
+        return None
+    if wait_result not in {0x00000000, 0x00000080}:
+        error = ctypes.WinError(ctypes.get_last_error()) if wait_result == 0xFFFFFFFF else OSError(f"unexpected mutex wait result: {wait_result}")
+        kernel32.CloseHandle(handle)
+        raise error
+
+    def release() -> None:
+        release_error = None
+        if not kernel32.ReleaseMutex(handle):
+            release_error = ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.CloseHandle(handle) and release_error is None:
+            release_error = ctypes.WinError(ctypes.get_last_error())
+        if release_error is not None:
+            raise release_error
+
+    return _GenerationPreparationLease(release)
 
 
 @contextmanager

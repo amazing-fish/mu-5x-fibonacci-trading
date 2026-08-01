@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
@@ -18,6 +19,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     TrustedBundle,
     TrustedDatasetFileSnapshot,
     TrustedLoadContext,
+    TrustedManifestSnapshot,
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, VALIDATION_FAILURE_REASONS, evaluate_candle_bundle
@@ -53,10 +55,12 @@ class LoadTrustedBundle:
         *,
         now_ms: int | None = None,
         dataset_keys: tuple[DatasetKey, ...] | None = None,
+        dataset_key_selector: Callable[[TrustedManifestSnapshot], tuple[DatasetKey, ...]] | None = None,
     ) -> TrustedLoadContext:
         context, manifest_result = self._open_context_result(
             now_ms=now_ms,
             dataset_keys=dataset_keys,
+            dataset_key_selector=dataset_key_selector,
         )
         if context is None:
             reason = manifest_result.reason or HealthReason.MANIFEST_BLOCKED
@@ -229,7 +233,10 @@ class LoadTrustedBundle:
         *,
         now_ms: int | None = None,
         dataset_keys: tuple[DatasetKey, ...] | None = None,
+        dataset_key_selector: Callable[[TrustedManifestSnapshot], tuple[DatasetKey, ...]] | None = None,
     ):
+        if dataset_keys is not None and dataset_key_selector is not None:
+            raise ValueError("dataset_keys and dataset_key_selector are mutually exclusive")
         observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
         if dataset_keys is not None:
             dataset_keys = tuple(dict.fromkeys(dataset_keys))
@@ -237,6 +244,7 @@ class LoadTrustedBundle:
             return self._open_context_result_locked(
                 observed_at_ms,
                 dataset_keys=dataset_keys,
+                dataset_key_selector=dataset_key_selector,
             )
 
     def _open_context_result_locked(
@@ -244,6 +252,7 @@ class LoadTrustedBundle:
         observed_at_ms: int,
         *,
         dataset_keys: tuple[DatasetKey, ...] | None,
+        dataset_key_selector: Callable[[TrustedManifestSnapshot], tuple[DatasetKey, ...]] | None = None,
     ):
         manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
@@ -255,6 +264,8 @@ class LoadTrustedBundle:
                 error_type="ManifestSchemaError",
                 message="trusted manifest must be pinned to a generation",
             )
+        if dataset_key_selector is not None:
+            dataset_keys = tuple(dict.fromkeys(dataset_key_selector(manifest_result.snapshot)))
         generation_root = manifest_result.generation_root or self.store.data_dir
         file_snapshots = []
         if dataset_keys is None:
