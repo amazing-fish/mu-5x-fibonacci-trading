@@ -249,6 +249,116 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(bundle_1h.candles_by_interval["1h"])
             self.assertTrue(bundle_1h.trust_decision.allowed)
 
+    def test_partial_load_context_falls_back_to_snapshot_when_lease_open_fails(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            loader = LoadTrustedBundle(store)
+            failed_lease_path = store.generation_cache_path("run-old", SYMBOL, "1h")
+            original_open = store.open_file_for_snapshot
+
+            def open_except_1h(path):
+                if path == failed_lease_path:
+                    raise OSError("simulated lease failure")
+                return original_open(path)
+
+            with patch.object(store, "open_file_for_snapshot", side_effect=open_except_1h):
+                bundle_5m = loader.execute(
+                    LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
+                    trading_strict_policy(),
+                )
+
+            snapshots_by_interval = {
+                snapshot.key.interval: snapshot
+                for snapshot in bundle_5m.load_context.dataset_file_snapshots
+            }
+            self.assertIsNotNone(snapshots_by_interval["1h"].payload)
+            self.assertEqual(
+                {"15m"},
+                {lease.key.interval for lease in bundle_5m.load_context.dataset_file_leases},
+            )
+
+            RefreshTrustedMarketData(store, _StaticProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=DAY_MS,
+                    run_id="run-new",
+                )
+            )
+            self.assertFalse((data_dir / "generations" / "run-old").exists())
+
+            bundle_1h = loader.execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("1h",), days=1, now_ms=DAY_MS),
+                trading_strict_policy(),
+                context=bundle_5m.load_context,
+            )
+            self.assertEqual("run-old", bundle_1h.run_id)
+            self.assertTrue(bundle_1h.candles_by_interval["1h"])
+            self.assertTrue(bundle_1h.trust_decision.allowed)
+
+    def test_partial_load_context_fails_closed_when_lease_and_snapshot_fail(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            loader = LoadTrustedBundle(store)
+            failed_path = store.generation_cache_path("run-current", SYMBOL, "1h")
+            original_open = store.open_file_for_snapshot
+            original_read = store.read_file_bytes
+            opened_handles = []
+
+            def open_except_1h(path):
+                if path == failed_path:
+                    raise OSError("simulated lease failure")
+                handle = original_open(path)
+                opened_handles.append(handle)
+                return handle
+
+            def read_except_1h(path):
+                if path == failed_path:
+                    raise OSError("simulated snapshot failure")
+                return original_read(path)
+
+            with (
+                patch.object(store, "open_file_for_snapshot", side_effect=open_except_1h),
+                patch.object(store, "read_file_bytes", side_effect=read_except_1h),
+                self.assertRaisesRegex(RuntimeError, "unable to preserve trusted dataset"),
+            ):
+                loader.execute(
+                    LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
+                    trading_strict_policy(),
+                )
+
+            self.assertTrue(opened_handles)
+            self.assertTrue(all(handle.closed for handle in opened_handles))
+
     def test_load_context_snapshot_blocks_publication_until_file_read_completes(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest

@@ -259,7 +259,7 @@ class LoadTrustedBundle:
             manifest_result.generation_id,
             dataset_keys=dataset_keys,
         )
-        file_leases = self._lease_unrequested_dataset_files_locked(
+        file_leases, fallback_snapshots = self._lease_unrequested_dataset_files_locked(
             manifest_result.snapshot,
             manifest_result.generation_id,
             dataset_keys=dataset_keys,
@@ -272,7 +272,7 @@ class LoadTrustedBundle:
                 observed_at_ms=observed_at_ms,
                 generation_root=manifest_result.generation_root or self.store.data_dir,
                 generation_id=manifest_result.generation_id,
-                dataset_file_snapshots=tuple(file_snapshots),
+                dataset_file_snapshots=(*file_snapshots, *fallback_snapshots),
                 dataset_file_leases=file_leases,
             ),
             manifest_result,
@@ -380,27 +380,47 @@ class LoadTrustedBundle:
         generation_id: str,
         *,
         dataset_keys: tuple[DatasetKey, ...] | None,
-    ) -> tuple[TrustedDatasetFileLease, ...]:
+    ) -> tuple[tuple[TrustedDatasetFileLease, ...], tuple[TrustedDatasetFileSnapshot, ...]]:
         if dataset_keys is None:
-            return ()
+            return (), ()
         requested_keys = set(dataset_keys)
         leases = []
-        for (symbol, interval), health in sorted(manifest.datasets.items(), key=lambda item: item[0]):
-            if health.key in requested_keys:
-                continue
-            path = self.store.generation_cache_path(generation_id, symbol, interval)
-            try:
-                handle = self.store.open_file_for_snapshot(path)
-            except Exception:
-                continue
-            leases.append(
-                TrustedDatasetFileLease(
-                    key=health.key,
-                    source_file=path,
-                    handle=handle,
+        fallback_snapshots = []
+        try:
+            for (symbol, interval), health in sorted(manifest.datasets.items(), key=lambda item: item[0]):
+                if health.key in requested_keys:
+                    continue
+                path = self.store.generation_cache_path(generation_id, symbol, interval)
+                try:
+                    handle = self.store.open_file_for_snapshot(path)
+                except Exception as lease_error:
+                    try:
+                        payload = self.store.read_file_bytes(path)
+                    except Exception as snapshot_error:
+                        raise RuntimeError(
+                            f"unable to preserve trusted dataset {health.key.tuple()} after "
+                            f"{type(lease_error).__name__}: {lease_error}"
+                        ) from snapshot_error
+                    fallback_snapshots.append(
+                        TrustedDatasetFileSnapshot(
+                            key=health.key,
+                            source_file=path,
+                            payload=payload,
+                        )
+                    )
+                    continue
+                leases.append(
+                    TrustedDatasetFileLease(
+                        key=health.key,
+                        source_file=path,
+                        handle=handle,
+                    )
                 )
-            )
-        return tuple(leases)
+        except Exception:
+            for lease in leases:
+                lease.close()
+            raise
+        return tuple(leases), tuple(fallback_snapshots)
 
     def _dataset_path(
         self,
