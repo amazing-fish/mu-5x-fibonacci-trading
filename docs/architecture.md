@@ -46,10 +46,10 @@ Rules:
 - Adjacent candle continuity is gated by `previous close -> next open`; gaps above 2% raise `DataQualityError`.
 - If an incremental OKX refresh fails, existing cached data is still usable.
 - `data/live/current.json` is the atomic pointer to the current trusted generation. Each generation lives under `data/live/generations/<run_id>/` with its schema v3 manifest and matching canonical CSV set. The global refresh command/use case is the only writer for the current pointer and generation directories.
-- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, and demo are cache-only consumers.
+- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, walk-forward, Fibonacci experiments, and demo are cache-only consumers.
 - Trusted refresh can be scoped with repeatable `--symbol` values such as `MU` or `MU-USDT-SWAP`. Explicit-symbol mode normalizes and de-dupes OKX swap symbols, skips the Top universe ticker list, and publishes only the requested subset into the same schema v3 generation contract.
 - Trusted refresh may fetch up to `--max-concurrency` symbol/interval segments concurrently (CLI default `2`). Programmatic requests default to serial execution (`1`) so existing compatibility-facade callers with custom fetchers remain thread-safe unless they explicitly opt into concurrency. Dataset validation, generation CSV writes, manifest construction, and the single atomic `current.json` publication remain on the caller thread after all fetch candidates are collected.
-- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest and visualization default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, or `python -m mu_strategy.commands.okx_demo_loop`.
+- Trusted consumers never perform provider/network refresh, CSV writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest, visualization, walk-forward, and Fibonacci experiment entry points default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, `python -m mu_strategy.walk_forward`, `python -m mu_strategy.experiments.fibonacci_pullback`, or `python -m mu_strategy.commands.okx_demo_loop`.
 - The old in-process per-symbol consumer refresh APIs remain removed. Canonical subset refresh is only available through the standalone trusted refresh command and still writes the shared generation publication.
 - Trusted storage is CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service.
 - Generated backtest, visualization, data-health, and scanner reports are local artifacts. Write them under ignored paths such as `reports/live/`; do not treat tracked report files as the authoritative baseline.
@@ -96,9 +96,9 @@ Use this layer to state the current best-known strategy and supporting notes. It
 
 Package: `mu_strategy.experiments`
 
-`experiments.walk_forward` runs strategy-group comparisons and renders the Markdown and HTML component matrix reports. Walk-forward windows are independent; aggregate dashboard drawdown uses per-window drawdown rather than concatenating reset equity curves.
+`experiments.walk_forward` loads `15m` and `1h` candles from the trusted `data/live` generation, fails closed when that publication is missing or unusable, runs strategy-group comparisons, and renders the Markdown and HTML component matrix reports. Walk-forward windows are independent; aggregate dashboard drawdown uses per-window drawdown rather than concatenating reset equity curves.
 
-`experiments.fibonacci_pullback` runs 1h-12h Fibonacci lookback sweeps for one or more assets and renders the ranking reports used by `docs/fibonacci-preferred-parameters.md`.
+`experiments.fibonacci_pullback` uses the same cache-only trusted-generation boundary for 1h-12h Fibonacci lookback sweeps and renders the ranking reports used by `docs/fibonacci-preferred-parameters.md`. The trusted layer is OKX-only, so a non-OKX `AssetSpec.source` is rejected before any load rather than silently remapped or routed to a legacy provider.
 
 ## Strategy Release Provenance
 

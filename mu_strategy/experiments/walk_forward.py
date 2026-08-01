@@ -8,7 +8,8 @@ from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
-from mu_strategy.data import cached_historical
+from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -16,6 +17,7 @@ from mu_strategy.strategies.registry import StrategyGroup, selected_strategy_gro
 
 
 DAY_MS = 86_400_000
+TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
 @dataclass(frozen=True)
@@ -357,11 +359,9 @@ def render_walk_forward_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run strategy-group walk-forward backtests.")
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
-    parser.add_argument("--source", choices=("binance", "okx"), default="okx")
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--windows", type=int, default=2)
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
     parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_strategy_group_review.md"))
     parser.add_argument("--html-report", type=Path, default=Path("reports/live/mu_okx_strategy_components.html"))
     parser.add_argument(
@@ -378,22 +378,21 @@ def main() -> None:
     args = parser.parse_args()
 
     total_days = args.window_days * args.windows
-    candles_15m, file_15m = cached_historical(
+    data_dir = args.data_dir or Path("data/live")
+    bundle = refresh_trusted_candle_bundle(
         args.symbol,
-        "15m",
+        intervals=TRUSTED_REQUESTED_INTERVALS,
         days=total_days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
+        data_dir=data_dir,
+        refresh=False,
     )
-    candles_1h, file_1h = cached_historical(
-        args.symbol,
-        "1h",
-        days=total_days,
-        data_dir=args.data_dir,
-        refresh=args.refresh,
-        source=args.source,
-    )
+    status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+    if status_error:
+        parser.error(status_error)
+    candles_15m = bundle.candles_by_interval["15m"]
+    candles_1h = bundle.candles_by_interval["1h"]
+    file_15m = bundle.files_by_interval["15m"]
+    file_1h = bundle.files_by_interval["1h"]
     group_results = run_strategy_group_walk_forward_backtests(
         candles_15m,
         candles_1h,
