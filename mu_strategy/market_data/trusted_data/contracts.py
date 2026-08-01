@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from mu_strategy.models import Candle
 
@@ -300,12 +301,35 @@ class TrustedDatasetFileSnapshot:
 
 
 @dataclass(frozen=True)
+class TrustedDatasetFileLease:
+    key: DatasetKey
+    source_file: Path
+    handle: BinaryIO = field(repr=False, compare=False)
+    _read_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def read_bytes(self) -> bytes:
+        with self._read_lock:
+            self.handle.seek(0)
+            return self.handle.read()
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
 class TrustedLoadContext:
     manifest: TrustedManifestSnapshot
     observed_at_ms: int
     generation_root: Path
     generation_id: str
     dataset_file_snapshots: tuple[TrustedDatasetFileSnapshot, ...] | None = field(default=None, repr=False)
+    dataset_file_leases: tuple[TrustedDatasetFileLease, ...] | None = field(default=None, repr=False)
 
 
 def derive_snapshot_usability(

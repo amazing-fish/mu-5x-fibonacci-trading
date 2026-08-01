@@ -16,6 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     SystemClock,
     TrustDecision,
     TrustedBundle,
+    TrustedDatasetFileLease,
     TrustedDatasetFileSnapshot,
     TrustedLoadContext,
     TrustedManifestSnapshot,
@@ -258,6 +259,11 @@ class LoadTrustedBundle:
             manifest_result.generation_id,
             dataset_keys=dataset_keys,
         )
+        file_leases = self._lease_unrequested_dataset_files_locked(
+            manifest_result.snapshot,
+            manifest_result.generation_id,
+            dataset_keys=dataset_keys,
+        )
         if observed_at_ms is None:
             observed_at_ms = int(self.clock.now_ms())
         return (
@@ -267,6 +273,7 @@ class LoadTrustedBundle:
                 generation_root=manifest_result.generation_root or self.store.data_dir,
                 generation_id=manifest_result.generation_id,
                 dataset_file_snapshots=tuple(file_snapshots),
+                dataset_file_leases=file_leases,
             ),
             manifest_result,
         )
@@ -281,12 +288,46 @@ class LoadTrustedBundle:
         missing_keys = tuple(key for key in required_keys if key not in existing_keys)
         if not missing_keys:
             return context
-        with self.store.publication_snapshot_lock():
-            added_snapshots = self._snapshot_dataset_files_locked(
-                context.manifest,
-                context.generation_id,
-                dataset_keys=missing_keys,
-            )
+        leases_by_key = {
+            lease.key: lease
+            for lease in (context.dataset_file_leases or ())
+        }
+        added_snapshots = []
+        remaining_keys = []
+        for key in missing_keys:
+            lease = leases_by_key.get(key)
+            if lease is None:
+                remaining_keys.append(key)
+                continue
+            try:
+                payload = lease.read_bytes()
+            except Exception as exc:
+                added_snapshots.append(
+                    TrustedDatasetFileSnapshot(
+                        key=key,
+                        source_file=lease.source_file,
+                        payload=None,
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+            else:
+                added_snapshots.append(
+                    TrustedDatasetFileSnapshot(
+                        key=key,
+                        source_file=lease.source_file,
+                        payload=payload,
+                    )
+                )
+        if remaining_keys:
+            with self.store.publication_snapshot_lock():
+                added_snapshots.extend(
+                    self._snapshot_dataset_files_locked(
+                        context.manifest,
+                        context.generation_id,
+                        dataset_keys=tuple(remaining_keys),
+                    )
+                )
         return replace(
             context,
             dataset_file_snapshots=(*existing_snapshots, *added_snapshots),
@@ -332,6 +373,34 @@ class LoadTrustedBundle:
                     )
                 )
         return tuple(file_snapshots)
+
+    def _lease_unrequested_dataset_files_locked(
+        self,
+        manifest: TrustedManifestSnapshot,
+        generation_id: str,
+        *,
+        dataset_keys: tuple[DatasetKey, ...] | None,
+    ) -> tuple[TrustedDatasetFileLease, ...]:
+        if dataset_keys is None:
+            return ()
+        requested_keys = set(dataset_keys)
+        leases = []
+        for (symbol, interval), health in sorted(manifest.datasets.items(), key=lambda item: item[0]):
+            if health.key in requested_keys:
+                continue
+            path = self.store.generation_cache_path(generation_id, symbol, interval)
+            try:
+                handle = self.store.open_file_for_snapshot(path)
+            except Exception:
+                continue
+            leases.append(
+                TrustedDatasetFileLease(
+                    key=health.key,
+                    source_file=path,
+                    handle=handle,
+                )
+            )
+        return tuple(leases)
 
     def _dataset_path(
         self,

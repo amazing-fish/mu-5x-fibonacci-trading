@@ -105,7 +105,7 @@ class TrustedDataStore:
 
     @contextmanager
     def refresh_lifecycle(self):
-        if self.retention_policy is None or not self.generations_dir.is_dir():
+        if not self.generations_dir.is_dir():
             yield
             return
         with _trusted_store_lock(self.generations_dir):
@@ -144,6 +144,11 @@ class TrustedDataStore:
 
     def read_file_bytes(self, path: Path) -> bytes:
         return Path(path).read_bytes()
+
+    def open_file_for_snapshot(self, path: Path):
+        if os.name == "nt":
+            return _open_windows_shared_delete_file(path)
+        return Path(path).open("rb")
 
     def write_csv(self, candles: list[Candle], path: Path) -> None:
         path = Path(path)
@@ -594,6 +599,45 @@ def _directory_file_bytes(root: Path) -> int:
         for name in file_names:
             total += (current / name).lstat().st_size
     return total
+
+
+def _open_windows_shared_delete_file(path: Path):
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateFileW(
+        str(Path(path).resolve()),
+        0x80000000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x00000080,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "rb")
 
 
 @contextmanager

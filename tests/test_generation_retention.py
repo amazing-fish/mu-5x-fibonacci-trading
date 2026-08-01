@@ -195,13 +195,59 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(bundle_5m.trust_decision.allowed)
             self.assertTrue(bundle_1h.trust_decision.allowed)
             self.assertEqual(
-                [
-                    store.generation_cache_path("run-current", SYMBOL, "5m"),
-                    store.generation_cache_path("run-current", SYMBOL, "1h"),
-                ],
+                [store.generation_cache_path("run-current", SYMBOL, "5m")],
                 read_paths,
             )
             self.assertEqual(2, len(bundle_1h.load_context.dataset_file_snapshots))
+            self.assertEqual(
+                {"15m", "1h"},
+                {lease.key.interval for lease in bundle_5m.load_context.dataset_file_leases},
+            )
+
+    def test_partial_load_context_extends_after_generation_reclamation(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            loader = LoadTrustedBundle(store)
+            bundle_5m = loader.execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
+                trading_strict_policy(),
+            )
+
+            RefreshTrustedMarketData(store, _StaticProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=DAY_MS,
+                    run_id="run-new",
+                )
+            )
+            self.assertFalse((data_dir / "generations" / "run-old").exists())
+            bundle_1h = loader.execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("1h",), days=1, now_ms=DAY_MS),
+                trading_strict_policy(),
+                context=bundle_5m.load_context,
+            )
+
+            self.assertEqual("run-old", bundle_1h.run_id)
+            self.assertTrue(bundle_1h.candles_by_interval["1h"])
+            self.assertTrue(bundle_1h.trust_decision.allowed)
 
     def test_load_context_snapshot_blocks_publication_until_file_read_completes(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
@@ -365,6 +411,80 @@ class GenerationRetentionTests(unittest.TestCase):
                 "run-fast",
                 json.loads((data_dir / "current.json").read_text(encoding="utf-8"))["generation_id"],
             )
+
+    def test_refresh_without_retention_policy_joins_lifecycle_lock(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        class BlockingIncrementalProvider(_ReuseOnlyProvider):
+            def __init__(self):
+                super().__init__()
+                self.incremental_started = threading.Event()
+                self.release_incremental = threading.Event()
+
+            def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((symbol, interval, since_time_ms))
+                self.incremental_started.set()
+                if not self.release_incremental.wait(10):
+                    raise TimeoutError("incremental release timed out")
+                return []
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            direct_provider = BlockingIncrementalProvider()
+            cli_provider = BlockingIncrementalProvider()
+            cli_provider.release_incremental.set()
+            direct_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir),
+                direct_provider,
+            )
+            cli_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(
+                    data_dir=data_dir,
+                    retention_policy=GenerationRetentionPolicy(keep_recent=1),
+                ),
+                cli_provider,
+            )
+            errors = []
+
+            def execute(refresh, run_id):
+                try:
+                    refresh.execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id=run_id,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            direct_thread = threading.Thread(target=execute, args=(direct_refresh, "run-direct"))
+            cli_thread = threading.Thread(target=execute, args=(cli_refresh, "run-cli"))
+            direct_thread.start()
+            try:
+                self.assertTrue(direct_provider.incremental_started.wait(10))
+                cli_thread.start()
+                self.assertFalse(cli_provider.incremental_started.wait(0.25))
+            finally:
+                direct_provider.release_incremental.set()
+                direct_thread.join(10)
+                cli_thread.join(10)
+
+            self.assertFalse(direct_thread.is_alive())
+            self.assertFalse(cli_thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertEqual([], direct_provider.history_calls)
+            self.assertEqual([], cli_provider.history_calls)
 
     def test_refresh_lifecycle_lock_releases_after_prepublication_failure(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
