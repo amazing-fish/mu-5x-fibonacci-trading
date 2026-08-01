@@ -827,6 +827,21 @@ class TrustedDataRefreshTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
             write_generation_publication(Path(tmp), symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
+            RefreshTrustedMarketData(
+                store,
+                RecordingProvider(
+                    ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+                    history_fetcher=lambda symbol, interval, *, days: range_candles(0, 86_100_000),
+                ),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=86_400_000,
+                )
+            )
             degraded_fresh = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             )
@@ -899,7 +914,23 @@ class TrustedDataRefreshTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", candles_by_interval=candles_by_interval)
-            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), _IncrementalFailureProvider()).execute(
+            store = TrustedDataStore(data_dir=data_dir)
+            RefreshTrustedMarketData(
+                store,
+                RecordingProvider(
+                    ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+                    history_fetcher=lambda symbol, interval, *, days: candles_by_interval[interval],
+                ),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=end_ms,
+                )
+            )
+            run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=end_ms)
             )
 

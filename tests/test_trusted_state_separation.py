@@ -24,6 +24,15 @@ class TrustedStateSeparationTests(unittest.TestCase):
             from tests.factories.trusted_publication import write_generation_publication
 
             write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
+            RefreshTrustedMarketData(store, _SuccessfulHistoryProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=86_400_000,
+                )
+            )
 
             run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(
@@ -36,7 +45,7 @@ class TrustedStateSeparationTests(unittest.TestCase):
             )
             command_result = classify_refresh_run(run)
             manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
-            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8"))
+            run_log = json.loads((data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()[-1])
 
         self.assertEqual(RefreshAttemptStatus.DEGRADED, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
@@ -368,6 +377,20 @@ def _valid_status(interval: str):
         updated_at_ms=0,
         source_file=Path(f"data/live/okx/BTC-USDT-SWAP/{interval}.csv"),
     )
+
+
+class _SuccessfulHistoryProvider:
+    def fetch_tickers(self):
+        return [{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}]
+
+    def fetch_history(self, symbol, interval, *, days):
+        return [
+            Candle(timestamp, 100.0, 101.0, 99.0, 100.0, 1.0)
+            for timestamp in range(0, 86_100_001, 300_000)
+        ]
+
+    def fetch_incremental(self, symbol, interval, *, since_time_ms):
+        raise AssertionError("v3 upgrade must use full history")
 
 
 class _IncrementalFailureProvider:

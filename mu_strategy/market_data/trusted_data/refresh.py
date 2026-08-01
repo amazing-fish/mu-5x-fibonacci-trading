@@ -24,6 +24,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     RefreshAttemptStatus,
     SnapshotUsability,
     SystemClock,
+    TrustedStorageLayout,
     UniverseSnapshot,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
@@ -531,6 +532,9 @@ class RefreshTrustedMarketData:
         health = manifest_result.snapshot.datasets.get((symbol, interval))
         if health is None or not _is_reusable_prior_health(health):
             return None
+        storage = manifest_result.snapshot.storage_by_dataset.get((symbol, interval))
+        if storage is None:
+            return None
         try:
             cached = self.store.read_generation_dataset(
                 manifest_result.snapshot,
@@ -541,6 +545,11 @@ class RefreshTrustedMarketData:
             )
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
+        if (
+            storage.layout is not TrustedStorageLayout.SEGMENTED_CSV_V1
+            or manifest_result.snapshot.imported_from_run_id is not None
+        ):
+            return None
         coverage = assess_requested_coverage(
             cached,
             interval=interval,

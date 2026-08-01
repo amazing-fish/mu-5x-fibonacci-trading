@@ -109,8 +109,25 @@ class TrustedDataStore:
             raise ValueError("segment_id must be UTC YYYY-MM")
         return self.segment_source_root(symbol, interval) / f"{segment_id}.csv"
 
+    def imported_segment_source_file(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        generation_id: str,
+    ) -> Path:
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
+        canonical = self.segment_source_file(symbol, interval, segment_id)
+        return canonical.with_name(f"{segment_id}.import-{generation_id}.csv")
+
     def segment_path(self, symbol: str, interval: str, segment_id: str) -> Path:
         source_file = self.segment_source_file(symbol, interval, segment_id)
+        return self._segment_path_from_source(source_file)
+
+    def _segment_path_from_source(self, source_file: Path) -> Path:
+        source_file = Path(source_file)
+        if source_file.is_absolute() or any(part == ".." for part in source_file.parts):
+            raise ValueError("trusted segment source_file must be a safe relative path")
         candidate = self.data_dir / source_file
         current = candidate
         while current != self.data_dir and current != current.parent:
@@ -195,6 +212,7 @@ class TrustedDataStore:
         symbol: str,
         interval: str,
         physical_candles: list[Candle] | None = None,
+        import_generation_id: str | None = None,
     ) -> DatasetStorage:
         source_root = self.segment_source_root(symbol, interval)
         if not candles:
@@ -215,6 +233,7 @@ class TrustedDataStore:
                 symbol=symbol,
                 interval=interval,
                 source_root=source_root,
+                import_generation_id=import_generation_id,
             )
 
     def _write_segmented_dataset_locked(
@@ -225,10 +244,28 @@ class TrustedDataStore:
         symbol: str,
         interval: str,
         source_root: Path,
+        import_generation_id: str | None,
     ) -> DatasetStorage:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
+        source_files_by_segment: dict[str, Path] = {}
+        first_logical_segment_id = next(iter(logical_partitions))
         for segment_id, candidate_rows in physical_partitions.items():
-            path = self.segment_path(symbol, interval, segment_id)
+            if (
+                import_generation_id is not None
+                and segment_id == first_logical_segment_id
+                and utc_month_segment_id(logical_partitions[segment_id][0].open_time_ms - 1) == segment_id
+            ):
+                source_file = self.imported_segment_source_file(
+                    symbol,
+                    interval,
+                    segment_id,
+                    import_generation_id,
+                )
+                path = self._segment_path_from_source(source_file)
+            else:
+                source_file = self.segment_source_file(symbol, interval, segment_id)
+                path = self.segment_path(symbol, interval, segment_id)
+            source_files_by_segment[segment_id] = source_file
             if not path.exists():
                 self.write_csv(candidate_rows, path)
                 physical_rows_by_segment[segment_id] = list(candidate_rows)
@@ -290,7 +327,7 @@ class TrustedDataStore:
             references.append(
                 SegmentReference(
                     segment_id=segment_id,
-                    source_file=self.segment_source_file(symbol, interval, segment_id),
+                    source_file=source_files_by_segment[segment_id],
                     start_row=start_row,
                     rows=len(segment_candles),
                     first_timestamp_ms=segment_candles[0].open_time_ms,
@@ -338,7 +375,14 @@ class TrustedDataStore:
             )
             candles = self.read_csv(path)
         elif storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
-            candles = self._read_segmented_dataset(health, storage, symbol=symbol, interval=interval)
+            candles = self._read_segmented_dataset(
+                health,
+                storage,
+                symbol=symbol,
+                interval=interval,
+                generation_id=generation_id,
+                imported_from_run_id=snapshot.imported_from_run_id,
+            )
         else:
             raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
         if verify_logical:
@@ -418,16 +462,24 @@ class TrustedDataStore:
         *,
         symbol: str,
         interval: str,
+        generation_id: str,
+        imported_from_run_id: str | None,
     ) -> list[Candle]:
         expected_root = self.segment_source_root(symbol, interval)
         if storage.source_root.as_posix() != expected_root.as_posix():
             raise ManifestSchemaError("schema-v4 dataset source_root does not match dataset key")
         candles: list[Candle] = []
-        for reference in storage.segments:
-            expected_source = self.segment_source_file(symbol, interval, reference.segment_id)
-            if reference.source_file.as_posix() != expected_source.as_posix():
+        for index, reference in enumerate(storage.segments):
+            if not _is_allowed_segment_source(
+                reference.source_file,
+                expected_root=expected_root,
+                segment_id=reference.segment_id,
+                generation_id=generation_id,
+                imported_from_run_id=imported_from_run_id,
+                first_reference=index == 0,
+            ):
                 raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
-            path = self.segment_path(symbol, interval, reference.segment_id)
+            path = self._segment_path_from_source(reference.source_file)
             segment_candles = self._read_csv_slice(
                 path,
                 start_row=reference.start_row,
@@ -651,7 +703,12 @@ class TrustedDataStore:
                 generation_root=source_result.generation_root or self.generation_root(source_generation_id),
                 generation_id=source_generation_id,
             )
-            storage = self.write_segmented_dataset(candles, symbol=symbol, interval=interval)
+            storage = self.write_segmented_dataset(
+                candles,
+                symbol=symbol,
+                interval=interval,
+                import_generation_id=target_generation_id,
+            )
             health_payload = health.to_dict()
             health_payload.pop("source_file", None)
             health_payload["storage"] = storage.to_dict()
@@ -846,9 +903,15 @@ def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_r
                 raise ManifestSchemaError(
                     "schema-v4 dataset source_root must equal segments/okx/<symbol>/<interval>"
                 )
-            for reference in storage.segments:
-                expected_source = expected_root / f"{reference.segment_id}.csv"
-                if reference.source_file.as_posix() != expected_source.as_posix():
+            for index, reference in enumerate(storage.segments):
+                if not _is_allowed_segment_source(
+                    reference.source_file,
+                    expected_root=expected_root,
+                    segment_id=reference.segment_id,
+                    generation_id=snapshot.run_id,
+                    imported_from_run_id=snapshot.imported_from_run_id,
+                    first_reference=index == 0,
+                ):
                     raise ManifestSchemaError(
                         "schema-v4 segment source_file must match symbol/interval/segment_id"
                     )
@@ -870,6 +933,26 @@ def _partition_candles_by_utc_month(candles: list[Candle]) -> dict[str, list[Can
         previous_timestamp = candle.open_time_ms
         previous_segment_id = segment_id
     return partitions
+
+
+def _is_allowed_segment_source(
+    source_file: Path,
+    *,
+    expected_root: Path,
+    segment_id: str,
+    generation_id: str,
+    imported_from_run_id: str | None,
+    first_reference: bool,
+) -> bool:
+    canonical = expected_root / f"{segment_id}.csv"
+    if source_file.as_posix() == canonical.as_posix():
+        return True
+    imported = expected_root / f"{segment_id}.import-{generation_id}.csv"
+    return (
+        imported_from_run_id is not None
+        and first_reference
+        and source_file.as_posix() == imported.as_posix()
+    )
 
 
 def _validate_segment_candles(candles: list[Candle], *, segment_id: str) -> None:

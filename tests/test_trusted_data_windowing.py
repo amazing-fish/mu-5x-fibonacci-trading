@@ -446,8 +446,7 @@ def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
         symbols = json.loads(manifest_path.read_text(encoding="utf-8")).get("symbols") or {}
     symbols.setdefault(symbol, {"intervals": {}})
     for interval, candles in bundle.items():
-        path = store.generation_cache_path(run_id, symbol, interval)
-        store.write_csv(candles, path)
+        storage = store.write_segmented_dataset(candles, symbol=symbol, interval=interval)
         symbols[symbol]["intervals"][interval] = {
             "symbol": symbol,
             "interval": interval,
@@ -459,14 +458,15 @@ def _write_bundle(store, symbol: str, bundle: dict[str, list[Candle]]) -> None:
             "first_timestamp_ms": candles[0].open_time_ms,
             "last_timestamp_ms": candles[-1].open_time_ms,
             "updated_at_ms": candles[-1].open_time_ms,
-            "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(candles),
             "validation": {"ok": True, "reason": "ok"},
+            "storage": storage.to_dict(),
         }
     store.write_generation_manifest(
         run_id,
         {
-            "schema_version": 3,
+            "schema_version": 4,
+            "storage_layout": "segmented_csv_v1",
             "run_id": run_id,
             "attempt_status": "success",
             "snapshot_usability": "usable",

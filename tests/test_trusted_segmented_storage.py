@@ -613,6 +613,70 @@ class SegmentedFailureContractTests(unittest.TestCase):
 
 
 class FlatGenerationImportTests(unittest.TestCase):
+    def test_refresh_from_v3_current_forces_month_lookbehind_before_incremental_reuse(self):
+        now_ms = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        source_rows = _window_candles(now_ms - DAY_MS, now_ms - STEP_MS)
+        provider = WindowedHistoryProvider(now_ms=now_ms)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            _write_flat_v3_generation(store, RUN_A, source_rows)
+            store.replace_current(RUN_A)
+
+            _refresh(store, provider, RUN_B, days=1, now_ms=now_ms)
+            first_v4 = store.read_generation_manifest(RUN_B).snapshot
+            first_reference = first_v4.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+            _refresh(store, provider, RUN_C, days=14, now_ms=now_ms)
+
+            self.assertEqual([33, 46], provider.history_days)
+            self.assertEqual(0, provider.incremental_calls)
+            self.assertGreater(first_reference.start_row, 0)
+            self.assertEqual(source_rows, _read_exact(store, RUN_A))
+            self.assertEqual(source_rows, _read_exact(store, RUN_B)[-len(source_rows) :])
+            self.assertEqual(14 * 288 + 1, len(_read_exact(store, RUN_C)))
+
+    def test_partial_first_month_import_isolated_from_later_canonical_lookbehind(self):
+        source_run = "5" * 32
+        imported_run = "6" * 32
+        refreshed_run = "7" * 32
+        expanded_run = "8" * 32
+        now_ms = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        source_rows = _window_candles(now_ms - DAY_MS, now_ms - STEP_MS)
+        provider = WindowedHistoryProvider(now_ms=now_ms)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            _write_flat_v3_generation(store, source_run, source_rows)
+            imported = store.import_flat_generation(source_run, imported_run, publish=True)
+            import_reference = imported.snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+            import_path = Path(tmp) / import_reference.source_file
+            import_bytes = import_path.read_bytes()
+
+            _refresh(store, provider, refreshed_run, days=1, now_ms=now_ms)
+            _refresh(store, provider, expanded_run, days=14, now_ms=now_ms)
+
+            self.assertEqual(
+                f"2026-01.import-{imported_run}.csv",
+                import_reference.source_file.name,
+            )
+            self.assertEqual([33, 46], provider.history_days)
+            self.assertEqual(0, provider.incremental_calls)
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
+            self.assertEqual(import_bytes, import_path.read_bytes())
+            self.assertEqual(source_rows, _read_exact(store, source_run))
+            self.assertEqual(source_rows, _read_exact(store, imported_run))
+            self.assertEqual(source_rows, _read_exact(store, refreshed_run)[-len(source_rows) :])
+            self.assertEqual(14 * 288 + 1, len(_read_exact(store, expanded_run)))
+
+            imported_manifest_path = store.generation_manifest_path(imported_run)
+            imported_manifest = json.loads(imported_manifest_path.read_text(encoding="utf-8"))
+            imported_manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0][
+                "source_file"
+            ] = f"segments/okx/{SYMBOL}/5m/2026-01.import-{'9' * 32}.csv"
+            imported_manifest_path.write_text(json.dumps(imported_manifest, sort_keys=True), encoding="utf-8")
+            malformed = store.read_generation_manifest(imported_run)
+            self.assertFalse(malformed.ok)
+            self.assertEqual(HealthReason.MALFORMED_MANIFEST, malformed.reason)
+            self.assertEqual(import_bytes, import_path.read_bytes())
+
     def test_explicit_v3_import_round_trips_candles_hashes_and_can_publish(self):
         source_run = "d" * 32
         target_run = "e" * 32

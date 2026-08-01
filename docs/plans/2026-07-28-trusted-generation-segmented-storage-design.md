@@ -160,6 +160,11 @@ changing an older manifest's offsets. Extra provider rows before the already sto
 are ignored; every overlapping timestamp must still match canonically, and a logical slice outside
 the stored lookbehind fails closed.
 
+A healthy flat-v3 current generation is readable compatibility evidence, not a safe incremental
+base for the first canonical v4 month. Refresh verifies that v3 dataset, then forces a full-history
+lookbehind fetch. The same one-time full-fetch rule applies when current is an explicitly imported
+v4 snapshot.
+
 The lock is deliberately scoped to one `symbol/interval` writer directory. It serializes only the
 shared-tail read/compare/replace sequence, so a stale shorter refresh cannot replace a longer tail
 written by another process. It is not a store-wide publication lock, consumer lock, preparation
@@ -250,13 +255,20 @@ explicit migration operation owned by the trusted refresh/storage writer boundar
 3. read exact generation-local paths and verify rows, timestamps, per-dataset logical hashes,
    health, interval dependencies, and usability;
 4. partition the verified candles through the same UTC key and segment writer used by refresh;
+   if the first month begins after UTC month-open, bind only that first reference to
+   `YYYY-MM.import-<target_run_id>.csv`, because an offline import has no provider from which to
+   obtain the missing physical prefix;
 5. construct and strictly verify a new v4 manifest with import provenance;
 6. re-read the new exact generation and assert identical `Candle` values and full logical hashes;
 7. publish it only when the explicit migration invocation requests publication, using the same
    `current.json` commit point.
 
 Normal readers never import. Refresh never silently interprets malformed v4 as v3. The original
-v3 generation and files are retained unchanged.
+v3 generation and files are retained unchanged. Import compatibility filenames are accepted only
+for the first reference of a manifest carrying `imported_from_run_id`, and the embedded target run
+ID must exactly equal that manifest's `run_id`. The next ordinary refresh forces full lookbehind
+and writes the canonical `YYYY-MM.csv`; it never prepends to or rewrites the import compatibility
+file, so old exact replay remains stable.
 
 ## Rejected alternatives and deferred lifecycle policy
 

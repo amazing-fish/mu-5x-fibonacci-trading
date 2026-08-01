@@ -622,8 +622,12 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
         layout = _required_str(payload, "storage_layout")
         if layout != TrustedStorageLayout.SEGMENTED_CSV_V1.value:
             raise ManifestSchemaError(f"unsupported manifest storage_layout: {layout}")
-        datasets, storage_by_dataset = _segmented_datasets_from_symbols(symbols)
         imported_from_run_id = _optional_non_empty_str(payload, "imported_from_run_id")
+        datasets, storage_by_dataset = _segmented_datasets_from_symbols(
+            symbols,
+            run_id=run_id,
+            imported_from_run_id=imported_from_run_id,
+        )
 
     snapshot = TrustedManifestSnapshot(
         schema_version=schema_version,
@@ -734,6 +738,9 @@ def utc_month_segment_id(open_time_ms: int) -> str:
 
 def _segmented_datasets_from_symbols(
     symbols: dict[str, Any],
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
 ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], DatasetStorage]]:
     datasets: dict[tuple[str, str], DatasetHealth] = {}
     storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
@@ -748,7 +755,13 @@ def _segmented_datasets_from_symbols(
                 raise ManifestSchemaError("manifest dataset health entries must be objects")
             if "source_file" in payload:
                 raise ManifestSchemaError("schema-v4 dataset must use storage instead of source_file")
-            storage = _dataset_storage_from_dict(str(symbol), str(interval), payload.get("storage"))
+            storage = _dataset_storage_from_dict(
+                str(symbol),
+                str(interval),
+                payload.get("storage"),
+                run_id=run_id,
+                imported_from_run_id=imported_from_run_id,
+            )
             health_payload = dict(payload)
             health_payload.pop("storage", None)
             health_payload["source_file"] = storage.source_root.as_posix()
@@ -759,7 +772,14 @@ def _segmented_datasets_from_symbols(
     return datasets, storage_by_dataset
 
 
-def _dataset_storage_from_dict(symbol: str, interval: str, payload: Any) -> DatasetStorage:
+def _dataset_storage_from_dict(
+    symbol: str,
+    interval: str,
+    payload: Any,
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
+) -> DatasetStorage:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 dataset storage must be object")
     if set(payload) != _DATASET_STORAGE_FIELDS:
@@ -778,8 +798,15 @@ def _dataset_storage_from_dict(symbol: str, interval: str, payload: Any) -> Data
     if not isinstance(segment_payloads, list):
         raise ManifestSchemaError("schema-v4 dataset segments must be array")
     segments = tuple(
-        _segment_reference_from_dict(symbol, interval, item)
-        for item in segment_payloads
+        _segment_reference_from_dict(
+            symbol,
+            interval,
+            item,
+            run_id=run_id,
+            imported_from_run_id=imported_from_run_id,
+            first_reference=index == 0,
+        )
+        for index, item in enumerate(segment_payloads)
     )
     return DatasetStorage(
         layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
@@ -788,7 +815,15 @@ def _dataset_storage_from_dict(symbol: str, interval: str, payload: Any) -> Data
     )
 
 
-def _segment_reference_from_dict(symbol: str, interval: str, payload: Any) -> SegmentReference:
+def _segment_reference_from_dict(
+    symbol: str,
+    interval: str,
+    payload: Any,
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
+    first_reference: bool,
+) -> SegmentReference:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 segment reference must be object")
     if set(payload) != _SEGMENT_REFERENCE_FIELDS:
@@ -798,9 +833,18 @@ def _segment_reference_from_dict(symbol: str, interval: str, payload: Any) -> Se
         raise ManifestSchemaError("schema-v4 segment_id must be UTC YYYY-MM")
     expected_source = Path("segments") / "okx" / symbol / interval / f"{segment_id}.csv"
     source_file_value = payload.get("source_file")
-    if not isinstance(source_file_value, str) or Path(source_file_value).as_posix() != expected_source.as_posix():
+    imported_source = expected_source.with_name(f"{segment_id}.import-{run_id}.csv")
+    source_file = Path(source_file_value) if isinstance(source_file_value, str) else None
+    if source_file is None or not (
+        source_file.as_posix() == expected_source.as_posix()
+        or (
+            imported_from_run_id is not None
+            and first_reference
+            and source_file.as_posix() == imported_source.as_posix()
+        )
+    ):
         raise ManifestSchemaError(
-            "schema-v4 segment source_file must equal segments/okx/<symbol>/<interval>/<YYYY-MM>.csv"
+            "schema-v4 segment source_file must equal the canonical month path or its exact import compatibility path"
         )
     rows = payload.get("rows")
     start_row = payload.get("start_row")
@@ -829,7 +873,7 @@ def _segment_reference_from_dict(symbol: str, interval: str, payload: Any) -> Se
         raise ManifestSchemaError("schema-v4 segment closed must be boolean")
     return SegmentReference(
         segment_id=segment_id,
-        source_file=expected_source,
+        source_file=source_file,
         start_row=int(start_row),
         rows=int(rows),
         first_timestamp_ms=int(first_timestamp_ms),
