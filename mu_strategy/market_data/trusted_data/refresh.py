@@ -17,6 +17,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     FreshnessState,
     HealthReason,
     IntegrityState,
+    IntervalPlan,
     RefreshSegmentDiagnostics,
     RefreshRun,
     RefreshAttemptStatus,
@@ -158,15 +159,21 @@ class RefreshTrustedMarketData:
         self.clock = clock or SystemClock()
 
     def execute(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
-        with self.store.refresh_lifecycle():
-            return self._execute_in_refresh_lifecycle(request)
-
-    def _execute_in_refresh_lifecycle(self, request: RefreshTrustedMarketDataRequest) -> RefreshRun:
-        started_at_ms = _now_ms(request.now_ms, self.clock)
         plan = self.planner.plan(request.requested_intervals)
         for interval in plan.effective_intervals:
             validate_storage_segment(interval, field="interval")
         run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
+        with self.store.refresh_lifecycle():
+            return self._execute_in_refresh_lifecycle(request, plan=plan, run_id=run_id)
+
+    def _execute_in_refresh_lifecycle(
+        self,
+        request: RefreshTrustedMarketDataRequest,
+        *,
+        plan: IntervalPlan,
+        run_id: str,
+    ) -> RefreshRun:
+        started_at_ms = _now_ms(request.now_ms, self.clock)
         previous_manifest = self.store.read_manifest()
         self.store.prepare_generation(run_id)
         try:

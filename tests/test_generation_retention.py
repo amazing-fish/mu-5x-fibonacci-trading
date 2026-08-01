@@ -522,6 +522,80 @@ class GenerationRetentionTests(unittest.TestCase):
                 json.loads((data_dir / "current.json").read_text(encoding="utf-8"))["generation_id"],
             )
 
+    def test_first_store_refreshes_serialize_before_generations_exist(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        class BlockingHistoryProvider(_StaticProvider):
+            def __init__(self):
+                self.history_started = threading.Event()
+                self.release_history = threading.Event()
+
+            def fetch_history(self, symbol, interval, *, days):
+                self.history_started.set()
+                if not self.release_history.wait(10):
+                    raise TimeoutError("history release timed out")
+                return super().fetch_history(symbol, interval, days=days)
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "new-store"
+            first_provider = BlockingHistoryProvider()
+            second_provider = _ReuseOnlyProvider()
+            first_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir),
+                first_provider,
+            )
+            second_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir),
+                second_provider,
+            )
+            results = {}
+            errors = []
+
+            def execute(name, refresh, run_id):
+                try:
+                    results[name] = refresh.execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id=run_id,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            first_thread = threading.Thread(target=execute, args=("first", first_refresh, "run-first"))
+            second_thread = threading.Thread(target=execute, args=("second", second_refresh, "run-second"))
+            first_thread.start()
+            try:
+                self.assertTrue(first_provider.history_started.wait(10))
+                second_thread.start()
+                second_thread.join(0.25)
+                self.assertTrue(
+                    second_thread.is_alive(),
+                    "second first-store refresh bypassed the lifecycle lock",
+                )
+                self.assertEqual([], second_provider.history_calls)
+                self.assertEqual([], second_provider.incremental_calls)
+            finally:
+                first_provider.release_history.set()
+                first_thread.join(10)
+                second_thread.join(10)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertFalse(results["first"].refresh_segments[0].reused_prior_generation)
+            self.assertTrue(results["second"].refresh_segments[0].reused_prior_generation)
+            self.assertEqual([], second_provider.history_calls)
+            self.assertEqual(1, len(second_provider.incremental_calls))
+            self.assertEqual(
+                "run-second",
+                json.loads((data_dir / "current.json").read_text(encoding="utf-8"))["generation_id"],
+            )
+
     def test_refresh_without_retention_policy_joins_lifecycle_lock(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore

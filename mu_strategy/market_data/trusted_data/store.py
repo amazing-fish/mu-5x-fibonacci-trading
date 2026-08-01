@@ -105,9 +105,7 @@ class TrustedDataStore:
 
     @contextmanager
     def refresh_lifecycle(self):
-        if not self.generations_dir.is_dir():
-            yield
-            return
+        self.generations_dir.mkdir(parents=True, exist_ok=True)
         with _trusted_store_lock(self.generations_dir):
             yield
 
