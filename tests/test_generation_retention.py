@@ -1,7 +1,9 @@
 import io
 import json
+import multiprocessing
 import os
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -43,6 +45,44 @@ class _StaticProvider:
 
 
 class GenerationRetentionTests(unittest.TestCase):
+    def test_publication_snapshot_lock_serializes_processes_without_store_writes(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            tree_before = _tree_bytes(data_dir)
+            context = multiprocessing.get_context("spawn")
+            holder_ready = context.Event()
+            release_holder = context.Event()
+            waiter_attempting = context.Event()
+            waiter_acquired = context.Event()
+            holder = context.Process(
+                target=_hold_store_lock,
+                args=(str(data_dir), holder_ready, release_holder),
+            )
+            waiter = context.Process(
+                target=_wait_for_store_lock,
+                args=(str(data_dir), waiter_attempting, waiter_acquired),
+            )
+            holder.start()
+            try:
+                self.assertTrue(holder_ready.wait(10), "holder did not acquire the store lock")
+                waiter.start()
+                self.assertTrue(waiter_attempting.wait(10), "waiter did not attempt the store lock")
+                self.assertFalse(waiter_acquired.wait(0.25), "waiter acquired before holder released")
+                release_holder.set()
+                self.assertTrue(waiter_acquired.wait(10), "waiter did not acquire after holder released")
+            finally:
+                release_holder.set()
+                for process in (holder, waiter):
+                    if process.pid is None:
+                        continue
+                    process.join(10)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(10)
+            self.assertEqual(0, holder.exitcode)
+            self.assertEqual(0, waiter.exitcode)
+            self.assertEqual(tree_before, _tree_bytes(data_dir))
+
     def test_current_generation_survives_outside_keep_recent_window(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
@@ -194,6 +234,72 @@ class GenerationRetentionTests(unittest.TestCase):
 
             self.assertEqual(["current", "reclamation", "run_log"], calls)
 
+    def test_reclamation_skips_a_manifestless_in_progress_generation(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_plain_generation(data_dir, "run-old", b"old", mtime_ns=1_000_000_000)
+            _write_plain_generation(data_dir, "run-current", b"current", mtime_ns=2_000_000_000)
+            _write_plain_generation(
+                data_dir,
+                "run-in-progress",
+                b"partial",
+                mtime_ns=3_000_000_000,
+                committed=False,
+            )
+            _write_current_pointer(data_dir, "run-current")
+
+            report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertEqual(("run-old",), report.removed_ids)
+            self.assertTrue((data_dir / "generations" / "run-in-progress").is_dir())
+
+    def test_context_manifest_and_file_snapshot_share_one_store_lock(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            active = {"value": False}
+            original_read_manifest = store.read_manifest
+            original_read_file_bytes = store.read_file_bytes
+
+            @contextmanager
+            def recording_lock():
+                self.assertFalse(active["value"])
+                active["value"] = True
+                try:
+                    yield
+                finally:
+                    active["value"] = False
+
+            def read_manifest():
+                self.assertTrue(active["value"])
+                return original_read_manifest()
+
+            def read_file_bytes(path):
+                self.assertTrue(active["value"])
+                return original_read_file_bytes(path)
+
+            with patch.object(store, "publication_snapshot_lock", side_effect=recording_lock):
+                with patch.object(store, "read_manifest", side_effect=read_manifest):
+                    with patch.object(store, "read_file_bytes", side_effect=read_file_bytes):
+                        context = LoadTrustedBundle(store).open_context(now_ms=DAY_MS)
+
+            self.assertEqual("run-current", context.generation_id)
+            self.assertFalse(active["value"])
+
     def test_delete_failure_warns_without_failing_refresh_and_reaches_run_log(self):
         from mu_strategy.commands.refresh_market_data import main
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -287,7 +393,7 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual(before, _tree_bytes(data_dir))
             self.assertEqual(("run-old",), report.candidate_ids)
             self.assertEqual((), report.removed_ids)
-            self.assertEqual(len(b"old bytes"), report.bytes_reclaimable)
+            self.assertEqual(len(b"old bytes") + len(b"{}"), report.bytes_reclaimable)
             self.assertEqual(0, report.bytes_reclaimed)
 
     def test_command_dry_run_reports_candidates_without_deleting_them(self):
@@ -500,10 +606,19 @@ class _Hex:
         self.hex = value
 
 
-def _write_plain_generation(data_dir: Path, generation_id: str, payload: bytes, *, mtime_ns: int) -> Path:
+def _write_plain_generation(
+    data_dir: Path,
+    generation_id: str,
+    payload: bytes,
+    *,
+    mtime_ns: int,
+    committed: bool = True,
+) -> Path:
     root = data_dir / "generations" / generation_id
     root.mkdir(parents=True)
     (root / "payload.bin").write_bytes(payload)
+    if committed:
+        (root / "manifest.json").write_bytes(b"{}")
     os.utime(root, ns=(mtime_ns, mtime_ns))
     return root
 
@@ -532,6 +647,25 @@ def _tree_bytes(root: Path) -> dict[str, bytes | None]:
         relative = path.relative_to(root).as_posix()
         snapshot[relative] = None if path.is_dir() else path.read_bytes()
     return snapshot
+
+
+def _hold_store_lock(data_dir: str, ready, release) -> None:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    with store.publication_snapshot_lock():
+        ready.set()
+        if not release.wait(10):
+            raise TimeoutError("lock holder release timed out")
+
+
+def _wait_for_store_lock(data_dir: str, attempting, acquired) -> None:
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    attempting.set()
+    with store.publication_snapshot_lock():
+        acquired.set()
 
 
 if __name__ == "__main__":

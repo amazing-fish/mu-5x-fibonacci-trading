@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import io
 import json
@@ -9,6 +10,7 @@ import os
 import re
 import shutil
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +92,14 @@ class TrustedDataStore:
     def run_log_path(self) -> Path:
         return self.data_dir / "refresh_runs.jsonl"
 
+    @contextmanager
+    def publication_snapshot_lock(self):
+        if not self.data_dir.is_dir():
+            yield
+            return
+        with _trusted_store_lock(self.data_dir):
+            yield
+
     def generation_root(self, generation_id: str) -> Path:
         generation_id = validate_storage_segment(generation_id, field="generation_id")
         return self.generations_dir / generation_id
@@ -120,6 +130,9 @@ class TrustedDataStore:
     def read_csv_bytes(self, payload: bytes) -> list[Candle]:
         with io.StringIO(payload.decode("utf-8"), newline="") as handle:
             return _read_candles_csv(handle)
+
+    def read_file_bytes(self, path: Path) -> bytes:
+        return Path(path).read_bytes()
 
     def write_csv(self, candles: list[Candle], path: Path) -> None:
         path = Path(path)
@@ -254,6 +267,19 @@ class TrustedDataStore:
         manifest: dict[str, Any],
         run_log_payload: dict[str, Any],
     ) -> tuple[str, ...]:
+        with self.publication_snapshot_lock():
+            return self._commit_generation_publication_locked(
+                generation_id,
+                manifest,
+                run_log_payload,
+            )
+
+    def _commit_generation_publication_locked(
+        self,
+        generation_id: str,
+        manifest: dict[str, Any],
+        run_log_payload: dict[str, Any],
+    ) -> tuple[str, ...]:
         self.write_generation_manifest(generation_id, manifest)
         publication_warnings = []
         warning_sink_token = _CURRENT_POINTER_WARNING_SINK.set(publication_warnings.append)
@@ -267,6 +293,7 @@ class TrustedDataStore:
                 reclamation = self.reclaim_generations(
                     self.retention_policy,
                     dry_run=self.reclamation_dry_run,
+                    _lock_held=True,
                 )
             except Exception as exc:
                 failure = GenerationReclamationFailure(None, type(exc).__name__, str(exc))
@@ -314,7 +341,15 @@ class TrustedDataStore:
         policy: GenerationRetentionPolicy,
         *,
         dry_run: bool = False,
+        _lock_held: bool = False,
     ) -> GenerationReclamationReport:
+        if not _lock_held:
+            with self.publication_snapshot_lock():
+                return self.reclaim_generations(
+                    policy,
+                    dry_run=dry_run,
+                    _lock_held=True,
+                )
         failures: list[GenerationReclamationFailure] = []
         try:
             current_generation_id = self._current_generation_id_for_reclamation()
@@ -331,7 +366,13 @@ class TrustedDataStore:
         generations: list[Path] = []
         for entry in entries:
             try:
-                generations.append(self._validated_reclamation_target(entry))
+                target = self._validated_reclamation_target(entry)
+                manifest_path = target / "manifest.json"
+                if not manifest_path.exists():
+                    continue
+                if manifest_path.is_symlink() or not manifest_path.is_file():
+                    raise ValueError(f"trusted generation manifest must be a regular file: {target.name}")
+                generations.append(target)
             except Exception as exc:
                 failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
         if failures:
@@ -454,6 +495,71 @@ def _directory_file_bytes(root: Path) -> int:
         for name in file_names:
             total += (current / name).lstat().st_size
     return total
+
+
+@contextmanager
+def _trusted_store_lock(data_dir: Path):
+    if os.name == "posix":
+        import fcntl
+
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(data_dir, flags)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+        return
+    if os.name == "nt":
+        with _windows_named_mutex(data_dir):
+            yield
+        return
+    raise OSError(errno.ENOTSUP, f"trusted store locking is unsupported on platform: {os.name}")
+
+
+@contextmanager
+def _windows_named_mutex(data_dir: Path):
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    canonical_path = str(Path(data_dir).resolve()).casefold()
+    mutex_name = f"Local\\mu_strategy_trusted_store_{hashlib.sha256(canonical_path.encode('utf-8')).hexdigest()}"
+    handle = kernel32.CreateMutexW(None, False, mutex_name)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    wait_result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+    if wait_result not in {0x00000000, 0x00000080}:
+        error = ctypes.WinError(ctypes.get_last_error()) if wait_result == 0xFFFFFFFF else OSError(f"unexpected mutex wait result: {wait_result}")
+        kernel32.CloseHandle(handle)
+        raise error
+
+    body_error = None
+    try:
+        yield
+    except BaseException as exc:
+        body_error = exc
+        raise
+    finally:
+        release_error = None
+        if not kernel32.ReleaseMutex(handle):
+            release_error = ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.CloseHandle(handle) and release_error is None:
+            release_error = ctypes.WinError(ctypes.get_last_error())
+        if release_error is not None and body_error is None:
+            raise release_error
 
 
 def _atomic_write_text(

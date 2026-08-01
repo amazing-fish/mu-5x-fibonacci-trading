@@ -220,6 +220,10 @@ class LoadTrustedBundle:
         now_ms: int | None = None,
     ):
         observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        with self.store.publication_snapshot_lock():
+            return self._open_context_result_locked(observed_at_ms)
+
+    def _open_context_result_locked(self, observed_at_ms: int):
         manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None, manifest_result
@@ -242,7 +246,7 @@ class LoadTrustedBundle:
                 interval,
             )
             try:
-                payload = path.read_bytes()
+                payload = self.store.read_file_bytes(path)
             except Exception as exc:
                 file_snapshots.append(
                     TrustedDatasetFileSnapshot(
