@@ -105,6 +105,10 @@ def evaluate_candle_bundle(
         interval: seeds_by_interval[interval].candles
         for interval in intervals
     }
+    physical_candles_by_interval, physical_validation_by_interval = validate_physical_candle_bundle(
+        intervals,
+        raw_candles_by_interval,
+    )
     window_plan = resolve_shared_window(raw_candles_by_interval, days=days)
     pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
     health_by_key: dict[tuple[str, str], DatasetHealth] = {}
@@ -221,6 +225,13 @@ def evaluate_candle_bundle(
         days=days,
         window_end_time_ms=window_plan.end_time_ms,
     )
+    apply_physical_validation_gate(
+        symbol,
+        intervals,
+        health_by_key,
+        candles_by_key,
+        physical_validation_by_interval,
+    )
     if on_validated_candles is not None:
         for interval in intervals:
             seed = seeds_by_interval[interval]
@@ -235,7 +246,11 @@ def evaluate_candle_bundle(
             ):
                 continue
             try:
-                content_sha256 = on_validated_candles(interval, seed, candles)
+                content_sha256 = on_validated_candles(
+                    interval,
+                    replace(seed, candles=physical_candles_by_interval[interval]),
+                    candles,
+                )
             except Exception as exc:
                 if (raise_os_errors and isinstance(exc, OSError)) or isinstance(exc, raise_exceptions):
                     raise
@@ -258,6 +273,77 @@ def evaluate_candle_bundle(
             else:
                 health_by_key[key] = replace(health, content_sha256=content_sha256)
     return DatasetEvaluationResult(health_by_key, candles_by_key, window_plan)
+
+
+def validate_physical_candle_bundle(
+    intervals: tuple[str, ...],
+    raw_candles_by_interval: dict[str, list[Candle]],
+) -> tuple[dict[str, list[Candle]], dict[str, ValidationReport]]:
+    normalized_by_interval: dict[str, list[Candle]] = {}
+    validation_by_interval: dict[str, ValidationReport] = {}
+    for interval in intervals:
+        normalized, report = normalize_and_validate_candles(
+            raw_candles_by_interval.get(interval) or [],
+            interval=interval,
+        )
+        normalized_by_interval[interval] = normalized
+        validation_by_interval[interval] = report
+
+    base_report = validation_by_interval.get("5m")
+    five = normalized_by_interval.get("5m") or []
+    if base_report is None or not base_report.ok or not five:
+        return normalized_by_interval, validation_by_interval
+    for interval in ("15m", "1h"):
+        native_report = validation_by_interval.get(interval)
+        if native_report is None or not native_report.ok:
+            continue
+        try:
+            built = aggregate_candles(five, interval=interval, ohlc_policy="okx_native")
+        except ValueError as exc:
+            report = ValidationReport(False, HealthReason.OHLCV_INVALID, warnings=(str(exc),))
+        else:
+            built = clip_parent_candles_to_complete_base_window(
+                built,
+                base_candles=five,
+                interval=interval,
+            )
+            native = clip_parent_candles_to_complete_base_window(
+                normalized_by_interval.get(interval) or [],
+                base_candles=five,
+                interval=interval,
+            )
+            report = validate_built_native_candles(built, native, interval=interval)
+        validation_by_interval[interval] = report
+    return normalized_by_interval, validation_by_interval
+
+
+def apply_physical_validation_gate(
+    symbol: str,
+    intervals: tuple[str, ...],
+    health_by_key: dict[tuple[str, str], DatasetHealth],
+    candles_by_key: dict[tuple[str, str], list[Candle]],
+    validation_by_interval: dict[str, ValidationReport],
+) -> None:
+    for interval in intervals:
+        key = (symbol, interval)
+        health = health_by_key.get(key)
+        report = validation_by_interval.get(interval)
+        if (
+            health is None
+            or report is None
+            or report.ok
+            or health.availability is not AvailabilityState.AVAILABLE
+            or health.integrity is not IntegrityState.VALID
+        ):
+            continue
+        health_by_key[key] = replace(
+            health,
+            integrity=IntegrityState.INVALID,
+            freshness=FreshnessState.STALE,
+            reasons=(report.reason,),
+            validation=report,
+        )
+        candles_by_key[key] = []
 
 
 def classify_publication_health(

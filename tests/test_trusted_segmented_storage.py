@@ -131,6 +131,49 @@ class UtcMonthPartitionTests(unittest.TestCase):
 
 
 class SegmentedRefreshBehaviorTests(unittest.TestCase):
+    def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        complete = _window_candles(0, 2 * DAY_MS - STEP_MS)
+        missing_lookbehind = complete[:10] + complete[11:]
+        provider = MutableBundleProvider({"5m": missing_lookbehind})
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            first_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=2 * DAY_MS,
+                    run_id=RUN_A,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.FAILED, first_run.attempt_status)
+            self.assertEqual(SnapshotUsability.INVALID, first_run.snapshot_usability)
+            self.assertEqual(HealthReason.TIMESTAMP_GAP, first_run.datasets[(SYMBOL, "5m")].primary_reason)
+            self.assertFalse(store.segment_path(SYMBOL, "5m", "1970-01").exists())
+            first_manifest = store.read_generation_manifest(RUN_A).snapshot
+            self.assertEqual((), first_manifest.storage_by_dataset[(SYMBOL, "5m")].segments)
+
+            provider.rows_by_interval["5m"] = complete
+            second_run = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=2 * DAY_MS,
+                    run_id=RUN_B,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, second_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
+            self.assertEqual(2, provider.history_calls.count("5m"))
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "1970-01").exists())
+            second_rows = _read_exact(store, RUN_B)
+            self.assertEqual(complete[-len(second_rows) :], second_rows)
+
     def test_built_native_mismatch_does_not_write_segment_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
 

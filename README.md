@@ -152,7 +152,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 当前产物约定
 
 - `data/live/current.json`、其指向的 `data/live/generations/<run_id>/manifest.json`，以及 manifest 引用的 `data/live/segments/` 月分段共同构成当前可信数据 baseline；只有明确发布 baseline 时才应入库。
-- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、blocking symbols、segment diagnostics、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
+- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、blocking symbols、segment diagnostics、每个周期的 latest candle、rows、valid/stale 状态、失败原因，以及 v3 flat file 或 v4 segment root 的实际存储路径。
 - `reports/live/mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html`：推荐的本地 MU 180d 交互式回测报告路径。
 - `reports/live/*.md` / `reports/live/*.html` 是可再生成的本地 artifact，默认不入库；如果需要审阅，给出本地链接或重新生成。
 - `docs/fibonacci-preferred-parameters.md` 是历史参数记录，不等同于当前可信市场数据 baseline。
@@ -160,7 +160,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 数据注意事项
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
-- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest，但保留首月的物理回看行，使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下增长。
+- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest，但保留首月的物理回看行，使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。完整物理序列会在裁剪前执行本地连续性校验和 `5m -> 15m/1h` built/native 校验，任何失败都不会写入 canonical segment。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下增长。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 writer 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是正常运行时唯一 writer；`import_trusted_generation` 只是显式离线 migration writer。backtest、visualization、walk-forward、Fibonacci experiment、demo 和 exact-generation experiment reader 都只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。

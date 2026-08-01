@@ -153,7 +153,9 @@ longer grow, even if a pointer is rolled back or an import attempts to extend it
 
 On a full-history fetch, refresh asks the provider for the requested logical days plus 32 physical
 lookbehind days. The shared evaluator still applies the exact requested-days health and logical
-window, while the segment writer receives the pre-prune series as unreferenced physical material.
+window, and separately validates the complete pre-prune physical series for local continuity and
+`5m -> 15m/1h` built/native equality before the segment writer receives it as unreferenced
+physical material. A physical-only failure marks that dataset invalid and skips its writer hook.
 Thirty-two days cover the complete UTC month containing any logical-window start. A later wider
 request can therefore move `start_row` earlier inside that stored month without prepending rows or
 changing an older manifest's offsets. Extra provider rows before the already stored physical prefix
@@ -205,7 +207,8 @@ before publication never consults B's manifest and cannot mix A and B interval r
 The write order is:
 
 1. validate and materialize all candidate candle bundles through the existing shared evaluator,
-   including `5m -> 15m/1h` built/native comparison, before invoking any segment writer hook;
+   including both logical-window and full physical-lookbehind local validation plus
+   `5m -> 15m/1h` built/native comparison, before invoking any segment writer hook;
 2. create or atomically grow the required shared segment files under the dataset writer lock and
    fsync every newly created directory ancestor plus the final file/directory state;
 3. write and fsync `generations/<run_id>/manifest.json`;

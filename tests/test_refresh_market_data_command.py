@@ -133,6 +133,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
         self.assertNotIn("stock_token_top_count_below_limit", ",".join(manifest["warnings"]))
         self.assertIn("explicit", html)
+        self.assertIn("storage_path", html)
+        self.assertIn("segments/okx/MU-USDT-SWAP/5m", html)
 
     def test_max_concurrency_cli_rejects_zero_and_negative_values(self):
         from mu_strategy.commands.refresh_market_data import main
