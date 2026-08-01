@@ -20,12 +20,13 @@ from mu_strategy.market_data.trusted_data.refresh import (
     RefreshTrustedMarketData,
     RefreshTrustedMarketDataRequest,
 )
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 from mu_strategy.viz.data_health import write_data_health_dashboard
 
 
 REFRESH_COMMAND_UNUSABLE_EXIT_CODE = 1
 REFRESH_COMMAND_DEGRADED_USABLE_EXIT_CODE = 2
+DEFAULT_KEEP_GENERATIONS = 3
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class RefreshCommandResult:
     slowest_segments: tuple[dict[str, Any], ...] = ()
     failed_segments: tuple[dict[str, Any], ...] = ()
     blocking_symbols: dict[str, list[dict[str, str]]] | None = None
+    reclamation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -80,6 +82,8 @@ class RefreshCommandResult:
                 symbol: [dict(value) for value in values]
                 for symbol, values in self.blocking_symbols.items()
             }
+        if self.reclamation is not None:
+            payload["reclamation"] = dict(self.reclamation)
         return payload
 
 
@@ -91,6 +95,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None) -> int:
         parser.error("--limit must be non-negative")
     if args.max_concurrency < 1:
         parser.error("--max-concurrency must be positive")
+    if args.keep_generations < 1:
+        parser.error("--keep-generations must be at least 1")
     if args.loop and args.interval_seconds <= 0:
         raise ValueError("interval_seconds must be positive")
     intervals = tuple(args.interval or DEFAULT_INTERVALS)
@@ -155,11 +161,30 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--html-output", type=Path, default=Path("reports/live/data_health.html"))
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--interval-seconds", type=int, default=300)
+    parser.add_argument(
+        "--keep-generations",
+        type=int,
+        default=DEFAULT_KEEP_GENERATIONS,
+        help=(
+            "Keep the most recent N trusted generations in addition to always protecting current.json. "
+            f"Must be at least 1; defaults to {DEFAULT_KEEP_GENERATIONS}."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Publish the refresh normally and report reclamation candidates without deleting generations.",
+    )
     return parser
 
 
 def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> RefreshRun:
-    return RefreshTrustedMarketData(TrustedDataStore(data_dir=args.data_dir)).execute(
+    store = TrustedDataStore(
+        data_dir=args.data_dir,
+        retention_policy=GenerationRetentionPolicy(keep_recent=args.keep_generations),
+        reclamation_dry_run=args.dry_run,
+    )
+    run = RefreshTrustedMarketData(store).execute(
         RefreshTrustedMarketDataRequest(
             requested_intervals=intervals,
             days=args.days,
@@ -169,6 +194,7 @@ def _refresh_once(args: argparse.Namespace, *, intervals: tuple[str, ...]) -> Re
             stock_token_config=args.stock_token_config,
         )
     )
+    return replace(run, reclamation=store.last_reclamation_report)
 
 
 def _write_dashboard_or_warning(manifest: dict[str, Any], html_output: Path | None) -> tuple[str, ...]:
@@ -215,6 +241,7 @@ def classify_refresh_run(run: RefreshRun) -> RefreshCommandResult:
         slowest_segments=tuple(diagnostics.get("slowest_segments") or ()),
         failed_segments=tuple(diagnostics.get("failed_segments") or ()),
         blocking_symbols=diagnostics.get("blocking_symbols"),
+        reclamation=run.reclamation.to_dict() if run.reclamation is not None else None,
     )
 
 

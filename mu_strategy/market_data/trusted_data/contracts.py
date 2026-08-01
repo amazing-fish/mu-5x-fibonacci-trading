@@ -374,6 +374,55 @@ class RefreshSegmentDiagnostics:
 
 
 @dataclass(frozen=True)
+class GenerationReclamationFailure:
+    generation_id: str | None
+    error_type: str
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "error_type": self.error_type,
+            "message": self.message,
+        }
+        if self.generation_id is not None:
+            payload["generation_id"] = self.generation_id
+        return payload
+
+    def warning(self) -> str:
+        target = self.generation_id or "generations"
+        return f"generation_reclamation_failed: {target}: {self.error_type}: {self.message}"
+
+
+@dataclass(frozen=True)
+class GenerationReclamationReport:
+    dry_run: bool
+    keep_recent: int
+    current_generation_id: str | None
+    candidate_ids: tuple[str, ...] = ()
+    removed_ids: tuple[str, ...] = ()
+    bytes_reclaimable: int = 0
+    bytes_reclaimed: int = 0
+    failures: tuple[GenerationReclamationFailure, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "dry_run": self.dry_run,
+            "keep_recent": self.keep_recent,
+            "candidate_ids": list(self.candidate_ids),
+            "removed_ids": list(self.removed_ids),
+            "bytes_reclaimable": self.bytes_reclaimable,
+            "bytes_reclaimed": self.bytes_reclaimed,
+            "failures": [failure.to_dict() for failure in self.failures],
+        }
+        if self.current_generation_id is not None:
+            payload["current_generation_id"] = self.current_generation_id
+        return payload
+
+    def warnings(self) -> tuple[str, ...]:
+        return tuple(failure.warning() for failure in self.failures)
+
+
+@dataclass(frozen=True)
 class RefreshRun:
     run_id: str
     attempt_status: RefreshAttemptStatus
@@ -388,6 +437,7 @@ class RefreshRun:
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
     refresh_segments: tuple[RefreshSegmentDiagnostics, ...] = ()
+    reclamation: GenerationReclamationReport | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -439,6 +489,8 @@ class RefreshRun:
             "cycle_error": self.cycle_error,
         }
         payload.update(refresh_run_diagnostics_payload(self))
+        if self.reclamation is not None:
+            payload["reclamation"] = self.reclamation.to_dict()
         return payload
 
 

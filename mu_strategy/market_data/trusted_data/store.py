@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.cache import CSV_FIELDS
 from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
+    GenerationReclamationFailure,
+    GenerationReclamationReport,
     ManifestSchemaError,
     TrustedManifestSnapshot,
     trusted_manifest_snapshot_from_dict,
@@ -24,6 +27,7 @@ from mu_strategy.models import Candle
 
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LOGGER = logging.getLogger(__name__)
+DEFAULT_RUN_LOG_MAX_LINES = 1_000
 # Keep post-commit warnings structured without allowing -Werror to turn them into false failures.
 _CURRENT_POINTER_WARNING_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
     "trusted_current_pointer_warning_sink",
@@ -47,9 +51,31 @@ class ManifestReadResult:
         return self.snapshot is not None and self.reason is None
 
 
+@dataclass(frozen=True)
+class GenerationRetentionPolicy:
+    keep_recent: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.keep_recent, int) or isinstance(self.keep_recent, bool) or self.keep_recent < 1:
+            raise ValueError("keep_recent must be an integer of at least 1")
+
+
 class TrustedDataStore:
-    def __init__(self, *, data_dir: Path):
+    def __init__(
+        self,
+        *,
+        data_dir: Path,
+        run_log_max_lines: int = DEFAULT_RUN_LOG_MAX_LINES,
+        retention_policy: GenerationRetentionPolicy | None = None,
+        reclamation_dry_run: bool = False,
+    ):
+        if not isinstance(run_log_max_lines, int) or isinstance(run_log_max_lines, bool) or run_log_max_lines < 1:
+            raise ValueError("run_log_max_lines must be an integer of at least 1")
         self.data_dir = Path(data_dir)
+        self.run_log_max_lines = run_log_max_lines
+        self.retention_policy = retention_policy
+        self.reclamation_dry_run = reclamation_dry_run
+        self.last_reclamation_report: GenerationReclamationReport | None = None
 
     @property
     def current_path(self) -> Path:
@@ -231,8 +257,31 @@ class TrustedDataStore:
             self.replace_current(generation_id)
         finally:
             _CURRENT_POINTER_WARNING_SINK.reset(warning_sink_token)
+        log_payload = dict(run_log_payload)
+        if self.retention_policy is not None:
+            try:
+                reclamation = self.reclaim_generations(
+                    self.retention_policy,
+                    dry_run=self.reclamation_dry_run,
+                )
+            except Exception as exc:
+                failure = GenerationReclamationFailure(None, type(exc).__name__, str(exc))
+                reclamation = GenerationReclamationReport(
+                    dry_run=self.reclamation_dry_run,
+                    keep_recent=self.retention_policy.keep_recent,
+                    current_generation_id=None,
+                    failures=(failure,),
+                )
+            self.last_reclamation_report = reclamation
+            publication_warnings.extend(reclamation.warnings())
+            log_payload["reclamation"] = reclamation.to_dict()
+        if publication_warnings:
+            log_payload["warnings"] = [
+                *list(log_payload.get("warnings") or ()),
+                *publication_warnings,
+            ]
         try:
-            self.append_run_log(run_log_payload)
+            self.append_run_log(log_payload)
         except Exception as exc:
             publication_warnings.append(f"audit_log_append_failed: {exc}")
         return tuple(publication_warnings)
@@ -244,11 +293,134 @@ class TrustedDataStore:
     def append_run_log(self, payload: dict[str, Any]) -> Path:
         path = self.run_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        existing_lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+        if len(existing_lines) >= self.run_log_max_lines:
+            keep_count = self.run_log_max_lines - 1
+            retained = existing_lines[-keep_count:] if keep_count else []
+            _atomic_write_text(path, "".join((*retained, line)))
+            return path
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-            handle.write("\n")
+            handle.write(line)
             _flush_and_fsync(handle)
         return path
+
+    def reclaim_generations(
+        self,
+        policy: GenerationRetentionPolicy,
+        *,
+        dry_run: bool = False,
+    ) -> GenerationReclamationReport:
+        failures: list[GenerationReclamationFailure] = []
+        try:
+            current_generation_id = self._current_generation_id_for_reclamation()
+            entries = tuple(self.generations_dir.iterdir())
+        except Exception as exc:
+            failures.append(GenerationReclamationFailure(None, type(exc).__name__, str(exc)))
+            return GenerationReclamationReport(
+                dry_run=dry_run,
+                keep_recent=policy.keep_recent,
+                current_generation_id=None,
+                failures=tuple(failures),
+            )
+
+        generations: list[Path] = []
+        for entry in entries:
+            try:
+                generations.append(self._validated_reclamation_target(entry))
+            except Exception as exc:
+                failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
+        if failures:
+            return GenerationReclamationReport(
+                dry_run=dry_run,
+                keep_recent=policy.keep_recent,
+                current_generation_id=current_generation_id,
+                failures=tuple(failures),
+            )
+
+        try:
+            current_target = self._validated_reclamation_target(self.generations_dir / current_generation_id)
+        except Exception as exc:
+            failures.append(GenerationReclamationFailure(current_generation_id, type(exc).__name__, str(exc)))
+            return GenerationReclamationReport(
+                dry_run=dry_run,
+                keep_recent=policy.keep_recent,
+                current_generation_id=current_generation_id,
+                failures=tuple(failures),
+            )
+
+        ordered = sorted(generations, key=lambda path: (path.stat().st_mtime_ns, path.name))
+        protected_ids = {path.name for path in ordered[-policy.keep_recent :]}
+        protected_ids.add(current_target.name)
+        candidates = tuple(path for path in ordered if path.name not in protected_ids)
+        sizes: dict[str, int] = {}
+        for candidate in candidates:
+            try:
+                sizes[candidate.name] = _directory_file_bytes(candidate)
+            except Exception as exc:
+                failures.append(GenerationReclamationFailure(candidate.name, type(exc).__name__, str(exc)))
+
+        candidate_ids = tuple(candidate.name for candidate in candidates)
+        bytes_reclaimable = sum(sizes.values())
+        if dry_run:
+            return GenerationReclamationReport(
+                dry_run=True,
+                keep_recent=policy.keep_recent,
+                current_generation_id=current_generation_id,
+                candidate_ids=candidate_ids,
+                bytes_reclaimable=bytes_reclaimable,
+                failures=tuple(failures),
+            )
+
+        removed_ids: list[str] = []
+        bytes_reclaimed = 0
+        failed_ids = {failure.generation_id for failure in failures}
+        for candidate in candidates:
+            if candidate.name in failed_ids:
+                continue
+            try:
+                if self._current_generation_id_for_reclamation() == candidate.name:
+                    raise RuntimeError("generation became current during reclamation")
+                target = self._validated_reclamation_target(candidate)
+                shutil.rmtree(target)
+            except Exception as exc:
+                failures.append(GenerationReclamationFailure(candidate.name, type(exc).__name__, str(exc)))
+                continue
+            removed_ids.append(candidate.name)
+            bytes_reclaimed += sizes[candidate.name]
+        if removed_ids:
+            try:
+                _fsync_directory(self.generations_dir)
+            except Exception as exc:
+                failures.append(GenerationReclamationFailure(None, type(exc).__name__, str(exc)))
+        return GenerationReclamationReport(
+            dry_run=False,
+            keep_recent=policy.keep_recent,
+            current_generation_id=current_generation_id,
+            candidate_ids=candidate_ids,
+            removed_ids=tuple(removed_ids),
+            bytes_reclaimable=bytes_reclaimable,
+            bytes_reclaimed=bytes_reclaimed,
+            failures=tuple(failures),
+        )
+
+    def _current_generation_id_for_reclamation(self) -> str:
+        pointer = json.loads(self.current_path.read_text(encoding="utf-8"))
+        generation_id, _ = self._resolve_current_pointer(pointer)
+        return generation_id
+
+    def _validated_reclamation_target(self, target: Path) -> Path:
+        target = Path(target)
+        generation_id = validate_storage_segment(target.name, field="generation_id")
+        if target.is_symlink():
+            raise ValueError(f"trusted generation must not be a symlink: {generation_id}")
+        resolved_root = self.generations_dir.resolve(strict=True)
+        resolved_target = target.resolve(strict=True)
+        if resolved_target.parent != resolved_root:
+            raise ValueError(f"trusted generation must stay directly inside generations/: {generation_id}")
+        if not resolved_target.is_dir():
+            raise ValueError(f"trusted generation must be a directory: {generation_id}")
+        return resolved_target
 
 
 def candles_content_sha256(candles: list[Candle]) -> str:
@@ -260,6 +432,19 @@ def candles_content_sha256(candles: list[Candle]) -> str:
             digest.update(b"\0")
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _directory_file_bytes(root: Path) -> int:
+    total = 0
+    for current_root, directory_names, file_names in os.walk(root, followlinks=False):
+        current = Path(current_root)
+        for name in directory_names:
+            path = current / name
+            if path.is_symlink():
+                total += path.lstat().st_size
+        for name in file_names:
+            total += (current / name).lstat().st_size
+    return total
 
 
 def _atomic_write_text(
