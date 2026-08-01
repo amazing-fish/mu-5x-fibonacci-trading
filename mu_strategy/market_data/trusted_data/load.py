@@ -16,6 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     SystemClock,
     TrustDecision,
     TrustedBundle,
+    TrustedDatasetFileSnapshot,
     TrustedLoadContext,
     ValidationReport,
 )
@@ -85,6 +86,12 @@ class LoadTrustedBundle:
                 )
 
         manifest = context.manifest
+        file_snapshots_by_key = None
+        if context.dataset_file_snapshots is not None:
+            file_snapshots_by_key = {
+                snapshot.key: snapshot
+                for snapshot in context.dataset_file_snapshots
+            }
         published_health_by_interval: dict[str, DatasetHealth] = {}
         path_by_interval: dict[str, Path] = {}
         seeds_by_interval: dict[str, DatasetEvaluationSeed] = {}
@@ -116,9 +123,31 @@ class LoadTrustedBundle:
                 )
                 continue
             published_health_by_interval[interval] = manifest_health
+            file_snapshot = (
+                file_snapshots_by_key.get(DatasetKey(resolved.inst_id, interval))
+                if file_snapshots_by_key is not None
+                else None
+            )
             try:
-                candles = self.store.read_csv(path) if path.exists() else []
+                if file_snapshots_by_key is None:
+                    candles = self.store.read_csv(path) if path.exists() else []
+                elif file_snapshot is None:
+                    raise FileNotFoundError(f"pinned dataset snapshot is missing: {path}")
+                elif file_snapshot.source_file != path:
+                    raise ManifestSchemaError("pinned dataset snapshot path must match its manifest dataset")
+                elif file_snapshot.payload is None:
+                    error_type = file_snapshot.error_type or "FileNotFoundError"
+                    message = file_snapshot.message or f"pinned dataset snapshot is unavailable: {path}"
+                    raise _PinnedDatasetSnapshotError(error_type, message)
+                else:
+                    candles = self.store.read_csv_bytes(file_snapshot.payload)
             except Exception as exc:
+                if isinstance(exc, _PinnedDatasetSnapshotError):
+                    error_type = exc.error_type
+                    message = exc.message
+                else:
+                    error_type = type(exc).__name__
+                    message = str(exc)
                 seeds_by_interval[interval] = DatasetEvaluationSeed(
                     key=DatasetKey(resolved.inst_id, interval),
                     source_file=path,
@@ -126,8 +155,8 @@ class LoadTrustedBundle:
                     prefailed_reason=HealthReason.CACHE_READ_FAILED,
                     prefailed_availability=AvailabilityState.MISSING,
                     prefailed_freshness=FreshnessState.STALE,
-                    error_type=type(exc).__name__,
-                    message=str(exc),
+                    error_type=error_type,
+                    message=message,
                 )
                 continue
             seeds_by_interval[interval] = DatasetEvaluationSeed(
@@ -190,7 +219,14 @@ class LoadTrustedBundle:
         *,
         now_ms: int | None = None,
     ):
-        observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        observed_at_ms = int(now_ms) if now_ms is not None else None
+        with self.store.publication_snapshot_lock():
+            return self._open_context_result_locked(observed_at_ms)
+
+    def _open_context_result_locked(
+        self,
+        observed_at_ms: int | None,
+    ):
         manifest_result = self.store.read_manifest()
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None, manifest_result
@@ -201,12 +237,45 @@ class LoadTrustedBundle:
                 error_type="ManifestSchemaError",
                 message="trusted manifest must be pinned to a generation",
             )
+        file_snapshots = []
+        for (symbol, interval), health in sorted(
+            manifest_result.snapshot.datasets.items(),
+            key=lambda item: item[0],
+        ):
+            path = self.store.generation_cache_path(
+                manifest_result.generation_id,
+                symbol,
+                interval,
+            )
+            try:
+                payload = self.store.read_file_bytes(path)
+            except Exception as exc:
+                file_snapshots.append(
+                    TrustedDatasetFileSnapshot(
+                        key=health.key,
+                        source_file=path,
+                        payload=None,
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                    )
+                )
+            else:
+                file_snapshots.append(
+                    TrustedDatasetFileSnapshot(
+                        key=health.key,
+                        source_file=path,
+                        payload=payload,
+                    )
+                )
+        if observed_at_ms is None:
+            observed_at_ms = int(self.clock.now_ms())
         return (
             TrustedLoadContext(
                 manifest=manifest_result.snapshot,
                 observed_at_ms=observed_at_ms,
                 generation_root=manifest_result.generation_root or self.store.data_dir,
                 generation_id=manifest_result.generation_id,
+                dataset_file_snapshots=tuple(file_snapshots),
             ),
             manifest_result,
         )
@@ -230,6 +299,14 @@ class LoadTrustedBundle:
 
     def _unpublished_dataset_path(self, symbol: str, interval: str) -> Path:
         return self.store.generations_dir / "unpublished" / self.store.generation_source_file(symbol, interval)
+
+
+class _PinnedDatasetSnapshotError(Exception):
+    def __init__(self, error_type: str, message: str):
+        super().__init__(message)
+        self.error_type = error_type
+        self.message = message
+
 
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:

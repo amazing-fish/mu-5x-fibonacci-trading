@@ -111,6 +111,130 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(run.refresh_segments[0].reused_prior_generation)
             self.assertEqual("incremental_reuse", run.refresh_segments[0].fetch_mode)
 
+    def test_open_load_context_survives_generation_reclamation(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            loader = LoadTrustedBundle(store)
+            old_context = loader.open_context(now_ms=DAY_MS)
+
+            RefreshTrustedMarketData(store, _StaticProvider()).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=DAY_MS,
+                    run_id="run-new",
+                )
+            )
+            self.assertFalse((data_dir / "generations" / "run-old").exists())
+
+            bundle = loader.execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
+                trading_strict_policy(),
+                context=old_context,
+            )
+
+            self.assertEqual("run-old", bundle.run_id)
+            self.assertTrue(bundle.candles_by_interval["5m"])
+            self.assertTrue(bundle.trust_decision.allowed)
+
+    def test_load_context_snapshot_blocks_publication_until_file_read_completes(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            reader_store = TrustedDataStore(data_dir=data_dir)
+            publisher_store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            snapshot_started = threading.Event()
+            release_snapshot = threading.Event()
+            publication_attempted = threading.Event()
+            publication_done = threading.Event()
+            errors = []
+            original_read_file_bytes = reader_store.read_file_bytes
+            original_commit = publisher_store.commit_generation_publication
+
+            def blocking_read_file_bytes(path):
+                snapshot_started.set()
+                if not release_snapshot.wait(10):
+                    raise TimeoutError("snapshot release timed out")
+                return original_read_file_bytes(path)
+
+            def observed_commit(*args, **kwargs):
+                publication_attempted.set()
+                return original_commit(*args, **kwargs)
+
+            def load_context():
+                try:
+                    LoadTrustedBundle(reader_store).open_context(now_ms=DAY_MS)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def publish():
+                try:
+                    RefreshTrustedMarketData(publisher_store, _StaticProvider()).execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id="run-new",
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    publication_done.set()
+
+            with patch.object(reader_store, "read_file_bytes", side_effect=blocking_read_file_bytes):
+                with patch.object(publisher_store, "commit_generation_publication", side_effect=observed_commit):
+                    reader_thread = threading.Thread(target=load_context)
+                    publisher_thread = threading.Thread(target=publish)
+                    reader_thread.start()
+                    try:
+                        self.assertTrue(snapshot_started.wait(10))
+                        publisher_thread.start()
+                        self.assertTrue(publication_attempted.wait(10))
+                        self.assertFalse(
+                            publication_done.wait(0.25),
+                            "publication entered reclamation while a load snapshot was open",
+                        )
+                    finally:
+                        release_snapshot.set()
+                        reader_thread.join(10)
+                        publisher_thread.join(10)
+
+            self.assertFalse(reader_thread.is_alive())
+            self.assertFalse(publisher_thread.is_alive())
+            self.assertEqual([], errors)
+
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 

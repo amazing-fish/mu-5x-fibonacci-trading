@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import errno
 import hashlib
+import io
 import json
 import logging
 import os
@@ -93,6 +94,14 @@ class TrustedDataStore:
     def run_log_path(self) -> Path:
         return self.data_dir / "refresh_runs.jsonl"
 
+    @contextmanager
+    def publication_snapshot_lock(self):
+        if not self.data_dir.is_dir():
+            yield
+            return
+        with _trusted_store_lock(self.data_dir):
+            yield
+
     def generation_root(self, generation_id: str) -> Path:
         generation_id = validate_storage_segment(generation_id, field="generation_id")
         return self.generations_dir / generation_id
@@ -118,8 +127,14 @@ class TrustedDataStore:
 
     def read_csv(self, path: Path) -> list[Candle]:
         with Path(path).open("r", newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            return [Candle.from_csv_row(row) for row in reader]
+            return _read_candles_csv(handle)
+
+    def read_csv_bytes(self, payload: bytes) -> list[Candle]:
+        with io.StringIO(payload.decode("utf-8"), newline="") as handle:
+            return _read_candles_csv(handle)
+
+    def read_file_bytes(self, path: Path) -> bytes:
+        return Path(path).read_bytes()
 
     def write_csv(self, candles: list[Candle], path: Path) -> None:
         path = Path(path)
@@ -536,6 +551,11 @@ def candles_content_sha256(candles: list[Candle]) -> str:
             digest.update(b"\0")
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _read_candles_csv(handle) -> list[Candle]:
+    reader = csv.DictReader(handle)
+    return [Candle.from_csv_row(row) for row in reader]
 
 
 def _directory_file_bytes(root: Path) -> int:
