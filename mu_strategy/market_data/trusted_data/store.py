@@ -440,6 +440,18 @@ class TrustedDataStore:
             current_manifest_path = current_target / "manifest.json"
             if current_manifest_path.is_symlink() or not current_manifest_path.is_file():
                 raise ValueError(f"current trusted generation manifest must be a regular file: {current_generation_id}")
+            current_manifest_result = self._read_manifest_file(
+                current_manifest_path,
+                generation_root=current_target,
+                generation_id=current_generation_id,
+            )
+            if not current_manifest_result.ok:
+                message = current_manifest_result.message or (
+                    current_manifest_result.reason.value
+                    if current_manifest_result.reason is not None
+                    else "current trusted generation manifest is malformed"
+                )
+                raise ManifestSchemaError(message)
         except Exception as exc:
             failures.append(GenerationReclamationFailure(current_generation_id, type(exc).__name__, str(exc)))
             return GenerationReclamationReport(

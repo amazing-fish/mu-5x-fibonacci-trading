@@ -237,7 +237,7 @@ class LoadTrustedBundle:
     ):
         if dataset_keys is not None and dataset_key_selector is not None:
             raise ValueError("dataset_keys and dataset_key_selector are mutually exclusive")
-        observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        observed_at_ms = int(now_ms) if now_ms is not None else None
         if dataset_keys is not None:
             dataset_keys = tuple(dict.fromkeys(dataset_keys))
         with self.store.publication_snapshot_lock():
@@ -249,7 +249,7 @@ class LoadTrustedBundle:
 
     def _open_context_result_locked(
         self,
-        observed_at_ms: int,
+        observed_at_ms: int | None,
         *,
         dataset_keys: tuple[DatasetKey, ...] | None,
         dataset_key_selector: Callable[[TrustedManifestSnapshot], tuple[DatasetKey, ...]] | None = None,
@@ -302,6 +302,8 @@ class LoadTrustedBundle:
                         payload=payload,
                     )
                 )
+        if observed_at_ms is None:
+            observed_at_ms = int(self.clock.now_ms())
         return (
             TrustedLoadContext(
                 manifest=manifest_result.snapshot,

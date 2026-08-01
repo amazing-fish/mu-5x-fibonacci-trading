@@ -625,6 +625,37 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual((), report.removed_ids)
             self.assertEqual("run-current", report.failures[0].generation_id)
 
+    def test_reclamation_preserves_fallbacks_when_current_manifest_is_malformed(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            fallback = _write_plain_generation(
+                data_dir,
+                "run-fallback",
+                b"fallback",
+                mtime_ns=1_000_000_000,
+            )
+            current = _write_plain_generation(
+                data_dir,
+                "run-current",
+                b"current",
+                mtime_ns=2_000_000_000,
+            )
+            (current / "manifest.json").write_bytes(b"{")
+            _write_current_pointer(data_dir, "run-current")
+
+            report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertTrue(fallback.is_dir())
+            self.assertTrue(current.is_dir())
+            self.assertEqual((), report.candidate_ids)
+            self.assertEqual((), report.removed_ids)
+            self.assertEqual("run-current", report.failures[0].generation_id)
+            self.assertEqual("ManifestSchemaError", report.failures[0].error_type)
+
     def test_refresh_error_releases_preparation_lease_for_later_reclamation(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
@@ -659,6 +690,54 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual(("run-aborted",), report.removed_ids)
             self.assertFalse((data_dir / "generations" / "run-aborted").exists())
             self.assertTrue((data_dir / "generations" / "run-current").is_dir())
+
+    def test_default_context_clock_is_sampled_after_dataset_snapshot(self):
+        from mu_strategy.market_data.trusted_data.contracts import DatasetKey
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            original_read_file_bytes = store.read_file_bytes
+            snapshot_read = {"value": False}
+            test_case = self
+
+            def recording_read_file_bytes(path):
+                payload = original_read_file_bytes(path)
+                snapshot_read["value"] = True
+                return payload
+
+            class AfterSnapshotClock:
+                def __init__(self):
+                    self.calls = 0
+
+                def now_ms(self):
+                    self.calls += 1
+                    test_case.assertTrue(snapshot_read["value"])
+                    return DAY_MS
+
+            clock = AfterSnapshotClock()
+            loader = LoadTrustedBundle(store, clock=clock)
+            dataset_keys = (DatasetKey(SYMBOL, "5m"),)
+
+            with patch.object(store, "read_file_bytes", side_effect=recording_read_file_bytes):
+                context = loader.open_context(dataset_keys=dataset_keys)
+                explicit_context = loader.open_context(
+                    now_ms=DAY_MS - 1,
+                    dataset_keys=dataset_keys,
+                )
+
+            self.assertEqual(DAY_MS, context.observed_at_ms)
+            self.assertEqual(DAY_MS - 1, explicit_context.observed_at_ms)
+            self.assertEqual(1, clock.calls)
 
     def test_context_manifest_and_file_snapshot_share_one_store_lock(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
@@ -796,7 +875,10 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual(before, _tree_bytes(data_dir))
             self.assertEqual(("run-old",), report.candidate_ids)
             self.assertEqual((), report.removed_ids)
-            self.assertEqual(len(b"old bytes") + len(b"{}"), report.bytes_reclaimable)
+            self.assertEqual(
+                len(b"old bytes") + len(_plain_generation_manifest_bytes("run-old")),
+                report.bytes_reclaimable,
+            )
             self.assertEqual(0, report.bytes_reclaimed)
 
     def test_command_dry_run_reports_candidates_without_deleting_them(self):
@@ -1021,9 +1103,30 @@ def _write_plain_generation(
     root.mkdir(parents=True)
     (root / "payload.bin").write_bytes(payload)
     if committed:
-        (root / "manifest.json").write_bytes(b"{}")
+        (root / "manifest.json").write_bytes(_plain_generation_manifest_bytes(generation_id))
     os.utime(root, ns=(mtime_ns, mtime_ns))
     return root
+
+
+def _plain_generation_manifest_bytes(generation_id: str) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 3,
+            "run_id": generation_id,
+            "attempt_status": "failed",
+            "snapshot_usability": "invalid",
+            "started_at_ms": 0,
+            "completed_at_ms": 0,
+            "requested_intervals": ["5m"],
+            "effective_intervals": ["5m"],
+            "universes": {"crypto_top": [], "stock_token_top": []},
+            "symbols": {},
+            "provider_failures": [],
+            "warnings": [],
+            "cycle_error": {"error_type": "TestFixture", "message": "no datasets"},
+        },
+        sort_keys=True,
+    ).encode("utf-8")
 
 
 def _write_current_pointer(data_dir: Path, generation_id: str) -> None:
