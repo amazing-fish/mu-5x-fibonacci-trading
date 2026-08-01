@@ -437,21 +437,7 @@ class TrustedDataStore:
 
         try:
             current_target = self._validated_reclamation_target(self.generations_dir / current_generation_id)
-            current_manifest_path = current_target / "manifest.json"
-            if current_manifest_path.is_symlink() or not current_manifest_path.is_file():
-                raise ValueError(f"current trusted generation manifest must be a regular file: {current_generation_id}")
-            current_manifest_result = self._read_manifest_file(
-                current_manifest_path,
-                generation_root=current_target,
-                generation_id=current_generation_id,
-            )
-            if not current_manifest_result.ok:
-                message = current_manifest_result.message or (
-                    current_manifest_result.reason.value
-                    if current_manifest_result.reason is not None
-                    else "current trusted generation manifest is malformed"
-                )
-                raise ManifestSchemaError(message)
+            self._validated_reclamation_manifest(current_target, required=True)
         except Exception as exc:
             failures.append(GenerationReclamationFailure(current_generation_id, type(exc).__name__, str(exc)))
             return GenerationReclamationReport(
@@ -466,14 +452,12 @@ class TrustedDataStore:
         for entry in entries:
             try:
                 target = self._validated_reclamation_target(entry)
-                manifest_path = target / "manifest.json"
-                if not manifest_path.exists():
+                manifest_result = self._validated_reclamation_manifest(target, required=False)
+                if manifest_result is None:
                     if self._manifestless_generation_is_active(target):
                         continue
                     abandoned.append((target, target.stat().st_mtime_ns))
                     continue
-                if manifest_path.is_symlink() or not manifest_path.is_file():
-                    raise ValueError(f"trusted generation manifest must be a regular file: {target.name}")
                 generations.append((target, target.stat().st_mtime_ns))
             except Exception as exc:
                 failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
@@ -580,6 +564,35 @@ class TrustedDataStore:
         if not resolved_target.is_dir():
             raise ValueError(f"trusted generation must be a directory: {generation_id}")
         return resolved_target
+
+    def _validated_reclamation_manifest(
+        self,
+        generation_root: Path,
+        *,
+        required: bool,
+    ) -> ManifestReadResult | None:
+        manifest_path = generation_root / "manifest.json"
+        if manifest_path.is_symlink():
+            raise ValueError(f"trusted generation manifest must be a regular file: {generation_root.name}")
+        if not manifest_path.exists():
+            if required:
+                raise ValueError(f"current trusted generation manifest must be a regular file: {generation_root.name}")
+            return None
+        if not manifest_path.is_file():
+            raise ValueError(f"trusted generation manifest must be a regular file: {generation_root.name}")
+        result = self._read_manifest_file(
+            manifest_path,
+            generation_root=generation_root,
+            generation_id=generation_root.name,
+        )
+        if not result.ok:
+            message = result.message or (
+                result.reason.value
+                if result.reason is not None
+                else "trusted generation manifest is malformed"
+            )
+            raise ManifestSchemaError(message)
+        return result
 
 
 class _GenerationPreparationLease:

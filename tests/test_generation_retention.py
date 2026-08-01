@@ -517,6 +517,77 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual(b"preserve me", invalid_entry.read_bytes())
             self.assertTrue((data_dir / "generations" / "run-current").is_dir())
 
+    def test_malformed_generation_manifest_is_preserved_without_blocking_valid_reclamation(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            old = _write_plain_generation(data_dir, "run-old", b"old", mtime_ns=1_000_000_000)
+            malformed = _write_plain_generation(
+                data_dir,
+                "run-malformed",
+                b"malformed",
+                mtime_ns=2_000_000_000,
+            )
+            (malformed / "manifest.json").write_bytes(b"{")
+            current = _write_plain_generation(
+                data_dir,
+                "run-current",
+                b"current",
+                mtime_ns=3_000_000_000,
+            )
+            _write_current_pointer(data_dir, "run-current")
+
+            report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertFalse(old.exists())
+            self.assertTrue(malformed.is_dir())
+            self.assertTrue(current.is_dir())
+            self.assertEqual(("run-old",), report.removed_ids)
+            self.assertEqual("run-malformed", report.failures[0].generation_id)
+            self.assertEqual("ManifestSchemaError", report.failures[0].error_type)
+
+    def test_broken_manifest_symlink_is_reported_and_preserved(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            broken = data_dir / "generations" / "run-broken"
+            broken.mkdir(parents=True)
+            (broken / "payload.bin").write_bytes(b"preserve")
+            manifest_path = broken / "manifest.json"
+            os.utime(broken, ns=(1_000_000_000, 1_000_000_000))
+            current = _write_plain_generation(
+                data_dir,
+                "run-current",
+                b"current",
+                mtime_ns=2_000_000_000,
+            )
+            _write_current_pointer(data_dir, "run-current")
+            original_is_symlink = Path.is_symlink
+            original_exists = Path.exists
+
+            def is_symlink(path):
+                return path == manifest_path or original_is_symlink(path)
+
+            def exists(path):
+                if path == manifest_path:
+                    raise AssertionError("broken manifest symlink must be rejected before exists()")
+                return original_exists(path)
+
+            with patch.object(Path, "is_symlink", new=is_symlink):
+                with patch.object(Path, "exists", new=exists):
+                    report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                        GenerationRetentionPolicy(keep_recent=1)
+                    )
+
+            self.assertTrue(broken.is_dir())
+            self.assertTrue(current.is_dir())
+            self.assertEqual((), report.removed_ids)
+            self.assertEqual("run-broken", report.failures[0].generation_id)
+
     def test_keep_recent_lower_bound_rejects_zero_and_bool(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy
 
