@@ -66,6 +66,10 @@ class GenerationRetentionPolicy:
             raise ValueError("keep_recent must be an integer of at least 1")
 
 
+class GenerationReaderLeaseActive(RuntimeError):
+    pass
+
+
 class TrustedDataStore:
     def __init__(
         self,
@@ -490,6 +494,10 @@ class TrustedDataStore:
                 self._validated_reclamation_manifest(target)
                 if self._generation_is_retention_pinned(target):
                     raise RuntimeError("generation became retention pinned during reclamation")
+                if self._generation_has_active_reader_lease(target):
+                    raise GenerationReaderLeaseActive(
+                        f"generation is leased by an active trusted reader: {candidate.name}"
+                    )
                 shutil.rmtree(target)
             except Exception as exc:
                 failures.append(GenerationReclamationFailure(candidate.name, type(exc).__name__, str(exc)))
@@ -555,6 +563,18 @@ class TrustedDataStore:
                 f"generation retention pin reason must be strategy_release_provenance: {generation_root.name}"
             )
         return True
+
+    def _generation_has_active_reader_lease(self, generation_root: Path) -> bool:
+        if os.name != "nt":
+            return False
+        manifest_result = self._validated_reclamation_manifest(generation_root)
+        assert manifest_result.snapshot is not None
+        return any(
+            _windows_path_has_open_handle(
+                _resolve_generation_source_file(health.source_file, generation_root)
+            )
+            for health in manifest_result.snapshot.datasets.values()
+        )
 
     def _validated_reclamation_target(self, target: Path) -> Path:
         target = Path(target)
@@ -744,6 +764,44 @@ def _windows_store_mutex_name(data_dir: Path) -> str:
     canonical_path = str(Path(data_dir).resolve()).casefold()
     digest = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
     return f"Global\\mu_strategy_trusted_store_{digest}"
+
+
+def _windows_path_has_open_handle(path: Path) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000,
+        0,
+        None,
+        3,
+        0x00000080,
+        0,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = ctypes.get_last_error()
+        if error == 32:
+            return True
+        raise ctypes.WinError(error)
+    if not kernel32.CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return False
 
 
 def _atomic_write_text(

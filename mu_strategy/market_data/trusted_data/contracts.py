@@ -331,6 +331,10 @@ class TrustedLoadContext:
     dataset_file_snapshots: tuple[TrustedDatasetFileSnapshot, ...] | None = field(default=None, repr=False)
     dataset_file_leases: tuple[TrustedDatasetFileLease, ...] | None = field(default=None, repr=False)
 
+    def close(self) -> None:
+        for lease in self.dataset_file_leases or ():
+            lease.close()
+
 
 def derive_snapshot_usability(
     datasets: dict[tuple[str, str], DatasetHealth],

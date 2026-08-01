@@ -203,6 +203,7 @@ class GenerationRetentionTests(unittest.TestCase):
                 {"15m", "1h"},
                 {lease.key.interval for lease in bundle_5m.load_context.dataset_file_leases},
             )
+            bundle_1h.load_context.close()
 
     def test_partial_load_context_extends_after_generation_reclamation(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -219,17 +220,20 @@ class GenerationRetentionTests(unittest.TestCase):
                 end_ms=DAY_MS - 300_000,
                 run_id="run-old",
             )
+            policy = GenerationRetentionPolicy(keep_recent=1)
             store = TrustedDataStore(
                 data_dir=data_dir,
-                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+                retention_policy=policy,
             )
             loader = LoadTrustedBundle(store)
             bundle_5m = loader.execute(
                 LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1, now_ms=DAY_MS),
                 trading_strict_policy(),
             )
+            old_root = data_dir / "generations" / "run-old"
+            old_tree = _tree_bytes(old_root)
 
-            RefreshTrustedMarketData(store, _StaticProvider()).execute(
+            refresh_run = RefreshTrustedMarketData(store, _StaticProvider()).execute(
                 RefreshTrustedMarketDataRequest(
                     requested_intervals=("5m",),
                     days=1,
@@ -238,7 +242,15 @@ class GenerationRetentionTests(unittest.TestCase):
                     run_id="run-new",
                 )
             )
-            self.assertFalse((data_dir / "generations" / "run-old").exists())
+            if os.name == "nt":
+                self.assertTrue(old_root.is_dir())
+                self.assertEqual(old_tree, _tree_bytes(old_root))
+                self.assertEqual(
+                    ["GenerationReaderLeaseActive"],
+                    [failure.error_type for failure in refresh_run.reclamation.failures],
+                )
+            else:
+                self.assertFalse(old_root.exists())
             bundle_1h = loader.execute(
                 LoadTrustedBundleQuery(SYMBOL, intervals=("1h",), days=1, now_ms=DAY_MS),
                 trading_strict_policy(),
@@ -248,6 +260,11 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual("run-old", bundle_1h.run_id)
             self.assertTrue(bundle_1h.candles_by_interval["1h"])
             self.assertTrue(bundle_1h.trust_decision.allowed)
+            if os.name == "nt":
+                bundle_1h.load_context.close()
+                report = store.reclaim_generations(policy)
+                self.assertEqual(("run-old",), report.removed_ids)
+                self.assertFalse(old_root.exists())
 
     def test_partial_load_context_falls_back_to_snapshot_when_lease_open_fails(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
@@ -292,6 +309,7 @@ class GenerationRetentionTests(unittest.TestCase):
                 {"15m"},
                 {lease.key.interval for lease in bundle_5m.load_context.dataset_file_leases},
             )
+            bundle_5m.load_context.close()
 
             RefreshTrustedMarketData(store, _StaticProvider()).execute(
                 RefreshTrustedMarketDataRequest(
@@ -1131,6 +1149,7 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(any("generation_reclamation_failed" in warning for warning in output["warnings"]))
             self.assertTrue(run_log[-1]["reclamation"]["failures"])
             self.assertTrue(any("generation_reclamation_failed" in warning for warning in run_log[-1]["warnings"]))
+            bundle.load_context.close()
 
     def test_crafted_traversal_target_is_refused_without_touching_outside(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
