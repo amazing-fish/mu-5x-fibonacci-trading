@@ -269,18 +269,25 @@ class TrustedDataStore:
         return path
 
     def _finish_generation_preparation(self, generation_id: str) -> None:
+        if not self.abort_generation_preparation(generation_id):
+            return
+        marker_path = self.generation_root(generation_id) / _GENERATION_IN_PROGRESS_MARKER
+        if marker_path.is_symlink() or not marker_path.is_file():
+            raise OSError(f"generation preparation marker must be a regular file: {generation_id}")
+        marker_path.unlink()
+        _fsync_directory(marker_path.parent)
+
+    def abort_generation_preparation(self, generation_id: str) -> bool:
+        generation_id = validate_storage_segment(generation_id, field="generation_id")
         lease = self._generation_preparation_leases.pop(generation_id, None)
         if lease is None:
-            return
+            return False
         marker_path = self.generation_root(generation_id) / _GENERATION_IN_PROGRESS_MARKER
         try:
             lease.close()
         finally:
             _unregister_local_generation_marker(marker_path)
-        if marker_path.is_symlink() or not marker_path.is_file():
-            raise OSError(f"generation preparation marker must be a regular file: {generation_id}")
-        marker_path.unlink()
-        _fsync_directory(marker_path.parent)
+        return True
 
     def replace_current(self, generation_id: str) -> Path:
         generation_id = validate_storage_segment(generation_id, field="generation_id")

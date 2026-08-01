@@ -17,6 +17,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     FreshnessState,
     HealthReason,
     IntegrityState,
+    IntervalPlan,
     RefreshSegmentDiagnostics,
     RefreshRun,
     RefreshAttemptStatus,
@@ -171,6 +172,25 @@ class RefreshTrustedMarketData:
             validate_storage_segment(interval, field="interval")
         run_id = validate_storage_segment(request.run_id or uuid.uuid4().hex, field="run_id")
         self.store.prepare_generation(run_id)
+        try:
+            return self._execute_prepared(
+                request,
+                started_at_ms=started_at_ms,
+                plan=plan,
+                run_id=run_id,
+            )
+        except BaseException:
+            self.store.abort_generation_preparation(run_id)
+            raise
+
+    def _execute_prepared(
+        self,
+        request: RefreshTrustedMarketDataRequest,
+        *,
+        started_at_ms: int,
+        plan: IntervalPlan,
+        run_id: str,
+    ) -> RefreshRun:
         try:
             universe = self._universe(request)
         except Exception as exc:

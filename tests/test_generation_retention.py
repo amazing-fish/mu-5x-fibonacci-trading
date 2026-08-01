@@ -409,6 +409,72 @@ class GenerationRetentionTests(unittest.TestCase):
                 {(path.parent.name, path.stem) for path in watchlist_paths},
             )
 
+            class PendingOrderBroker:
+                def get_positions(self, *, inst_type=None, inst_id=None):
+                    return {"code": "0", "data": []}
+
+                def get_open_orders(self, *, inst_type=None, inst_id=None):
+                    return {
+                        "code": "0",
+                        "data": [
+                            {
+                                "instId": unselected_symbol,
+                                "clOrdId": "OD" + "A" * 20,
+                                "ordId": "pending-1",
+                                "state": "live",
+                                "ordType": "limit",
+                                "side": "buy",
+                            }
+                        ],
+                    }
+
+                def cancel_order(self, **_kwargs):
+                    return {"code": "0", "data": [{"sCode": "0"}]}
+
+            live_snapshot_paths = []
+
+            def recording_live_read(store, path):
+                live_snapshot_paths.append(Path(path))
+                return original_read_file_bytes(store, path)
+
+            def wait_scanner(symbol, *_args, **_kwargs):
+                from mu_strategy.entry.scanner import EntryScanResult
+
+                return EntryScanResult(
+                    symbol=symbol,
+                    action="wait",
+                    reason="test_wait",
+                    last_close=100.0,
+                    regime_1h="yellow",
+                    rsi14=None,
+                    macd_hist=None,
+                    macd_hist_prev=None,
+                )
+
+            with patch.object(TrustedDataStore, "read_file_bytes", recording_live_read):
+                with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=DAY_MS):
+                    live_result = run_once(
+                        DemoTradingConfig(
+                            universe_limit=1,
+                            dry_run=False,
+                            data_dir=data_dir,
+                            days=1,
+                            watchlist_symbols=(),
+                        ),
+                        broker=PendingOrderBroker(),
+                        scanner=wait_scanner,
+                    )
+
+            self.assertIsNone(live_result["universe_error"])
+            self.assertEqual(
+                {
+                    (symbol, interval)
+                    for symbol in (top_symbol, unselected_symbol)
+                    for interval in ("5m", "15m", "1h")
+                },
+                {(path.parent.name, path.stem) for path in live_snapshot_paths},
+            )
+
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
@@ -558,6 +624,41 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(abandoned.is_dir())
             self.assertEqual((), report.removed_ids)
             self.assertEqual("run-current", report.failures[0].generation_id)
+
+    def test_refresh_error_releases_preparation_lease_for_later_reclamation(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-current",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+
+            with patch.object(store, "write_csv", side_effect=OSError("generation write failed")):
+                with self.assertRaisesRegex(OSError, "generation write failed"):
+                    RefreshTrustedMarketData(store, _StaticProvider()).execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id="run-aborted",
+                        )
+                    )
+
+            report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertEqual(("run-aborted",), report.removed_ids)
+            self.assertFalse((data_dir / "generations" / "run-aborted").exists())
+            self.assertTrue((data_dir / "generations" / "run-current").is_dir())
 
     def test_context_manifest_and_file_snapshot_share_one_store_lock(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle

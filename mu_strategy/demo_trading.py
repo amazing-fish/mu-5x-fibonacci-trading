@@ -93,6 +93,7 @@ def run_once(
     open_exposure = 0
     open_position_inst_ids: set[str] = set()
     open_order_inst_ids: set[str] = set()
+    open_order_scan_inst_ids: set[str] = set()
     open_order_rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
@@ -104,7 +105,7 @@ def run_once(
         else None
     )
 
-    if trusted_loader is not None and universe_provider is None:
+    if trusted_loader is not None and universe_provider is None and config.dry_run:
         try:
             trusted_context = trusted_loader.open_context(
                 dataset_key_selector=lambda manifest: _demo_context_dataset_keys(config, manifest)
@@ -136,7 +137,19 @@ def run_once(
         if not _okx_response_failed(open_orders):
             open_order_inst_ids = _open_order_inst_ids(open_orders)
             open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
+            open_order_scan_inst_ids = _open_order_scan_inst_ids(open_order_rows_by_inst_id)
             existing_client_order_ids = _client_order_ids(open_orders)
+        if trusted_loader is not None and universe_provider is None and universe_error is None:
+            try:
+                trusted_context = trusted_loader.open_context(
+                    dataset_key_selector=lambda manifest: _demo_context_dataset_keys(
+                        config,
+                        manifest,
+                        extra_symbols=tuple(sorted(open_order_scan_inst_ids)),
+                    )
+                )
+            except Exception as exc:
+                universe_error = _universe_load_error(exc)
         if account_error is None:
             open_exposure = _count_open_exposure(positions, open_orders)
             open_position_inst_ids = _open_position_inst_ids(positions)
@@ -148,7 +161,10 @@ def run_once(
                     )
                     if trusted_loader is not None and trusted_context is None:
                         trusted_context = trusted_loader.open_context(
-                            dataset_keys=_demo_dataset_keys_for_tickers(selected_tickers)
+                            dataset_keys=_demo_dataset_keys_for_tickers(
+                                selected_tickers,
+                                extra_symbols=tuple(sorted(open_order_scan_inst_ids)),
+                            )
                         )
                     tickers = selected_tickers
                 except Exception as exc:
@@ -451,6 +467,8 @@ def _dedupe_manifest_tickers(tickers: list[OKXSwapTicker]) -> list[OKXSwapTicker
 def _demo_context_dataset_keys(
     config: DemoTradingConfig,
     manifest: TrustedManifestSnapshot,
+    *,
+    extra_symbols: tuple[str, ...] = (),
 ) -> tuple[DatasetKey, ...]:
     tickers = _merge_watchlist_tickers(
         _tickers_from_universe_snapshot(
@@ -459,14 +477,24 @@ def _demo_context_dataset_keys(
         ),
         config.watchlist_symbols,
     )
-    return _demo_dataset_keys_for_tickers(tickers)
+    return _demo_dataset_keys_for_tickers(tickers, extra_symbols=extra_symbols)
 
 
-def _demo_dataset_keys_for_tickers(tickers: list[OKXSwapTicker]) -> tuple[DatasetKey, ...]:
+def _demo_dataset_keys_for_tickers(
+    tickers: list[OKXSwapTicker],
+    *,
+    extra_symbols: tuple[str, ...] = (),
+) -> tuple[DatasetKey, ...]:
     effective_intervals = IntervalDependencyPlanner().plan(DEMO_REQUESTED_INTERVALS).effective_intervals
+    symbols = list(
+        dict.fromkeys(
+            [ticker.inst_id for ticker in tickers]
+            + [resolve_okx_swap_symbol(symbol).inst_id for symbol in extra_symbols]
+        )
+    )
     return tuple(
-        DatasetKey(ticker.inst_id, interval)
-        for ticker in tickers
+        DatasetKey(symbol, interval)
+        for symbol in symbols
         for interval in effective_intervals
     )
 
@@ -777,6 +805,16 @@ def _tickers_to_scan(
         scan_tickers.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0, source="open_order"))
         seen.add(inst_id)
     return scan_tickers
+
+
+def _open_order_scan_inst_ids(
+    open_order_rows_by_inst_id: dict[str, list[dict[str, Any]]],
+) -> set[str]:
+    return {
+        inst_id
+        for inst_id, rows in open_order_rows_by_inst_id.items()
+        if any(_is_bot_fib_limit_order(row) for row in rows)
+    }
 
 
 def _expire_stale_limit_orders(
