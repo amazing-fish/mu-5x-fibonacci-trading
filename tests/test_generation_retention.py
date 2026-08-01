@@ -97,6 +97,44 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(run.refresh_segments[0].reused_prior_generation)
             self.assertEqual("incremental_reuse", run.refresh_segments[0].fetch_mode)
 
+    def test_open_load_context_survives_reclamation_of_its_generation(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            writer_store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
+            request = dict(
+                requested_intervals=("5m",),
+                days=1,
+                symbols=(SYMBOL,),
+                now_ms=DAY_MS,
+            )
+            RefreshTrustedMarketData(writer_store, _StaticProvider()).execute(
+                RefreshTrustedMarketDataRequest(**request, run_id="run-old")
+            )
+            loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir))
+            old_context = loader.open_context(now_ms=DAY_MS)
+
+            RefreshTrustedMarketData(writer_store, _StaticProvider()).execute(
+                RefreshTrustedMarketDataRequest(**request, run_id="run-new")
+            )
+            self.assertFalse((data_dir / "generations" / "run-old").exists())
+            old_bundle = loader.execute(
+                LoadTrustedBundleQuery(SYMBOL, intervals=("5m",), days=1),
+                observe_only_policy(),
+                context=old_context,
+            )
+
+            self.assertEqual("run-old", old_bundle.run_id)
+            self.assertTrue(old_bundle.trust_decision.allowed)
+            self.assertTrue(old_bundle.candles_by_interval["5m"])
+
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 

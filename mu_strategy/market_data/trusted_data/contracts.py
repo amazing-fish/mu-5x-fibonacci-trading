@@ -291,11 +291,21 @@ class TrustedManifestSnapshot:
 
 
 @dataclass(frozen=True)
+class TrustedDatasetFileSnapshot:
+    key: DatasetKey
+    source_file: Path
+    payload: bytes | None = field(repr=False)
+    error_type: str | None = None
+    message: str | None = None
+
+
+@dataclass(frozen=True)
 class TrustedLoadContext:
     manifest: TrustedManifestSnapshot
     observed_at_ms: int
     generation_root: Path
     generation_id: str
+    dataset_file_snapshots: tuple[TrustedDatasetFileSnapshot, ...] | None = field(default=None, repr=False)
 
 
 def derive_snapshot_usability(
