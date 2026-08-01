@@ -566,10 +566,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertTrue(bundle.candles_by_interval["15m"])
         self.assertTrue(bundle.candles_by_interval["1h"])
 
-    def test_refresh_accepts_requested_coverage_left_boundary_one_interval_tolerance(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+    def test_complete_logical_coverage_tolerance_does_not_replace_month_lookbehind_proof(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
-        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.store import SegmentCorrectionError, TrustedDataStore
         from mu_strategy.market_data.trusted_data.validation import aggregate_candles
         from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 
@@ -583,25 +582,18 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
-                RefreshTrustedMarketDataRequest(
-                    requested_intervals=("15m", "1h"),
-                    days=14,
-                    limit=1,
-                    stock_token_inst_ids=set(),
-                    now_ms=end_ms,
+            with self.assertRaisesRegex(SegmentCorrectionError, "complete month lookbehind"):
+                RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
+                    RefreshTrustedMarketDataRequest(
+                        requested_intervals=("15m", "1h"),
+                        days=14,
+                        limit=1,
+                        stock_token_inst_ids=set(),
+                        now_ms=end_ms,
+                    )
                 )
-            )
-            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
 
-        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
-        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
-        self.assertEqual("usable", manifest["snapshot_usability"])
-        for interval in ("5m", "15m", "1h"):
-            with self.subTest(interval=interval):
-                health = run.datasets[("BTC-USDT-SWAP", interval)]
-                self.assertEqual("ok", health.primary_reason.value)
-                self.assertEqual(interval_to_ms(interval), health.first_timestamp_ms)
+            self.assertFalse(any((data_dir / "segments").rglob("*.csv")))
 
     def test_refresh_accepts_okx_history_when_confirmed_candles_lag_wall_clock(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
@@ -627,11 +619,10 @@ class TrustedDataRefreshTests(unittest.TestCase):
         pages: dict[str, tuple[list[Candle], list[Candle]]] = {}
         for interval, rows in history.items():
             latest_confirmed_ms = wall_end_ms - confirmed_lags_ms[interval]
-            required_start_ms = latest_confirmed_ms - (days * DAY_MS)
             interval_rows = [bar for bar in rows if bar.open_time_ms <= latest_confirmed_ms]
             pages[interval] = (
                 [bar for bar in interval_rows if wall_start_ms <= bar.open_time_ms <= latest_confirmed_ms],
-                [bar for bar in interval_rows if required_start_ms <= bar.open_time_ms < wall_start_ms],
+                [bar for bar in interval_rows if 0 <= bar.open_time_ms < wall_start_ms],
             )
             self.assertTrue(pages[interval][0], interval)
             self.assertTrue(pages[interval][1], interval)
@@ -729,7 +720,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
             ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             history_fetcher=lambda symbol, interval, *, days: short_history[interval],
         )
-        full_five = range_candles(interval_to_ms("5m"), 14 * DAY_MS)
+        full_five = range_candles(0, 14 * DAY_MS)
         full_history = {"5m": full_five, "15m": aggregate_candles(full_five, interval="15m"), "1h": aggregate_candles(full_five, interval="1h")}
 
         class FullHistoryProvider(RecordingProvider):
@@ -770,7 +761,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 
         one_day_end_ms = 20 * DAY_MS
-        one_day_five = range_candles(one_day_end_ms - DAY_MS, one_day_end_ms)
+        one_day_five = range_candles(0, one_day_end_ms)
         one_day_history = {
             "5m": one_day_five,
             "15m": aggregate_candles(one_day_five, interval="15m"),
@@ -909,7 +900,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS
 
         end_ms = 20 * DAY_MS
-        five = range_candles(end_ms - DAY_MS, end_ms)
+        five = range_candles(0, end_ms)
         candles_by_interval = {"5m": five, "15m": aggregate_candles(five, interval="15m"), "1h": aggregate_candles(five, interval="1h")}
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

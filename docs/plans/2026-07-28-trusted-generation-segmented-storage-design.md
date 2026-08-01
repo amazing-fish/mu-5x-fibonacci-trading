@@ -166,11 +166,16 @@ built/native relationship cannot be proven from invalid base evidence.
 For a valid base, both logical health/hash material and writer input are limited to parent rows
 inside the complete `5m` comparison window; independently fetched native edge rows that were not
 compared never become canonical.
-Thirty-two days cover the complete UTC month containing any logical-window start. A later wider
-request can therefore move `start_row` earlier inside that stored month without prepending rows or
-changing an older manifest's offsets. Extra provider rows before the already stored physical prefix
-are ignored; every overlapping timestamp must still match canonically, and a logical slice outside
-the stored lookbehind fails closed.
+Thirty-two days are sufficient to cover the complete UTC month containing any logical-window
+start, but the request size is not proof that the provider returned those rows. Physical partitions
+before the logical start month are discarded. When a full-history result completely covers the
+requested logical window, a missing canonical start month is written only when its first candle is
+the UTC month open; a shortened response that nevertheless satisfies logical coverage therefore
+fails before shared mutation. Explicit `partial_available_history` remains a distinct, visible
+state and does not claim this proof. A later wider request can move `start_row` earlier inside a
+complete stored month without prepending rows or changing an older manifest's offsets. Extra
+provider rows before the already stored physical prefix are ignored; every overlapping timestamp
+must still match canonically, and a logical slice outside the stored lookbehind fails closed.
 
 A healthy flat-v3 current generation is readable compatibility evidence, not a safe incremental
 base for the first canonical v4 month. Refresh verifies that v3 dataset, then forces a full-history
@@ -267,8 +272,9 @@ explicit migration operation owned by the trusted refresh/storage writer boundar
 
 1. accept an exact source v3 run ID and a distinct target v4 run ID;
 2. parse the source as schema v3 only and bind its manifest run ID to its directory;
-3. read exact generation-local paths and verify rows, timestamps, per-dataset logical hashes,
-   health, interval dependencies, and usability;
+3. before creating the target generation or any shared segment, reject every unusable dataset,
+   read exact generation-local paths, and apply the same local plus built/native bundle validation;
+   verify rows, timestamps, per-dataset logical hashes, health, and interval dependencies;
 4. partition the verified candles through the same UTC key and segment writer used by refresh;
    if the first month begins after UTC month-open, bind only that first reference to
    `YYYY-MM.import-<target_run_id>.csv`, because an offline import has no provider from which to

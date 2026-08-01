@@ -214,6 +214,7 @@ class TrustedDataStore:
         interval: str,
         physical_candles: list[Candle] | None = None,
         import_generation_id: str | None = None,
+        require_complete_start_month: bool = False,
     ) -> DatasetStorage:
         source_root = self.segment_source_root(symbol, interval)
         if not candles:
@@ -225,6 +226,12 @@ class TrustedDataStore:
         physical_partitions = _partition_candles_by_utc_month(
             physical_candles if physical_candles is not None else candles
         )
+        first_logical_segment_id = next(iter(logical_partitions))
+        physical_partitions = {
+            segment_id: rows
+            for segment_id, rows in physical_partitions.items()
+            if segment_id >= first_logical_segment_id
+        }
         segment_directory = self.data_dir / source_root
         self._ensure_data_directory(segment_directory)
         with _exclusive_dataset_writer_lock(segment_directory / ".write.lock"):
@@ -235,6 +242,7 @@ class TrustedDataStore:
                 interval=interval,
                 source_root=source_root,
                 import_generation_id=import_generation_id,
+                require_complete_start_month=require_complete_start_month,
             )
 
     def _write_segmented_dataset_locked(
@@ -246,6 +254,7 @@ class TrustedDataStore:
         interval: str,
         source_root: Path,
         import_generation_id: str | None,
+        require_complete_start_month: bool,
     ) -> DatasetStorage:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
         source_files_by_segment: dict[str, Path] = {}
@@ -275,6 +284,15 @@ class TrustedDataStore:
             source_files_by_segment[segment_id] = source_file
             if not path.exists():
                 if source_file == self.segment_source_file(symbol, interval, segment_id):
+                    if (
+                        require_complete_start_month
+                        and segment_id == first_logical_segment_id
+                        and utc_month_segment_id(candidate_rows[0].open_time_ms - 1) == segment_id
+                    ):
+                        raise SegmentCorrectionError(
+                            f"canonical trusted segment requires complete month lookbehind: "
+                            f"{symbol}/{interval}/{segment_id}"
+                        )
                     self._validate_previous_canonical_segment_adjacency(
                         symbol,
                         interval,
@@ -736,6 +754,46 @@ class TrustedDataStore:
         if source_snapshot.schema_version != 3:
             raise ManifestSchemaError("flat import source must be schema v3")
 
+        imported_candles: dict[tuple[str, str], list[Candle]] = {}
+        candles_by_symbol: dict[str, dict[str, list[Candle]]] = {}
+        for (symbol, interval), health in source_snapshot.datasets.items():
+            if not health.is_usable:
+                raise ManifestSchemaError(
+                    f"flat import source dataset is unusable: {symbol}/{interval}"
+                )
+            candles = self.read_generation_dataset(
+                source_snapshot,
+                symbol=symbol,
+                interval=interval,
+                generation_root=source_result.generation_root or self.generation_root(source_generation_id),
+                generation_id=source_generation_id,
+            )
+            imported_candles[(symbol, interval)] = candles
+            candles_by_symbol.setdefault(symbol, {})[interval] = candles
+
+        from mu_strategy.market_data.trusted_data.evaluate import validate_physical_candle_bundle
+
+        for symbol, candles_by_interval in candles_by_symbol.items():
+            intervals = tuple(candles_by_interval)
+            if any(interval in candles_by_interval for interval in ("15m", "1h")) and "5m" not in candles_by_interval:
+                raise ManifestSchemaError(f"flat import parent intervals require 5m evidence: {symbol}")
+            normalized_by_interval, validation_by_interval = validate_physical_candle_bundle(
+                intervals,
+                candles_by_interval,
+            )
+            for interval in intervals:
+                report = validation_by_interval[interval]
+                if not report.ok:
+                    raise ManifestSchemaError(
+                        f"flat import source dataset failed validation: "
+                        f"{symbol}/{interval}/{report.reason.value}"
+                    )
+                if normalized_by_interval[interval] != candles_by_interval[interval]:
+                    raise ManifestSchemaError(
+                        f"flat import source dataset contains unvalidated parent-edge rows: "
+                        f"{symbol}/{interval}"
+                    )
+
         self.prepare_generation(target_generation_id)
         symbols_payload: dict[str, dict[str, Any]] = {}
         for symbol, symbol_entry in (source_result.payload.get("symbols") or {}).items():
@@ -747,15 +805,8 @@ class TrustedDataStore:
             copied_symbol_entry["intervals"] = {}
             symbols_payload[str(symbol)] = copied_symbol_entry
 
-        imported_candles: dict[tuple[str, str], list[Candle]] = {}
         for (symbol, interval), health in source_snapshot.datasets.items():
-            candles = self.read_generation_dataset(
-                source_snapshot,
-                symbol=symbol,
-                interval=interval,
-                generation_root=source_result.generation_root or self.generation_root(source_generation_id),
-                generation_id=source_generation_id,
-            )
+            candles = imported_candles[(symbol, interval)]
             storage = self.write_segmented_dataset(
                 candles,
                 symbol=symbol,
@@ -766,7 +817,6 @@ class TrustedDataStore:
             health_payload.pop("source_file", None)
             health_payload["storage"] = storage.to_dict()
             symbols_payload.setdefault(symbol, {"intervals": {}})["intervals"][interval] = health_payload
-            imported_candles[(symbol, interval)] = candles
 
         manifest = {
             key: copy.deepcopy(value)

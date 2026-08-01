@@ -480,14 +480,31 @@ class RefreshTrustedMarketData:
         }
 
         storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
+        base_candidate = candidates.get((symbol, "5m"))
+        shared_window_end_ms = (
+            max(candle.open_time_ms for candle in base_candidate.candles)
+            if base_candidate is not None and base_candidate.candles
+            else None
+        )
 
         def write_valid_dataset(interval: str, seed: DatasetEvaluationSeed, candles: list[Candle]) -> str:
             candidate = candidates[(symbol, interval)]
+            coverage = assess_requested_coverage(
+                candles,
+                interval=interval,
+                requested_days=days,
+                window_end_time_ms=shared_window_end_ms,
+            )
+            require_complete_start_month = (
+                candidate.diagnostics.fetch_mode in {"full_history", "prior_read_failed_full_history"}
+                and coverage.covered
+            )
             storage_by_dataset[(symbol, interval)] = self.store.write_segmented_dataset(
                 candles,
                 symbol=symbol,
                 interval=interval,
                 physical_candles=seed.candles,
+                require_complete_start_month=require_complete_start_month,
             )
             return candles_content_sha256(candles)
 

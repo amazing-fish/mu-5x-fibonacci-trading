@@ -443,6 +443,45 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertTrue(february_path.exists())
             self.assertEqual(("2026-01", "2026-02"), tuple(ref.segment_id for ref in storage.segments))
 
+    def test_shortened_full_history_does_not_create_partial_canonical_start_month(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        now_ms = FEB_START_MS + 10 * DAY_MS
+        provider = MutableHistoryProvider(
+            _window_candles(now_ms - 2 * DAY_MS, now_ms - STEP_MS)
+        )
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "complete month lookbehind"):
+                RefreshTrustedMarketData(store, provider).execute(
+                    RefreshTrustedMarketDataRequest(
+                        requested_intervals=("5m",),
+                        days=1,
+                        symbols=(SYMBOL,),
+                        now_ms=now_ms,
+                        run_id=RUN_A,
+                    )
+                )
+
+            self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+            self.assertFalse(store.current_path.exists())
+
+            provider.rows = _window_candles(FEB_START_MS, now_ms - STEP_MS)
+            corrected = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    symbols=(SYMBOL,),
+                    now_ms=now_ms,
+                    run_id=RUN_B,
+                )
+            )
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, corrected.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, corrected.snapshot_usability)
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+
     def test_closed_segment_historical_correction_fails_before_publication(self):
         initial_rows = _candles_through(FEB_START_MS)
         provider = MutableHistoryProvider(initial_rows)
@@ -922,6 +961,28 @@ class FlatGenerationImportTests(unittest.TestCase):
             self.assertEqual(source_rows, imported_rows)
             self.assertEqual(candles_content_sha256(source_rows), candles_content_sha256(imported_rows))
             self.assertEqual(target_run, json.loads(store.current_path.read_text(encoding="utf-8"))["generation_id"])
+
+    def test_v3_import_rejects_unusable_dataset_before_shared_or_target_writes(self):
+        rows = _candles_through(FEB_START_MS)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            _write_flat_v3_generation(store, RUN_A, rows)
+            manifest_path = store.generation_manifest_path(RUN_A)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            status = manifest["symbols"][SYMBOL]["intervals"]["5m"]
+            manifest["attempt_status"] = "failed"
+            manifest["snapshot_usability"] = "invalid"
+            status["integrity"] = "invalid"
+            status["freshness"] = "stale"
+            status["reasons"] = ["ohlcv_invalid"]
+            status["validation"] = {"ok": False, "reason": "ohlcv_invalid"}
+            store.write_generation_manifest(RUN_A, manifest)
+
+            with self.assertRaisesRegex(ManifestSchemaError, "source dataset is unusable"):
+                store.import_flat_generation(RUN_A, RUN_B)
+
+            self.assertFalse(store.generation_root(RUN_B).exists())
+            self.assertFalse(store.segments_dir.exists())
 
     def test_import_command_is_explicit_and_does_not_publish_without_flag(self):
         from mu_strategy.commands.import_trusted_generation import main
