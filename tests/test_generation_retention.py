@@ -377,6 +377,69 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertTrue(opened_handles)
             self.assertTrue(all(handle.closed for handle in opened_handles))
 
+    def test_healthy_load_preserves_unrequested_missing_datasets_as_error_snapshots(self):
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import observe_only_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        healthy_symbol = "ETH-USDT-SWAP"
+        missing_symbol = "BTC-USDT-SWAP"
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            manifest = write_generation_publication(
+                data_dir,
+                symbol=healthy_symbol,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-degraded",
+            )
+            store = TrustedDataStore(data_dir=data_dir)
+            missing_intervals = {}
+            for interval, healthy in manifest["symbols"][healthy_symbol]["intervals"].items():
+                missing_intervals[interval] = {
+                    **healthy,
+                    "symbol": missing_symbol,
+                    "availability": "missing",
+                    "integrity": "unknown",
+                    "freshness": "unknown",
+                    "reasons": ["cache_missing"],
+                    "rows": 0,
+                    "first_timestamp_ms": None,
+                    "last_timestamp_ms": None,
+                    "source_file": store.generation_source_file(missing_symbol, interval).as_posix(),
+                    "content_sha256": None,
+                    "validation": {"ok": False, "reason": "cache_missing"},
+                }
+            manifest["attempt_status"] = "degraded"
+            manifest["snapshot_usability"] = "invalid"
+            manifest["symbols"][missing_symbol] = {"intervals": missing_intervals}
+            manifest["provider_failures"] = [
+                {
+                    "symbol": missing_symbol,
+                    "interval": "*",
+                    "reason": "refresh_failed",
+                    "error_type": "TimeoutError",
+                    "message": "blocked",
+                }
+            ]
+            store.write_generation_manifest("run-degraded", manifest)
+
+            bundle = LoadTrustedBundle(store).execute(
+                LoadTrustedBundleQuery(healthy_symbol, intervals=("5m",), days=1, now_ms=DAY_MS),
+                observe_only_policy(),
+            )
+
+            self.assertTrue(bundle.candles_by_interval["5m"])
+            missing_snapshots = [
+                snapshot
+                for snapshot in bundle.load_context.dataset_file_snapshots
+                if snapshot.key.symbol == missing_symbol
+            ]
+            self.assertEqual(3, len(missing_snapshots))
+            self.assertTrue(all(snapshot.payload is None for snapshot in missing_snapshots))
+            self.assertTrue(all(snapshot.error_type == "FileNotFoundError" for snapshot in missing_snapshots))
+            bundle.load_context.close()
+
     def test_reclamation_treats_missing_manifest_dataset_as_unleased(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 

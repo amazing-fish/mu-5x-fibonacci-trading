@@ -397,6 +397,17 @@ class LoadTrustedBundle:
                     try:
                         payload = self.store.read_file_bytes(path)
                     except Exception as snapshot_error:
+                        if health.availability != AvailabilityState.AVAILABLE:
+                            fallback_snapshots.append(
+                                TrustedDatasetFileSnapshot(
+                                    key=health.key,
+                                    source_file=path,
+                                    payload=None,
+                                    error_type=type(snapshot_error).__name__,
+                                    message=str(snapshot_error),
+                                )
+                            )
+                            continue
                         raise RuntimeError(
                             f"unable to preserve trusted dataset {health.key.tuple()} after "
                             f"{type(lease_error).__name__}: {lease_error}"
