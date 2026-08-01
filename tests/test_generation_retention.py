@@ -368,6 +368,26 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertEqual(report.candidate_ids, report.removed_ids)
             self.assertEqual(["run-current"], _generation_ids(data_dir))
 
+    def test_invalid_entry_is_preserved_without_blocking_valid_reclamation(self):
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_plain_generation(data_dir, "run-old", b"old", mtime_ns=1_000_000_000)
+            _write_plain_generation(data_dir, "run-current", b"current", mtime_ns=2_000_000_000)
+            invalid_entry = data_dir / "generations" / "not-a-directory"
+            invalid_entry.write_bytes(b"preserve me")
+            _write_current_pointer(data_dir, "run-current")
+
+            report = TrustedDataStore(data_dir=data_dir).reclaim_generations(
+                GenerationRetentionPolicy(keep_recent=1)
+            )
+
+            self.assertEqual(("run-old",), report.removed_ids)
+            self.assertEqual("not-a-directory", report.failures[0].generation_id)
+            self.assertEqual(b"preserve me", invalid_entry.read_bytes())
+            self.assertTrue((data_dir / "generations" / "run-current").is_dir())
+
     def test_keep_recent_lower_bound_rejects_zero_and_bool(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy
 

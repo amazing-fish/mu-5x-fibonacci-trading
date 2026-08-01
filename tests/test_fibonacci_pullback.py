@@ -138,29 +138,20 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
 
         now_ms = DAY_MS
         symbols = ("MU-USDT-SWAP", "BTC-USDT-SWAP")
+        all_symbols = (*symbols, "SPCX-USDT-SWAP")
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "trusted"
             report_path = root / "multi-asset.md"
-            write_generation_manifest_and_caches(
-                data_dir,
-                symbol=symbols[0],
-                days=1,
-                run_id="old-run",
-                universe_symbols=(symbols[0],),
-            )
-            for run_id, symbol in (
-                ("old-run", symbols[1]),
-                ("new-run", symbols[0]),
-                ("new-run", symbols[1]),
-            ):
-                write_generation_manifest_and_caches(
-                    data_dir,
-                    symbol=symbol,
-                    days=1,
-                    run_id=run_id,
-                    universe_symbols=symbols,
-                )
+            for run_id in ("old-run", "new-run"):
+                for index, symbol in enumerate(all_symbols, start=1):
+                    write_generation_manifest_and_caches(
+                        data_dir,
+                        symbol=symbol,
+                        days=1,
+                        run_id=run_id,
+                        universe_symbols=all_symbols[:index],
+                    )
             store = TrustedDataStore(data_dir=data_dir)
             store.replace_current("old-run")
             contexts = []
@@ -207,6 +198,10 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertEqual(["old-run", "old-run"], [context.generation_id for context in contexts])
             self.assertIs(contexts[0], contexts[1])
+            self.assertEqual(
+                set(symbols),
+                {snapshot.key.symbol for snapshot in contexts[0].dataset_file_snapshots},
+            )
             self.assertIn(str(Path("generations") / "old-run"), report)
             self.assertNotIn(str(Path("generations") / "new-run"), report)
 

@@ -52,8 +52,12 @@ class LoadTrustedBundle:
         self,
         *,
         now_ms: int | None = None,
+        dataset_keys: tuple[DatasetKey, ...] | None = None,
     ) -> TrustedLoadContext:
-        context, manifest_result = self._open_context_result(now_ms=now_ms)
+        context, manifest_result = self._open_context_result(
+            now_ms=now_ms,
+            dataset_keys=dataset_keys,
+        )
         if context is None:
             reason = manifest_result.reason or HealthReason.MANIFEST_BLOCKED
             message = manifest_result.message or reason.value
@@ -227,6 +231,8 @@ class LoadTrustedBundle:
         dataset_keys: tuple[DatasetKey, ...] | None = None,
     ):
         observed_at_ms = int(now_ms if now_ms is not None else self.clock.now_ms())
+        if dataset_keys is not None:
+            dataset_keys = tuple(dict.fromkeys(dataset_keys))
         with self.store.publication_snapshot_lock():
             return self._open_context_result_locked(
                 observed_at_ms,

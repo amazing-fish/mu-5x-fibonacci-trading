@@ -10,7 +10,7 @@ from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
-from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext
+from mu_strategy.market_data.trusted_data.contracts import DatasetKey, TrustedLoadContext
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.models import BacktestResult, Candle
@@ -477,9 +477,16 @@ def main() -> None:
                     raise ValueError(f"trusted data layer supports OKX sources only; got source {asset.source!r}")
             asset_results: list[AssetFibonacciBacktest] = []
             data_dir = args.data_dir or Path("data/live")
-            trusted_context = LoadTrustedBundle(
-                TrustedDataStore(data_dir=data_dir)
-            ).open_context()
+            loader = LoadTrustedBundle(TrustedDataStore(data_dir=data_dir))
+            effective_intervals = loader.planner.plan(TRUSTED_REQUESTED_INTERVALS).effective_intervals
+            dataset_keys = tuple(
+                dict.fromkeys(
+                    DatasetKey(asset.symbol, interval)
+                    for asset in assets
+                    for interval in effective_intervals
+                )
+            )
+            trusted_context = loader.open_context(dataset_keys=dataset_keys)
             for asset in assets:
                 asset_result, _ = _run_asset_fibonacci_backtest(
                     asset,

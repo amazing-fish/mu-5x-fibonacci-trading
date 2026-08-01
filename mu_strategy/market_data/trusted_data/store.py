@@ -381,7 +381,7 @@ class TrustedDataStore:
                 failures=tuple(failures),
             )
 
-        generations: list[Path] = []
+        generations: list[tuple[Path, int]] = []
         for entry in entries:
             try:
                 target = self._validated_reclamation_target(entry)
@@ -390,16 +390,9 @@ class TrustedDataStore:
                     continue
                 if manifest_path.is_symlink() or not manifest_path.is_file():
                     raise ValueError(f"trusted generation manifest must be a regular file: {target.name}")
-                generations.append(target)
+                generations.append((target, target.stat().st_mtime_ns))
             except Exception as exc:
                 failures.append(GenerationReclamationFailure(entry.name or None, type(exc).__name__, str(exc)))
-        if failures:
-            return GenerationReclamationReport(
-                dry_run=dry_run,
-                keep_recent=policy.keep_recent,
-                current_generation_id=current_generation_id,
-                failures=tuple(failures),
-            )
 
         try:
             current_target = self._validated_reclamation_target(self.generations_dir / current_generation_id)
@@ -412,7 +405,13 @@ class TrustedDataStore:
                 failures=tuple(failures),
             )
 
-        ordered = sorted(generations, key=lambda path: (path.stat().st_mtime_ns, path.name))
+        ordered = [
+            path
+            for path, _ in sorted(
+                generations,
+                key=lambda item: (item[1], item[0].name),
+            )
+        ]
         protected_ids = {path.name for path in ordered[-policy.keep_recent :]}
         protected_ids.add(current_target.name)
         candidates = tuple(path for path in ordered if path.name not in protected_ids)
