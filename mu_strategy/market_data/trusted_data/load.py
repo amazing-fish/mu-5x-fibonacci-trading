@@ -227,7 +227,7 @@ class LoadTrustedBundle:
         self,
         observed_at_ms: int | None,
     ):
-        manifest_result = self.store.read_manifest()
+        manifest_result = self.store.read_manifest(_snapshot_lock_held=True)
         if not manifest_result.ok or manifest_result.snapshot is None:
             return None, manifest_result
         if manifest_result.generation_id is None:

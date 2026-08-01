@@ -235,6 +235,88 @@ class GenerationRetentionTests(unittest.TestCase):
             self.assertFalse(publisher_thread.is_alive())
             self.assertEqual([], errors)
 
+    def test_overlapping_refreshes_serialize_prior_generation_reuse(self):
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
+
+        class BlockingIncrementalProvider(_ReuseOnlyProvider):
+            def __init__(self):
+                super().__init__()
+                self.incremental_started = threading.Event()
+                self.release_incremental = threading.Event()
+
+            def fetch_incremental(self, symbol, interval, *, since_time_ms):
+                self.incremental_calls.append((symbol, interval, since_time_ms))
+                self.incremental_started.set()
+                if not self.release_incremental.wait(10):
+                    raise TimeoutError("incremental release timed out")
+                return []
+
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(
+                data_dir,
+                symbol=SYMBOL,
+                start_ms=0,
+                end_ms=DAY_MS - 300_000,
+                run_id="run-old",
+            )
+            policy = GenerationRetentionPolicy(keep_recent=1)
+            slow_provider = BlockingIncrementalProvider()
+            fast_provider = BlockingIncrementalProvider()
+            fast_provider.release_incremental.set()
+            slow_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir, retention_policy=policy),
+                slow_provider,
+            )
+            fast_refresh = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=data_dir, retention_policy=policy),
+                fast_provider,
+            )
+            results = {}
+            errors = []
+
+            def execute(name, refresh, run_id):
+                try:
+                    results[name] = refresh.execute(
+                        RefreshTrustedMarketDataRequest(
+                            requested_intervals=("5m",),
+                            days=1,
+                            symbols=(SYMBOL,),
+                            now_ms=DAY_MS,
+                            run_id=run_id,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            slow_thread = threading.Thread(target=execute, args=("slow", slow_refresh, "run-slow"))
+            fast_thread = threading.Thread(target=execute, args=("fast", fast_refresh, "run-fast"))
+            slow_thread.start()
+            try:
+                self.assertTrue(slow_provider.incremental_started.wait(10))
+                fast_thread.start()
+                self.assertFalse(
+                    fast_provider.incremental_started.wait(0.25),
+                    "overlapping refresh read the prior generation before its owner committed",
+                )
+            finally:
+                slow_provider.release_incremental.set()
+                slow_thread.join(10)
+                fast_thread.join(10)
+
+            self.assertFalse(slow_thread.is_alive())
+            self.assertFalse(fast_thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertTrue(results["slow"].refresh_segments[0].reused_prior_generation)
+            self.assertTrue(results["fast"].refresh_segments[0].reused_prior_generation)
+            self.assertEqual([], slow_provider.history_calls)
+            self.assertEqual([], fast_provider.history_calls)
+            self.assertEqual(
+                "run-fast",
+                json.loads((data_dir / "current.json").read_text(encoding="utf-8"))["generation_id"],
+            )
+
     def test_keep_one_removes_exactly_the_oldest_non_current_generations(self):
         from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
 
@@ -846,6 +928,21 @@ class GenerationRetentionTests(unittest.TestCase):
 
             rows = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(["run-0", "run-1", "run-2"], [row["run_id"] for row in rows])
+
+    def test_run_log_discards_tail_torn_inside_multibyte_utf8(self):
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp), run_log_max_lines=3)
+            complete = json.dumps({"run_id": "run-0"}, ensure_ascii=False).encode("utf-8") + b"\n"
+            multibyte_prefix = "中".encode("utf-8")[:1]
+            store.run_log_path.write_bytes(complete + b'{"message":"' + multibyte_prefix)
+
+            store.append_run_log({"run_id": "run-1", "message": "中文"})
+
+            rows = [json.loads(line) for line in store.run_log_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(["run-0", "run-1"], [row["run_id"] for row in rows])
+            self.assertEqual("中文", rows[-1]["message"])
 
 
 class ConsumerReclamationBoundaryTests(unittest.TestCase):

@@ -81,6 +81,7 @@ class TrustedDataStore:
         self.retention_policy = retention_policy
         self.reclamation_dry_run = reclamation_dry_run
         self.last_reclamation_report: GenerationReclamationReport | None = None
+        self._refresh_lifecycle_lock = None
 
     @property
     def current_path(self) -> Path:
@@ -152,10 +153,44 @@ class TrustedDataStore:
         finally:
             _cleanup_tmp(tmp_path)
 
-    def read_manifest(self) -> ManifestReadResult:
+    def read_manifest(self, *, _snapshot_lock_held: bool = False) -> ManifestReadResult:
+        if self.retention_policy is not None and not _snapshot_lock_held:
+            self._acquire_refresh_lifecycle_lock()
+            try:
+                result = self._read_manifest_without_refresh_lock()
+            except BaseException:
+                self._release_refresh_lifecycle_lock()
+                raise
+            if not result.ok:
+                self._release_refresh_lifecycle_lock()
+            return result
+        return self._read_manifest_without_refresh_lock()
+
+    def _read_manifest_without_refresh_lock(self) -> ManifestReadResult:
         if not self.current_path.exists():
             return ManifestReadResult(None, None, HealthReason.MANIFEST_MISSING)
         return self._read_current_manifest()
+
+    def _acquire_refresh_lifecycle_lock(self) -> None:
+        if self._refresh_lifecycle_lock is not None or not self.generations_dir.is_dir():
+            return
+        lifecycle_lock = _trusted_store_lock(self.generations_dir)
+        lifecycle_lock.__enter__()
+        self._refresh_lifecycle_lock = lifecycle_lock
+
+    def _release_refresh_lifecycle_lock(self) -> None:
+        lifecycle_lock = self._refresh_lifecycle_lock
+        self._refresh_lifecycle_lock = None
+        if lifecycle_lock is not None:
+            lifecycle_lock.__exit__(None, None, None)
+
+    @contextmanager
+    def _standalone_reclamation_lock(self):
+        if self._refresh_lifecycle_lock is not None or not self.generations_dir.is_dir():
+            yield
+            return
+        with _trusted_store_lock(self.generations_dir):
+            yield
 
     def _read_current_manifest(self) -> ManifestReadResult:
         try:
@@ -270,12 +305,15 @@ class TrustedDataStore:
         run_log_payload: dict[str, Any],
     ) -> tuple[str, ...]:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        with _trusted_store_lock(self.data_dir):
-            return self._commit_generation_publication_locked(
-                generation_id,
-                manifest,
-                run_log_payload,
-            )
+        try:
+            with self.publication_snapshot_lock():
+                return self._commit_generation_publication_locked(
+                    generation_id,
+                    manifest,
+                    run_log_payload,
+                )
+        finally:
+            self._release_refresh_lifecycle_lock()
 
     def _commit_generation_publication_locked(
         self,
@@ -344,11 +382,18 @@ class TrustedDataStore:
         path = self.run_log_path
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
-        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
-        existing_lines = existing_text.splitlines(keepends=True)
-        incomplete_tail = bool(existing_lines and not existing_lines[-1].endswith(("\n", "\r")))
+        existing_bytes = path.read_bytes() if path.exists() else b""
+        existing_byte_lines = existing_bytes.splitlines(keepends=True)
+        incomplete_tail = bool(
+            existing_byte_lines
+            and not existing_byte_lines[-1].endswith((b"\n", b"\r"))
+        )
         if incomplete_tail:
-            existing_lines.pop()
+            existing_byte_lines.pop()
+        existing_lines = [
+            byte_line.rstrip(b"\r\n").decode("utf-8") + "\n"
+            for byte_line in existing_byte_lines
+        ]
         if len(existing_lines) >= self.run_log_max_lines or incomplete_tail:
             keep_count = self.run_log_max_lines - 1
             retained = existing_lines[-keep_count:] if keep_count else []
@@ -378,8 +423,9 @@ class TrustedDataStore:
                     ),
                 ),
             )
-        with _trusted_store_lock(self.data_dir):
-            return self._reclaim_generations_locked(policy, dry_run=dry_run)
+        with self._standalone_reclamation_lock():
+            with self.publication_snapshot_lock():
+                return self._reclaim_generations_locked(policy, dry_run=dry_run)
 
     def _reclaim_generations_locked(
         self,
