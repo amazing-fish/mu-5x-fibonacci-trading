@@ -141,6 +141,11 @@ A writer may:
 4. extend a formerly trailing segment once more as it becomes closed at month rollover; and
 5. reuse an already closed segment without opening it for replacement.
 
+Before creating a canonical month, the writer reads the latest existing canonical predecessor
+under the same dataset lock and requires exact one-interval adjacency. A shortened predecessor
+therefore cannot be made permanently closed by a later month; after its missing tail is supplied,
+the same refresh can append that tail and then create the adjacent month.
+
 The writer renders a growing trailing month to a temporary CSV and atomically replaces the
 month file only after verifying that the complete existing file is an exact byte prefix of the
 replacement. A generation whose rolling retention window begins inside an existing month records

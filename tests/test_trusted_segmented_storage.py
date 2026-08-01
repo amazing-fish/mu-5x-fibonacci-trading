@@ -417,6 +417,32 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
             self.assertEqual(original_bytes, segment_path.read_bytes())
 
+    def test_new_month_requires_adjacency_to_existing_predecessor(self):
+        initial_rows = _candles_through(FEB_START_MS - 2 * STEP_MS)
+        next_month_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(initial_rows, symbol=SYMBOL, interval="5m")
+            january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            february_path = store.segment_path(SYMBOL, "5m", "2026-02")
+            january_bytes = january_path.read_bytes()
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "not adjacent"):
+                store.write_segmented_dataset(next_month_rows, symbol=SYMBOL, interval="5m")
+
+            self.assertEqual(january_bytes, january_path.read_bytes())
+            self.assertFalse(february_path.exists())
+
+            missing_january_tail = _window_candles(FEB_START_MS - STEP_MS, FEB_START_MS - STEP_MS)
+            storage = store.write_segmented_dataset(
+                [*missing_january_tail, *next_month_rows],
+                symbol=SYMBOL,
+                interval="5m",
+            )
+
+            self.assertTrue(february_path.exists())
+            self.assertEqual(("2026-01", "2026-02"), tuple(ref.segment_id for ref in storage.segments))
+
     def test_closed_segment_historical_correction_fails_before_publication(self):
         initial_rows = _candles_through(FEB_START_MS)
         provider = MutableHistoryProvider(initial_rows)
@@ -454,8 +480,10 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
         extended_rows = [source_rows[0], source_rows[1], source_rows[-1]]
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
-            store.write_segmented_dataset(initial_rows, symbol=SYMBOL, interval="5m")
             january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            february_path = store.segment_path(SYMBOL, "5m", "2026-02")
+            store.write_csv([initial_rows[0]], january_path)
+            store.write_csv([initial_rows[-1]], february_path)
             january_bytes = january_path.read_bytes()
 
             with self.assertRaisesRegex(SegmentCorrectionError, "closed trusted segment cannot grow"):

@@ -274,6 +274,13 @@ class TrustedDataStore:
                 path = self.segment_path(symbol, interval, segment_id)
             source_files_by_segment[segment_id] = source_file
             if not path.exists():
+                if source_file == self.segment_source_file(symbol, interval, segment_id):
+                    self._validate_previous_canonical_segment_adjacency(
+                        symbol,
+                        interval,
+                        segment_id,
+                        candidate_rows[0],
+                    )
                 self.write_csv(candidate_rows, path)
                 physical_rows_by_segment[segment_id] = list(candidate_rows)
                 continue
@@ -364,6 +371,39 @@ class TrustedDataStore:
             for candidate in segment_dir.glob("*.csv")
             if re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", candidate.stem)
         )
+
+    def _validate_previous_canonical_segment_adjacency(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        first_candidate: Candle,
+    ) -> None:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        previous_ids = [
+            candidate.stem
+            for candidate in segment_dir.glob("*.csv")
+            if re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", candidate.stem)
+            and candidate.stem < segment_id
+        ]
+        if not previous_ids:
+            return
+        previous_id = max(previous_ids)
+        previous_path = self.segment_path(symbol, interval, previous_id)
+        previous_rows = self.read_csv(previous_path)
+        _validate_segment_candles(previous_rows, segment_id=previous_id)
+        _validate_candidate_segment_continuity(
+            previous_rows,
+            symbol=symbol,
+            interval=interval,
+            segment_id=previous_id,
+        )
+        expected_first_ms = previous_rows[-1].open_time_ms + interval_to_ms(interval)
+        if first_candidate.open_time_ms != expected_first_ms:
+            raise SegmentCorrectionError(
+                f"new trusted segment is not adjacent to its canonical predecessor: "
+                f"{symbol}/{interval}/{previous_id}->{segment_id}"
+            )
 
     def read_generation_dataset(
         self,
