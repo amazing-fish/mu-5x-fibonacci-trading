@@ -1,4 +1,5 @@
 import errno
+import json
 import unittest
 import warnings
 from pathlib import Path
@@ -237,7 +238,7 @@ class TrustedStoreDurabilityTests(unittest.TestCase):
             )
 
     def test_commit_reports_current_pointer_directory_sync_failure_as_warning(self):
-        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.store import GenerationRetentionPolicy, TrustedDataStore
         from tests.factories.trusted_publication import write_generation_manifest_and_caches
 
         with TemporaryDirectory() as tmp:
@@ -254,7 +255,10 @@ class TrustedStoreDurabilityTests(unittest.TestCase):
                 days=1,
                 run_id="run-new",
             )
-            store = TrustedDataStore(data_dir=data_dir)
+            store = TrustedDataStore(
+                data_dir=data_dir,
+                retention_policy=GenerationRetentionPolicy(keep_recent=1),
+            )
             store.replace_current("run-old")
 
             def fail_current_pointer_directory(directory):
@@ -274,10 +278,24 @@ class TrustedStoreDurabilityTests(unittest.TestCase):
             self.assertEqual(
                 (
                     "current_pointer_directory_sync_failed: OSError: directory sync failed",
+                    "generation_reclamation_failed: generations: CurrentPointerDurabilityUnconfirmed: "
+                    "reclamation skipped because current pointer directory sync failed",
                 ),
                 warnings,
             )
             self.assertEqual("run-new", store.read_manifest().generation_id)
+            self.assertTrue((data_dir / "generations" / "run-old").is_dir())
+            self.assertEqual((), store.last_reclamation_report.removed_ids)
+            self.assertEqual(
+                "CurrentPointerDurabilityUnconfirmed",
+                store.last_reclamation_report.failures[0].error_type,
+            )
+            run_log = json.loads(store.run_log_path.read_text(encoding="utf-8"))
+            self.assertEqual([], run_log["reclamation"]["removed_ids"])
+            self.assertEqual(
+                "CurrentPointerDurabilityUnconfirmed",
+                run_log["reclamation"]["failures"][0]["error_type"],
+            )
 
 
 def _windows_api(

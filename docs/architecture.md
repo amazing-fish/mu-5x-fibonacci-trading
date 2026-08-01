@@ -17,7 +17,7 @@ Module: `mu_strategy.fs_durability`
 
 This low-level module does not define a publication commit point or recovery protocol. Trusted-generation publication, Stage 0 observation append logs, and immutable strategy-release publication still decide independently which file and directory entries must be durable, in what order, and how a failed or ambiguous write is recovered.
 
-Trusted-generation publication keeps atomic replacement of `current.json` as its commit point. File and directory-sync failures before that replacement still fail publication. If the replacement succeeds but syncing its parent directory fails, the new complete pointer is already visible, so the writer reports `current_pointer_directory_sync_failed` as an explicit publication warning instead of returning a false rollback/failure result. A restart after that warning may observe either the previous complete pointer or the new complete pointer; trusted readers continue to validate whichever generation the pointer names.
+Trusted-generation publication keeps atomic replacement of `current.json` as its commit point. File and directory-sync failures before that replacement still fail publication. If the replacement succeeds but syncing its parent directory fails, the new complete pointer is already visible, so the writer reports `current_pointer_directory_sync_failed` as an explicit publication warning instead of returning a false rollback/failure result. A restart after that warning may observe either the previous complete pointer or the new complete pointer; generation reclamation is skipped for that cycle so both possible pointer targets remain present, and trusted readers continue to validate whichever generation the pointer names.
 
 ## Data
 

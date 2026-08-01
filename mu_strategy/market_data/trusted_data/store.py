@@ -31,6 +31,7 @@ from mu_strategy.models import Candle
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_RUN_LOG_MAX_LINES = 1_000
+_CURRENT_POINTER_DIRECTORY_SYNC_WARNING_PREFIX = "current_pointer_directory_sync_failed:"
 # Keep post-commit warnings structured without allowing -Werror to turn them into false failures.
 _CURRENT_POINTER_WARNING_SINK: ContextVar[Callable[[str], None] | None] = ContextVar(
     "trusted_current_pointer_warning_sink",
@@ -289,20 +290,37 @@ class TrustedDataStore:
             _CURRENT_POINTER_WARNING_SINK.reset(warning_sink_token)
         log_payload = dict(run_log_payload)
         if self.retention_policy is not None:
-            try:
-                reclamation = self.reclaim_generations(
-                    self.retention_policy,
-                    dry_run=self.reclamation_dry_run,
-                    _lock_held=True,
+            pointer_durability_unconfirmed = any(
+                warning.startswith(_CURRENT_POINTER_DIRECTORY_SYNC_WARNING_PREFIX)
+                for warning in publication_warnings
+            )
+            if pointer_durability_unconfirmed:
+                failure = GenerationReclamationFailure(
+                    None,
+                    "CurrentPointerDurabilityUnconfirmed",
+                    "reclamation skipped because current pointer directory sync failed",
                 )
-            except Exception as exc:
-                failure = GenerationReclamationFailure(None, type(exc).__name__, str(exc))
                 reclamation = GenerationReclamationReport(
                     dry_run=self.reclamation_dry_run,
                     keep_recent=self.retention_policy.keep_recent,
-                    current_generation_id=None,
+                    current_generation_id=generation_id,
                     failures=(failure,),
                 )
+            else:
+                try:
+                    reclamation = self.reclaim_generations(
+                        self.retention_policy,
+                        dry_run=self.reclamation_dry_run,
+                        _lock_held=True,
+                    )
+                except Exception as exc:
+                    failure = GenerationReclamationFailure(None, type(exc).__name__, str(exc))
+                    reclamation = GenerationReclamationReport(
+                        dry_run=self.reclamation_dry_run,
+                        keep_recent=self.retention_policy.keep_recent,
+                        current_generation_id=None,
+                        failures=(failure,),
+                    )
             self.last_reclamation_report = reclamation
             publication_warnings.extend(reclamation.warnings())
             log_payload["reclamation"] = reclamation.to_dict()
