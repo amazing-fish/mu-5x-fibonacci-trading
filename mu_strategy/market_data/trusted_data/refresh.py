@@ -43,6 +43,9 @@ from mu_strategy.models import Candle
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_REQUEST_MAX_CONCURRENCY = 1
+# Seed the complete UTC month containing any logical-window start without
+# changing requested-days health or manifest coverage semantics.
+SEGMENT_MONTH_LOOKBEHIND_DAYS = 32
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
@@ -327,7 +330,11 @@ class RefreshTrustedMarketData:
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
                 fetch_mode = "incremental_reuse"
             else:
-                fetched = self.provider.fetch_history(symbol, interval, days=days)
+                fetched = self.provider.fetch_history(
+                    symbol,
+                    interval,
+                    days=segmented_history_fetch_days(days),
+                )
                 fetch_mode = "full_history"
             candles = dedupe_candles([*existing, *fetched])
             return DatasetRefreshCandidate(
@@ -352,7 +359,11 @@ class RefreshTrustedMarketData:
         except ReusablePriorDatasetReadError as exc:
             prior_failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
             try:
-                fetched = self.provider.fetch_history(symbol, interval, days=days)
+                fetched = self.provider.fetch_history(
+                    symbol,
+                    interval,
+                    days=segmented_history_fetch_days(days),
+                )
                 candles = dedupe_candles(fetched)
                 return DatasetRefreshCandidate(
                     key=DatasetKey(symbol, interval),
@@ -475,6 +486,7 @@ class RefreshTrustedMarketData:
                 candles,
                 symbol=symbol,
                 interval=interval,
+                physical_candles=seed.candles,
             )
             return candles_content_sha256(candles)
 
@@ -547,6 +559,12 @@ def _is_reusable_prior_health(health: DatasetHealth) -> bool:
         and health.freshness in {FreshnessState.FRESH, FreshnessState.STALE}
         and bool(health.content_sha256)
     )
+
+
+def segmented_history_fetch_days(requested_days: int) -> int:
+    if not isinstance(requested_days, int) or isinstance(requested_days, bool) or requested_days < 1:
+        raise ValueError("requested_days must be a positive integer")
+    return requested_days + SEGMENT_MONTH_LOOKBEHIND_DAYS
 
 
 def _is_reusable_partial_history(health: DatasetHealth, *, requested_days: int) -> bool:

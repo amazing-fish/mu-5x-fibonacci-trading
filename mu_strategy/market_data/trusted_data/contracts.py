@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -705,6 +705,7 @@ def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> d
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UTC_MONTH_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+_UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _SEGMENT_REFERENCE_FIELDS = frozenset(
     {
         "segment_id",
@@ -723,9 +724,10 @@ _DATASET_STORAGE_FIELDS = frozenset({"layout", "source_root", "segments"})
 def utc_month_segment_id(open_time_ms: int) -> str:
     if not _is_int(open_time_ms):
         raise ValueError("open_time_ms must be an integer")
+    seconds, milliseconds = divmod(open_time_ms, 1000)
     try:
-        instant = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
-    except (OSError, OverflowError, ValueError) as exc:
+        instant = _UTC_EPOCH + timedelta(seconds=seconds, milliseconds=milliseconds)
+    except (OverflowError, ValueError) as exc:
         raise ValueError("open_time_ms is outside the supported UTC datetime range") from exc
     return f"{instant.year:04d}-{instant.month:02d}"
 

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import copy
 import csv
+import errno
 import hashlib
 import json
 import logging
 import os
 import re
+import time
 import uuid
 from bisect import bisect_left
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,18 +104,34 @@ class TrustedDataStore:
         return Path("segments") / "okx" / symbol / interval
 
     def segment_source_file(self, symbol: str, interval: str, segment_id: str) -> Path:
+        segment_id = validate_storage_segment(segment_id, field="segment_id")
         if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", segment_id):
             raise ValueError("segment_id must be UTC YYYY-MM")
         return self.segment_source_root(symbol, interval) / f"{segment_id}.csv"
 
     def segment_path(self, symbol: str, interval: str, segment_id: str) -> Path:
-        return self.data_dir / self.segment_source_file(symbol, interval, segment_id)
+        source_file = self.segment_source_file(symbol, interval, segment_id)
+        candidate = self.data_dir / source_file
+        current = candidate
+        while current != self.data_dir and current != current.parent:
+            if current.is_symlink():
+                raise ValueError("trusted segment path must not contain symlinks")
+            current = current.parent
+        resolved_root = self.segments_dir.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+        try:
+            resolved_candidate.relative_to(resolved_root)
+        except ValueError as exc:
+            raise ValueError("trusted segment path must stay inside segments root") from exc
+        return candidate
 
     def prepare_generation(self, generation_id: str) -> Path:
         root = self.generation_root(generation_id)
-        if root.exists():
-            raise FileExistsError(f"trusted generation already exists: {generation_id}")
-        root.mkdir(parents=True)
+        self._ensure_data_directory(self.generations_dir)
+        try:
+            root.mkdir()
+        except FileExistsError as exc:
+            raise FileExistsError(f"trusted generation already exists: {generation_id}") from exc
         _fsync_directory(self.generations_dir)
         return root
 
@@ -121,7 +140,7 @@ class TrustedDataStore:
 
     def write_csv(self, candles: list[Candle], path: Path, *, required_prefix: bytes | None = None) -> None:
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_data_directory(path.parent)
         tmp_path = _tmp_path(path)
         try:
             with tmp_path.open("w", newline="", encoding="utf-8") as handle:
@@ -139,6 +158,30 @@ class TrustedDataStore:
         finally:
             _cleanup_tmp(tmp_path)
 
+    def _ensure_data_directory(self, path: Path) -> None:
+        data_root = self.data_dir.absolute()
+        target = Path(path).absolute()
+        try:
+            relative = target.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError("trusted storage writer path must stay inside data_dir") from exc
+        if not data_root.exists():
+            data_root.mkdir(parents=True)
+            _fsync_directory(data_root.parent)
+        if data_root.is_symlink() or not data_root.is_dir():
+            raise ValueError("trusted data_dir must be a real directory")
+        current = data_root
+        for part in relative.parts:
+            child = current / part
+            try:
+                child.mkdir()
+            except FileExistsError:
+                if child.is_symlink() or not child.is_dir():
+                    raise ValueError(f"trusted storage directory must be a real directory: {child}")
+            else:
+                _fsync_directory(current)
+            current = child
+
     def empty_segmented_storage(self, symbol: str, interval: str) -> DatasetStorage:
         return DatasetStorage(
             layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
@@ -151,6 +194,7 @@ class TrustedDataStore:
         *,
         symbol: str,
         interval: str,
+        physical_candles: list[Candle] | None = None,
     ) -> DatasetStorage:
         source_root = self.segment_source_root(symbol, interval)
         if not candles:
@@ -158,48 +202,88 @@ class TrustedDataStore:
                 layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
                 source_root=source_root,
             )
-        partitions = _partition_candles_by_utc_month(candles)
-        references: list[SegmentReference] = []
-        segment_items = list(partitions.items())
-        for index, (segment_id, segment_candles) in enumerate(segment_items):
+        logical_partitions = _partition_candles_by_utc_month(candles)
+        physical_partitions = _partition_candles_by_utc_month(
+            physical_candles if physical_candles is not None else candles
+        )
+        segment_directory = self.data_dir / source_root
+        self._ensure_data_directory(segment_directory)
+        with _exclusive_dataset_writer_lock(segment_directory / ".write.lock"):
+            return self._write_segmented_dataset_locked(
+                logical_partitions,
+                physical_partitions,
+                symbol=symbol,
+                interval=interval,
+                source_root=source_root,
+            )
+
+    def _write_segmented_dataset_locked(
+        self,
+        logical_partitions: dict[str, list[Candle]],
+        physical_partitions: dict[str, list[Candle]],
+        *,
+        symbol: str,
+        interval: str,
+        source_root: Path,
+    ) -> DatasetStorage:
+        physical_rows_by_segment: dict[str, list[Candle]] = {}
+        for segment_id, candidate_rows in physical_partitions.items():
             path = self.segment_path(symbol, interval, segment_id)
-            closed = index < len(segment_items) - 1
-            start_row = 0
-            physical_rows = len(segment_candles)
-            if path.exists():
-                existing_bytes = path.read_bytes()
-                existing = self.read_csv(path)
-                _validate_segment_candles(existing, segment_id=segment_id)
-                existing_timestamps = [candle.open_time_ms for candle in existing]
-                start_row = bisect_left(existing_timestamps, segment_candles[0].open_time_ms)
-                if start_row < len(existing) and existing[start_row].open_time_ms == segment_candles[0].open_time_ms:
-                    shared_rows = min(len(existing) - start_row, len(segment_candles))
-                elif start_row == len(existing):
-                    shared_rows = 0
-                else:
-                    raise SegmentCorrectionError(
-                        f"trusted segment cannot insert or prepend rows: {symbol}/{interval}/{segment_id}"
-                    )
-                if not _canonical_candles_equal(
-                    existing[start_row : start_row + shared_rows],
-                    segment_candles[:shared_rows],
-                ):
+            if not path.exists():
+                self.write_csv(candidate_rows, path)
+                physical_rows_by_segment[segment_id] = list(candidate_rows)
+                continue
+
+            existing_bytes = path.read_bytes()
+            existing = self.read_csv(path)
+            _validate_segment_candles(existing, segment_id=segment_id)
+            existing_by_timestamp = {candle.open_time_ms: candle for candle in existing}
+            for candidate in candidate_rows:
+                if candidate.open_time_ms < existing[0].open_time_ms:
+                    continue
+                if candidate.open_time_ms > existing[-1].open_time_ms:
+                    break
+                stored = existing_by_timestamp.get(candidate.open_time_ms)
+                if stored is None or stored.to_csv_row() != candidate.to_csv_row():
                     raise SegmentCorrectionError(
                         f"historical correction would rewrite trusted segment: {symbol}/{interval}/{segment_id}"
                     )
-                if len(segment_candles) > shared_rows:
-                    if self._has_later_segment(symbol, interval, segment_id):
-                        raise SegmentCorrectionError(
-                            f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
-                        )
-                    combined = [*existing, *segment_candles[shared_rows:]]
-                    self.write_csv(combined, path, required_prefix=existing_bytes)
-                    physical_rows = len(combined)
-                else:
-                    physical_rows = len(existing)
+            suffix_start = bisect_left(
+                [candle.open_time_ms for candle in candidate_rows],
+                existing[-1].open_time_ms + 1,
+            )
+            suffix = candidate_rows[suffix_start:]
+            if suffix:
+                if self._has_later_segment(symbol, interval, segment_id):
+                    raise SegmentCorrectionError(
+                        f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
+                    )
+                combined = [*existing, *suffix]
+                self.write_csv(combined, path, required_prefix=existing_bytes)
+                physical_rows_by_segment[segment_id] = combined
             else:
-                self.write_csv(segment_candles, path)
-            if closed and start_row + len(segment_candles) != physical_rows:
+                physical_rows_by_segment[segment_id] = existing
+
+        references: list[SegmentReference] = []
+        segment_items = list(logical_partitions.items())
+        for index, (segment_id, segment_candles) in enumerate(segment_items):
+            closed = index < len(segment_items) - 1
+            physical_rows = physical_rows_by_segment.get(segment_id)
+            if physical_rows is None:
+                raise SegmentCorrectionError(
+                    f"physical month lookbehind is missing logical segment: {symbol}/{interval}/{segment_id}"
+                )
+            physical_timestamps = [candle.open_time_ms for candle in physical_rows]
+            start_row = bisect_left(physical_timestamps, segment_candles[0].open_time_ms)
+            if not _canonical_candles_equal(
+                physical_rows[start_row : start_row + len(segment_candles)],
+                segment_candles,
+            ):
+                raise SegmentCorrectionError(
+                    f"physical month lookbehind does not contain logical dataset: "
+                    f"{symbol}/{interval}/{segment_id}"
+                )
+            if closed and start_row + len(segment_candles) != len(physical_rows):
                 raise SegmentCorrectionError(
                     f"closed trusted segment reference must reach physical EOF: {symbol}/{interval}/{segment_id}"
                 )
@@ -343,7 +427,7 @@ class TrustedDataStore:
             expected_source = self.segment_source_file(symbol, interval, reference.segment_id)
             if reference.source_file.as_posix() != expected_source.as_posix():
                 raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
-            path = self.data_dir / expected_source
+            path = self.segment_path(symbol, interval, reference.segment_id)
             segment_candles = self._read_csv_slice(
                 path,
                 start_row=reference.start_row,
@@ -641,6 +725,54 @@ def candles_content_sha256(candles: list[Candle]) -> str:
             digest.update(b"\0")
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+@contextmanager
+def _exclusive_dataset_writer_lock(path: Path):
+    path = Path(path)
+    created = False
+    try:
+        handle = path.open("x+b")
+        created = True
+    except FileExistsError:
+        handle = path.open("r+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"1")
+            _flush_and_fsync(handle)
+        if created:
+            _fsync_directory(path.parent)
+        handle.seek(0)
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        raise OSError(errno.ENOTSUP, f"trusted segment locking is unsupported on platform: {os.name}")
+    finally:
+        handle.close()
 
 
 def _atomic_write_text(

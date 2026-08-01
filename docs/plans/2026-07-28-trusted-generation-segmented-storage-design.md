@@ -134,10 +134,12 @@ closed because its complete UTC month range is in the past relative to that cand
 A writer may:
 
 1. create a missing segment atomically;
-2. grow the one trailing segment only by appending after every overlapping canonical row has
+2. acquire the stable dataset-level `.write.lock`, then re-read the physical segment before any
+   compare/replace decision;
+3. grow the one trailing segment only by appending after every overlapping canonical row has
    matched;
-3. extend a formerly trailing segment once more as it becomes closed at month rollover; and
-4. reuse an already closed segment without opening it for replacement.
+4. extend a formerly trailing segment once more as it becomes closed at month rollover; and
+5. reuse an already closed segment without opening it for replacement.
 
 The writer renders a growing trailing month to a temporary CSV and atomically replaces the
 month file only after verifying that the complete existing file is an exact byte prefix of the
@@ -148,6 +150,20 @@ not create another persistent historical copy. Once a reference is closed, subse
 must compare it and leave its bytes untouched. The existence of any later valid UTC-month file
 in the same dataset directory is the durable physical closure boundary: an earlier file can no
 longer grow, even if a pointer is rolled back or an import attempts to extend it.
+
+On a full-history fetch, refresh asks the provider for the requested logical days plus 32 physical
+lookbehind days. The shared evaluator still applies the exact requested-days health and logical
+window, while the segment writer receives the pre-prune series as unreferenced physical material.
+Thirty-two days cover the complete UTC month containing any logical-window start. A later wider
+request can therefore move `start_row` earlier inside that stored month without prepending rows or
+changing an older manifest's offsets. Extra provider rows before the already stored physical prefix
+are ignored; every overlapping timestamp must still match canonically, and a logical slice outside
+the stored lookbehind fails closed.
+
+The lock is deliberately scoped to one `symbol/interval` writer directory. It serializes only the
+shared-tail read/compare/replace sequence, so a stale shorter refresh cannot replace a longer tail
+written by another process. It is not a store-wide publication lock, consumer lock, preparation
+lease, retention mechanism, or garbage collector.
 
 Any changed value at an already stored timestamp is a historical correction. This design chooses
 **fail closed** rather than creating an implicit variant or rewriting evidence. The refresh raises
@@ -184,7 +200,8 @@ before publication never consults B's manifest and cannot mix A and B interval r
 The write order is:
 
 1. validate and materialize all candidate candle bundles through the existing shared evaluator;
-2. create or atomically grow the required shared segment files and fsync file/directory state;
+2. create or atomically grow the required shared segment files under the dataset writer lock and
+   fsync every newly created directory ancestor plus the final file/directory state;
 3. write and fsync `generations/<run_id>/manifest.json`;
 4. re-read and strictly validate that manifest and all storage references;
 5. atomically replace and directory-sync `current.json`;
@@ -260,9 +277,12 @@ is unpinned and never deletes either generations or segments.
 Tests must cover:
 
 - UTC month/month-end/month-start/year rollover and timezone-independent partition keys;
+- same-month logical-window expansion using physical lookbehind without changing old offsets;
 - real multi-cycle refresh directories whose persistent byte delta is new segment bytes plus
   bounded manifests/log metadata, not a new full-history CSV;
 - byte-identical closed files and prefix-stable trailing growth;
+- cross-process stale-tail serialization and a valid exact generation after each current switch;
+- ancestor directory fsync for a first segment write;
 - old/current exact-ID replay and full logical hashes after later publication;
 - one-operation generation pinning during publication;
 - fail-closed historical correction;

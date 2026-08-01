@@ -136,12 +136,13 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             with patch("mu_strategy.market_data.providers.okx.fetch_okx_historical", side_effect=AssertionError("network")):
                 with patch("mu_strategy.market_data.providers.okx.fetch_okx_incremental", side_effect=AssertionError("network")):
                     with patch.object(store, "write_csv", side_effect=AssertionError("write_csv")):
-                        with patch.object(store, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
-                            with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
-                                bundle = loader.execute(
-                                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=86_400_000),
-                                    observe_only_policy(),
-                                )
+                        with patch.object(store, "write_segmented_dataset", side_effect=AssertionError("write_segmented_dataset")):
+                            with patch.object(store, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
+                                with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
+                                    bundle = loader.execute(
+                                        LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=86_400_000),
+                                        observe_only_policy(),
+                                    )
             self.assertTrue(bundle.trust_decision.allowed)
             self.assertEqual(("5m", "15m", "1h"), tuple(bundle.health_by_interval))
 
@@ -710,7 +711,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(SnapshotUsability.USABLE, first.snapshot_usability)
         self.assertEqual(["15m", "1h"], manifest["requested_intervals"])
         self.assertEqual(["5m", "15m", "1h"], manifest["effective_intervals"])
-        self.assertIn(("BTC-USDT-SWAP", "5m", 1), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 33), provider.history_calls)
         self.assertIn(("BTC-USDT-SWAP", "5m", DAY_MS - 300_000), provider.incremental_calls)
 
     def test_refresh_does_not_reuse_unusable_prior_health_as_incremental_base(self):
@@ -759,7 +760,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
         self.assertEqual([], provider.incremental_calls)
-        self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 46), provider.history_calls)
 
     def test_refresh_falls_back_to_history_when_requested_retention_expands(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -815,7 +816,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
         self.assertEqual([], provider.incremental_calls)
-        self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 46), provider.history_calls)
 
     def test_refresh_attempt_and_snapshot_axes_remain_separate(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -963,7 +964,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
         self.assertEqual("ok", run.datasets[("BTC-USDT-SWAP", "5m")].primary_reason.value)
-        self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
+        self.assertEqual([("BTC-USDT-SWAP", "5m", 33)], provider.history_calls)
         self.assertEqual([], provider.incremental_calls)
         self.assertEqual("prior_read_failed_full_history", run.refresh_segments[0].fetch_mode)
         self.assertEqual("cache_read_failed", run.refresh_segments[0].fetch_reason.value)
@@ -1049,8 +1050,9 @@ class TrustedDemoConsumerTests(unittest.TestCase):
             manifest_before = manifest_path(data_dir).read_bytes()
             with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("writer")):
                 with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("writer")):
-                    with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("writer")):
-                        result = run_once(DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()), broker=None, scanner=lambda symbol, *_args, **_kwargs: _wait(symbol))
+                    with patch.object(TrustedDataStore, "write_segmented_dataset", side_effect=AssertionError("writer")):
+                        with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("writer")):
+                            result = run_once(DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()), broker=None, scanner=lambda symbol, *_args, **_kwargs: _wait(symbol))
             self.assertEqual("dry_run", result["mode"])
             self.assertEqual(manifest_before, manifest_path(data_dir).read_bytes())
 
@@ -1066,9 +1068,12 @@ class TrustedDemoConsumerTests(unittest.TestCase):
 
     def test_consumer_modules_keep_refresh_and_freshness_logic_out(self):
         forbidden = {
-            "mu_strategy/cli.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
-            "mu_strategy/viz/backtest.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
-            "mu_strategy/demo_trading.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
+            "mu_strategy/cli.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            "mu_strategy/viz/backtest.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            "mu_strategy/demo_trading.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            "mu_strategy/commands/okx_demo_loop.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            "mu_strategy/experiments/fibonacci_pullback.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            "mu_strategy/experiments/walk_forward.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
         }
         for relative_path, needles in forbidden.items():
             source = Path(relative_path).read_text(encoding="utf-8")

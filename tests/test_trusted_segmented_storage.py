@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import multiprocessing
 import unittest
 from datetime import datetime, timezone
 from io import StringIO
@@ -26,6 +28,7 @@ from mu_strategy.market_data.trusted_data.store import (
     candles_content_sha256,
 )
 from mu_strategy.models import Candle
+from mu_strategy.market_data.utils import DAY_MS
 
 
 SYMBOL = "MU-USDT-SWAP"
@@ -35,6 +38,7 @@ FEB_START_MS = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
 RUN_A = "a" * 32
 RUN_B = "b" * 32
 RUN_C = "c" * 32
+RUN_D = "f" * 32
 
 
 class MutableHistoryProvider:
@@ -42,6 +46,7 @@ class MutableHistoryProvider:
         self.rows = list(rows)
         self.return_all_incremental = False
         self.history_calls = 0
+        self.history_days: list[int] = []
         self.incremental_calls = 0
 
     def fetch_tickers(self):
@@ -49,6 +54,7 @@ class MutableHistoryProvider:
 
     def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
         self.history_calls += 1
+        self.history_days.append(days)
         return list(self.rows)
 
     def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
@@ -56,6 +62,24 @@ class MutableHistoryProvider:
         if self.return_all_incremental:
             return list(self.rows)
         return [candle for candle in self.rows if candle.open_time_ms >= since_time_ms]
+
+
+class WindowedHistoryProvider:
+    def __init__(self, *, now_ms: int):
+        self.now_ms = now_ms
+        self.history_days: list[int] = []
+        self.incremental_calls = 0
+
+    def fetch_tickers(self):
+        raise AssertionError("explicit symbol refresh must not fetch tickers")
+
+    def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
+        self.history_days.append(days)
+        return _window_candles(self.now_ms - days * DAY_MS, self.now_ms - STEP_MS)
+
+    def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+        self.incremental_calls += 1
+        raise AssertionError("expanded logical window must use full history")
 
 
 class UtcMonthPartitionTests(unittest.TestCase):
@@ -67,13 +91,17 @@ class UtcMonthPartitionTests(unittest.TestCase):
             (datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc), "2026-01"),
             (datetime(2026, 1, 31, 23, 59, 59, 999000, tzinfo=timezone.utc), "2026-01"),
             (datetime(2026, 2, 1, 0, 0, tzinfo=timezone.utc), "2026-02"),
+            (datetime(2026, 3, 8, 6, 59, 59, 999000, tzinfo=timezone.utc), "2026-03"),
+            (datetime(2026, 3, 8, 7, 0, 0, tzinfo=timezone.utc), "2026-03"),
+            (datetime(2026, 11, 1, 5, 59, 59, 999000, tzinfo=timezone.utc), "2026-11"),
+            (datetime(2026, 11, 1, 6, 0, 0, tzinfo=timezone.utc), "2026-11"),
         )
         for instant, expected in cases:
             with self.subTest(instant=instant.isoformat()):
                 self.assertEqual(expected, utc_month_segment_id(int(instant.timestamp() * 1000)))
 
     def test_partition_key_rejects_non_integer_and_out_of_range_values(self):
-        for value in (True, 1.5, "0", 10**30):
+        for value in (True, 1.5, "0", -(10**30), 10**30):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     utc_month_segment_id(value)
@@ -90,7 +118,10 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             first_tree = _file_sizes(data_dir)
             january_path = store.segment_path(SYMBOL, "5m", "2026-01")
             january_bytes = january_path.read_bytes()
+            january_sha256 = hashlib.sha256(january_bytes).hexdigest()
+            january_mtime_ns = january_path.stat().st_mtime_ns
             initial_segment_bytes = _segment_bytes(data_dir)
+            average_initial_row_bytes = initial_segment_bytes / len(initial_rows)
 
             provider.rows = _candles_through(FEB_START_MS + 6 * STEP_MS)
             _refresh(store, provider, RUN_B)
@@ -107,7 +138,14 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
                 second_delta,
             )
             self.assertLess(second_delta, initial_segment_bytes // 4)
+            self.assertLessEqual(second_segment_delta, 2 * 6 * average_initial_row_bytes)
             self.assertEqual(january_bytes, january_path.read_bytes())
+            self.assertEqual(january_sha256, hashlib.sha256(january_path.read_bytes()).hexdigest())
+            self.assertEqual(january_mtime_ns, january_path.stat().st_mtime_ns)
+            self.assertEqual(1, provider.history_calls)
+            self.assertEqual(1, provider.incremental_calls)
+            self.assertTrue(_refresh_segment(store, RUN_B)["reused_prior_generation"])
+            self.assertEqual("incremental_reuse", _refresh_segment(store, RUN_B)["fetch_mode"])
             self.assertFalse(any((data_dir / "generations").rglob("*.csv")))
 
             provider.rows = _candles_through(FEB_START_MS + 12 * STEP_MS)
@@ -127,7 +165,33 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
             self.assertEqual(third_segment_delta + third_metadata, third_delta)
             self.assertLess(third_delta, initial_segment_bytes // 4)
+            self.assertLessEqual(third_segment_delta, 2 * 6 * average_initial_row_bytes)
             self.assertEqual(january_bytes, january_path.read_bytes())
+            self.assertEqual(january_sha256, hashlib.sha256(january_path.read_bytes()).hexdigest())
+            self.assertEqual(january_mtime_ns, january_path.stat().st_mtime_ns)
+
+            provider.rows = _candles_through(FEB_START_MS + 18 * STEP_MS)
+            before_fourth = _file_sizes(data_dir)
+            before_fourth_segment_bytes = _segment_bytes(data_dir)
+            _refresh(store, provider, RUN_D)
+            after_fourth = _file_sizes(data_dir)
+            fourth_segment_delta = _segment_bytes(data_dir) - before_fourth_segment_bytes
+            fourth_delta = sum(after_fourth.values()) - sum(before_fourth.values())
+            fourth_metadata = (
+                after_fourth[f"generations/{RUN_D}/manifest.json"]
+                + after_fourth["refresh_runs.jsonl"]
+                - before_fourth["refresh_runs.jsonl"]
+                + after_fourth["current.json"]
+                - before_fourth["current.json"]
+            )
+
+            self.assertEqual(fourth_segment_delta + fourth_metadata, fourth_delta)
+            self.assertLessEqual(fourth_segment_delta, 2 * 6 * average_initial_row_bytes)
+            self.assertEqual(january_bytes, january_path.read_bytes())
+            self.assertEqual(january_sha256, hashlib.sha256(january_path.read_bytes()).hexdigest())
+            self.assertEqual(january_mtime_ns, january_path.stat().st_mtime_ns)
+            self.assertEqual(1, provider.history_calls)
+            self.assertEqual(3, provider.incremental_calls)
 
     def test_trailing_growth_preserves_old_exact_generation_and_current_matches_exact_reader(self):
         first_rows = _candles_through(FEB_START_MS)
@@ -307,8 +371,145 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
             self.assertEqual(RUN_A, json.loads(store.current_path.read_text(encoding="utf-8"))["generation_id"])
 
+    def test_cross_process_refresh_serializes_tail_and_current_always_names_exact_generation(self):
+        initial = _window_candles(FEB_START_MS, FEB_START_MS + 2 * STEP_MS)
+        longer = _window_candles(FEB_START_MS, FEB_START_MS + 10 * STEP_MS)
+        shorter = _window_candles(FEB_START_MS, FEB_START_MS + 6 * STEP_MS)
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            _refresh(store, MutableHistoryProvider(initial), RUN_A)
+            tail_path = store.segment_path(SYMBOL, "5m", "2026-02")
+            context = multiprocessing.get_context("spawn")
+            shorter_entered = context.Event()
+            release_shorter = context.Event()
+            shorter_result = context.Queue()
+            longer_result = context.Queue()
+            shorter_process = context.Process(
+                target=_refresh_in_process,
+                args=(str(data_dir), shorter, RUN_C, len(shorter), shorter_entered, release_shorter, shorter_result),
+            )
+            longer_process = context.Process(
+                target=_refresh_in_process,
+                args=(str(data_dir), longer, RUN_B, None, None, None, longer_result),
+            )
+            shorter_process.start()
+            self.assertTrue(shorter_entered.wait(timeout=10))
+            longer_process.start()
+            longer_process.join(timeout=0.3)
+            self.assertTrue(longer_process.is_alive())
+            release_shorter.set()
+            shorter_process.join(timeout=20)
+            longer_process.join(timeout=20)
+
+            self.assertEqual(0, shorter_process.exitcode)
+            self.assertEqual(0, longer_process.exitcode)
+            self.assertEqual(("ok", RUN_C), shorter_result.get(timeout=2))
+            self.assertEqual(("ok", RUN_B), longer_result.get(timeout=2))
+            self.assertEqual(longer, store.read_csv(tail_path))
+            self.assertEqual(shorter, _read_exact(store, RUN_C))
+            self.assertEqual(longer, _read_exact(store, RUN_B))
+            current_id = json.loads(store.current_path.read_text(encoding="utf-8"))["generation_id"]
+            self.assertIn(current_id, {RUN_B, RUN_C})
+            self.assertEqual({RUN_B: longer, RUN_C: shorter}[current_id], _read_exact(store, current_id))
+
+    def test_new_segment_directory_ancestors_are_fsynced(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "live"
+            store = TrustedDataStore(data_dir=data_dir)
+            synced: list[Path] = []
+            with patch(
+                "mu_strategy.market_data.trusted_data.store._fsync_directory",
+                side_effect=lambda path: synced.append(Path(path).absolute()),
+            ):
+                store.write_segmented_dataset(
+                    [_window_candles(FEB_START_MS, FEB_START_MS)[0]],
+                    symbol=SYMBOL,
+                    interval="5m",
+                )
+
+            segment_directory = data_dir / "segments" / "okx" / SYMBOL / "5m"
+            expected = {
+                data_dir.parent.absolute(),
+                data_dir.absolute(),
+                (data_dir / "segments").absolute(),
+                (data_dir / "segments" / "okx").absolute(),
+                (data_dir / "segments" / "okx" / SYMBOL).absolute(),
+                segment_directory.absolute(),
+            }
+            self.assertTrue(expected.issubset(set(synced)), (expected, synced))
+
+    def test_retention_window_can_expand_earlier_within_stored_month(self):
+        now_ms = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        provider = WindowedHistoryProvider(now_ms=now_ms)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            _refresh(store, provider, RUN_A, days=1, now_ms=now_ms)
+            first_manifest = store.read_generation_manifest(RUN_A).snapshot
+            first_rows = _read_exact(store, RUN_A)
+            first_reference = first_manifest.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+
+            _refresh(store, provider, RUN_B, days=14, now_ms=now_ms)
+            second_manifest = store.read_generation_manifest(RUN_B).snapshot
+            second_rows = _read_exact(store, RUN_B)
+            second_reference = second_manifest.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+
+            self.assertEqual([33, 46], provider.history_days)
+            self.assertEqual(0, provider.incremental_calls)
+            self.assertEqual(1 * 288 + 1, len(first_rows))
+            self.assertEqual(14 * 288 + 1, len(second_rows))
+            self.assertEqual(first_rows, second_rows[-len(first_rows) :])
+            self.assertGreater(first_reference.start_row, second_reference.start_row)
+            self.assertEqual(first_rows, _read_exact(store, RUN_A))
+
+    def test_torn_write_after_segment_replace_before_manifest_keeps_old_current_readable(self):
+        initial_rows = _candles_through(FEB_START_MS)
+        provider = MutableHistoryProvider(initial_rows)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            _refresh(store, provider, RUN_A)
+            old_pointer = store.current_path.read_bytes()
+            provider.rows = _candles_through(FEB_START_MS + 4 * STEP_MS)
+
+            with patch.object(
+                store,
+                "write_generation_manifest",
+                side_effect=OSError("manifest offline"),
+            ):
+                with self.assertRaisesRegex(OSError, "manifest offline"):
+                    _refresh(store, provider, RUN_B)
+
+            self.assertEqual(old_pointer, store.current_path.read_bytes())
+            self.assertEqual(initial_rows, _read_exact(store, RUN_A))
+
 
 class SegmentedFailureContractTests(unittest.TestCase):
+    def test_segment_paths_reject_traversal_without_touching_outside_sentinel(self):
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            data_dir = workspace / "live"
+            store, _ = _published_store(data_dir)
+            sentinel = workspace / "sentinel.csv"
+            sentinel.write_bytes(b"outside-must-remain-unchanged")
+
+            for value in ("../2026-01", "..\\2026-01", "C:2026-01", "2026/01"):
+                with self.subTest(segment_id=value):
+                    with self.assertRaises(ValueError):
+                        store.segment_source_file(SYMBOL, "5m", value)
+
+            manifest_path = store.generation_manifest_path(RUN_A)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0][
+                "source_file"
+            ] = "../sentinel.csv"
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+            result = store.read_generation_manifest(RUN_A)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(HealthReason.MALFORMED_MANIFEST, result.reason)
+            self.assertEqual(b"outside-must-remain-unchanged", sentinel.read_bytes())
+
     def test_claimed_storage_corruption_fails_closed(self):
         cases = (
             "missing",
@@ -517,10 +718,14 @@ class FlatGenerationImportTests(unittest.TestCase):
 
 
 def _candles_through(end_ms: int) -> list[Candle]:
+    return _window_candles(JAN_START_MS, end_ms)
+
+
+def _window_candles(start_ms: int, end_ms: int) -> list[Candle]:
     rows: list[Candle] = []
-    timestamp = JAN_START_MS
+    timestamp = start_ms
     while timestamp <= end_ms:
-        index = (timestamp - JAN_START_MS) // STEP_MS
+        index = timestamp // STEP_MS
         price = round(100.0 + index / 100.0, 8)
         rows.append(
             Candle(
@@ -538,18 +743,26 @@ def _candles_through(end_ms: int) -> list[Candle]:
 
 def _refresh(
     store: TrustedDataStore,
-    provider: MutableHistoryProvider,
+    provider,
     run_id: str,
+    *,
+    days: int = 20,
+    now_ms: int | None = None,
 ):
     return RefreshTrustedMarketData(store, provider).execute(
         RefreshTrustedMarketDataRequest(
             requested_intervals=("5m",),
-            days=20,
+            days=days,
             symbols=(SYMBOL,),
-            now_ms=provider.rows[-1].open_time_ms + STEP_MS,
+            now_ms=now_ms if now_ms is not None else provider.rows[-1].open_time_ms + STEP_MS,
             run_id=run_id,
         )
     )
+
+
+def _refresh_segment(store: TrustedDataStore, run_id: str) -> dict:
+    manifest = json.loads(store.generation_manifest_path(run_id).read_text(encoding="utf-8"))
+    return manifest["diagnostics"]["refresh_segments"][0]
 
 
 def _read_exact(store: TrustedDataStore, run_id: str) -> list[Candle]:
@@ -638,6 +851,37 @@ def _write_flat_v3_generation(store: TrustedDataStore, run_id: str, rows: list[C
     }
     store.write_generation_manifest(run_id, manifest)
     return path
+
+
+def _refresh_in_process(
+    data_dir: str,
+    rows: list[Candle],
+    run_id: str,
+    pause_segment_rows: int | None,
+    entered,
+    release,
+    result_queue,
+) -> None:
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    original_write_csv = store.write_csv
+
+    def controlled_write(candles, path, *, required_prefix=None):
+        if pause_segment_rows is not None and len(candles) == pause_segment_rows:
+            entered.set()
+            if not release.wait(timeout=10):
+                raise AssertionError("timed out waiting to release paused segment writer")
+        return original_write_csv(candles, path, required_prefix=required_prefix)
+
+    try:
+        if pause_segment_rows is None:
+            _refresh(store, MutableHistoryProvider(rows), run_id)
+        else:
+            with patch.object(store, "write_csv", side_effect=controlled_write):
+                _refresh(store, MutableHistoryProvider(rows), run_id)
+        result_queue.put(("ok", run_id))
+    except BaseException as exc:
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        raise
 
 
 if __name__ == "__main__":

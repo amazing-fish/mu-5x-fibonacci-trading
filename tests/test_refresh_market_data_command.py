@@ -102,7 +102,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         load_config.assert_not_called()
         self.assertEqual(0, exit_code)
         self.assertEqual(
-            [("MU-USDT-SWAP", "5m", 1), ("MU-USDT-SWAP", "15m", 1)],
+            [("MU-USDT-SWAP", "5m", 33), ("MU-USDT-SWAP", "15m", 33)],
             fetch_calls,
         )
         self.assertEqual("explicit_symbols", output["fetch_mode"])
@@ -472,7 +472,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         def fetch_history(symbol: str, interval: str, *, days: int):
             self.assertEqual("BTC-USDT-SWAP", symbol)
             self.assertEqual("5m", interval)
-            self.assertEqual(14, days)
+            self.assertEqual(46, days)
             return range_candles(end_ms - DAY_MS, end_ms)
 
         with TemporaryDirectory() as tmp:

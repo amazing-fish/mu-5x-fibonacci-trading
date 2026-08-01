@@ -312,6 +312,12 @@ def _blocked_market_data_paths(module_name: str):
                 side_effect=AssertionError("trusted store write must not be used"),
             )
         )
+        stack.enter_context(
+            patch(
+                "mu_strategy.market_data.trusted_data.store.TrustedDataStore.write_segmented_dataset",
+                side_effect=AssertionError("trusted segmented store write must not be used"),
+            )
+        )
         yield
 
 

@@ -160,13 +160,13 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 数据注意事项
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
-- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下增长。
+- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest，但保留首月的物理回看行，使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下增长。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 writer 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是正常运行时唯一 writer；`import_trusted_generation` 只是显式离线 migration writer。backtest、visualization、walk-forward、Fibonacci experiment、demo 和 exact-generation experiment reader 都只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。
 - backtest、visualization、walk-forward 和 Fibonacci experiment 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；Fibonacci 的非 OKX `AssetSpec.source` 也会明确 fail-closed，demo loop 的 `--refresh` 同样会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...`、`python -m mu_strategy.walk_forward ...`、`python -m mu_strategy.experiments.fibonacci_pullback ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
-- 可信数据层当前使用 `data/live/current.json` + metadata-only `data/live/generations/<run_id>/manifest.json` + `data/live/segments/` + `data/live/refresh_runs.jsonl`。schema v4 除既有 health/universe/diagnostics 字段外，严格声明 `segmented_csv_v1`，并为每个 dataset 保存按 UTC 月排序的 `segment_id/source_file/start_row/rows/timestamp range/content_sha256/closed`。dataset 的 `content_sha256` 仍绑定完整逻辑 candle 序列，不是 segment hash 的简单拼接。
+- 可信数据层当前使用 `data/live/current.json` + metadata-only `data/live/generations/<run_id>/manifest.json` + `data/live/segments/` + `data/live/refresh_runs.jsonl`。schema v4 除既有 health/universe/diagnostics 字段外，严格声明 `segmented_csv_v1`，并为每个 dataset 保存按 UTC 月排序的 `segment_id/source_file/start_row/rows/timestamp range/content_sha256/closed`。dataset 的 `content_sha256` 仍绑定完整逻辑 candle 序列，不是 segment hash 的简单拼接。共享尾段的 read/compare/replace 由稳定的数据集级 `.write.lock` 串行化；它不锁 consumer、`current.json` 或整个 store，也不承担 retention/GC 生命周期。
 - schema v3 generation-local flat CSV 仍可按 exact ID 严格只读；转换只允许显式 `import_trusted_generation`，不会在 v4 malformed/unknown layout 时静默 fallback。
 - `refresh_runs.jsonl` 和 `refresh_market_data` JSON 输出会暴露 per-symbol/per-interval diagnostics，包括 `refresh_segments`、最多 5 条 `slowest_segments`、失败/非 ok 的 `failed_segments`，以及按 symbol 汇总的 `blocking_symbols`。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。

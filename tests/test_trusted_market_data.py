@@ -546,7 +546,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
 
         self.assertEqual("success", run.attempt_status.value)
         self.assertEqual(("5m", "15m"), run.effective_intervals)
-        self.assertEqual([("MU-USDT-SWAP", "5m", 1), ("MU-USDT-SWAP", "15m", 1)], provider.history_calls)
+        self.assertEqual([("MU-USDT-SWAP", "5m", 33), ("MU-USDT-SWAP", "15m", 33)], provider.history_calls)
         self.assertEqual([], provider.incremental_calls)
         self.assertTrue(bundle.trust_decision.allowed, bundle.trust_decision)
         self.assertEqual("run-explicit", bundle.run_id)
@@ -613,7 +613,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
             manifest = json.loads(_manifest_path(data_dir).read_text(encoding="utf-8"))
             run_log = [json.loads(line) for line in (data_dir / "refresh_runs.jsonl").read_text(encoding="utf-8").splitlines()]
 
-        self.assertEqual([("MU-USDT-SWAP", "5m", 1)], first_provider.history_calls)
+        self.assertEqual([("MU-USDT-SWAP", "5m", 33)], first_provider.history_calls)
         self.assertEqual([], first_provider.incremental_calls)
         self.assertEqual("full_history", first.refresh_segments[0].fetch_mode)
         self.assertEqual(0, first.refresh_segments[0].existing_rows)
@@ -759,17 +759,18 @@ class TrustedCandleBundleTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
-                with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
-                    with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
-                        with patch("mu_strategy.market_data.service.refresh_with_okx_provider", side_effect=AssertionError("provider"), create=True):
-                            with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
-                                refresh_trusted_candle_bundle(
-                                    "MU-USDT-SWAP",
-                                    intervals=("15m", "1h"),
-                                    days=1,
-                                    data_dir=data_dir,
-                                    refresh=True,
-                                )
+                with patch.object(TrustedDataStore, "write_segmented_dataset", side_effect=AssertionError("write_segmented_dataset")):
+                    with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
+                        with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
+                            with patch("mu_strategy.market_data.service.refresh_with_okx_provider", side_effect=AssertionError("provider"), create=True):
+                                with self.assertRaisesRegex(TrustedConsumerRefreshError, "refresh_market_data"):
+                                    refresh_trusted_candle_bundle(
+                                        "MU-USDT-SWAP",
+                                        intervals=("15m", "1h"),
+                                        days=1,
+                                        data_dir=data_dir,
+                                        refresh=True,
+                                    )
 
             self.assertFalse(_manifest_path(data_dir).exists())
             self.assertFalse((data_dir / "refresh_runs.jsonl").exists())
@@ -816,14 +817,15 @@ class TrustedCandleBundleTests(unittest.TestCase):
             with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
                 with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("append_run_log")):
                     with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("write_csv")):
-                        bundle = refresh_trusted_candle_bundle(
-                            "MU-USDT-SWAP",
-                            intervals=("15m", "1h"),
-                            days=1,
-                            data_dir=data_dir,
-                            refresh=False,
-                            clock=_FixedClock(86_400_000),
-                        )
+                        with patch.object(TrustedDataStore, "write_segmented_dataset", side_effect=AssertionError("write_segmented_dataset")):
+                            bundle = refresh_trusted_candle_bundle(
+                                "MU-USDT-SWAP",
+                                intervals=("15m", "1h"),
+                                days=1,
+                                data_dir=data_dir,
+                                refresh=False,
+                                clock=_FixedClock(86_400_000),
+                            )
 
         self.assertEqual(96, len(bundle.candles_by_interval["15m"]))
         self.assertEqual(24, len(bundle.candles_by_interval["1h"]))
@@ -1064,7 +1066,11 @@ def _normalize_report(candles: list[Candle]):
 
 
 def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
-    five_minute = _five_minute_candles(days=days)
+    # Refresh requests include physical month-segment lookbehind. This deterministic
+    # fixture models a provider whose available history still ends at the test's
+    # one-day logical window instead of manufacturing future candles from epoch.
+    logical_days = days - 32 if days > 32 else days
+    five_minute = _five_minute_candles(days=logical_days)
     if interval == "5m":
         return five_minute
     from mu_strategy.market_data.trusted import aggregate_candles
