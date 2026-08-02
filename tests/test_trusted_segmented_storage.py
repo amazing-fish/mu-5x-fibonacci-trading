@@ -302,10 +302,10 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
                 self.assertEqual(compatibility_bytes, compatibility_path.read_bytes())
 
     def test_partial_start_reuses_existing_canonical_month_instead_of_wedging_extension(self):
-        january_rows = _window_candles(FEB_START_MS - (2 * STEP_MS), FEB_START_MS - STEP_MS)
+        january_rows = _window_candles(JAN_MONTH_START_MS, FEB_START_MS - STEP_MS)
         february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
         canonical_rows = [*january_rows, *february_rows]
-        partial_rows = [january_rows[-1], *february_rows]
+        partial_rows = [*january_rows[-2:], *february_rows]
 
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
@@ -333,7 +333,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
             prior_partial = store.write_segmented_dataset(
-                january_rows[:1],
+                partial_rows[:1],
                 symbol=SYMBOL,
                 interval="5m",
                 isolate_partial_start_month=True,
@@ -344,7 +344,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
 
             storage = store.write_segmented_dataset(
-                canonical_rows,
+                partial_rows,
                 symbol=SYMBOL,
                 interval="5m",
                 reuse_partial_start_source_file=prior_partial_source,

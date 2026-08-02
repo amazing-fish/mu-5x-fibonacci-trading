@@ -409,7 +409,11 @@ class TrustedDataStore:
             existing_bytes = path.read_bytes()
             existing = self.read_csv(path)
             _validate_segment_candles(existing, segment_id=segment_id)
-            if reused_partial_start_ms is not None and existing[0].open_time_ms != reused_partial_start_ms:
+            if (
+                reused_partial_start_ms is not None
+                and source_file == Path(reuse_partial_start_source_file)
+                and existing[0].open_time_ms != reused_partial_start_ms
+            ):
                 raise ManifestSchemaError(
                     f"partial trusted segment filename does not match physical first timestamp: "
                     f"{symbol}/{interval}/{segment_id}"
