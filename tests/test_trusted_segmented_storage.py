@@ -289,7 +289,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     SegmentCorrectionError,
-                    "historical correction.*compatibility segment",
+                    "historical correction.*segment representation",
                 ):
                     store.write_segmented_dataset(
                         canonical_rows,
@@ -300,6 +300,123 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
                 self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
                 self.assertEqual(compatibility_bytes, compatibility_path.read_bytes())
+
+    def test_new_compatibility_source_rejects_corrections_against_existing_representations(self):
+        canonical_rows = _window_candles(
+            JAN_MONTH_START_MS,
+            JAN_START_MS + STEP_MS,
+        )
+        compatibility_rows = _window_candles(JAN_START_MS, JAN_START_MS + STEP_MS)
+        changed_rows = list(compatibility_rows)
+        changed = changed_rows[0]
+        changed_rows[0] = Candle(
+            changed.open_time_ms,
+            changed.open,
+            changed.high + 1.0,
+            changed.low,
+            changed.close + 0.5,
+            changed.volume,
+        )
+        cases = (
+            ("canonical", "partial"),
+            ("canonical", "import"),
+            ("partial", "import"),
+            ("import", "partial"),
+        )
+        for existing_kind, new_kind in cases:
+            with self.subTest(existing_kind=existing_kind, new_kind=new_kind), TemporaryDirectory() as tmp:
+                store = TrustedDataStore(data_dir=Path(tmp))
+                if existing_kind == "canonical":
+                    existing_storage = store.write_segmented_dataset(
+                        canonical_rows,
+                        symbol=SYMBOL,
+                        interval="5m",
+                    )
+                elif existing_kind == "partial":
+                    existing_storage = store.write_segmented_dataset(
+                        compatibility_rows,
+                        symbol=SYMBOL,
+                        interval="5m",
+                        isolate_partial_start_month=True,
+                    )
+                else:
+                    existing_storage = store.write_segmented_dataset(
+                        compatibility_rows,
+                        symbol=SYMBOL,
+                        interval="5m",
+                        import_generation_id=RUN_A,
+                    )
+                existing_path = Path(tmp) / existing_storage.segments[0].source_file
+                existing_bytes = existing_path.read_bytes()
+                if new_kind == "partial":
+                    new_path = Path(tmp) / store.partial_segment_source_file(
+                        SYMBOL,
+                        "5m",
+                        "2026-01",
+                        JAN_START_MS,
+                    )
+                    kwargs = {"isolate_partial_start_month": True}
+                else:
+                    new_path = Path(tmp) / store.imported_segment_source_file(
+                        SYMBOL,
+                        "5m",
+                        "2026-01",
+                        RUN_B,
+                    )
+                    kwargs = {"import_generation_id": RUN_B}
+
+                with self.assertRaisesRegex(
+                    SegmentCorrectionError,
+                    "historical correction.*segment representation",
+                ):
+                    store.write_segmented_dataset(
+                        changed_rows,
+                        symbol=SYMBOL,
+                        interval="5m",
+                        **kwargs,
+                    )
+
+                self.assertFalse(new_path.exists())
+                self.assertEqual(existing_bytes, existing_path.read_bytes())
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            partial_storage = store.write_segmented_dataset(
+                compatibility_rows[:1],
+                symbol=SYMBOL,
+                interval="5m",
+                isolate_partial_start_month=True,
+            )
+            partial_path = Path(tmp) / partial_storage.segments[0].source_file
+            partial_bytes = partial_path.read_bytes()
+            store.write_segmented_dataset(
+                canonical_rows,
+                symbol=SYMBOL,
+                interval="5m",
+            )
+            changed_extension = list(compatibility_rows)
+            changed = changed_extension[-1]
+            changed_extension[-1] = Candle(
+                changed.open_time_ms,
+                changed.open,
+                changed.high + 1.0,
+                changed.low,
+                changed.close + 0.5,
+                changed.volume,
+            )
+
+            with self.assertRaisesRegex(
+                SegmentCorrectionError,
+                "historical correction.*segment representation",
+            ):
+                store.write_segmented_dataset(
+                    changed_extension,
+                    symbol=SYMBOL,
+                    interval="5m",
+                    isolate_partial_start_month=True,
+                )
+
+            self.assertEqual(partial_bytes, partial_path.read_bytes())
 
     def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability

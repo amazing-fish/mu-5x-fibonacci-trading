@@ -387,12 +387,13 @@ class TrustedDataStore:
                         segment_id,
                         candidate_rows[0],
                     )
-                    self._validate_compatibility_segment_overlaps(
-                        symbol,
-                        interval,
-                        segment_id,
-                        candidate_rows,
-                    )
+                self._validate_other_segment_representation_overlaps(
+                    symbol,
+                    interval,
+                    segment_id,
+                    candidate_rows,
+                    excluded_path=path,
+                )
                 self.write_csv(candidate_rows, path)
                 physical_rows_by_segment[segment_id] = list(candidate_rows)
                 continue
@@ -412,6 +413,13 @@ class TrustedDataStore:
                 interval=interval,
                 segment_id=segment_id,
                 target="trusted segment",
+            )
+            self._validate_other_segment_representation_overlaps(
+                symbol,
+                interval,
+                segment_id,
+                candidate_rows,
+                excluded_path=path,
             )
             suffix_start = bisect_left(
                 [candle.open_time_ms for candle in candidate_rows],
@@ -552,20 +560,22 @@ class TrustedDataStore:
                 f"{symbol}/{interval}/{segment_id}->{next_id}"
             )
 
-    def _validate_compatibility_segment_overlaps(
+    def _validate_other_segment_representation_overlaps(
         self,
         symbol: str,
         interval: str,
         segment_id: str,
         candidate_rows: list[Candle],
+        *,
+        excluded_path: Path,
     ) -> None:
         segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
-        compatibility_name = re.compile(
-            rf"{re.escape(segment_id)}\.(?:partial--?[0-9]+|"
-            rf"import-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})\.csv"
+        representation_name = re.compile(
+            rf"{re.escape(segment_id)}(?:\.csv|\.(?:partial--?[0-9]+|"
+            rf"import-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})\.csv)"
         )
-        for discovered_path in sorted(segment_dir.glob(f"{segment_id}.*.csv")):
-            if compatibility_name.fullmatch(discovered_path.name) is None:
+        for discovered_path in sorted(segment_dir.glob(f"{segment_id}*.csv")):
+            if discovered_path == excluded_path or representation_name.fullmatch(discovered_path.name) is None:
                 continue
             source_file = discovered_path.relative_to(self.data_dir)
             path = self._segment_path_from_source(source_file)
@@ -583,7 +593,7 @@ class TrustedDataStore:
                 symbol=symbol,
                 interval=interval,
                 segment_id=segment_id,
-                target=f"trusted compatibility segment {path.name}",
+                target=f"trusted segment representation {path.name}",
             )
 
     def read_generation_dataset(
