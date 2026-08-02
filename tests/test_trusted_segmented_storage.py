@@ -1016,6 +1016,8 @@ class SegmentedFailureContractTests(unittest.TestCase):
             "duplicate_reference",
             "out_of_order",
             "source_path_mismatch",
+            "source_root_backslashes",
+            "source_file_backslashes",
             "partial_path_not_first_reference",
             "partial_path_mismatches_physical_start",
             "empty_valid_storage",
@@ -1042,6 +1044,12 @@ class SegmentedFailureContractTests(unittest.TestCase):
                         segments.reverse()
                     elif case == "source_path_mismatch":
                         segments[0]["source_file"] = "segments/okx/OTHER/5m/2026-01.csv"
+                    elif case == "source_root_backslashes":
+                        dataset["storage"]["source_root"] = dataset["storage"]["source_root"].replace(
+                            "/", "\\"
+                        )
+                    elif case == "source_file_backslashes":
+                        segments[0]["source_file"] = segments[0]["source_file"].replace("/", "\\")
                     elif case == "partial_path_not_first_reference":
                         second = segments[1]
                         partial_start_ms = second["first_timestamp_ms"] - (second["start_row"] * STEP_MS)

@@ -1108,13 +1108,27 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                 run_once(DemoTradingConfig(refresh=True, dry_run=False, data_dir=data_dir), broker=Broker(), scanner=lambda *args, **kwargs: self.fail("scanner"))
 
     def test_consumer_modules_keep_refresh_and_freshness_logic_out(self):
+        writer_calls = (
+            "RefreshTrustedMarketData(",
+            "prepare_generation(",
+            "write_csv(",
+            "write_segmented_dataset(",
+            "write_generation_manifest(",
+            "replace_current(",
+            "commit_generation_publication(",
+            "import_flat_generation(",
+            "append_run_log(",
+        )
         forbidden = {
-            "mu_strategy/cli.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
-            "mu_strategy/viz/backtest.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
-            "mu_strategy/demo_trading.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
-            "mu_strategy/commands/okx_demo_loop.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
-            "mu_strategy/experiments/fibonacci_pullback.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
-            "mu_strategy/experiments/walk_forward.py": ("RefreshTrustedMarketData(", "write_manifest(", "write_segmented_dataset(", "append_run_log("),
+            relative_path: writer_calls
+            for relative_path in (
+                "mu_strategy/cli.py",
+                "mu_strategy/viz/backtest.py",
+                "mu_strategy/demo_trading.py",
+                "mu_strategy/commands/okx_demo_loop.py",
+                "mu_strategy/experiments/fibonacci_pullback.py",
+                "mu_strategy/experiments/walk_forward.py",
+            )
         }
         for relative_path, needles in forbidden.items():
             source = Path(relative_path).read_text(encoding="utf-8")
