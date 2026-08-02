@@ -35,8 +35,10 @@ from mu_strategy.market_data.utils import DAY_MS
 
 SYMBOL = "MU-USDT-SWAP"
 STEP_MS = 300_000
+JAN_MONTH_START_MS = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 JAN_START_MS = int(datetime(2026, 1, 22, tzinfo=timezone.utc).timestamp() * 1000)
 FEB_START_MS = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+MAR_START_MS = int(datetime(2026, 3, 1, tzinfo=timezone.utc).timestamp() * 1000)
 RUN_A = "a" * 32
 RUN_B = "b" * 32
 RUN_C = "c" * 32
@@ -566,6 +568,66 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
             self.assertTrue(february_path.exists())
             self.assertEqual(("2026-01", "2026-02"), tuple(ref.segment_id for ref in storage.segments))
+
+    def test_backfilled_month_requires_adjacency_to_existing_successor(self):
+        february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
+        incomplete_january_rows = _window_candles(
+            JAN_MONTH_START_MS,
+            JAN_MONTH_START_MS + STEP_MS,
+        )
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(february_rows, symbol=SYMBOL, interval="5m")
+            january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            february_path = store.segment_path(SYMBOL, "5m", "2026-02")
+            february_bytes = february_path.read_bytes()
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "not adjacent.*successor"):
+                store.write_segmented_dataset(
+                    incomplete_january_rows,
+                    symbol=SYMBOL,
+                    interval="5m",
+                )
+
+            self.assertFalse(january_path.exists())
+            self.assertEqual(february_bytes, february_path.read_bytes())
+
+            complete_january_rows = _window_candles(
+                JAN_MONTH_START_MS,
+                FEB_START_MS - STEP_MS,
+            )
+            storage = store.write_segmented_dataset(
+                [*complete_january_rows, *february_rows],
+                symbol=SYMBOL,
+                interval="5m",
+            )
+
+            self.assertTrue(january_path.exists())
+            self.assertEqual(february_bytes, february_path.read_bytes())
+            self.assertEqual(("2026-01", "2026-02"), tuple(ref.segment_id for ref in storage.segments))
+
+    def test_multi_month_backfill_validates_final_candidate_against_successor(self):
+        march_rows = _window_candles(MAR_START_MS, MAR_START_MS + STEP_MS)
+        backfill_rows = _window_candles(FEB_START_MS - STEP_MS, MAR_START_MS - STEP_MS)
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(march_rows, symbol=SYMBOL, interval="5m")
+            march_path = store.segment_path(SYMBOL, "5m", "2026-03")
+            march_bytes = march_path.read_bytes()
+
+            storage = store.write_segmented_dataset(
+                [*backfill_rows, *march_rows],
+                symbol=SYMBOL,
+                interval="5m",
+            )
+
+            self.assertEqual(
+                ("2026-01", "2026-02", "2026-03"),
+                tuple(ref.segment_id for ref in storage.segments),
+            )
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+            self.assertEqual(march_bytes, march_path.read_bytes())
 
     def test_shortened_full_history_does_not_create_partial_canonical_start_month(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability

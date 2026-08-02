@@ -277,13 +277,53 @@ class TrustedDataStore:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
         source_files_by_segment: dict[str, Path] = {}
         first_logical_segment_id = next(iter(logical_partitions))
-        for segment_id, candidate_rows in physical_partitions.items():
-            _validate_candidate_segment_continuity(
-                candidate_rows,
-                symbol=symbol,
-                interval=interval,
-                segment_id=segment_id,
+        physical_items = list(physical_partitions.items())
+        _validate_candidate_partitions_continuity(
+            physical_items,
+            symbol=symbol,
+            interval=interval,
+            validate_cross_partition=any(
+                not self.segment_path(symbol, interval, segment_id).exists()
+                for segment_id, _ in physical_items
+            ),
+        )
+        if physical_items:
+            last_segment_id, last_candidate_rows = physical_items[-1]
+            logical_start_is_mid_month = (
+                utc_month_segment_id(
+                    logical_partitions[first_logical_segment_id][0].open_time_ms - 1
+                )
+                == first_logical_segment_id
             )
+            reused_partial_start_ms = (
+                _partial_segment_source_start_ms(
+                    reuse_partial_start_source_file,
+                    expected_root=source_root,
+                    segment_id=last_segment_id,
+                )
+                if reuse_partial_start_source_file is not None
+                and last_segment_id == first_logical_segment_id
+                else None
+            )
+            last_segment_uses_noncanonical_source = (
+                last_segment_id == first_logical_segment_id
+                and (
+                    reused_partial_start_ms is not None
+                    or logical_start_is_mid_month
+                    and (import_generation_id is not None or isolate_partial_start_month)
+                )
+            )
+            if (
+                not last_segment_uses_noncanonical_source
+                and not self.segment_path(symbol, interval, last_segment_id).exists()
+            ):
+                self._validate_next_canonical_segment_adjacency(
+                    symbol,
+                    interval,
+                    last_segment_id,
+                    last_candidate_rows[-1],
+                )
+        for segment_id, candidate_rows in physical_partitions.items():
             canonical_source_file = self.segment_source_file(symbol, interval, segment_id)
             reused_partial_start_ms = (
                 _partial_segment_source_start_ms(
@@ -474,6 +514,39 @@ class TrustedDataStore:
             raise SegmentCorrectionError(
                 f"new trusted segment is not adjacent to its canonical predecessor: "
                 f"{symbol}/{interval}/{previous_id}->{segment_id}"
+            )
+
+    def _validate_next_canonical_segment_adjacency(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        last_candidate: Candle,
+    ) -> None:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        next_ids = [
+            candidate.stem
+            for candidate in segment_dir.glob("*.csv")
+            if re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", candidate.stem)
+            and candidate.stem > segment_id
+        ]
+        if not next_ids:
+            return
+        next_id = min(next_ids)
+        next_path = self.segment_path(symbol, interval, next_id)
+        next_rows = self.read_csv(next_path)
+        _validate_segment_candles(next_rows, segment_id=next_id)
+        _validate_candidate_segment_continuity(
+            next_rows,
+            symbol=symbol,
+            interval=interval,
+            segment_id=next_id,
+        )
+        expected_first_ms = last_candidate.open_time_ms + interval_to_ms(interval)
+        if next_rows[0].open_time_ms != expected_first_ms:
+            raise SegmentCorrectionError(
+                f"new trusted segment is not adjacent to its canonical successor: "
+                f"{symbol}/{interval}/{segment_id}->{next_id}"
             )
 
     def read_generation_dataset(
@@ -1179,6 +1252,36 @@ def _validate_candidate_segment_continuity(
             raise SegmentCorrectionError(
                 f"trusted segment candidate contains a timestamp gap: {symbol}/{interval}/{segment_id}"
             )
+
+
+def _validate_candidate_partitions_continuity(
+    partitions: list[tuple[str, list[Candle]]],
+    *,
+    symbol: str,
+    interval: str,
+    validate_cross_partition: bool,
+) -> None:
+    expected_interval_ms = interval_to_ms(interval)
+    previous_segment_id: str | None = None
+    previous_last: Candle | None = None
+    for segment_id, candles in partitions:
+        _validate_candidate_segment_continuity(
+            candles,
+            symbol=symbol,
+            interval=interval,
+            segment_id=segment_id,
+        )
+        if (
+            validate_cross_partition
+            and previous_last is not None
+            and candles[0].open_time_ms - previous_last.open_time_ms != expected_interval_ms
+        ):
+            raise SegmentCorrectionError(
+                f"trusted segment candidates contain a timestamp gap across UTC months: "
+                f"{symbol}/{interval}/{previous_segment_id}->{segment_id}"
+            )
+        previous_segment_id = segment_id
+        previous_last = candles[-1]
 
 
 def _validate_dataset_candles(
