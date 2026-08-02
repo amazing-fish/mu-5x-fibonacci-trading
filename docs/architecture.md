@@ -63,6 +63,32 @@ Rules:
 - Schema-v3 generation-local flat CSV remains a strict known read-only layout for exact-ID compatibility. `python -m mu_strategy.commands.import_trusted_generation` is the only v3-to-v4 conversion path. Before any target/shared write it rejects every unusable source dataset and runs the same local and built/native bundle validation; after writing, it verifies candle/hash round trips before optional publication. A normal refresh never incrementally reuses v3 or an imported-v4 snapshot: its first upgrade fetches full month lookbehind. If an import's first month starts after UTC month-open, only that first reference uses a target-run-bound `YYYY-MM.import-<run_id>.csv` compatibility path; later canonical refreshes use `YYYY-MM.csv`, while the old import remains exact-readable. Unknown version/layout/import-path combinations never fall back.
 - Missing or malformed manifests/segments, invalid paths, malformed CSV, count/hash/range mismatch, partial claimed data, and historical value corrections fail closed. A correction cannot rewrite stored evidence or replace `current.json`. Retention, pinning policy, GC, and deletion are deferred; this storage layer deletes nothing.
 
+### Storage layout
+
+```text
+data/live/
+  current.json
+  generations/
+    <run_id>/
+      manifest.json
+  segments/
+    <source>/
+      <symbol>/
+        <interval>/
+          <YYYY-MM>.csv
+  refresh_runs.jsonl
+```
+
+Schema-v4 generation directories are metadata-only and contain no CSV. Closed month segments
+are immutable and are never rewritten; the trailing month may grow only while preserving its
+existing canonical byte prefix. Under continuous refresh, each run adds persistent bytes in
+proportion to new candle content plus bounded manifest/run metadata rather than the full retained
+history, while total segment residency remains proportional to total retained history. Retention,
+pin policy, GC, deletion, and bounding the monotonically growing `refresh_runs.jsonl` are separate
+follow-ups. A `partial_available_history` dataset that starts mid-month uses the deterministic
+`YYYY-MM.partial-<first_timestamp_ms>.csv` compatibility path for its first reference, never the
+canonical month path.
+
 ## Core
 
 Package: `mu_strategy.core`

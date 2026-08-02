@@ -505,6 +505,7 @@ class RefreshTrustedMarketData:
                 interval=interval,
                 physical_candles=seed.candles,
                 require_complete_start_month=require_complete_start_month,
+                isolate_partial_start_month=coverage.coverage_state == "partial_available_history",
             )
             return candles_content_sha256(candles)
 

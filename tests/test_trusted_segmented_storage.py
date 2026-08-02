@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import unittest
+from contextlib import chdir
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -131,6 +132,24 @@ class UtcMonthPartitionTests(unittest.TestCase):
 
 
 class SegmentedRefreshBehaviorTests(unittest.TestCase):
+    def test_refresh_writes_only_to_configured_data_dir_not_repository_default(self):
+        provider = MutableHistoryProvider(_window_candles(FEB_START_MS, FEB_START_MS + STEP_MS))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "repository"
+            repository.mkdir()
+            configured_data_dir = root / "configured" / "live"
+            store = TrustedDataStore(data_dir=configured_data_dir)
+
+            with chdir(repository):
+                run = _refresh(store, provider, RUN_A, days=1)
+
+            self.assertTrue(run.datasets[(SYMBOL, "5m")].is_usable)
+            self.assertTrue((configured_data_dir / "current.json").is_file())
+            self.assertTrue(store.generation_manifest_path(RUN_A).is_file())
+            self.assertTrue(any((configured_data_dir / "segments").rglob("*.csv")))
+            self.assertFalse((repository / "data" / "live").exists())
+
     def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
 
@@ -286,12 +305,14 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             store = TrustedDataStore(data_dir=data_dir)
             _refresh(store, provider, RUN_A)
             first_tree = _file_sizes(data_dir)
-            january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            first_storage = store.read_generation_manifest(RUN_A).snapshot.storage_by_dataset[(SYMBOL, "5m")]
+            january_path = data_dir / first_storage.segments[0].source_file
             january_bytes = january_path.read_bytes()
             january_sha256 = hashlib.sha256(january_bytes).hexdigest()
             january_mtime_ns = january_path.stat().st_mtime_ns
             initial_segment_bytes = _segment_bytes(data_dir)
             average_initial_row_bytes = initial_segment_bytes / len(initial_rows)
+            self.assertLess(first_tree[f"generations/{RUN_A}/manifest.json"], 10 * 1024)
 
             provider.rows = _candles_through(FEB_START_MS + 6 * STEP_MS)
             _refresh(store, provider, RUN_B)
@@ -308,6 +329,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
                 second_delta,
             )
             self.assertLess(second_delta, initial_segment_bytes // 4)
+            self.assertLess(second_manifest_bytes, 10 * 1024)
             self.assertLessEqual(second_segment_delta, 2 * 6 * average_initial_row_bytes)
             self.assertEqual(january_bytes, january_path.read_bytes())
             self.assertEqual(january_sha256, hashlib.sha256(january_path.read_bytes()).hexdigest())
@@ -489,7 +511,8 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
             _refresh(store, provider, RUN_A)
-            january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            first_storage = store.read_generation_manifest(RUN_A).snapshot.storage_by_dataset[(SYMBOL, "5m")]
+            january_path = data_dir / first_storage.segments[0].source_file
             january_bytes = january_path.read_bytes()
             old_pointer = store.current_path.read_bytes()
 
@@ -829,6 +852,7 @@ class SegmentedFailureContractTests(unittest.TestCase):
             "duplicate_reference",
             "out_of_order",
             "source_path_mismatch",
+            "partial_path_without_partial_coverage",
             "empty_valid_storage",
         )
         for case in cases:
@@ -853,6 +877,8 @@ class SegmentedFailureContractTests(unittest.TestCase):
                         segments.reverse()
                     elif case == "source_path_mismatch":
                         segments[0]["source_file"] = "segments/okx/OTHER/5m/2026-01.csv"
+                    elif case == "partial_path_without_partial_coverage":
+                        dataset["coverage_state"] = "covered"
                     elif case == "empty_valid_storage":
                         dataset["storage"]["segments"] = []
                     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")

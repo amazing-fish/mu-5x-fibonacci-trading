@@ -761,6 +761,7 @@ def _segmented_datasets_from_symbols(
                 payload.get("storage"),
                 run_id=run_id,
                 imported_from_run_id=imported_from_run_id,
+                allow_partial_start_reference=payload.get("coverage_state") == "partial_available_history",
             )
             health_payload = dict(payload)
             health_payload.pop("storage", None)
@@ -779,6 +780,7 @@ def _dataset_storage_from_dict(
     *,
     run_id: str,
     imported_from_run_id: str | None,
+    allow_partial_start_reference: bool,
 ) -> DatasetStorage:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 dataset storage must be object")
@@ -805,6 +807,7 @@ def _dataset_storage_from_dict(
             run_id=run_id,
             imported_from_run_id=imported_from_run_id,
             first_reference=index == 0,
+            allow_partial_start_reference=allow_partial_start_reference,
         )
         for index, item in enumerate(segment_payloads)
     )
@@ -823,6 +826,7 @@ def _segment_reference_from_dict(
     run_id: str,
     imported_from_run_id: str | None,
     first_reference: bool,
+    allow_partial_start_reference: bool,
 ) -> SegmentReference:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 segment reference must be object")
@@ -834,6 +838,12 @@ def _segment_reference_from_dict(
     expected_source = Path("segments") / "okx" / symbol / interval / f"{segment_id}.csv"
     source_file_value = payload.get("source_file")
     imported_source = expected_source.with_name(f"{segment_id}.import-{run_id}.csv")
+    first_timestamp_ms = payload.get("first_timestamp_ms")
+    partial_source = (
+        expected_source.with_name(f"{segment_id}.partial-{first_timestamp_ms}.csv")
+        if _is_int(first_timestamp_ms)
+        else None
+    )
     source_file = Path(source_file_value) if isinstance(source_file_value, str) else None
     if source_file is None or not (
         source_file.as_posix() == expected_source.as_posix()
@@ -842,13 +852,18 @@ def _segment_reference_from_dict(
             and first_reference
             and source_file.as_posix() == imported_source.as_posix()
         )
+        or (
+            allow_partial_start_reference
+            and first_reference
+            and partial_source is not None
+            and source_file.as_posix() == partial_source.as_posix()
+        )
     ):
         raise ManifestSchemaError(
-            "schema-v4 segment source_file must equal the canonical month path or its exact import compatibility path"
+            "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"
         )
     rows = payload.get("rows")
     start_row = payload.get("start_row")
-    first_timestamp_ms = payload.get("first_timestamp_ms")
     last_timestamp_ms = payload.get("last_timestamp_ms")
     content_sha256 = payload.get("content_sha256")
     closed = payload.get("closed")

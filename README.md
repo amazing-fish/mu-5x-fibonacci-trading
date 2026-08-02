@@ -122,6 +122,13 @@ Stage 0 dry-run cycles also append a versioned observation-only record to `data/
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 ```
 
+schema v4 把每个 generation 保持为只含 `manifest.json` 的 metadata-only 目录；CSV 数据按
+`segments/<source>/<symbol>/<interval>/<YYYY-MM>.csv` 共享。持续刷新时，单次新增的持久化
+bytes 与新增 candle content 加有界 manifest/run metadata 成比例，不再与完整历史量成比例；
+全部 segment 的驻留量则与实际保留的总历史量成比例。已关闭月份不可变且不会重写，尾月只
+能在保持既有 canonical byte prefix 的前提下连续增长。retention、pin policy、GC 和 deletion
+均不属于当前实现。
+
 已有 generation-local flat schema-v3 数据只能通过显式 migration 进入共享月分段表示。
 导入会保留原 generation，并在完整 candle/hash round trip 后才可选择原子发布新 generation：
 
@@ -160,7 +167,7 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 数据注意事项
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
-- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest；当 full-history 本轮已覆盖完整逻辑窗口时，只有 provider 实际返回逻辑起始月的完整月首数据才把该月建成 canonical。明确标记为 `partial_available_history` 的短历史不伪装成这项证明；更早且与逻辑无关的物理月份不会落盘。首月物理回看行使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。完整物理序列会在裁剪前执行本地连续性校验和 `5m -> 15m/1h` built/native 校验；物理 `5m` 无效时父周期也不会落盘，父周期的逻辑 health/hash 与物理存储都只覆盖被完整 `5m` 覆盖并实际比较的行。任何物理失败、旧尾与新 suffix 之间的时间缺口、或新月首行与既有前月尾部不相邻，都不会写入 canonical segment。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下连续增长。
+- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest；当 full-history 本轮已覆盖完整逻辑窗口时，只有 provider 实际返回逻辑起始月的完整月首数据才把该月建成 canonical。明确标记为 `partial_available_history` 且从月中开始的短历史只写入首时间戳绑定的 `YYYY-MM.partial-<first_timestamp_ms>.csv` 兼容路径，不会污染 canonical 月文件；更早且与逻辑无关的物理月份不会落盘。首月物理回看行使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。完整物理序列会在裁剪前执行本地连续性校验和 `5m -> 15m/1h` built/native 校验；物理 `5m` 无效时父周期也不会落盘，父周期的逻辑 health/hash 与物理存储都只覆盖被完整 `5m` 覆盖并实际比较的行。任何物理失败、旧尾与新 suffix 之间的时间缺口、或新月首行与既有前月尾部不相邻，都不会写入 canonical segment。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下连续增长。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
 - 可信数据层把 writer 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是正常运行时唯一 writer；`import_trusted_generation` 只是显式离线 migration writer。backtest、visualization、walk-forward、Fibonacci experiment、demo 和 exact-generation experiment reader 都只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。

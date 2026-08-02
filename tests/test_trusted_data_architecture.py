@@ -534,10 +534,29 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 )
             )
             manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+            self.assertLess(manifest_path(data_dir).stat().st_size, 10 * 1024)
             bundle = LoadTrustedBundle(store, clock=FixedClock(end_ms)).execute(
                 LoadTrustedBundleQuery("BTC-USDT-SWAP", intervals=("15m", "1h"), days=14),
                 trading_strict_policy(),
             )
+            for interval in ("5m", "15m", "1h"):
+                persisted = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"][interval]
+                first_reference = persisted["storage"]["segments"][0]
+                expected_name = (
+                    f"{first_reference['segment_id']}.partial-{first_reference['first_timestamp_ms']}.csv"
+                )
+                self.assertEqual(expected_name, Path(first_reference["source_file"]).name)
+                self.assertTrue((data_dir / first_reference["source_file"]).is_file())
+                self.assertFalse(
+                    (
+                        data_dir
+                        / "segments"
+                        / "okx"
+                        / "BTC-USDT-SWAP"
+                        / interval
+                        / f"{first_reference['segment_id']}.csv"
+                    ).exists()
+                )
 
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)

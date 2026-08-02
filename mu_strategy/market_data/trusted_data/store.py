@@ -121,6 +121,18 @@ class TrustedDataStore:
         canonical = self.segment_source_file(symbol, interval, segment_id)
         return canonical.with_name(f"{segment_id}.import-{generation_id}.csv")
 
+    def partial_segment_source_file(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        first_timestamp_ms: int,
+    ) -> Path:
+        if utc_month_segment_id(first_timestamp_ms) != segment_id:
+            raise ValueError("partial segment timestamp must belong to segment_id")
+        canonical = self.segment_source_file(symbol, interval, segment_id)
+        return canonical.with_name(f"{segment_id}.partial-{first_timestamp_ms}.csv")
+
     def segment_path(self, symbol: str, interval: str, segment_id: str) -> Path:
         source_file = self.segment_source_file(symbol, interval, segment_id)
         return self._segment_path_from_source(source_file)
@@ -215,6 +227,7 @@ class TrustedDataStore:
         physical_candles: list[Candle] | None = None,
         import_generation_id: str | None = None,
         require_complete_start_month: bool = False,
+        isolate_partial_start_month: bool = False,
     ) -> DatasetStorage:
         source_root = self.segment_source_root(symbol, interval)
         if not candles:
@@ -243,6 +256,7 @@ class TrustedDataStore:
                 source_root=source_root,
                 import_generation_id=import_generation_id,
                 require_complete_start_month=require_complete_start_month,
+                isolate_partial_start_month=isolate_partial_start_month,
             )
 
     def _write_segmented_dataset_locked(
@@ -255,6 +269,7 @@ class TrustedDataStore:
         source_root: Path,
         import_generation_id: str | None,
         require_complete_start_month: bool,
+        isolate_partial_start_month: bool,
     ) -> DatasetStorage:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
         source_files_by_segment: dict[str, Path] = {}
@@ -276,6 +291,18 @@ class TrustedDataStore:
                     interval,
                     segment_id,
                     import_generation_id,
+                )
+                path = self._segment_path_from_source(source_file)
+            elif (
+                isolate_partial_start_month
+                and segment_id == first_logical_segment_id
+                and utc_month_segment_id(logical_partitions[segment_id][0].open_time_ms - 1) == segment_id
+            ):
+                source_file = self.partial_segment_source_file(
+                    symbol,
+                    interval,
+                    segment_id,
+                    logical_partitions[segment_id][0].open_time_ms,
                 )
                 path = self._segment_path_from_source(source_file)
             else:
@@ -548,6 +575,8 @@ class TrustedDataStore:
                 generation_id=generation_id,
                 imported_from_run_id=imported_from_run_id,
                 first_reference=index == 0,
+                allow_partial_start_reference=health.coverage_state == "partial_available_history",
+                first_timestamp_ms=reference.first_timestamp_ms,
             ):
                 raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
             path = self._segment_path_from_source(reference.source_file)
@@ -644,7 +673,10 @@ class TrustedDataStore:
             raise ManifestSchemaError("generation manifest run_id must match generation_id")
         path = self.generation_manifest_path(generation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(path, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
+        _atomic_write_text(
+            path,
+            json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        )
         result = self._read_manifest_file(path, generation_root=self.generation_root(generation_id), generation_id=generation_id)
         if not result.ok:
             message = result.message or (result.reason.value if result.reason is not None else "generation manifest is malformed")
@@ -1014,6 +1046,8 @@ def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_r
                     generation_id=snapshot.run_id,
                     imported_from_run_id=snapshot.imported_from_run_id,
                     first_reference=index == 0,
+                    allow_partial_start_reference=health.coverage_state == "partial_available_history",
+                    first_timestamp_ms=reference.first_timestamp_ms,
                 ):
                     raise ManifestSchemaError(
                         "schema-v4 segment source_file must match symbol/interval/segment_id"
@@ -1046,15 +1080,24 @@ def _is_allowed_segment_source(
     generation_id: str,
     imported_from_run_id: str | None,
     first_reference: bool,
+    allow_partial_start_reference: bool,
+    first_timestamp_ms: int,
 ) -> bool:
     canonical = expected_root / f"{segment_id}.csv"
     if source_file.as_posix() == canonical.as_posix():
         return True
     imported = expected_root / f"{segment_id}.import-{generation_id}.csv"
-    return (
+    if (
         imported_from_run_id is not None
         and first_reference
         and source_file.as_posix() == imported.as_posix()
+    ):
+        return True
+    partial = expected_root / f"{segment_id}.partial-{first_timestamp_ms}.csv"
+    return (
+        allow_partial_start_reference
+        and first_reference
+        and source_file.as_posix() == partial.as_posix()
     )
 
 
