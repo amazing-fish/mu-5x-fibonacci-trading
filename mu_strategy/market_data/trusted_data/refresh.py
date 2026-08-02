@@ -331,6 +331,7 @@ class RefreshTrustedMarketData:
         path = self.store.data_dir / self.store.segment_source_root(symbol, interval)
         source_file = self.store.segment_source_root(symbol, interval)
         existing: list[Candle] = []
+        reusable_prior: ReusablePriorDataset | None = None
         try:
             reusable_prior = self._load_reusable_prior_dataset(
                 previous_manifest,
@@ -459,6 +460,11 @@ class RefreshTrustedMarketData:
                 fetch_reason=reason,
                 error_type=failure["error_type"],
                 message=failure["message"],
+                prior_partial_start_source_file=(
+                    reusable_prior.partial_start_source_file
+                    if reusable_prior is not None
+                    else None
+                ),
             )
 
     def _materialize_symbol_bundle(

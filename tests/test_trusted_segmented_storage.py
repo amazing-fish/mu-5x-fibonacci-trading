@@ -203,23 +203,46 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             third_reference = store.read_generation_manifest(RUN_C).snapshot.storage_by_dataset[
                 (SYMBOL, "5m")
             ].segments[0]
-            partial_bytes = partial_path.read_bytes()
 
             self.assertEqual(RefreshAttemptStatus.SUCCESS, third_run.attempt_status)
             self.assertEqual("complete", third_run.datasets[(SYMBOL, "5m")].coverage_state)
             self.assertEqual(first_reference.source_file, third_reference.source_file)
             self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
 
+            def failed_incremental(symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+                raise TimeoutError("incremental unavailable")
+
+            provider.fetch_incremental = failed_incremental
+            failed_run_id = "d" * 32
+            failed_run = _refresh(
+                store,
+                provider,
+                failed_run_id,
+                days=1,
+                now_ms=complete_end_ms + STEP_MS,
+            )
+            failed_reference = store.read_generation_manifest(failed_run_id).snapshot.storage_by_dataset[
+                (SYMBOL, "5m")
+            ].segments[0]
+            partial_bytes = partial_path.read_bytes()
+
+            self.assertEqual(RefreshAttemptStatus.DEGRADED, failed_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, failed_run.snapshot_usability)
+            self.assertEqual("complete", failed_run.datasets[(SYMBOL, "5m")].coverage_state)
+            self.assertEqual(first_reference.source_file, failed_reference.source_file)
+            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
+
             january_open_ms = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
             provider.rows = _window_candles(january_open_ms, complete_end_ms)
+            expanded_run_id = "e" * 32
             expanded_run = _refresh(
                 store,
                 provider,
-                RUN_D,
+                expanded_run_id,
                 days=3,
                 now_ms=complete_end_ms + STEP_MS,
             )
-            expanded_reference = store.read_generation_manifest(RUN_D).snapshot.storage_by_dataset[
+            expanded_reference = store.read_generation_manifest(expanded_run_id).snapshot.storage_by_dataset[
                 (SYMBOL, "5m")
             ].segments[0]
 
