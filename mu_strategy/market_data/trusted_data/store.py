@@ -228,6 +228,7 @@ class TrustedDataStore:
         import_generation_id: str | None = None,
         require_complete_start_month: bool = False,
         isolate_partial_start_month: bool = False,
+        reuse_partial_start_source_file: Path | None = None,
     ) -> DatasetStorage:
         source_root = self.segment_source_root(symbol, interval)
         if not candles:
@@ -257,6 +258,7 @@ class TrustedDataStore:
                 import_generation_id=import_generation_id,
                 require_complete_start_month=require_complete_start_month,
                 isolate_partial_start_month=isolate_partial_start_month,
+                reuse_partial_start_source_file=reuse_partial_start_source_file,
             )
 
     def _write_segmented_dataset_locked(
@@ -270,6 +272,7 @@ class TrustedDataStore:
         import_generation_id: str | None,
         require_complete_start_month: bool,
         isolate_partial_start_month: bool,
+        reuse_partial_start_source_file: Path | None,
     ) -> DatasetStorage:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
         source_files_by_segment: dict[str, Path] = {}
@@ -280,6 +283,17 @@ class TrustedDataStore:
                 symbol=symbol,
                 interval=interval,
                 segment_id=segment_id,
+            )
+            canonical_source_file = self.segment_source_file(symbol, interval, segment_id)
+            reused_partial_start_ms = (
+                _partial_segment_source_start_ms(
+                    reuse_partial_start_source_file,
+                    expected_root=source_root,
+                    segment_id=segment_id,
+                )
+                if reuse_partial_start_source_file is not None
+                and segment_id == first_logical_segment_id
+                else None
             )
             if (
                 import_generation_id is not None
@@ -293,6 +307,13 @@ class TrustedDataStore:
                     import_generation_id,
                 )
                 path = self._segment_path_from_source(source_file)
+            elif reused_partial_start_ms is not None:
+                source_file = Path(reuse_partial_start_source_file)
+                path = self._segment_path_from_source(source_file)
+                if not path.exists():
+                    raise SegmentCorrectionError(
+                        f"reused partial trusted segment is missing: {symbol}/{interval}/{segment_id}"
+                    )
             elif (
                 isolate_partial_start_month
                 and segment_id == first_logical_segment_id
@@ -302,11 +323,11 @@ class TrustedDataStore:
                     symbol,
                     interval,
                     segment_id,
-                    logical_partitions[segment_id][0].open_time_ms,
+                    candidate_rows[0].open_time_ms,
                 )
                 path = self._segment_path_from_source(source_file)
             else:
-                source_file = self.segment_source_file(symbol, interval, segment_id)
+                source_file = canonical_source_file
                 path = self.segment_path(symbol, interval, segment_id)
             source_files_by_segment[segment_id] = source_file
             if not path.exists():
@@ -333,6 +354,11 @@ class TrustedDataStore:
             existing_bytes = path.read_bytes()
             existing = self.read_csv(path)
             _validate_segment_candles(existing, segment_id=segment_id)
+            if reused_partial_start_ms is not None and existing[0].open_time_ms != reused_partial_start_ms:
+                raise ManifestSchemaError(
+                    f"partial trusted segment filename does not match physical first timestamp: "
+                    f"{symbol}/{interval}/{segment_id}"
+                )
             existing_by_timestamp = {candle.open_time_ms: candle for candle in existing}
             for candidate in candidate_rows:
                 if candidate.open_time_ms < existing[0].open_time_ms:
@@ -575,7 +601,8 @@ class TrustedDataStore:
                 generation_id=generation_id,
                 imported_from_run_id=imported_from_run_id,
                 first_reference=index == 0,
-                allow_partial_start_reference=health.coverage_state == "partial_available_history",
+                interval=interval,
+                start_row=reference.start_row,
                 first_timestamp_ms=reference.first_timestamp_ms,
             ):
                 raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
@@ -1046,7 +1073,8 @@ def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_r
                     generation_id=snapshot.run_id,
                     imported_from_run_id=snapshot.imported_from_run_id,
                     first_reference=index == 0,
-                    allow_partial_start_reference=health.coverage_state == "partial_available_history",
+                    interval=interval,
+                    start_row=reference.start_row,
                     first_timestamp_ms=reference.first_timestamp_ms,
                 ):
                     raise ManifestSchemaError(
@@ -1080,7 +1108,8 @@ def _is_allowed_segment_source(
     generation_id: str,
     imported_from_run_id: str | None,
     first_reference: bool,
-    allow_partial_start_reference: bool,
+    interval: str,
+    start_row: int,
     first_timestamp_ms: int,
 ) -> bool:
     canonical = expected_root / f"{segment_id}.csv"
@@ -1093,12 +1122,36 @@ def _is_allowed_segment_source(
         and source_file.as_posix() == imported.as_posix()
     ):
         return True
-    partial = expected_root / f"{segment_id}.partial-{first_timestamp_ms}.csv"
+    try:
+        partial_start_ms = first_timestamp_ms - (start_row * interval_to_ms(interval))
+        partial_segment_id = utc_month_segment_id(partial_start_ms)
+    except (IndexError, TypeError, ValueError):
+        return False
+    partial = expected_root / f"{segment_id}.partial-{partial_start_ms}.csv"
     return (
-        allow_partial_start_reference
-        and first_reference
+        first_reference
+        and partial_segment_id == segment_id
         and source_file.as_posix() == partial.as_posix()
     )
+
+
+def _partial_segment_source_start_ms(
+    source_file: Path,
+    *,
+    expected_root: Path,
+    segment_id: str,
+) -> int | None:
+    source_file = Path(source_file)
+    if source_file.parent.as_posix() != expected_root.as_posix():
+        return None
+    match = re.fullmatch(rf"{re.escape(segment_id)}\.partial-(-?[0-9]+)\.csv", source_file.name)
+    if match is None:
+        return None
+    first_timestamp_ms = int(match.group(1))
+    try:
+        return first_timestamp_ms if utc_month_segment_id(first_timestamp_ms) == segment_id else None
+    except ValueError:
+        return None
 
 
 def _validate_segment_candles(candles: list[Candle], *, segment_id: str) -> None:

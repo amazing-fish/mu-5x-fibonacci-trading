@@ -85,9 +85,12 @@ existing canonical byte prefix. Under continuous refresh, each run adds persiste
 proportion to new candle content plus bounded manifest/run metadata rather than the full retained
 history, while total segment residency remains proportional to total retained history. Retention,
 pin policy, GC, deletion, and bounding the monotonically growing `refresh_runs.jsonl` are separate
-follow-ups. A `partial_available_history` dataset that starts mid-month uses the deterministic
-`YYYY-MM.partial-<first_timestamp_ms>.csv` compatibility path for its first reference, never the
-canonical month path.
+follow-ups. A dataset first published as `partial_available_history` from mid-month uses the
+deterministic `YYYY-MM.partial-<physical_first_timestamp_ms>.csv` compatibility path for its first
+reference, never the canonical month path. If incremental appends later make the logical window
+complete without proving UTC month-open, subsequent complete generations keep referencing and
+growing that same compatibility file. A canonical `YYYY-MM.csv` is created only by a later
+full-history response with complete month-open evidence; old compatibility evidence stays exact-readable.
 
 ## Core
 

@@ -146,6 +146,13 @@ class DatasetRefreshCandidate:
     fetch_reason: HealthReason | None = None
     error_type: str | None = None
     message: str | None = None
+    prior_partial_start_source_file: Path | None = None
+
+
+@dataclass(frozen=True)
+class ReusablePriorDataset:
+    candles: list[Candle]
+    partial_start_source_file: Path | None = None
 
 
 class ReusablePriorDatasetReadError(Exception):
@@ -325,7 +332,13 @@ class RefreshTrustedMarketData:
         source_file = self.store.segment_source_root(symbol, interval)
         existing: list[Candle] = []
         try:
-            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval, days=days) or []
+            reusable_prior = self._load_reusable_prior_dataset(
+                previous_manifest,
+                symbol,
+                interval,
+                days=days,
+            )
+            existing = reusable_prior.candles if reusable_prior is not None else []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -356,6 +369,11 @@ class RefreshTrustedMarketData:
                     reused_prior_generation=bool(existing),
                 ),
                 had_existing=bool(existing),
+                prior_partial_start_source_file=(
+                    reusable_prior.partial_start_source_file
+                    if reusable_prior is not None
+                    else None
+                ),
             )
         except ReusablePriorDatasetReadError as exc:
             prior_failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
@@ -506,6 +524,7 @@ class RefreshTrustedMarketData:
                 physical_candles=seed.candles,
                 require_complete_start_month=require_complete_start_month,
                 isolate_partial_start_month=coverage.coverage_state == "partial_available_history",
+                reuse_partial_start_source_file=candidate.prior_partial_start_source_file,
             )
             return candles_content_sha256(candles)
 
@@ -539,7 +558,14 @@ class RefreshTrustedMarketData:
             return run
         return replace(run, warnings=(*run.warnings, *publication_warnings))
 
-    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str, *, days: int) -> list[Candle] | None:
+    def _load_reusable_prior_dataset(
+        self,
+        manifest_result,
+        symbol: str,
+        interval: str,
+        *,
+        days: int,
+    ) -> ReusablePriorDataset | None:
         if (
             not manifest_result.ok
             or manifest_result.snapshot is None
@@ -576,7 +602,20 @@ class RefreshTrustedMarketData:
         )
         if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None
-        return cached
+        partial_start_source_file = None
+        if storage.segments:
+            first_reference = storage.segments[0]
+            canonical_source_file = self.store.segment_source_file(
+                symbol,
+                interval,
+                first_reference.segment_id,
+            )
+            if first_reference.source_file.as_posix() != canonical_source_file.as_posix():
+                partial_start_source_file = first_reference.source_file
+        return ReusablePriorDataset(
+            candles=cached,
+            partial_start_source_file=partial_start_source_file,
+        )
 
 
 def _is_reusable_prior_health(health: DatasetHealth) -> bool:

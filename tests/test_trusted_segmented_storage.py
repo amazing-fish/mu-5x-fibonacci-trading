@@ -150,6 +150,85 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertTrue(any((configured_data_dir / "segments").rglob("*.csv")))
             self.assertFalse((repository / "data" / "live").exists())
 
+    def test_incremental_partial_history_that_becomes_complete_stays_out_of_canonical_month(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+
+        partial_end_ms = JAN_START_MS + (12 * 60 * 60_000)
+        complete_end_ms = JAN_START_MS + DAY_MS + (12 * 60 * 60_000)
+        provider = MutableHistoryProvider(_window_candles(JAN_START_MS, partial_end_ms))
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            first_run = _refresh(
+                store,
+                provider,
+                RUN_A,
+                days=1,
+                now_ms=partial_end_ms + STEP_MS,
+            )
+            first_snapshot = store.read_generation_manifest(RUN_A).snapshot
+            first_reference = first_snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+            partial_path = data_dir / first_reference.source_file
+
+            provider.rows = _window_candles(JAN_START_MS, complete_end_ms)
+            second_run = _refresh(
+                store,
+                provider,
+                RUN_B,
+                days=1,
+                now_ms=complete_end_ms + STEP_MS,
+            )
+            second_result = store.read_generation_manifest(RUN_B)
+            second_reference = second_result.snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
+
+            self.assertEqual("partial_available_history", first_run.datasets[(SYMBOL, "5m")].coverage_state)
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, second_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
+            self.assertEqual("complete", second_run.datasets[(SYMBOL, "5m")].coverage_state)
+            self.assertTrue(second_result.ok)
+            self.assertEqual(first_reference.source_file, second_reference.source_file)
+            self.assertGreater(second_reference.start_row, 0)
+            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
+            self.assertEqual(second_run.datasets[(SYMBOL, "5m")].rows, len(_read_exact(store, RUN_B)))
+
+            complete_end_ms += STEP_MS
+            provider.rows = _window_candles(JAN_START_MS, complete_end_ms)
+            third_run = _refresh(
+                store,
+                provider,
+                RUN_C,
+                days=1,
+                now_ms=complete_end_ms + STEP_MS,
+            )
+            third_reference = store.read_generation_manifest(RUN_C).snapshot.storage_by_dataset[
+                (SYMBOL, "5m")
+            ].segments[0]
+            partial_bytes = partial_path.read_bytes()
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, third_run.attempt_status)
+            self.assertEqual("complete", third_run.datasets[(SYMBOL, "5m")].coverage_state)
+            self.assertEqual(first_reference.source_file, third_reference.source_file)
+            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
+
+            january_open_ms = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+            provider.rows = _window_candles(january_open_ms, complete_end_ms)
+            expanded_run = _refresh(
+                store,
+                provider,
+                RUN_D,
+                days=3,
+                now_ms=complete_end_ms + STEP_MS,
+            )
+            expanded_reference = store.read_generation_manifest(RUN_D).snapshot.storage_by_dataset[
+                (SYMBOL, "5m")
+            ].segments[0]
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, expanded_run.attempt_status)
+            self.assertEqual(SnapshotUsability.USABLE, expanded_run.snapshot_usability)
+            self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-01"), expanded_reference.source_file)
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
+            self.assertEqual(partial_bytes, partial_path.read_bytes())
+
     def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
 
@@ -852,7 +931,8 @@ class SegmentedFailureContractTests(unittest.TestCase):
             "duplicate_reference",
             "out_of_order",
             "source_path_mismatch",
-            "partial_path_without_partial_coverage",
+            "partial_path_not_first_reference",
+            "partial_path_mismatches_physical_start",
             "empty_valid_storage",
         )
         for case in cases:
@@ -877,8 +957,18 @@ class SegmentedFailureContractTests(unittest.TestCase):
                         segments.reverse()
                     elif case == "source_path_mismatch":
                         segments[0]["source_file"] = "segments/okx/OTHER/5m/2026-01.csv"
-                    elif case == "partial_path_without_partial_coverage":
-                        dataset["coverage_state"] = "covered"
+                    elif case == "partial_path_not_first_reference":
+                        second = segments[1]
+                        partial_start_ms = second["first_timestamp_ms"] - (second["start_row"] * STEP_MS)
+                        second["source_file"] = (
+                            f"segments/okx/{SYMBOL}/5m/{second['segment_id']}.partial-{partial_start_ms}.csv"
+                        )
+                    elif case == "partial_path_mismatches_physical_start":
+                        first = segments[0]
+                        first["source_file"] = (
+                            f"segments/okx/{SYMBOL}/5m/{first['segment_id']}.partial-"
+                            f"{first['first_timestamp_ms'] + STEP_MS}.csv"
+                        )
                     elif case == "empty_valid_storage":
                         dataset["storage"]["segments"] = []
                     manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")

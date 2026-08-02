@@ -173,9 +173,12 @@ requested logical window, a missing canonical start month is written only when i
 the UTC month open; a shortened response that nevertheless satisfies logical coverage therefore
 fails before shared mutation. Explicit `partial_available_history` remains a distinct, visible
 state and does not claim this proof. When its first logical month starts after UTC month-open, that
-first reference uses the deterministic `YYYY-MM.partial-<first_timestamp_ms>.csv` compatibility
-path instead of poisoning the canonical month; a later response with a different or complete
-start can create separate evidence while the old exact generation remains readable. A later wider
+first reference uses the deterministic `YYYY-MM.partial-<physical_first_timestamp_ms>.csv`
+compatibility path instead of poisoning the canonical month. If later incremental appends make the
+same logical window complete without acquiring month-open evidence, the generation continues to
+reference and grow that compatibility file; logical coverage alone never promotes it to canonical.
+A later full-history response with complete month-open evidence can create separate canonical
+evidence while the old exact generation remains readable. A later wider
 request can move `start_row` earlier inside a complete stored month without prepending rows or
 changing an older manifest's offsets. Extra
 provider rows before the already stored physical prefix are ignored; every overlapping timestamp

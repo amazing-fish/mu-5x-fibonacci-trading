@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -761,7 +762,6 @@ def _segmented_datasets_from_symbols(
                 payload.get("storage"),
                 run_id=run_id,
                 imported_from_run_id=imported_from_run_id,
-                allow_partial_start_reference=payload.get("coverage_state") == "partial_available_history",
             )
             health_payload = dict(payload)
             health_payload.pop("storage", None)
@@ -780,7 +780,6 @@ def _dataset_storage_from_dict(
     *,
     run_id: str,
     imported_from_run_id: str | None,
-    allow_partial_start_reference: bool,
 ) -> DatasetStorage:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 dataset storage must be object")
@@ -807,7 +806,6 @@ def _dataset_storage_from_dict(
             run_id=run_id,
             imported_from_run_id=imported_from_run_id,
             first_reference=index == 0,
-            allow_partial_start_reference=allow_partial_start_reference,
         )
         for index, item in enumerate(segment_payloads)
     )
@@ -826,7 +824,6 @@ def _segment_reference_from_dict(
     run_id: str,
     imported_from_run_id: str | None,
     first_reference: bool,
-    allow_partial_start_reference: bool,
 ) -> SegmentReference:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 segment reference must be object")
@@ -835,35 +832,9 @@ def _segment_reference_from_dict(
     segment_id = payload.get("segment_id")
     if not isinstance(segment_id, str) or not _UTC_MONTH_RE.fullmatch(segment_id):
         raise ManifestSchemaError("schema-v4 segment_id must be UTC YYYY-MM")
-    expected_source = Path("segments") / "okx" / symbol / interval / f"{segment_id}.csv"
-    source_file_value = payload.get("source_file")
-    imported_source = expected_source.with_name(f"{segment_id}.import-{run_id}.csv")
-    first_timestamp_ms = payload.get("first_timestamp_ms")
-    partial_source = (
-        expected_source.with_name(f"{segment_id}.partial-{first_timestamp_ms}.csv")
-        if _is_int(first_timestamp_ms)
-        else None
-    )
-    source_file = Path(source_file_value) if isinstance(source_file_value, str) else None
-    if source_file is None or not (
-        source_file.as_posix() == expected_source.as_posix()
-        or (
-            imported_from_run_id is not None
-            and first_reference
-            and source_file.as_posix() == imported_source.as_posix()
-        )
-        or (
-            allow_partial_start_reference
-            and first_reference
-            and partial_source is not None
-            and source_file.as_posix() == partial_source.as_posix()
-        )
-    ):
-        raise ManifestSchemaError(
-            "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"
-        )
     rows = payload.get("rows")
     start_row = payload.get("start_row")
+    first_timestamp_ms = payload.get("first_timestamp_ms")
     last_timestamp_ms = payload.get("last_timestamp_ms")
     content_sha256 = payload.get("content_sha256")
     closed = payload.get("closed")
@@ -882,6 +853,32 @@ def _segment_reference_from_dict(
         raise ManifestSchemaError(str(exc)) from exc
     if first_segment_id != segment_id or last_segment_id != segment_id:
         raise ManifestSchemaError("schema-v4 segment timestamp bounds must belong to segment_id")
+    expected_source = Path("segments") / "okx" / symbol / interval / f"{segment_id}.csv"
+    imported_source = expected_source.with_name(f"{segment_id}.import-{run_id}.csv")
+    try:
+        partial_start_ms = int(first_timestamp_ms) - (int(start_row) * interval_to_ms(interval))
+        partial_segment_id = utc_month_segment_id(partial_start_ms)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ManifestSchemaError(f"schema-v4 segment interval is invalid: {interval}") from exc
+    partial_source = expected_source.with_name(f"{segment_id}.partial-{partial_start_ms}.csv")
+    source_file_value = payload.get("source_file")
+    source_file = Path(source_file_value) if isinstance(source_file_value, str) else None
+    if source_file is None or not (
+        source_file.as_posix() == expected_source.as_posix()
+        or (
+            imported_from_run_id is not None
+            and first_reference
+            and source_file.as_posix() == imported_source.as_posix()
+        )
+        or (
+            first_reference
+            and partial_segment_id == segment_id
+            and source_file.as_posix() == partial_source.as_posix()
+        )
+    ):
+        raise ManifestSchemaError(
+            "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"
+        )
     if not isinstance(content_sha256, str) or not _SHA256_RE.fullmatch(content_sha256):
         raise ManifestSchemaError("schema-v4 segment content_sha256 must be lowercase SHA-256")
     if not isinstance(closed, bool):
