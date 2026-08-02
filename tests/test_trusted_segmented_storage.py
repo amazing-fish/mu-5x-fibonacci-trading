@@ -831,6 +831,46 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
             self.assertEqual(("2026-02",), tuple(ref.segment_id for ref in storage.segments))
 
+    def test_physical_lookbehind_retains_chain_from_existing_predecessor(self):
+        december_start_ms = int(datetime(2025, 12, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        initial_rows = _window_candles(
+            december_start_ms,
+            JAN_MONTH_START_MS - 2 * STEP_MS,
+        )
+        missing_december_tail = _window_candles(
+            JAN_MONTH_START_MS - STEP_MS,
+            JAN_MONTH_START_MS - STEP_MS,
+        )
+        january_rows = _window_candles(JAN_MONTH_START_MS, FEB_START_MS - STEP_MS)
+        february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
+        physical_rows = [*missing_december_tail, *january_rows, *february_rows]
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(initial_rows, symbol=SYMBOL, interval="5m")
+            december_path = store.segment_path(SYMBOL, "5m", "2025-12")
+            january_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            previous_size = december_path.stat().st_size
+
+            storage = store.write_segmented_dataset(
+                february_rows,
+                symbol=SYMBOL,
+                interval="5m",
+                physical_candles=physical_rows,
+            )
+
+            self.assertGreater(december_path.stat().st_size, previous_size)
+            self.assertEqual(
+                JAN_MONTH_START_MS - STEP_MS,
+                store.read_csv(december_path)[-1].open_time_ms,
+            )
+            self.assertTrue(january_path.exists())
+            self.assertEqual(
+                FEB_START_MS - STEP_MS,
+                store.read_csv(january_path)[-1].open_time_ms,
+            )
+            self.assertEqual(("2026-02",), tuple(ref.segment_id for ref in storage.segments))
+
     def test_backfilled_month_requires_adjacency_to_existing_successor(self):
         february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
         incomplete_january_rows = _window_candles(

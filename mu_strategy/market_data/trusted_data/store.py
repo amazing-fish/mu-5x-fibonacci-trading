@@ -280,7 +280,7 @@ class TrustedDataStore:
             or reuse_partial_start_source_file is not None
             or isolate_partial_start_month
         )
-        retained_predecessor_id: str | None = None
+        retained_predecessor_ids: set[str] = set()
         prior_physical_segment_ids = [
             segment_id
             for segment_id in physical_partitions
@@ -291,13 +291,22 @@ class TrustedDataStore:
             and not self.segment_path(symbol, interval, first_logical_segment_id).exists()
             and not first_logical_uses_noncanonical_source
         ):
-            candidate_predecessor_id = max(prior_physical_segment_ids)
-            if self.segment_path(symbol, interval, candidate_predecessor_id).exists():
-                retained_predecessor_id = candidate_predecessor_id
+            existing_predecessor_ids = [
+                segment_id
+                for segment_id in prior_physical_segment_ids
+                if self.segment_path(symbol, interval, segment_id).exists()
+            ]
+            if existing_predecessor_ids:
+                first_retained_id = max(existing_predecessor_ids)
+                retained_predecessor_ids = {
+                    segment_id
+                    for segment_id in prior_physical_segment_ids
+                    if segment_id >= first_retained_id
+                }
         physical_partitions = {
             segment_id: rows
             for segment_id, rows in physical_partitions.items()
-            if segment_id >= first_logical_segment_id or segment_id == retained_predecessor_id
+            if segment_id >= first_logical_segment_id or segment_id in retained_predecessor_ids
         }
         physical_items = list(physical_partitions.items())
         _validate_candidate_partitions_continuity(
