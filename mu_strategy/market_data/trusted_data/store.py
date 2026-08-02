@@ -240,12 +240,6 @@ class TrustedDataStore:
         physical_partitions = _partition_candles_by_utc_month(
             physical_candles if physical_candles is not None else candles
         )
-        first_logical_segment_id = next(iter(logical_partitions))
-        physical_partitions = {
-            segment_id: rows
-            for segment_id, rows in physical_partitions.items()
-            if segment_id >= first_logical_segment_id
-        }
         segment_directory = self.data_dir / source_root
         self._ensure_data_directory(segment_directory)
         with _exclusive_dataset_writer_lock(segment_directory / ".write.lock"):
@@ -277,6 +271,34 @@ class TrustedDataStore:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
         source_files_by_segment: dict[str, Path] = {}
         first_logical_segment_id = next(iter(logical_partitions))
+        logical_start_is_mid_month = (
+            utc_month_segment_id(logical_partitions[first_logical_segment_id][0].open_time_ms - 1)
+            == first_logical_segment_id
+        )
+        first_logical_uses_noncanonical_source = logical_start_is_mid_month and (
+            import_generation_id is not None
+            or reuse_partial_start_source_file is not None
+            or isolate_partial_start_month
+        )
+        retained_predecessor_id: str | None = None
+        prior_physical_segment_ids = [
+            segment_id
+            for segment_id in physical_partitions
+            if segment_id < first_logical_segment_id
+        ]
+        if (
+            prior_physical_segment_ids
+            and not self.segment_path(symbol, interval, first_logical_segment_id).exists()
+            and not first_logical_uses_noncanonical_source
+        ):
+            candidate_predecessor_id = max(prior_physical_segment_ids)
+            if self.segment_path(symbol, interval, candidate_predecessor_id).exists():
+                retained_predecessor_id = candidate_predecessor_id
+        physical_partitions = {
+            segment_id: rows
+            for segment_id, rows in physical_partitions.items()
+            if segment_id >= first_logical_segment_id or segment_id == retained_predecessor_id
+        }
         physical_items = list(physical_partitions.items())
         _validate_candidate_partitions_continuity(
             physical_items,
@@ -289,12 +311,6 @@ class TrustedDataStore:
         )
         if physical_items:
             last_segment_id, last_candidate_rows = physical_items[-1]
-            logical_start_is_mid_month = (
-                utc_month_segment_id(
-                    logical_partitions[first_logical_segment_id][0].open_time_ms - 1
-                )
-                == first_logical_segment_id
-            )
             reused_partial_start_ms = (
                 _partial_segment_source_start_ms(
                     reuse_partial_start_source_file,
