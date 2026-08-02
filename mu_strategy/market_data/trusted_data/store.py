@@ -387,6 +387,12 @@ class TrustedDataStore:
                         segment_id,
                         candidate_rows[0],
                     )
+                    self._validate_compatibility_segment_overlaps(
+                        symbol,
+                        interval,
+                        segment_id,
+                        candidate_rows,
+                    )
                 self.write_csv(candidate_rows, path)
                 physical_rows_by_segment[segment_id] = list(candidate_rows)
                 continue
@@ -399,17 +405,14 @@ class TrustedDataStore:
                     f"partial trusted segment filename does not match physical first timestamp: "
                     f"{symbol}/{interval}/{segment_id}"
                 )
-            existing_by_timestamp = {candle.open_time_ms: candle for candle in existing}
-            for candidate in candidate_rows:
-                if candidate.open_time_ms < existing[0].open_time_ms:
-                    continue
-                if candidate.open_time_ms > existing[-1].open_time_ms:
-                    break
-                stored = existing_by_timestamp.get(candidate.open_time_ms)
-                if stored is None or stored.to_csv_row() != candidate.to_csv_row():
-                    raise SegmentCorrectionError(
-                        f"historical correction would rewrite trusted segment: {symbol}/{interval}/{segment_id}"
-                    )
+            _validate_candidate_overlap(
+                existing,
+                candidate_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+                target="trusted segment",
+            )
             suffix_start = bisect_left(
                 [candle.open_time_ms for candle in candidate_rows],
                 existing[-1].open_time_ms + 1,
@@ -547,6 +550,40 @@ class TrustedDataStore:
             raise SegmentCorrectionError(
                 f"new trusted segment is not adjacent to its canonical successor: "
                 f"{symbol}/{interval}/{segment_id}->{next_id}"
+            )
+
+    def _validate_compatibility_segment_overlaps(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        candidate_rows: list[Candle],
+    ) -> None:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        compatibility_name = re.compile(
+            rf"{re.escape(segment_id)}\.(?:partial--?[0-9]+|"
+            rf"import-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})\.csv"
+        )
+        for discovered_path in sorted(segment_dir.glob(f"{segment_id}.*.csv")):
+            if compatibility_name.fullmatch(discovered_path.name) is None:
+                continue
+            source_file = discovered_path.relative_to(self.data_dir)
+            path = self._segment_path_from_source(source_file)
+            existing = self.read_csv(path)
+            _validate_segment_candles(existing, segment_id=segment_id)
+            _validate_candidate_segment_continuity(
+                existing,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+            )
+            _validate_candidate_overlap(
+                existing,
+                candidate_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+                target=f"trusted compatibility segment {path.name}",
             )
 
     def read_generation_dataset(
@@ -1251,6 +1288,28 @@ def _validate_candidate_segment_continuity(
         if current.open_time_ms - previous.open_time_ms != expected_interval_ms:
             raise SegmentCorrectionError(
                 f"trusted segment candidate contains a timestamp gap: {symbol}/{interval}/{segment_id}"
+            )
+
+
+def _validate_candidate_overlap(
+    existing: list[Candle],
+    candidate_rows: list[Candle],
+    *,
+    symbol: str,
+    interval: str,
+    segment_id: str,
+    target: str,
+) -> None:
+    existing_by_timestamp = {candle.open_time_ms: candle for candle in existing}
+    for candidate in candidate_rows:
+        if candidate.open_time_ms < existing[0].open_time_ms:
+            continue
+        if candidate.open_time_ms > existing[-1].open_time_ms:
+            break
+        stored = existing_by_timestamp.get(candidate.open_time_ms)
+        if stored is None or stored.to_csv_row() != candidate.to_csv_row():
+            raise SegmentCorrectionError(
+                f"historical correction would rewrite {target}: {symbol}/{interval}/{segment_id}"
             )
 
 

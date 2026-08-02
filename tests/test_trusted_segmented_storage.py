@@ -254,6 +254,53 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
             self.assertEqual(partial_bytes, partial_path.read_bytes())
 
+    def test_canonical_month_rejects_corrections_against_all_compatibility_sources(self):
+        compatibility_rows = _window_candles(JAN_START_MS, JAN_START_MS + STEP_MS)
+        for compatibility_kind in ("partial", "import"):
+            with self.subTest(compatibility_kind=compatibility_kind), TemporaryDirectory() as tmp:
+                store = TrustedDataStore(data_dir=Path(tmp))
+                kwargs = (
+                    {"isolate_partial_start_month": True}
+                    if compatibility_kind == "partial"
+                    else {"import_generation_id": RUN_A}
+                )
+                storage = store.write_segmented_dataset(
+                    compatibility_rows,
+                    symbol=SYMBOL,
+                    interval="5m",
+                    **kwargs,
+                )
+                compatibility_path = Path(tmp) / storage.segments[0].source_file
+                compatibility_bytes = compatibility_path.read_bytes()
+                canonical_rows = _window_candles(
+                    JAN_MONTH_START_MS,
+                    JAN_START_MS + STEP_MS,
+                )
+                changed_index = (JAN_START_MS - JAN_MONTH_START_MS) // STEP_MS
+                changed = canonical_rows[changed_index]
+                canonical_rows[changed_index] = Candle(
+                    changed.open_time_ms,
+                    changed.open,
+                    changed.high + 1.0,
+                    changed.low,
+                    changed.close + 0.5,
+                    changed.volume,
+                )
+
+                with self.assertRaisesRegex(
+                    SegmentCorrectionError,
+                    "historical correction.*compatibility segment",
+                ):
+                    store.write_segmented_dataset(
+                        canonical_rows,
+                        symbol=SYMBOL,
+                        interval="5m",
+                        require_complete_start_month=True,
+                    )
+
+                self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
+                self.assertEqual(compatibility_bytes, compatibility_path.read_bytes())
+
     def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
 
