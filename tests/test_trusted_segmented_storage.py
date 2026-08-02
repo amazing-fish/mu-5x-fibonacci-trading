@@ -301,6 +301,61 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
                 self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
                 self.assertEqual(compatibility_bytes, compatibility_path.read_bytes())
 
+    def test_partial_start_reuses_existing_canonical_month_instead_of_wedging_extension(self):
+        january_rows = _window_candles(FEB_START_MS - (2 * STEP_MS), FEB_START_MS - STEP_MS)
+        february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
+        canonical_rows = [*january_rows, *february_rows]
+        partial_rows = [january_rows[-1], *february_rows]
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
+            partial_path = Path(tmp) / store.partial_segment_source_file(
+                SYMBOL,
+                "5m",
+                "2026-01",
+                partial_rows[0].open_time_ms,
+            )
+
+            storage = store.write_segmented_dataset(
+                partial_rows,
+                symbol=SYMBOL,
+                interval="5m",
+                isolate_partial_start_month=True,
+            )
+
+            self.assertEqual(
+                store.segment_source_file(SYMBOL, "5m", "2026-01"),
+                storage.segments[0].source_file,
+            )
+            self.assertFalse(partial_path.exists())
+
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            prior_partial = store.write_segmented_dataset(
+                january_rows[:1],
+                symbol=SYMBOL,
+                interval="5m",
+                isolate_partial_start_month=True,
+            )
+            prior_partial_source = prior_partial.segments[0].source_file
+            prior_partial_path = Path(tmp) / prior_partial_source
+            prior_partial_bytes = prior_partial_path.read_bytes()
+            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
+
+            storage = store.write_segmented_dataset(
+                canonical_rows,
+                symbol=SYMBOL,
+                interval="5m",
+                reuse_partial_start_source_file=prior_partial_source,
+            )
+
+            self.assertEqual(
+                store.segment_source_file(SYMBOL, "5m", "2026-01"),
+                storage.segments[0].source_file,
+            )
+            self.assertEqual(prior_partial_bytes, prior_partial_path.read_bytes())
+
     def test_new_compatibility_source_rejects_corrections_against_existing_representations(self):
         canonical_rows = _window_candles(
             JAN_MONTH_START_MS,
@@ -367,7 +422,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     SegmentCorrectionError,
-                    "historical correction.*segment representation",
+                    "historical correction.*trusted segment",
                 ):
                     store.write_segmented_dataset(
                         changed_rows,
@@ -407,7 +462,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 SegmentCorrectionError,
-                "historical correction.*segment representation",
+                "historical correction.*trusted segment",
             ):
                 store.write_segmented_dataset(
                     changed_extension,

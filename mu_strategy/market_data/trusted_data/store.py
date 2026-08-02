@@ -347,6 +347,14 @@ class TrustedDataStore:
                     import_generation_id,
                 )
                 path = self._segment_path_from_source(source_file)
+            elif self.segment_path(symbol, interval, segment_id).exists() and (
+                reused_partial_start_ms is not None
+                or isolate_partial_start_month
+                and segment_id == first_logical_segment_id
+                and utc_month_segment_id(logical_partitions[segment_id][0].open_time_ms - 1) == segment_id
+            ):
+                source_file = canonical_source_file
+                path = self.segment_path(symbol, interval, segment_id)
             elif reused_partial_start_ms is not None:
                 source_file = Path(reuse_partial_start_source_file)
                 path = self._segment_path_from_source(source_file)
