@@ -569,8 +569,8 @@ class TrustedExperimentDatasetV1:
             raise ValueError("dataset run_id must be lowercase 32-character hex")
         if not _SYMBOL_PATTERN.fullmatch(self.symbol):
             raise ValueError("dataset symbol is invalid")
-        if self.manifest_schema_version != 3:
-            raise ValueError("historical dataset requires manifest schema v3")
+        if self.manifest_schema_version not in (3, 4):
+            raise ValueError("historical dataset requires manifest schema v3 or v4")
         if not self.requested_intervals or not self.effective_intervals:
             raise ValueError("dataset intervals must not be empty")
         if len(set(self.requested_intervals)) != len(self.requested_intervals) or len(set(self.effective_intervals)) != len(

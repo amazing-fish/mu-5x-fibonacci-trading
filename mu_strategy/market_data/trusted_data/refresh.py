@@ -14,19 +14,27 @@ from mu_strategy.market_data.trusted_data.contracts import (
     Clock,
     DatasetHealth,
     DatasetKey,
+    DatasetStorage,
     FreshnessState,
     HealthReason,
     IntegrityState,
+    ManifestSchemaError,
     RefreshSegmentDiagnostics,
     RefreshRun,
     RefreshAttemptStatus,
     SnapshotUsability,
     SystemClock,
+    TrustedStorageLayout,
     UniverseSnapshot,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256, validate_storage_segment
+from mu_strategy.market_data.trusted_data.store import (
+    SegmentCorrectionError,
+    TrustedDataStore,
+    candles_content_sha256,
+    validate_storage_segment,
+)
 from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
 from mu_strategy.market_data.utils import dedupe_candles
@@ -36,6 +44,9 @@ from mu_strategy.models import Candle
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
 DEFAULT_MAX_CONCURRENCY = 2
 DEFAULT_REQUEST_MAX_CONCURRENCY = 1
+# Seed the complete UTC month containing any logical-window start without
+# changing requested-days health or manifest coverage semantics.
+SEGMENT_MONTH_LOOKBEHIND_DAYS = 32
 DEFAULT_STOCK_TOKEN_CONFIG = Path("config/okx_stock_tokens.json")
 DEFAULT_LIVE_DATA_DIR = Path("data/live")
 OKXHistoryFetcher = Callable[..., list[Candle]]
@@ -135,6 +146,13 @@ class DatasetRefreshCandidate:
     fetch_reason: HealthReason | None = None
     error_type: str | None = None
     message: str | None = None
+    prior_partial_start_source_file: Path | None = None
+
+
+@dataclass(frozen=True)
+class ReusablePriorDataset:
+    candles: list[Candle]
+    partial_start_source_file: Path | None = None
 
 
 class ReusablePriorDatasetReadError(Exception):
@@ -192,6 +210,7 @@ class RefreshTrustedMarketData:
             return run
 
         datasets: dict[tuple[str, str], DatasetHealth] = {}
+        storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
         candles_by_key: dict[tuple[str, str], list[Candle]] = {}
         refresh_segments_by_key: dict[tuple[str, str], RefreshSegmentDiagnostics] = {}
         symbols = tuple(
@@ -213,7 +232,7 @@ class RefreshTrustedMarketData:
             }
             for key, candidate in candidates.items():
                 refresh_segments_by_key[key] = candidate.diagnostics
-            symbol_datasets, symbol_candles = self._materialize_symbol_bundle(
+            symbol_datasets, symbol_candles, symbol_storage = self._materialize_symbol_bundle(
                 symbol=symbol,
                 intervals=plan.effective_intervals,
                 candidates=candidates,
@@ -224,6 +243,7 @@ class RefreshTrustedMarketData:
                 if key in refresh_segments_by_key:
                     refresh_segments_by_key[key] = refresh_segments_by_key[key].with_health(health)
             datasets.update(symbol_datasets)
+            storage_by_dataset.update(symbol_storage)
             candles_by_key.update(symbol_candles)
 
         warnings: list[str] = []
@@ -244,6 +264,7 @@ class RefreshTrustedMarketData:
             effective_intervals=plan.effective_intervals,
             universe_snapshot=universe,
             datasets=datasets,
+            storage_by_dataset=storage_by_dataset,
             provider_failures=provider_failures,
             warnings=tuple(warnings),
             refresh_segments=tuple(refresh_segments_by_key.values()),
@@ -307,17 +328,28 @@ class RefreshTrustedMarketData:
         previous_manifest,
     ) -> DatasetRefreshCandidate:
         started_at_ms = self.clock.now_ms()
-        path = self.store.generation_cache_path(run_id, symbol, interval)
-        source_file = self.store.generation_source_file(symbol, interval)
+        path = self.store.data_dir / self.store.segment_source_root(symbol, interval)
+        source_file = self.store.segment_source_root(symbol, interval)
         existing: list[Candle] = []
+        reusable_prior: ReusablePriorDataset | None = None
         try:
-            existing = self._load_reusable_prior_candles(previous_manifest, symbol, interval, days=days) or []
+            reusable_prior = self._load_reusable_prior_dataset(
+                previous_manifest,
+                symbol,
+                interval,
+                days=days,
+            )
+            existing = reusable_prior.candles if reusable_prior is not None else []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
                 fetch_mode = "incremental_reuse"
             else:
-                fetched = self.provider.fetch_history(symbol, interval, days=days)
+                fetched = self.provider.fetch_history(
+                    symbol,
+                    interval,
+                    days=segmented_history_fetch_days(days),
+                )
                 fetch_mode = "full_history"
             candles = dedupe_candles([*existing, *fetched])
             return DatasetRefreshCandidate(
@@ -338,11 +370,20 @@ class RefreshTrustedMarketData:
                     reused_prior_generation=bool(existing),
                 ),
                 had_existing=bool(existing),
+                prior_partial_start_source_file=(
+                    reusable_prior.partial_start_source_file
+                    if reusable_prior is not None
+                    else None
+                ),
             )
         except ReusablePriorDatasetReadError as exc:
             prior_failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
             try:
-                fetched = self.provider.fetch_history(symbol, interval, days=days)
+                fetched = self.provider.fetch_history(
+                    symbol,
+                    interval,
+                    days=segmented_history_fetch_days(days),
+                )
                 candles = dedupe_candles(fetched)
                 return DatasetRefreshCandidate(
                     key=DatasetKey(symbol, interval),
@@ -419,6 +460,11 @@ class RefreshTrustedMarketData:
                 fetch_reason=reason,
                 error_type=failure["error_type"],
                 message=failure["message"],
+                prior_partial_start_source_file=(
+                    reusable_prior.partial_start_source_file
+                    if reusable_prior is not None
+                    else None
+                ),
             )
 
     def _materialize_symbol_bundle(
@@ -429,7 +475,11 @@ class RefreshTrustedMarketData:
         candidates: dict[tuple[str, str], DatasetRefreshCandidate],
         days: int,
         now_ms: int,
-    ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], list[Candle]]]:
+    ) -> tuple[
+        dict[tuple[str, str], DatasetHealth],
+        dict[tuple[str, str], list[Candle]],
+        dict[tuple[str, str], DatasetStorage],
+    ]:
         seeds_by_interval = {
             interval: DatasetEvaluationSeed(
                 key=candidates[(symbol, interval)].key,
@@ -453,11 +503,35 @@ class RefreshTrustedMarketData:
             for interval in intervals
         }
 
+        storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
+        base_candidate = candidates.get((symbol, "5m"))
+        shared_window_end_ms = (
+            max(candle.open_time_ms for candle in base_candidate.candles)
+            if base_candidate is not None and base_candidate.candles
+            else None
+        )
+
         def write_valid_dataset(interval: str, seed: DatasetEvaluationSeed, candles: list[Candle]) -> str:
             candidate = candidates[(symbol, interval)]
-            if candidate.path.exists():
-                raise FileExistsError(f"generation dataset already exists: {candidate.path}")
-            self.store.write_csv(candles, candidate.path)
+            coverage = assess_requested_coverage(
+                candles,
+                interval=interval,
+                requested_days=days,
+                window_end_time_ms=shared_window_end_ms,
+            )
+            require_complete_start_month = (
+                candidate.diagnostics.fetch_mode in {"full_history", "prior_read_failed_full_history"}
+                and coverage.covered
+            )
+            storage_by_dataset[(symbol, interval)] = self.store.write_segmented_dataset(
+                candles,
+                symbol=symbol,
+                interval=interval,
+                physical_candles=seed.candles,
+                require_complete_start_month=require_complete_start_month,
+                isolate_partial_start_month=coverage.coverage_state == "partial_available_history",
+                reuse_partial_start_source_file=candidate.prior_partial_start_source_file,
+            )
             return candles_content_sha256(candles)
 
         result = evaluate_candle_bundle(
@@ -471,8 +545,14 @@ class RefreshTrustedMarketData:
             retain_invalid_candles_for_reasons=(HealthReason.TIMESTAMP_GAP,),
             allow_timestamp_gap_built_native_inputs=True,
             raise_os_errors=True,
+            raise_exceptions=(ManifestSchemaError, SegmentCorrectionError),
         )
-        return result.health_by_key, result.candles_by_key
+        for interval in intervals:
+            storage_by_dataset.setdefault(
+                (symbol, interval),
+                self.store.empty_segmented_storage(symbol, interval),
+            )
+        return result.health_by_key, result.candles_by_key, storage_by_dataset
 
     def _persist_run(self, run: RefreshRun) -> RefreshRun:
         publication_warnings = self.store.commit_generation_publication(
@@ -484,35 +564,41 @@ class RefreshTrustedMarketData:
             return run
         return replace(run, warnings=(*run.warnings, *publication_warnings))
 
-    def _previous_dataset_path(self, manifest_result, symbol: str, interval: str) -> Path | None:
-        if not manifest_result.ok or manifest_result.snapshot is None or manifest_result.generation_root is None:
-            return None
-        health = manifest_result.snapshot.datasets.get((symbol, interval))
-        if health is None:
-            return None
-        try:
-            return self.store.resolve_source_file(
-                health.source_file,
-                generation_root=manifest_result.generation_root,
-                generation_id=manifest_result.generation_id,
-            )
-        except Exception:
-            return None
-
-    def _load_reusable_prior_candles(self, manifest_result, symbol: str, interval: str, *, days: int) -> list[Candle] | None:
-        if not manifest_result.ok or manifest_result.snapshot is None:
+    def _load_reusable_prior_dataset(
+        self,
+        manifest_result,
+        symbol: str,
+        interval: str,
+        *,
+        days: int,
+    ) -> ReusablePriorDataset | None:
+        if (
+            not manifest_result.ok
+            or manifest_result.snapshot is None
+            or manifest_result.generation_root is None
+            or manifest_result.generation_id is None
+        ):
             return None
         health = manifest_result.snapshot.datasets.get((symbol, interval))
         if health is None or not _is_reusable_prior_health(health):
             return None
-        previous_path = self._previous_dataset_path(manifest_result, symbol, interval)
-        if previous_path is None or not previous_path.exists():
+        storage = manifest_result.snapshot.storage_by_dataset.get((symbol, interval))
+        if storage is None:
             return None
         try:
-            cached = self.store.read_csv(previous_path)
+            cached = self.store.read_generation_dataset(
+                manifest_result.snapshot,
+                symbol=symbol,
+                interval=interval,
+                generation_root=manifest_result.generation_root,
+                generation_id=manifest_result.generation_id,
+            )
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
-        if candles_content_sha256(cached) != health.content_sha256:
+        if (
+            storage.layout is not TrustedStorageLayout.SEGMENTED_CSV_V1
+            or manifest_result.snapshot.imported_from_run_id is not None
+        ):
             return None
         coverage = assess_requested_coverage(
             cached,
@@ -522,7 +608,20 @@ class RefreshTrustedMarketData:
         )
         if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None
-        return cached
+        partial_start_source_file = None
+        if storage.segments:
+            first_reference = storage.segments[0]
+            canonical_source_file = self.store.segment_source_file(
+                symbol,
+                interval,
+                first_reference.segment_id,
+            )
+            if first_reference.source_file.as_posix() != canonical_source_file.as_posix():
+                partial_start_source_file = first_reference.source_file
+        return ReusablePriorDataset(
+            candles=cached,
+            partial_start_source_file=partial_start_source_file,
+        )
 
 
 def _is_reusable_prior_health(health: DatasetHealth) -> bool:
@@ -532,6 +631,12 @@ def _is_reusable_prior_health(health: DatasetHealth) -> bool:
         and health.freshness in {FreshnessState.FRESH, FreshnessState.STALE}
         and bool(health.content_sha256)
     )
+
+
+def segmented_history_fetch_days(requested_days: int) -> int:
+    if not isinstance(requested_days, int) or isinstance(requested_days, bool) or requested_days < 1:
+        raise ValueError("requested_days must be a positive integer")
+    return requested_days + SEGMENT_MONTH_LOOKBEHIND_DAYS
 
 
 def _is_reusable_partial_history(health: DatasetHealth, *, requested_days: int) -> bool:

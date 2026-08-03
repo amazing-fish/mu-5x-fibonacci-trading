@@ -102,7 +102,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         load_config.assert_not_called()
         self.assertEqual(0, exit_code)
         self.assertEqual(
-            [("MU-USDT-SWAP", "5m", 1), ("MU-USDT-SWAP", "15m", 1)],
+            [("MU-USDT-SWAP", "5m", 33), ("MU-USDT-SWAP", "15m", 33)],
             fetch_calls,
         )
         self.assertEqual("explicit_symbols", output["fetch_mode"])
@@ -133,6 +133,8 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
         self.assertNotIn("stock_token_top_count_below_limit", ",".join(manifest["warnings"]))
         self.assertIn("explicit", html)
+        self.assertIn("storage_path", html)
+        self.assertIn("segments/okx/MU-USDT-SWAP/5m", html)
 
     def test_max_concurrency_cli_rejects_zero_and_negative_values(self):
         from mu_strategy.commands.refresh_market_data import main
@@ -472,7 +474,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
         def fetch_history(symbol: str, interval: str, *, days: int):
             self.assertEqual("BTC-USDT-SWAP", symbol)
             self.assertEqual("5m", interval)
-            self.assertEqual(14, days)
+            self.assertEqual(46, days)
             return range_candles(end_ms - DAY_MS, end_ms)
 
         with TemporaryDirectory() as tmp:
@@ -640,12 +642,15 @@ def _run(
         AvailabilityState,
         DatasetHealth,
         DatasetKey,
+        DatasetStorage,
         FreshnessState,
         HealthReason,
         IntegrityState,
         RefreshAttemptStatus,
         RefreshRun,
+        SegmentReference,
         SnapshotUsability,
+        TrustedStorageLayout,
         UniverseSnapshot,
         derive_snapshot_usability,
     )
@@ -670,6 +675,24 @@ def _run(
         source_file=Path("data/live/okx/BTC-USDT-SWAP/5m.csv"),
     )
     datasets = {("BTC-USDT-SWAP", "5m"): health}
+    storage_by_dataset = {
+        ("BTC-USDT-SWAP", "5m"): DatasetStorage(
+            layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
+            source_root=Path("segments/okx/BTC-USDT-SWAP/5m"),
+            segments=(
+                SegmentReference(
+                    segment_id="1970-01",
+                    source_file=Path("segments/okx/BTC-USDT-SWAP/5m/1970-01.csv"),
+                    start_row=0,
+                    rows=1,
+                    first_timestamp_ms=0,
+                    last_timestamp_ms=0,
+                    content_sha256="0" * 64,
+                    closed=False,
+                ),
+            ),
+        )
+    }
     return RefreshRun(
         run_id=run_id,
         attempt_status=attempt_status,
@@ -682,6 +705,7 @@ def _run(
             crypto_top=({"inst_id": "BTC-USDT-SWAP", "last": 100.0, "volume_ccy_24h": 10.0, "source": "top"},)
         ),
         datasets=datasets,
+        storage_by_dataset=storage_by_dataset,
         cycle_error=cycle_error,
     )
 

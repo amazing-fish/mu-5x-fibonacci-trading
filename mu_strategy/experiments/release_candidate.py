@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
@@ -12,10 +11,8 @@ from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
     IntegrityState,
-    ManifestSchemaError,
     RefreshAttemptStatus,
     SnapshotUsability,
-    trusted_manifest_snapshot_from_dict,
 )
 from mu_strategy.market_data.trusted_data.store import (
     TrustedDataStore,
@@ -74,20 +71,13 @@ class HistoricalTrustedGenerationReader:
             raise HistoricalGenerationError(str(exc)) from exc
 
         generation_root = self.store.generation_root(run_id)
-        manifest_path = generation_root / "manifest.json"
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise HistoricalGenerationError(f"historical manifest read failed: {type(exc).__name__}") from exc
-        if not isinstance(payload, dict):
-            raise HistoricalGenerationError("historical manifest root must be an object")
-        try:
-            snapshot = trusted_manifest_snapshot_from_dict(payload)
-        except (ManifestSchemaError, TypeError, ValueError) as exc:
-            raise HistoricalGenerationError(f"historical manifest schema_version/contract invalid: {exc}") from exc
-
-        if snapshot.run_id != run_id:
-            raise HistoricalGenerationError("historical manifest run_id must match generation directory")
+        manifest_result = self.store.read_generation_manifest(run_id)
+        if not manifest_result.ok or manifest_result.snapshot is None:
+            detail = manifest_result.message or (
+                manifest_result.reason.value if manifest_result.reason is not None else "unknown manifest error"
+            )
+            raise HistoricalGenerationError(f"historical manifest schema_version/contract invalid: {detail}")
+        snapshot = manifest_result.snapshot
         if snapshot.attempt_status is RefreshAttemptStatus.FAILED:
             raise HistoricalGenerationError("historical generation attempt_status is failed")
         if snapshot.snapshot_usability is not SnapshotUsability.USABLE:
@@ -107,23 +97,19 @@ class HistoricalTrustedGenerationReader:
             if not health.content_sha256:
                 raise HistoricalGenerationError(f"historical dataset {symbol}/{interval} has no content SHA-256")
 
-            expected_source = self.store.generation_source_file(symbol, interval)
-            if health.source_file.as_posix() != expected_source.as_posix():
-                raise HistoricalGenerationError(
-                    f"historical dataset source_file must equal {expected_source.as_posix()}"
-                )
-            csv_path = generation_root / expected_source
             try:
-                candles = self.store.read_csv(csv_path)
+                candles = self.store.read_generation_dataset(
+                    snapshot,
+                    symbol=symbol,
+                    interval=interval,
+                    generation_root=generation_root,
+                    generation_id=run_id,
+                )
             except Exception as exc:
                 raise HistoricalGenerationError(
-                    f"historical dataset read failed for {symbol}/{interval}: {type(exc).__name__}"
+                    f"historical dataset read failed for {symbol}/{interval}: {type(exc).__name__}: {exc}"
                 ) from exc
-            if len(candles) != health.rows:
-                raise HistoricalGenerationError(f"historical dataset row count mismatch for {symbol}/{interval}")
             actual_hash = candles_content_sha256(candles)
-            if actual_hash != health.content_sha256:
-                raise HistoricalGenerationError(f"historical dataset content SHA-256 mismatch for {symbol}/{interval}")
 
             candles_by_interval[interval] = tuple(candles)
             freshness_by_interval[interval] = health.freshness.value

@@ -136,12 +136,13 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             with patch("mu_strategy.market_data.providers.okx.fetch_okx_historical", side_effect=AssertionError("network")):
                 with patch("mu_strategy.market_data.providers.okx.fetch_okx_incremental", side_effect=AssertionError("network")):
                     with patch.object(store, "write_csv", side_effect=AssertionError("write_csv")):
-                        with patch.object(store, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
-                            with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
-                                bundle = loader.execute(
-                                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=86_400_000),
-                                    observe_only_policy(),
-                                )
+                        with patch.object(store, "write_segmented_dataset", side_effect=AssertionError("write_segmented_dataset")):
+                            with patch.object(store, "write_generation_manifest", side_effect=AssertionError("write_generation_manifest")):
+                                with patch.object(store, "append_run_log", side_effect=AssertionError("append_run_log")):
+                                    bundle = loader.execute(
+                                        LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=86_400_000),
+                                        observe_only_policy(),
+                                    )
             self.assertTrue(bundle.trust_decision.allowed)
             self.assertEqual(("5m", "15m", "1h"), tuple(bundle.health_by_interval))
 
@@ -533,10 +534,29 @@ class TrustedDataRefreshTests(unittest.TestCase):
                 )
             )
             manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
+            self.assertLess(manifest_path(data_dir).stat().st_size, 10 * 1024)
             bundle = LoadTrustedBundle(store, clock=FixedClock(end_ms)).execute(
                 LoadTrustedBundleQuery("BTC-USDT-SWAP", intervals=("15m", "1h"), days=14),
                 trading_strict_policy(),
             )
+            for interval in ("5m", "15m", "1h"):
+                persisted = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"][interval]
+                first_reference = persisted["storage"]["segments"][0]
+                expected_name = (
+                    f"{first_reference['segment_id']}.partial-{first_reference['first_timestamp_ms']}.csv"
+                )
+                self.assertEqual(expected_name, Path(first_reference["source_file"]).name)
+                self.assertTrue((data_dir / first_reference["source_file"]).is_file())
+                self.assertFalse(
+                    (
+                        data_dir
+                        / "segments"
+                        / "okx"
+                        / "BTC-USDT-SWAP"
+                        / interval
+                        / f"{first_reference['segment_id']}.csv"
+                    ).exists()
+                )
 
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
@@ -565,10 +585,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertTrue(bundle.candles_by_interval["15m"])
         self.assertTrue(bundle.candles_by_interval["1h"])
 
-    def test_refresh_accepts_requested_coverage_left_boundary_one_interval_tolerance(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+    def test_complete_logical_coverage_tolerance_does_not_replace_month_lookbehind_proof(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
-        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.trusted_data.store import SegmentCorrectionError, TrustedDataStore
         from mu_strategy.market_data.trusted_data.validation import aggregate_candles
         from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 
@@ -582,25 +601,18 @@ class TrustedDataRefreshTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
-                RefreshTrustedMarketDataRequest(
-                    requested_intervals=("15m", "1h"),
-                    days=14,
-                    limit=1,
-                    stock_token_inst_ids=set(),
-                    now_ms=end_ms,
+            with self.assertRaisesRegex(SegmentCorrectionError, "complete month lookbehind"):
+                RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), provider).execute(
+                    RefreshTrustedMarketDataRequest(
+                        requested_intervals=("15m", "1h"),
+                        days=14,
+                        limit=1,
+                        stock_token_inst_ids=set(),
+                        now_ms=end_ms,
+                    )
                 )
-            )
-            manifest = json.loads(manifest_path(data_dir).read_text(encoding="utf-8"))
 
-        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
-        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
-        self.assertEqual("usable", manifest["snapshot_usability"])
-        for interval in ("5m", "15m", "1h"):
-            with self.subTest(interval=interval):
-                health = run.datasets[("BTC-USDT-SWAP", interval)]
-                self.assertEqual("ok", health.primary_reason.value)
-                self.assertEqual(interval_to_ms(interval), health.first_timestamp_ms)
+            self.assertFalse(any((data_dir / "segments").rglob("*.csv")))
 
     def test_refresh_accepts_okx_history_when_confirmed_candles_lag_wall_clock(self):
         from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
@@ -626,11 +638,10 @@ class TrustedDataRefreshTests(unittest.TestCase):
         pages: dict[str, tuple[list[Candle], list[Candle]]] = {}
         for interval, rows in history.items():
             latest_confirmed_ms = wall_end_ms - confirmed_lags_ms[interval]
-            required_start_ms = latest_confirmed_ms - (days * DAY_MS)
             interval_rows = [bar for bar in rows if bar.open_time_ms <= latest_confirmed_ms]
             pages[interval] = (
                 [bar for bar in interval_rows if wall_start_ms <= bar.open_time_ms <= latest_confirmed_ms],
-                [bar for bar in interval_rows if required_start_ms <= bar.open_time_ms < wall_start_ms],
+                [bar for bar in interval_rows if 0 <= bar.open_time_ms < wall_start_ms],
             )
             self.assertTrue(pages[interval][0], interval)
             self.assertTrue(pages[interval][1], interval)
@@ -689,6 +700,12 @@ class TrustedDataRefreshTests(unittest.TestCase):
             ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             history_fetcher=lambda symbol, interval, *, days: history[interval],
         )
+
+        def unchanged_incremental(symbol, interval, *, since_time_ms):
+            provider.incremental_calls.append((symbol, interval, since_time_ms))
+            return []
+
+        provider.fetch_incremental = unchanged_incremental
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
@@ -704,7 +721,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(SnapshotUsability.USABLE, first.snapshot_usability)
         self.assertEqual(["15m", "1h"], manifest["requested_intervals"])
         self.assertEqual(["5m", "15m", "1h"], manifest["effective_intervals"])
-        self.assertIn(("BTC-USDT-SWAP", "5m", 1), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 33), provider.history_calls)
         self.assertIn(("BTC-USDT-SWAP", "5m", DAY_MS - 300_000), provider.incremental_calls)
 
     def test_refresh_does_not_reuse_unusable_prior_health_as_incremental_base(self):
@@ -722,7 +739,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
             ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
             history_fetcher=lambda symbol, interval, *, days: short_history[interval],
         )
-        full_five = range_candles(interval_to_ms("5m"), 14 * DAY_MS)
+        full_five = range_candles(0, 14 * DAY_MS)
         full_history = {"5m": full_five, "15m": aggregate_candles(full_five, interval="15m"), "1h": aggregate_candles(full_five, interval="1h")}
 
         class FullHistoryProvider(RecordingProvider):
@@ -753,7 +770,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
         self.assertEqual([], provider.incremental_calls)
-        self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 46), provider.history_calls)
 
     def test_refresh_falls_back_to_history_when_requested_retention_expands(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -763,7 +780,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 
         one_day_end_ms = 20 * DAY_MS
-        one_day_five = range_candles(one_day_end_ms - DAY_MS, one_day_end_ms)
+        one_day_five = range_candles(0, one_day_end_ms)
         one_day_history = {
             "5m": one_day_five,
             "15m": aggregate_candles(one_day_five, interval="15m"),
@@ -809,7 +826,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
         self.assertEqual([], provider.incremental_calls)
-        self.assertIn(("BTC-USDT-SWAP", "5m", 14), provider.history_calls)
+        self.assertIn(("BTC-USDT-SWAP", "5m", 46), provider.history_calls)
 
     def test_refresh_attempt_and_snapshot_axes_remain_separate(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -820,6 +837,21 @@ class TrustedDataRefreshTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
             write_generation_publication(Path(tmp), symbol="BTC-USDT-SWAP", start_ms=0, end_ms=86_100_000)
+            RefreshTrustedMarketData(
+                store,
+                RecordingProvider(
+                    ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+                    history_fetcher=lambda symbol, interval, *, days: range_candles(0, 86_100_000),
+                ),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=86_400_000,
+                )
+            )
             degraded_fresh = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=86_400_000)
             )
@@ -887,12 +919,28 @@ class TrustedDataRefreshTests(unittest.TestCase):
         from mu_strategy.market_data.utils import DAY_MS
 
         end_ms = 20 * DAY_MS
-        five = range_candles(end_ms - DAY_MS, end_ms)
+        five = range_candles(0, end_ms)
         candles_by_interval = {"5m": five, "15m": aggregate_candles(five, interval="15m"), "1h": aggregate_candles(five, interval="1h")}
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             write_generation_publication(data_dir, symbol="BTC-USDT-SWAP", candles_by_interval=candles_by_interval)
-            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=data_dir), _IncrementalFailureProvider()).execute(
+            store = TrustedDataStore(data_dir=data_dir)
+            RefreshTrustedMarketData(
+                store,
+                RecordingProvider(
+                    ticker_rows=[{"instId": "BTC-USDT-SWAP", "last": "100", "volCcy24h": "10"}],
+                    history_fetcher=lambda symbol, interval, *, days: candles_by_interval[interval],
+                ),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",),
+                    days=1,
+                    limit=1,
+                    stock_token_inst_ids=set(),
+                    now_ms=end_ms,
+                )
+            )
+            run = RefreshTrustedMarketData(store, _IncrementalFailureProvider()).execute(
                 RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=1, limit=1, stock_token_inst_ids=set(), now_ms=end_ms)
             )
 
@@ -957,7 +1005,7 @@ class TrustedDataRefreshTests(unittest.TestCase):
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
         self.assertEqual("ok", run.datasets[("BTC-USDT-SWAP", "5m")].primary_reason.value)
-        self.assertEqual([("BTC-USDT-SWAP", "5m", 1)], provider.history_calls)
+        self.assertEqual([("BTC-USDT-SWAP", "5m", 33)], provider.history_calls)
         self.assertEqual([], provider.incremental_calls)
         self.assertEqual("prior_read_failed_full_history", run.refresh_segments[0].fetch_mode)
         self.assertEqual("cache_read_failed", run.refresh_segments[0].fetch_reason.value)
@@ -1043,8 +1091,9 @@ class TrustedDemoConsumerTests(unittest.TestCase):
             manifest_before = manifest_path(data_dir).read_bytes()
             with patch.object(TrustedDataStore, "write_generation_manifest", side_effect=AssertionError("writer")):
                 with patch.object(TrustedDataStore, "write_csv", side_effect=AssertionError("writer")):
-                    with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("writer")):
-                        result = run_once(DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()), broker=None, scanner=lambda symbol, *_args, **_kwargs: _wait(symbol))
+                    with patch.object(TrustedDataStore, "write_segmented_dataset", side_effect=AssertionError("writer")):
+                        with patch.object(TrustedDataStore, "append_run_log", side_effect=AssertionError("writer")):
+                            result = run_once(DemoTradingConfig(universe_limit=1, dry_run=True, data_dir=data_dir, days=1, watchlist_symbols=()), broker=None, scanner=lambda symbol, *_args, **_kwargs: _wait(symbol))
             self.assertEqual("dry_run", result["mode"])
             self.assertEqual(manifest_before, manifest_path(data_dir).read_bytes())
 
@@ -1059,10 +1108,27 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                 run_once(DemoTradingConfig(refresh=True, dry_run=False, data_dir=data_dir), broker=Broker(), scanner=lambda *args, **kwargs: self.fail("scanner"))
 
     def test_consumer_modules_keep_refresh_and_freshness_logic_out(self):
+        writer_calls = (
+            "RefreshTrustedMarketData(",
+            "prepare_generation(",
+            "write_csv(",
+            "write_segmented_dataset(",
+            "write_generation_manifest(",
+            "replace_current(",
+            "commit_generation_publication(",
+            "import_flat_generation(",
+            "append_run_log(",
+        )
         forbidden = {
-            "mu_strategy/cli.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
-            "mu_strategy/viz/backtest.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
-            "mu_strategy/demo_trading.py": ("RefreshTrustedMarketData(", "write_manifest(", "append_run_log("),
+            relative_path: writer_calls
+            for relative_path in (
+                "mu_strategy/cli.py",
+                "mu_strategy/viz/backtest.py",
+                "mu_strategy/demo_trading.py",
+                "mu_strategy/commands/okx_demo_loop.py",
+                "mu_strategy/experiments/fibonacci_pullback.py",
+                "mu_strategy/experiments/walk_forward.py",
+            )
         }
         for relative_path, needles in forbidden.items():
             source = Path(relative_path).read_text(encoding="utf-8")

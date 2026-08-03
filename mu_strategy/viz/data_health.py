@@ -28,7 +28,7 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
           <td class="num">{_e(status.get("rows"))}</td>
           <td>{_e(_format_time_ms(status.get("last_timestamp_ms")))}</td>
           <td>{_e(status.get("reason") or _reasons_text(status))}</td>
-          <td class="mono">{_e(status.get("source_file"))}</td>
+          <td class="mono">{_e(_status_storage_path(status))}</td>
         </tr>"""
             )
     body = "\n".join(rows) if rows else '<tr><td colspan="10">暂无数据</td></tr>'
@@ -117,7 +117,7 @@ def render_data_health_dashboard(manifest: dict[str, Any]) -> str:
   <section>
     <h2>Intervals</h2>
     <table>
-      <thead><tr><th>symbol</th><th>universe</th><th>interval</th><th>freshness</th><th>availability</th><th>integrity</th><th>rows</th><th>latest</th><th>reason</th><th>source_file</th></tr></thead>
+      <thead><tr><th>symbol</th><th>universe</th><th>interval</th><th>freshness</th><th>availability</th><th>integrity</th><th>rows</th><th>latest</th><th>reason</th><th>storage_path</th></tr></thead>
       <tbody>{body}</tbody>
     </table>
   </section>
@@ -257,6 +257,16 @@ def _format_days(value: Any) -> str:
 
 def _reasons_text(status: dict[str, Any]) -> str:
     return ", ".join(str(item) for item in status.get("reasons") or []) or "-"
+
+
+def _status_storage_path(status: dict[str, Any]) -> str:
+    source_file = status.get("source_file")
+    if source_file:
+        return str(source_file)
+    storage = status.get("storage")
+    if isinstance(storage, dict) and storage.get("source_root"):
+        return str(storage["source_root"])
+    return "-"
 
 
 def _metric(label: str, value: Any) -> str:

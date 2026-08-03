@@ -223,8 +223,12 @@ class VisualizationTests(unittest.TestCase):
                     with patch("mu_strategy.viz.backtest.refresh_candle_bundle", side_effect=AssertionError("legacy bundle must not be used"), create=True):
                         with patch("mu_strategy.viz.backtest.cached_historical", side_effect=AssertionError("legacy cache must not be used"), create=True):
                             with patch("mu_strategy.viz.backtest.run_backtest", side_effect=fake_run_backtest):
-                                with patch("sys.stdout", new_callable=io.StringIO):
-                                    visualize.main()
+                                with patch(
+                                    "mu_strategy.market_data.trusted_data.store.TrustedDataStore.write_segmented_dataset",
+                                    side_effect=AssertionError("consumer must not write schema-v4 segments"),
+                                ):
+                                    with patch("sys.stdout", new_callable=io.StringIO):
+                                        visualize.main()
 
         self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
         self.assertEqual(("15m", "1h"), trusted_calls[0][1]["intervals"])

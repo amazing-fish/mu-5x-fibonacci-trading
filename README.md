@@ -62,7 +62,10 @@ python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-o
 python -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports\live\mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html
 ```
 
-主回测、可视化和普通实验入口默认使用可信 OKX cache-only 数据。该路径只读取 `data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v3 manifest 和对应 CSV，不访问网络、不写缓存；需要先运行独立刷新命令发布当前 generation：
+主回测、可视化和普通实验入口默认使用可信 OKX cache-only 数据。该路径只读取
+`data/live/current.json` 指向的 `data/live/generations/<run_id>/` schema v4 manifest，
+再按 manifest 固定的 row slice 读取 `data/live/segments/okx/<symbol>/<interval>/<YYYY-MM>.csv`；
+不访问网络、不写缓存。需要先运行独立刷新命令发布当前 generation：
 
 ```powershell
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
@@ -119,6 +122,20 @@ Stage 0 dry-run cycles also append a versioned observation-only record to `data/
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 ```
 
+schema v4 把每个 generation 保持为只含 `manifest.json` 的 metadata-only 目录；CSV 数据按
+`segments/<source>/<symbol>/<interval>/<YYYY-MM>.csv` 共享。持续刷新时，单次新增的持久化
+bytes 与新增 candle content 加有界 manifest/run metadata 成比例，不再与完整历史量成比例；
+全部 segment 的驻留量则与实际保留的总历史量成比例。已关闭月份不可变且不会重写，尾月只
+能在保持既有 canonical byte prefix 的前提下连续增长。retention、pin policy、GC 和 deletion
+均不属于当前实现。
+
+已有 generation-local flat schema-v3 数据只能通过显式 migration 进入共享月分段表示。
+导入会保留原 generation，并在完整 candle/hash round trip 后才可选择原子发布新 generation：
+
+```powershell
+python -m mu_strategy.commands.import_trusted_generation --data-dir data\live --source-run-id <v3_run_id> --target-run-id <new_v4_run_id> --publish
+```
+
 只刷新显式 symbol 子集（例如 MU-only）时，可重复传入 `--symbol`。传入后刷新范围只由这些 symbol 决定，不会拉取 Top universe ticker list，也不会因 `--limit` 扩大范围：
 
 ```powershell
@@ -141,8 +158,8 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 
 ## 当前产物约定
 
-- `data/live/current.json` 和其指向的 `data/live/generations/<run_id>/` 是当前可信数据 baseline；只有明确发布 baseline 时才应入库。
-- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、blocking symbols、segment diagnostics、每个周期的 latest candle、rows、valid/stale 状态和失败原因。
+- `data/live/current.json`、其指向的 `data/live/generations/<run_id>/manifest.json`，以及 manifest 引用的 `data/live/segments/` 月分段共同构成当前可信数据 baseline；只有明确发布 baseline 时才应入库。
+- `reports/live/data_health.html`：本地数据健康看板，展示 Top universe、blocking symbols、segment diagnostics、每个周期的 latest candle、rows、valid/stale 状态、失败原因，以及 v3 flat file 或 v4 segment root 的实际存储路径。
 - `reports/live/mu_okx_MU_USDT_SWAP_180d_baseline_backtest.html`：推荐的本地 MU 180d 交互式回测报告路径。
 - `reports/live/*.md` / `reports/live/*.html` 是可再生成的本地 artifact，默认不入库；如果需要审阅，给出本地链接或重新生成。
 - `docs/fibonacci-preferred-parameters.md` 是历史参数记录，不等同于当前可信市场数据 baseline。
@@ -150,20 +167,22 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 ## 数据注意事项
 
 - OKX 返回的最后一根 K 线不一定完整，数据层会忽略未确认 K 线。
-- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。
+- 每次可信刷新会优先复用当前已发布 generation，并增量补充后续已确认数据；没有可复用 generation 时才需要完整拉取。完整拉取会在逻辑 `--days` 之外额外请求 32 天，只把裁剪后的逻辑窗口写入 manifest；当 full-history 本轮已覆盖完整逻辑窗口时，只有 provider 实际返回逻辑起始月的完整月首数据才把该月建成 canonical。首次明确标记为 `partial_available_history` 且从月中开始的短历史只写入物理首时间戳绑定的 `YYYY-MM.partial-<first_timestamp_ms>.csv` 兼容路径，不会污染 canonical 月文件；如果后续增量已覆盖逻辑窗口但仍没有月首证据，完整 logical generation 会继续引用并增长同一兼容文件。只有后续 full-history 取得完整月首证据时才新建 canonical 月文件，旧兼容文件保持可精确回放。更早且与逻辑无关的物理月份不会落盘。首月物理回看行使后续在同一 UTC 月内扩大逻辑窗口时无需前插或改写旧引用。完整物理序列会在裁剪前执行本地连续性校验和 `5m -> 15m/1h` built/native 校验；物理 `5m` 无效时父周期也不会落盘，父周期的逻辑 health/hash 与物理存储都只覆盖被完整 `5m` 覆盖并实际比较的行。任何物理失败、旧尾与新 suffix 之间的时间缺口、或新月首行与既有前月尾部不相邻，都不会写入 canonical segment。已关闭 UTC 月段不会重写，只有尾月段可以在保持既有字节前缀的前提下连续增长。
 - 可信数据层只使用 OKX 公开行情；OKX 股票概念/代币化标的由 `config/okx_stock_tokens.json` 维护候选池，再按 OKX 24h turnover 取 Top10。
-- 可信数据层把 refresh process 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` trusted universe snapshot 的唯一写者；backtest、visualization、walk-forward、Fibonacci experiment 和 demo 只走 cache-only load。
+- 可信数据层把 writer 与 consumer process 分开：`python -m mu_strategy.commands.refresh_market_data` 是正常运行时唯一 writer；`import_trusted_generation` 只是显式离线 migration writer。backtest、visualization、walk-forward、Fibonacci experiment、demo 和 exact-generation experiment reader 都只走 cache-only load。
 - 可信 refresh 支持重复 `--symbol` 显式子集刷新；例如 `--symbol MU --symbol BTC-USDT-SWAP` 会经 OKX swap resolver 规范化、稳定去重，并只发布这些 symbol 的新 generation。未传 `--symbol` 时，仍使用默认 Top crypto + stock-token universe。
 - backtest、visualization、walk-forward 和 Fibonacci experiment 主入口不再支持旧数据参数 `--refresh`、`--source` 或 `--trusted-data`；Fibonacci 的非 OKX `AssetSpec.source` 也会明确 fail-closed，demo loop 的 `--refresh` 同样会被拒绝。正确顺序是先运行 `python -m mu_strategy.commands.refresh_market_data ...`，再运行 `python -m mu_strategy.cli ...`、`python -m mu_strategy.visualize ...`、`python -m mu_strategy.walk_forward ...`、`python -m mu_strategy.experiments.fibonacci_pullback ...` 或 `python -m mu_strategy.commands.okx_demo_loop ...`。
 - 已删除旧 per-symbol refresh API；需要刷新 canonical trusted data 时只能使用独立 refresh command。
-- 可信数据层当前使用 `data/live/current.json` + `data/live/generations/<run_id>/` + `data/live/refresh_runs.jsonl`；generation manifest schema v3 包含 `run_id`、`attempt_status` (`RefreshAttemptStatus`)、`snapshot_usability` (`SnapshotUsability`)、`requested_intervals`、`effective_intervals`、`universes`、每个 dataset 的 availability/integrity/freshness/reasons、warnings 和 cycle-level error。manifest 可以附带 backward-compatible optional `diagnostics.refresh_segments`，用于审计每个 symbol/interval 的 fetch mode、耗时、rows、reuse 和失败原因；trusted consumers 不依赖该字段，缺失时仍按 dataset health fail-closed。
+- 可信数据层当前使用 `data/live/current.json` + metadata-only `data/live/generations/<run_id>/manifest.json` + `data/live/segments/` + `data/live/refresh_runs.jsonl`。schema v4 除既有 health/universe/diagnostics 字段外，严格声明 `segmented_csv_v1`，并为每个 dataset 保存按 UTC 月排序的 `segment_id/source_file/start_row/rows/timestamp range/content_sha256/closed`。dataset 的 `content_sha256` 仍绑定完整逻辑 candle 序列，不是 segment hash 的简单拼接。共享尾段的 read/compare/replace 由稳定的数据集级 `.write.lock` 串行化；它不锁 consumer、`current.json` 或整个 store，也不承担 retention/GC 生命周期。
+- schema v3 generation-local flat CSV 仍可按 exact ID 严格只读；转换只允许显式 `import_trusted_generation`，不会在 v4 malformed/unknown layout 时静默 fallback。import 在创建 target generation 或 shared segment 之前要求每个 source dataset usable，并对全部 candle bundle 执行本地与 built/native 预校验。健康 v3 current 或显式 import 生成的 v4 第一次进入普通 refresh 时都强制 full-history lookbehind，不会从月中 flat slice 直接增量升级。import 若首月不完整，只允许该 manifest 的第一条引用使用与目标 run ID 精确绑定的 `YYYY-MM.import-<run_id>.csv` 兼容文件；后续 refresh 建立 canonical `YYYY-MM.csv`，旧 import 仍可 exact replay。
 - `refresh_runs.jsonl` 和 `refresh_market_data` JSON 输出会暴露 per-symbol/per-interval diagnostics，包括 `refresh_segments`、最多 5 条 `slowest_segments`、失败/非 ok 的 `failed_segments`，以及按 symbol 汇总的 `blocking_symbols`。
 - interval dependency 统一由 planner 处理：请求 `15m` 会实际读取/刷新 `5m,15m`；请求 `1h` 会实际读取/刷新 `5m,1h`；请求 `15m,1h` 会实际读取/刷新 `5m,15m,1h`。
 - freshness 按当前 clock、interval 和最后一根已确认 K 线计算；不会因为上次 fetch 成功就默认 fresh。
 - `RefreshAttemptStatus` 表示 refresh attempt 健康：只有全量 usable 且无 provider/cache/validation failure 才是 `success`；mixed usable/unusable 是 `degraded`；zero usable 不论来自 provider failure、cache read failure、validation failure、coverage failure 或 content hash mismatch 都是 `failed`。
 - `SnapshotUsability` 表示 publication 是否可被消费者使用，由所有 `DatasetHealth` 的 availability/integrity/freshness 三轴推导；zero usable fail-closed 为 `invalid`，mixed usable/unusable 会按最严格 dataset 轴推导为 `stale` 或 `invalid`。
 - `DatasetHealth` 表示单个 `symbol/interval` 的 availability、integrity、freshness、reason、validation 和 `content_sha256`，refresh/load/dashboard 不各自重新定义全局状态。
-- malformed manifest 会 fail-closed；trading strict policy 下缺失或损坏 manifest 都会阻断消费。旧 public import 仍保留在 `mu_strategy.market_data.trusted` / `service`，但只是兼容 facade。
+- malformed/unknown manifest、缺失或损坏 segment、row/hash 不一致都会 fail-closed；trading strict policy 下全部阻断消费。refresh 先完成整个 `5m/15m/1h` bundle 的局部与 built/native 交叉验证，再写任何对应共享 segment；无效 native 数据不会成为 canonical 物理证据。尝试改变已存 timestamp 的历史 candle 也会在 `current.json` 发布前 fail closed，不会改写证据。
+- generation reader 一次只 pin 一个 manifest；共享尾段后来增长时，旧 generation 仍只读取并验证自己的 `[start_row, start_row + rows)`。retention、pin policy、GC 和 deletion 不属于当前实现，任何 generation/segment 都不会自动删除。
 - 缓存会按请求窗口裁剪，避免长期回测误用超出窗口的数据。
 - 数据层会检查相邻 K 线的 `previous close -> next open` 连续性，默认超过 `2%` 会阻断读取/写入，避免坏缓存或异常拼接进入回测和 demo 扫描。
 - 如果增量刷新失败，已有缓存仍可用于本地复现，但结果不应被视为最新市场状态。

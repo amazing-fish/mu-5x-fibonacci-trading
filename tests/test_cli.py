@@ -64,9 +64,13 @@ class CliTests(unittest.TestCase):
                     with patch("mu_strategy.cli.refresh_candle_bundle", side_effect=AssertionError("legacy bundle must not be used"), create=True):
                         with patch("mu_strategy.cli.cached_historical", side_effect=AssertionError("legacy cache must not be used"), create=True):
                             with patch("mu_strategy.cli.run_backtest", side_effect=fake_run_backtest):
-                                with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
-                                    with patch("sys.stdout", new_callable=io.StringIO):
-                                        cli.main()
+                                with patch(
+                                    "mu_strategy.market_data.trusted_data.store.TrustedDataStore.write_segmented_dataset",
+                                    side_effect=AssertionError("consumer must not write schema-v4 segments"),
+                                ):
+                                    with patch("mu_strategy.cli.render_markdown_report", return_value="# report"):
+                                        with patch("sys.stdout", new_callable=io.StringIO):
+                                            cli.main()
 
         self.assertEqual("MU-USDT-SWAP", trusted_calls[0][0])
         self.assertEqual(("15m", "1h"), trusted_calls[0][1]["intervals"])
