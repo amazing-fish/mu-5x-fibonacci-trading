@@ -215,3 +215,4 @@ python -m mu_strategy.commands.okx_demo_loop --confirm-demo-orders --interval-se
 
 策略组可视化报告会按入场策略、加减仓策略、出场策略、过滤策略拆分展示，方便持续组合和消融回测。
 
+![Alt](https://repobeats.axiom.co/api/embed/48af15b987643d2e8b4f6a935a21045f7b316b74.svg "Repobeats analytics image")
