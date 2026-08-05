@@ -3,10 +3,10 @@ name: Python contract tests
 on:
   pull_request:
     branches:
-      - research/mu-strategy-groups
+      - main
   push:
     branches:
-      - research/mu-strategy-groups
+      - main
 
 permissions:
   contents: read
