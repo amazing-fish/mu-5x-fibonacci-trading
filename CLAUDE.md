@@ -22,7 +22,8 @@ MU 多头策略研究仓库。研究工作台 + 受控的 OKX Demo 应用层，*
 ## 铁律
 
 - **禁止实盘下单。** 只允许 read-only、shadow、本地 dry-run，以及显式 `--confirm-demo-order(s)` 后的 OKX Demo 下单。生产执行归 issue #7，不要在其他 PR 里碰。
-- **主仓库禁止 checkout 到非默认分支**，改代码开 worktree。默认分支是 `research/mu-strategy-groups`（不是 `main`）。
+- **主仓库禁止 checkout 到非默认分支**，改代码开 worktree。默认分支是 `main`。
+- **默认分支受 ruleset `upgradebyPR` 保护**（绑定 `~DEFAULT_BRANCH`，规则 `pull_request`），一切改动必须走 PR，直推会被 remote 拒绝 —— 包括只改 `CLAUDE.md` 或文档。
 - **可信数据层读写分离。** `python -m mu_strategy.commands.refresh_market_data` 是 `data/live/current.json` 和 `data/live/generations/<run_id>/` 的唯一写者。backtest、visualize、demo loop 全部 cache-only，禁止联网、禁止写缓存。
 - **数据缺失/过期一律 fail-closed**，不许加消费侧回退路径。
 - **零第三方依赖。** 当前纯 Python 3.12 标准库（Plotly 仅作为 HTML 里的 CDN 引用）。新增依赖需先讨论。

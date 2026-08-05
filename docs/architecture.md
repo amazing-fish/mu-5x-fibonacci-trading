@@ -241,7 +241,7 @@ This section is the design deliverable for [issue #30](https://github.com/amazin
 
 The labels below are normative:
 
-- **Current** describes behavior present on `research/mu-strategy-groups` at merge commit `f887a3a`.
+- **Current** describes behavior present on the default branch `main` at merge commit `f887a3a`. That commit predates the rename of the default branch from `research/mu-strategy-groups` to `main`; `main` continues the same history.
 - **Target** is a contract that later implementation PRs must satisfy.
 - **Open** is intentionally not frozen and must not be inferred from examples.
 
