@@ -5,8 +5,16 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from mu_strategy.backtest import OpenPosition, _make_fill, _maybe_add, _tighten_stop, run_backtest
-from mu_strategy.models import Candle
+from mu_strategy.backtest import (
+    OpenPosition,
+    _close_position,
+    _make_fill,
+    _maybe_add,
+    _return_on_margin,
+    _tighten_stop,
+    run_backtest,
+)
+from mu_strategy.models import Candle, Fill
 from mu_strategy.strategy import StrategyConfig
 
 
@@ -22,7 +30,7 @@ def candle(index, open_, high, low, close):
 
 
 class BacktestTests(unittest.TestCase):
-    def test_initial_stop_loss_is_limited_by_5x_20_percent_margin(self):
+    def test_initial_stop_loss_is_ten_percent_of_committed_margin_at_5x(self):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),))
         candles_15m = [
             candle(0, 100, 102, 99, 101),
@@ -35,7 +43,7 @@ class BacktestTests(unittest.TestCase):
         result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
 
         self.assertEqual(result.trade_count, 1)
-        self.assertAlmostEqual(result.trades[0].return_pct, -0.02, places=4)
+        self.assertAlmostEqual(result.trades[0].return_pct, -0.10, places=4)
 
     def test_fees_are_included_in_trade_return(self):
         config = StrategyConfig(fee_rate=0.001, trading_windows_et=(("00:00", "23:59"),))
@@ -49,7 +57,27 @@ class BacktestTests(unittest.TestCase):
 
         result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
 
-        self.assertLess(result.trades[0].return_pct, -0.02)
+        self.assertLess(result.trades[0].return_pct, -0.10)
+
+    def test_trade_return_on_margin_is_stable_across_equity_levels(self):
+        config = StrategyConfig(fee_rate=0)
+        returns = []
+        for equity in (10_000, 50_000):
+            fill = _make_fill(0, 100, 0.2, equity, config)
+            position = OpenPosition([fill], stop_price=98, entry_anchor=100, initial_stop_price=98)
+
+            _, trade = _close_position(position, candle(1, 98, 98, 98, 98), 98, equity, "stop", config)
+            returns.append(trade.return_pct)
+
+        self.assertAlmostEqual(-0.10, returns[0])
+        self.assertAlmostEqual(returns[0], returns[1])
+
+    def test_return_on_margin_handles_empty_and_zero_margin_fills(self):
+        zero_notional_fill = Fill(0, 100, 0.2, 0.0, 0.0, 0.0)
+
+        self.assertEqual(0.0, _return_on_margin(100.0, [], 5.0))
+        self.assertEqual(0.0, _return_on_margin(100.0, [zero_notional_fill], 5.0))
+        self.assertEqual(0.0, _return_on_margin(100.0, [zero_notional_fill], 0.0))
 
     def test_pyramid_adds_only_when_filters_are_green(self):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),))

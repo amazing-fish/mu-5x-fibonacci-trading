@@ -161,6 +161,7 @@ def run_all_existing_data_backtests(
                 config=config,
                 symbol=dataset.symbol,
                 data_files=[dataset.file_15m, dataset.file_1h],
+                candles=candles_15m,
             ),
             encoding="utf-8",
         )

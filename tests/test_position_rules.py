@@ -108,7 +108,7 @@ class BacktestTradeSnapshotTests(unittest.TestCase):
                     ],
                     "pnl": 559.5893694388899,
                     "fees": 0.0,
-                    "return_pct": 0.05595893694388899,
+                    "return_pct": 0.09326489490648165,
                     "max_stage": 3,
                     "exit_reason": "end_of_data",
                 }
