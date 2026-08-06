@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from mu_strategy.market_data.utils import DAY_MS
 from mu_strategy.models import BacktestResult, Candle
+from mu_strategy.research.robustness import (
+    buy_and_hold_return_pct,
+    stage_distribution,
+    trade_concentration,
+)
 from mu_strategy.strategy import StrategyConfig, fee_profile_label
 
 
@@ -14,6 +20,7 @@ def render_markdown_report(
     symbol: str,
     data_files: list[Path],
     sample_summary: list[str] | None = None,
+    candles: Sequence[Candle] | None = None,
 ) -> str:
     sample_summary = sample_summary or []
     lines = [
@@ -42,11 +49,16 @@ def render_markdown_report(
         f"- win rate: {result.win_rate:.2%}",
         f"- profit factor: {_format_float(result.profit_factor)}",
         "",
-        "## Trades",
-        "",
-        "| entry UTC | exit UTC | entry | exit | stage | return | reason |",
-        "|---|---|---:|---:|---:|---:|---|",
     ]
+    lines.extend(_robustness_lines(result, config=config, candles=candles))
+    lines.extend(
+        [
+            "## Trades",
+            "",
+            "| entry UTC | exit UTC | entry | exit | stage | return (on margin) | reason |",
+            "|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
     for trade in result.trades:
         lines.append(
             f"| {trade.entry_time_iso} | {trade.exit_time_iso} | "
@@ -58,6 +70,58 @@ def render_markdown_report(
     lines.append("")
     lines.append("This report is a research artifact, not financial advice.")
     return "\n".join(lines)
+
+
+def _robustness_lines(
+    result: BacktestResult,
+    *,
+    config: StrategyConfig,
+    candles: Sequence[Candle] | None,
+) -> list[str]:
+    concentration = trade_concentration(result.trades, top_n=5)
+    distribution = stage_distribution(result.trades)
+    lines = ["## Robustness", ""]
+
+    if candles is not None:
+        benchmark_1x = buy_and_hold_return_pct(candles)
+        benchmark_leveraged = buy_and_hold_return_pct(candles, leverage=config.leverage)
+        lines.extend(
+            [
+                f"- buy-and-hold benchmark (1x): {benchmark_1x:.2%}",
+                f"- buy-and-hold benchmark ({config.leverage:g}x price-only diagnostic): "
+                f"{benchmark_leveraged:.2%}",
+                f"- strategy excess vs {config.leverage:g}x price-only diagnostic: "
+                f"{result.total_return_pct - benchmark_leveraged:.2%}",
+                "- leveraged benchmark caveat: diagnostic only; it excludes liquidation, fees, funding, "
+                "and path dependence and is not an achievable hold return.",
+            ]
+        )
+
+    share = concentration.top_n_share_of_net_pnl
+    share_label = "n/a (net PnL is not positive)" if share is None else f"{share:.2%}"
+    if share is not None and share > 1:
+        share_label += " — removing the top 5 leaves the strategy unprofitable"
+    lines.extend(
+        [
+            f"- top 5 winners' share of net PnL: {share_label}",
+            f"- net PnL excluding top 5 winners: {concentration.net_pnl_excluding_top_n:.2f}",
+            "",
+            "### Stage distribution",
+            "",
+            "| max stage | trades | wins | win rate | net PnL |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+    )
+    if distribution.stages:
+        for stage in distribution.stages:
+            lines.append(
+                f"| {stage.max_stage} | {stage.trade_count} | {stage.win_count} | "
+                f"{stage.win_rate:.2%} | {stage.net_pnl:.2f} |"
+            )
+    else:
+        lines.append("| - | 0 | 0 | 0.00% | 0.00 |")
+    lines.append("")
+    return lines
 
 
 def _format_float(value: float) -> str:

@@ -59,6 +59,7 @@ def main() -> None:
         symbol=args.symbol,
         data_files=[file_15m, file_1h],
         sample_summary=candle_sample_summary({"15m": candles_15m, "1h": candles_1h}),
+        candles=candles_15m,
     )
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(report, encoding="utf-8")

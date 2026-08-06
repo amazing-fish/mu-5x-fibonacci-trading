@@ -99,7 +99,6 @@ def run_backtest(
                             candle,
                             exit_price if exit_price is not None else _liquidation_risk_price(position, config),
                             equity,
-                            starting_equity,
                             "non_session_liquidation_risk",
                             config,
                         )
@@ -113,7 +112,6 @@ def run_backtest(
                             candle,
                             exit_price if exit_price is not None else position.stop_price,
                             equity,
-                            starting_equity,
                             "initial_stop",
                             config,
                         )
@@ -175,7 +173,6 @@ def run_backtest(
                     next_candle,
                     exit_price if exit_price is not None else _liquidation_risk_price(position, config),
                     equity,
-                    starting_equity,
                     "non_session_liquidation_risk",
                     config,
                 )
@@ -189,7 +186,6 @@ def run_backtest(
                     next_candle,
                     exit_price if exit_price is not None else position.stop_price,
                     equity,
-                    starting_equity,
                     "initial_stop",
                     config,
                 )
@@ -206,7 +202,6 @@ def run_backtest(
                 candle,
                 exit_price if exit_price is not None else _liquidation_risk_price(position, config),
                 equity,
-                starting_equity,
                 "non_session_liquidation_risk",
                 config,
             )
@@ -223,7 +218,6 @@ def run_backtest(
                 candle,
                 exit_price if exit_price is not None else position.stop_price,
                 equity,
-                starting_equity,
                 "stop",
                 config,
             )
@@ -245,7 +239,6 @@ def run_backtest(
             final,
             final.close,
             equity,
-            starting_equity,
             "end_of_data",
             config,
         )
@@ -260,6 +253,15 @@ def _make_fill(time_ms: int, price: float, margin_fraction: float, equity: float
     units = notional / price
     fee = notional * config.fee_rate
     return Fill(time_ms, price, margin_fraction, notional, units, fee)
+
+
+def _return_on_margin(net_pnl: float, fills: list[Fill], leverage: float) -> float:
+    if not fills or leverage == 0:
+        return 0.0
+    committed_margin = sum(fill.notional for fill in fills) / leverage
+    if committed_margin == 0:
+        return 0.0
+    return net_pnl / committed_margin
 
 
 def _buy_limit_fill_price(candle: Candle, limit_price: float) -> float | None:
@@ -377,7 +379,6 @@ def _close_position(
     candle: Candle,
     exit_price: float,
     equity: float,
-    starting_equity: float,
     reason: str,
     config: StrategyConfig,
 ) -> tuple[float, Trade]:
@@ -395,7 +396,7 @@ def _close_position(
         fills=position.fills.copy(),
         pnl=net_pnl,
         fees=fees,
-        return_pct=net_pnl / starting_equity,
+        return_pct=_return_on_margin(net_pnl, position.fills, config.leverage),
         max_stage=position.max_stage,
         exit_reason=reason,
     )

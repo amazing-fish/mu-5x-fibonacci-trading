@@ -146,6 +146,19 @@ class StageDistributionTests(unittest.TestCase):
 
         self.assertEqual([2, 6], [stage.max_stage for stage in result.stages])
 
+    def test_stage_rows_reconcile_to_trade_totals(self):
+        trades = [
+            trade(-2, max_stage=1),
+            trade(3, max_stage=4, index=1),
+            trade(5, max_stage=4, index=2),
+        ]
+
+        result = stage_distribution(trades)
+
+        self.assertEqual(len(trades), sum(stage.trade_count for stage in result.stages))
+        self.assertEqual(2, sum(stage.win_count for stage in result.stages))
+        self.assertEqual(sum(item.pnl for item in trades), sum(stage.net_pnl for stage in result.stages))
+
 
 class BuyAndHoldReturnTests(unittest.TestCase):
     def test_normal_and_levered_reference_cases(self):
