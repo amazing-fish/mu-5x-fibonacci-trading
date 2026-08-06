@@ -17,6 +17,9 @@ MU 多头策略研究仓库。研究工作台 + 受控的 OKX Demo 应用层，*
 - 用户要求"分析/评审/定方向"时，**只输出分析和 prompt，不要动产品代码**。
 - 允许 Claude 直接写的：`CLAUDE.md`、issue/PR 正文与评论、本地一次性诊断脚本（用完删）。
 - goal prompt 必须写明 GOAL、IMPLEMENT、MUST NOT CHANGE、NON-GOALS、TESTS、VERIFY、PR 要求。codex 看不到本次对话，上下文要自带。
+- goal prompt **不进仓库**，在会话里给出即可。它是一次性载体：codex 执行完，验收标准已落成测试、边界已落成代码，
+  prompt 本身价值归零。持久的东西放 issue（验收标准）和 PR（实际改动）。
+  `docs/plans/` 留给设计文档（`doc_kind: design`，讨论契约与不变量），完成后按 `docs/archive/legacy-plans/` 的惯例移走并标注过期。
 - 审阅 PR 时逐条核对 issue 的验收标准，并确认没有偷偷放宽 fail-closed 门禁。
 
 ## 铁律
@@ -75,8 +78,18 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 
 - 可信数据层已完工，schema-v4 分段存储已合并（#72 / issue #68）。
 - 30-B `OrderIntentFactory`(#59) 和 30-C 执行存储(#65) 已合并、有测试，但**无生产消费者**，处于休眠状态。原因：需要 `config/strategy-releases/` 里有可解析的 release，而发布 release 需要第二个 GitHub 身份（GitHub 禁止 PR 作者 approve 自己的 PR）。见已关闭的 #70。
-- 出场规则已提取为回测与实时共享的纯函数（#75），但**实时侧仍无消费者** —— `demo_trading.py` 里 `initial_stop` 只是报告字段，没有持仓监控或平仓动作。回测 47 笔全部由 stop 出场，收益 100% 由出场规则决定，所以这是上线前最关键的缺口。
+- 出场规则已提取为回测与实时共享的纯函数（#75），但**实时侧仍无消费者** —— `demo_trading.py` 里 `initial_stop` 只是报告字段，没有持仓监控或平仓动作。回测 47 笔全部由 stop 出场，收益 100% 由出场规则决定，所以这是上线前最关键的缺口（issue #85）。
 - 通知能力为零。
+- **回测报告不自陈质量**（issue #83）。实测 146 天 MU 样本：策略 +445.5% vs 标的裸涨 +121.2%，
+  但 12 笔盈利**全部**是 stage 4，top5 赢家贡献净利 111% —— 去掉即为亏损。报告不给基准也不给集中度。
+  另 `Trade.return_pct` 除的是 `starting_equity`（`backtest.py:398`）而非该笔占用资金，同一个 -2% 止损
+  在报告里从 -2.10% 显示到 -11.70%，看着像风控恶化，实际只是复利。
+- **committed 数据无法消费**（issue #84，待定方向）。`.gitignore:12-20` 是**刻意设计的白名单**（只放行
+  `manifest.json` + `okx/*/*.csv`，挡掉其余运行时状态），不是历史遗留 —— 别"修"它。但
+  `max_staleness_bars=3` 意味着 5m 数据 15 分钟即过期，而 committed 数据按定义是几周前的，
+  `research_strict` / `trading_strict` 都 `require_fresh=True`，所以消费必然 fail-closed。
+  唯一放松 freshness 的 `observe_only_policy` 同时开 `allow_invalid=True` +
+  `require_manifest_success=False`，**不可用它跑回测**（等于整体关掉完整性校验）。
 
 ## 存储层复杂度债（v4 分段）
 
@@ -107,3 +120,13 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 - review 时先 `grep "def test_"` 列全量测试名再判断缺什么。PR 描述里没写 ≠ 代码里没有。
 - `gh pr diff <n>` 会静默返回空文件。拿到 diff 先确认非空，或改用
   `git diff $(git merge-base <base> <head>) <head>`。
+
+## 诊断纪律（都是真栽过的）
+
+- **每轮开工先 `git fetch` 并核对 `HEAD` 与 `origin` 的差距。** 曾经在落后 7 个提交的工作树上 grep，
+  据此断定 codex 没做某项工作，实际它早已完成（#77）—— 拿旧工作树去质疑一个正确的远端结果。
+- **grep 出 0 结果时，先自证输入非空**（`wc -c` 或同批次另一条有输出的 grep），再采信这个 0。
+  上面那次误判的第二层原因是：`git show origin/... | grep -c` 返回的 0 是**真实结果**，
+  却因为刚踩过 `gh pr diff` 返空的坑，反过来怀疑它是空输入 —— 选错了要相信的那一边。
+  两条合起来是同一件事：**先确认自己看的是不是最新、是不是真的东西，再下判断。**
+- codex 报告"已完成、零 diff、不新开 PR"时，先核实再反驳。它做对过，而我判断错过。
