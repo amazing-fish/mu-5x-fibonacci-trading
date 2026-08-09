@@ -13,7 +13,7 @@ from mu_strategy.strategies.position_rules import (
     PositionStateSnapshot,
     tighten_stop,
 )
-from mu_strategy.strategy import StrategyConfig
+from mu_strategy.strategy import StrategyConfig, is_preferred_us_cash_window
 
 __all__ = [
     "ExitObservation",
@@ -95,7 +95,18 @@ def evaluate_exit(
 ) -> ExitObservation:
     """Evaluate a known position without mutating state or placing orders."""
 
-    exit_triggered = candle.low <= position.stop_price
+    non_session_liquidation_risk = _has_non_session_liquidation_risk(candle, position, config)
+    stop_triggered = candle.low <= position.stop_price
+    exit_triggered = non_session_liquidation_risk or stop_triggered
+    if non_session_liquidation_risk:
+        exit_reason = "non_session_liquidation_risk"
+        trigger_basis = "candle_low_at_or_below_non_session_liquidation_risk_price"
+    elif stop_triggered:
+        exit_reason = "stop"
+        trigger_basis = "candle_low_at_or_below_stop_before_candle"
+    else:
+        exit_reason = None
+        trigger_basis = "none"
     outcome = tighten_stop(
         position,
         candle,
@@ -110,8 +121,8 @@ def evaluate_exit(
         stop_before_candle=position.stop_price,
         stop_after_candle_if_open=outcome.stop_price,
         exit_triggered=exit_triggered,
-        exit_reason="stop" if exit_triggered else None,
-        trigger_basis="candle_low_at_or_below_stop_before_candle",
+        exit_reason=exit_reason,
+        trigger_basis=trigger_basis,
         latest_close_at_or_below_tightened_stop=candle.close <= outcome.stop_price,
         transition_fill_count=outcome.transition_fill_count,
         transition_start=outcome.transition_start,
@@ -317,3 +328,16 @@ def _finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _has_non_session_liquidation_risk(
+    candle: Candle,
+    position: PositionStateSnapshot,
+    config: StrategyConfig,
+) -> bool:
+    if is_preferred_us_cash_window(candle.open_time_ms, config):
+        return False
+    if config.leverage <= 0:
+        raise ValueError("leverage must be positive")
+    liquidation_risk_price = position.entry_price * max(0.0, 1 - (1 / config.leverage))
+    return candle.low <= liquidation_risk_price

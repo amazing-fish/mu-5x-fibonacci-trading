@@ -1,7 +1,9 @@
 import unittest
+from datetime import datetime, timezone
 
+from mu_strategy.backtest import OpenPosition, _has_non_session_liquidation_risk
 from mu_strategy.live_exit import evaluate_exit, map_okx_position, observe_okx_position
-from mu_strategy.models import Candle
+from mu_strategy.models import Candle, Fill
 from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot
 from mu_strategy.strategy import StrategyConfig
 
@@ -39,7 +41,8 @@ class LiveExitTests(unittest.TestCase):
         self.assertEqual(98, observation.stop_after_candle_if_open)
 
     def test_stop_trigger_uses_backtest_low_and_reports_backtest_reason(self):
-        candles = [candle(0, 100, 101, 97, 99)]
+        preferred_window_ms = int(datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        candles = [Candle(preferred_window_ms, 100, 101, 97, 99, 1000)]
 
         observation = evaluate_exit(
             stage_one_position(),
@@ -53,6 +56,36 @@ class LiveExitTests(unittest.TestCase):
         self.assertTrue(observation.exit_triggered)
         self.assertEqual("stop", observation.exit_reason)
         self.assertEqual("candle_low_at_or_below_stop_before_candle", observation.trigger_basis)
+
+    def test_non_session_liquidation_risk_reason_matches_backtest_precedence(self):
+        weekend_ms = int(datetime(2026, 8, 8, tzinfo=timezone.utc).timestamp() * 1000)
+        candles = [Candle(weekend_ms, 100, 101, 79, 90, 1000)]
+        snapshot = stage_one_position()
+        config = StrategyConfig()
+        backtest_position = OpenPosition(
+            fills=[Fill(0, 100, 0.2, 100, 1, 0)],
+            stop_price=98,
+            entry_anchor=100,
+            initial_stop_price=98,
+            max_stage=1,
+        )
+
+        observation = evaluate_exit(
+            snapshot,
+            candles[0],
+            index=0,
+            candles=candles,
+            regime="yellow",
+            config=config,
+        )
+
+        self.assertTrue(_has_non_session_liquidation_risk(candles[0], backtest_position, config))
+        self.assertTrue(observation.exit_triggered)
+        self.assertEqual("non_session_liquidation_risk", observation.exit_reason)
+        self.assertEqual(
+            "candle_low_at_or_below_non_session_liquidation_risk_price",
+            observation.trigger_basis,
+        )
 
     def test_close_below_new_stop_is_diagnostic_not_current_candle_exit(self):
         candles = [
