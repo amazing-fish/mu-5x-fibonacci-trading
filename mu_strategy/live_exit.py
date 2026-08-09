@@ -244,6 +244,7 @@ def map_okx_position(
             "initial_stop_price=assumed_stop_price",
             "max_stage=1",
             "stop_transition_state=defaults",
+            f"leverage={config.leverage}",
         ),
     )
 

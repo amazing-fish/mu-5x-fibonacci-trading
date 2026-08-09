@@ -2,6 +2,7 @@ import io
 import json
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -181,6 +182,36 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual(1, len(result["exit_observations"]))
         self.assertEqual("unknown", result["exit_observations"][0]["decision_status"])
         self.assertEqual("broker", result["exit_observation_status"]["source"])
+
+    def test_run_once_exit_observation_uses_active_demo_leverage(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
+        weekend_ms = int(datetime(2026, 8, 8, tzinfo=timezone.utc).timestamp() * 1000)
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="MU-USDT-SWAP", inst_id="MU-USDT-SWAP", source="okx"),
+            candles_by_interval={
+                "15m": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
+                "1h": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
+            },
+            files_by_interval={},
+            days=1,
+            trust_decision=TrustDecision(True, HealthReason.OK),
+        )
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, leverage=10, watchlist_symbols=()),
+            broker=None,
+            position_source=lambda: {
+                "code": "0",
+                "data": [{"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "110", "posSide": "long"}],
+                "msg": "",
+            },
+            candle_loader=lambda symbol, **kwargs: bundle,
+        )
+
+        evaluation = result["exit_observations"][0]["assumption_evaluation"]
+        self.assertEqual("non_session_liquidation_risk", evaluation["exit_reason"])
+        self.assertIn("leverage=10", result["exit_observations"][0]["assumptions"])
 
     def test_run_once_no_positions_returns_empty_exit_observations(self):
         result = run_once(

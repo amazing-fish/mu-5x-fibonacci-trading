@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
@@ -337,11 +337,13 @@ def run_once(
         unavailable_reason = None if data_error is None else str(data_error.get("reason") or "market_data_invalid")
         strategy_config = baseline_strategy_group(symbol).config
         for row in rows:
+            reported_leverage = _float(row.get("lever"))
+            active_leverage = reported_leverage if reported_leverage > 0 else config.leverage
             observation = observe_okx_position(
                 row,
                 candles=candles_15m if data_error is None else (),
                 regime=regime,
-                config=strategy_config,
+                config=replace(strategy_config, leverage=active_leverage),
                 unavailable_reason=unavailable_reason,
             )
             exit_observations.append(asdict(observation))
