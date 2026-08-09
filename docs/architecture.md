@@ -210,9 +210,10 @@ This is the five-minute demo automation layer. It consumes the fixed research ba
 1. Trusted manifest universe snapshot plus fixed watchlist symbols; `MU-USDT-SWAP` is included by default.
 2. Cache-only trusted `15m/1h` candle bundle load with `5m` dependency validation.
 3. `entry.scan_entry` result.
-4. Open exposure risk cap.
-5. Stable alphanumeric `clOrdId` for idempotency.
-6. OKX Demo isolated `5x` limit-buy placement near the Fibonacci trigger.
+4. Shadow-only exit observations that reuse the shared backtest position rules and never mutate broker state.
+5. Open exposure risk cap.
+6. Stable alphanumeric `clOrdId` for idempotency.
+7. OKX Demo isolated `5x` limit-buy placement near the Fibonacci trigger.
 
 Defaults:
 
@@ -266,6 +267,7 @@ Provenance: [primary | GitHub issues/merged PRs and repository source | observed
 |---|---|---|
 | Read-only observation | `okx_cli read-only` performs public reads and, unless `--public-only` is used, balance and position reads. `--demo` selects the demo environment; without it, private reads can target production, but no order mutation method is called. | There is no stage-labelled observation record tying account context to a scan cycle. |
 | Shadow observation | `okx_cli shadow-record` appends `ShadowExecutionEvent` rows to local JSONL. | It is a manually supplied observation log, not the authoritative intent-to-broker audit ledger. |
+| Exit observation | `demo_trading.run_once` reports `exit_observations` beside scans and orders. Known snapshots use the shared `tighten_stop` rule with the backtest event order; aggregate OKX rows keep the actual decision `unknown` and isolate synthetic stage-one estimates under `assumption_evaluation`. | OKX positions do not expose fill history, carried stop, max stage, or stop-transition state, so authoritative live exit decisions require a durable position-state source before any execution work. |
 | Dry-run scanner | `DemoTradingConfig.dry_run=True` can scan trusted cache data without credentials or private broker calls and can produce mutable `planned` order dictionaries. The CLI may make a public instrument metadata GET to calculate size. | Scan results are stdout/optional dashboard output only. The versionless scan JSON deliberately omits typed decision metadata, and the plan dictionary omits `decision_code`, `run_id`, target environment, and audit correlation. |
 | Typed decision | `EntryScanResult` and `ExecutionDecision` carry a typed `decision_code` and derive disposition/stage from the shared catalog. | `demo_trading.run_once` still gates order planning on compatibility `action == "enter"` and accepts legacy `UNKNOWN` results. Typed metadata does not yet reach a confirmed order. |
 | Demo order guard | `okx_cli demo-order` defaults to a sanitized dry-run and needs `--confirm-demo-order` to send. `OKXRestClient` checks `confirm_demo_order=True` again. | The confirmation is not a durable record containing actor, time, expiry, intent fingerprint, or `decision_code`. |

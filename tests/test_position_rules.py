@@ -3,8 +3,9 @@ import unittest
 from dataclasses import asdict
 
 import mu_strategy.strategies.position_rules as position_rules
-from mu_strategy.backtest import run_backtest
-from mu_strategy.models import Candle
+from mu_strategy.backtest import OpenPosition, _sell_stop_fill_price, _tighten_stop, run_backtest
+from mu_strategy.live_exit import evaluate_exit
+from mu_strategy.models import Candle, Fill
 from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
     PositionStateSnapshot,
@@ -118,6 +119,52 @@ class BacktestTradeSnapshotTests(unittest.TestCase):
 
 
 class ExitRuleTests(unittest.TestCase):
+    def test_live_exit_matches_backtest_event_order_for_stage_one_and_four(self):
+        candles = [
+            candle(0, 111, 112, 110, 111),
+            candle(1, 112, 113, 111, 112),
+            candle(2, 113, 114, 112, 113),
+            candle(3, 114, 115, 113, 114),
+            candle(4, 115, 116, 114, 115),
+        ]
+        config = StrategyConfig(stop_tightening="baseline")
+
+        for stage, prices, stop_price in (
+            (1, (100,), 98),
+            (4, (100, 102, 104, 106), 105),
+        ):
+            with self.subTest(stage=stage):
+                snapshot = position_snapshot(prices, stop_price=stop_price, max_stage=stage)
+                current = candles[-1]
+                observation = evaluate_exit(
+                    snapshot,
+                    current,
+                    index=len(candles) - 1,
+                    candles=candles,
+                    regime="green",
+                    config=config,
+                )
+                backtest_position = OpenPosition(
+                    fills=[Fill(fill.time_ms, fill.price, 0.2, fill.price, fill.units, 0) for fill in snapshot.fills],
+                    stop_price=snapshot.stop_price,
+                    entry_anchor=snapshot.entry_anchor,
+                    initial_stop_price=snapshot.initial_stop_price,
+                    max_stage=snapshot.max_stage,
+                )
+                backtest_exit_triggered = _sell_stop_fill_price(current, backtest_position.stop_price) is not None
+                if not backtest_exit_triggered:
+                    _tighten_stop(
+                        backtest_position,
+                        current,
+                        len(candles) - 1,
+                        candles,
+                        "green",
+                        config,
+                    )
+
+                self.assertEqual(backtest_exit_triggered, observation.exit_triggered)
+                self.assertEqual(backtest_position.stop_price, observation.stop_after_candle_if_open)
+
     def test_all_stop_modes_follow_their_stage_advance_sequences(self):
         candles = [
             candle(0, 111, 112, 110, 111),

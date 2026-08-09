@@ -2,6 +2,7 @@ import io
 import json
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -10,6 +11,7 @@ from mu_strategy.demo_trading import DemoTradingConfig, _data_error_scan_result,
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.service import CandleBundle
 from mu_strategy.market_data.symbols import ResolvedSymbol
+from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefreshError
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import Candle, EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.strategies.registry import baseline_strategy_group
@@ -85,6 +87,153 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertEqual("planned", result["orders"][0]["status"])
         self.assertEqual("BTC-USDT-SWAP", result["orders"][0]["symbol"])
         self.assertEqual(10.0, result["orders"][0]["notional_usdt"])
+
+    def test_run_once_dry_run_without_position_source_reports_empty_shadow_state(self):
+        class PrivateAccountBomb:
+            def get_positions(self, **kwargs):
+                raise AssertionError("dry-run must not read positions")
+
+            def get_open_orders(self, **kwargs):
+                raise AssertionError("dry-run must not read orders")
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=()),
+            broker=PrivateAccountBomb(),
+        )
+
+        self.assertEqual([], result["exit_observations"])
+        self.assertEqual("unavailable", result["exit_observation_status"]["status"])
+        self.assertEqual("dry_run_has_no_position_source", result["exit_observation_status"]["reason"])
+
+    def test_run_once_dry_run_injected_position_source_never_reads_broker(self):
+        class PrivateAccountBomb:
+            def __getattr__(self, name):
+                raise AssertionError(f"dry-run touched broker method {name}")
+
+        source_calls = []
+
+        def position_source():
+            source_calls.append("positions")
+            return {
+                "code": "0",
+                "data": [{"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "100", "posSide": "long"}],
+                "msg": "",
+            }
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=()),
+            broker=PrivateAccountBomb(),
+            position_source=position_source,
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+        )
+
+        self.assertEqual(["positions"], source_calls)
+        self.assertEqual(1, len(result["exit_observations"]))
+        self.assertEqual("unknown", result["exit_observations"][0]["decision_status"])
+        self.assertEqual("degraded", result["exit_observations"][0]["state_quality"])
+        self.assertEqual("injected", result["exit_observation_status"]["source"])
+
+    def test_run_once_live_shadow_reuses_positions_and_never_calls_trade_methods(self):
+        class ShadowOnlyBroker:
+            def __init__(self):
+                self.calls = []
+
+            def get_positions(self, *, inst_type=None, inst_id=None):
+                self.calls.append(("get_positions", inst_type, inst_id))
+                return {
+                    "code": "0",
+                    "data": [{"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "100", "posSide": "long"}],
+                    "msg": "",
+                }
+
+            def get_open_orders(self, *, inst_type=None, inst_id=None):
+                self.calls.append(("get_open_orders", inst_type, inst_id))
+                return {"code": "0", "data": [], "msg": ""}
+
+            def set_leverage(self, **kwargs):
+                raise AssertionError("shadow exit must not set leverage")
+
+            def place_order(self, **kwargs):
+                raise AssertionError("shadow exit must not place orders")
+
+            def place_limit_buy(self, **kwargs):
+                raise AssertionError("shadow exit must not place orders")
+
+            def close_position(self, **kwargs):
+                raise AssertionError("shadow exit must not close positions")
+
+            def cancel_order(self, **kwargs):
+                raise AssertionError("shadow exit must not cancel orders")
+
+            def amend_order(self, **kwargs):
+                raise AssertionError("shadow exit must not amend orders")
+
+        broker = ShadowOnlyBroker()
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=False, watchlist_symbols=()),
+            broker=broker,
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+        )
+
+        self.assertEqual(
+            [("get_positions", "SWAP", None), ("get_open_orders", "SWAP", None)],
+            broker.calls,
+        )
+        self.assertEqual(1, len(result["exit_observations"]))
+        self.assertEqual("unknown", result["exit_observations"][0]["decision_status"])
+        self.assertEqual("broker", result["exit_observation_status"]["source"])
+
+    def test_run_once_exit_observation_uses_active_demo_leverage(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
+
+        weekend_ms = int(datetime(2026, 8, 8, tzinfo=timezone.utc).timestamp() * 1000)
+        bundle = CandleBundle(
+            symbol=ResolvedSymbol(requested="MU-USDT-SWAP", inst_id="MU-USDT-SWAP", source="okx"),
+            candles_by_interval={
+                "15m": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
+                "1h": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
+            },
+            files_by_interval={},
+            days=1,
+            trust_decision=TrustDecision(True, HealthReason.OK),
+        )
+
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, leverage=10, watchlist_symbols=()),
+            broker=None,
+            position_source=lambda: {
+                "code": "0",
+                "data": [{"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "110", "posSide": "long"}],
+                "msg": "",
+            },
+            candle_loader=lambda symbol, **kwargs: bundle,
+        )
+
+        evaluation = result["exit_observations"][0]["assumption_evaluation"]
+        self.assertEqual("non_session_liquidation_risk", evaluation["exit_reason"])
+        self.assertIn("leverage=10", result["exit_observations"][0]["assumptions"])
+
+    def test_run_once_no_positions_returns_empty_exit_observations(self):
+        result = run_once(
+            DemoTradingConfig(universe_limit=0, dry_run=True, watchlist_symbols=()),
+            broker=None,
+            position_source=lambda: {"code": "0", "data": [], "msg": ""},
+        )
+
+        self.assertEqual([], result["exit_observations"])
+        self.assertEqual(0, result["exit_observation_status"]["position_count"])
+
+    def test_run_once_refresh_true_still_fails_closed_before_position_source(self):
+        source_calls = []
+
+        with self.assertRaises(TrustedConsumerRefreshError):
+            run_once(
+                DemoTradingConfig(universe_limit=0, dry_run=True, refresh=True, watchlist_symbols=()),
+                broker=None,
+                position_source=lambda: source_calls.append("positions"),
+            )
+
+        self.assertEqual([], source_calls)
 
     def test_run_once_scan_payload_keeps_exact_legacy_key_set_without_typed_metadata(self):
         def typed_scanner(symbol, candles_15m, candles_1h, **kwargs):

@@ -75,7 +75,7 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 
 - 可信数据层已完工，schema-v4 分段存储已合并（#72 / issue #68）。
 - 30-B `OrderIntentFactory`(#59) 和 30-C 执行存储(#65) 已合并、有测试，但**无生产消费者**，处于休眠状态。原因：需要 `config/strategy-releases/` 里有可解析的 release，而发布 release 需要第二个 GitHub 身份（GitHub 禁止 PR 作者 approve 自己的 PR）。见已关闭的 #70。
-- 出场规则已提取为回测与实时共享的纯函数（#75），但**实时侧仍无消费者** —— `demo_trading.py` 里 `initial_stop` 只是报告字段，没有持仓监控或平仓动作。回测 47 笔全部由 stop 出场，收益 100% 由出场规则决定，所以这是上线前最关键的缺口。
+- 出场规则已提取为回测与实时共享的纯函数（#75）。`demo_trading.py` 会在返回值中提供 shadow-only `exit_observations`，但 OKX 聚合持仓缺少 fills、当前 stop 和 stage，因此真实判断保持 `unknown`，合成 stage-one 估算单独标注；仍然没有任何平仓动作。
 - 通知能力为零。
 
 ## 存储层复杂度债（v4 分段）
