@@ -14,7 +14,7 @@
 - OKX 可信数据层只发布已确认 K 线；主回测、可视化和 demo 只读取已发布的 cache-only generation。
 
 执行规划模块只输出规划决策，不会下单，也不会调用 broker/order API。
-OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 OKX API 适配，`mu_strategy.demo_trading` 负责 5 分钟扫描、风控、幂等和 demo 限价单编排；它们只消费固定策略结果，不反向修改研究/回测逻辑。
+OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 OKX API 适配，`mu_strategy.demo_trading` 负责 5 分钟扫描、shadow-only 出场观测、风控、幂等和 demo 限价单编排；它们只消费固定策略结果，不反向修改研究/回测逻辑。
 
 ## 架构
 
@@ -30,7 +30,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 - `mu_strategy.selection`：固定策略下的候选标的排序。
 - `mu_strategy.execution`：非交易的入场与风险规划，以及不连接 Broker 的本地 SQLite intent/audit/idempotency 事务存储。
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
-- `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、风险上限、`clOrdId` 幂等和小额限价单。
+- `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、只读出场观测、风险上限、`clOrdId` 幂等和小额限价单。
 
 兼容入口仍然保留，例如 `mu_strategy.data`、`mu_strategy.walk_forward`、`mu_strategy.visualize`、`mu_strategy.cli`；其中 backtest、visualization、walk-forward 和 Fibonacci experiment 主入口默认只消费可信 OKX cache-only 数据。
 
@@ -113,6 +113,8 @@ python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy
 ```powershell
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html
 ```
+
+每轮返回值包含 `exit_observations` 和 `exit_observation_status`。普通 dry-run 没有账户持仓来源，因此前者为空并显式报告 unavailable；confirmed demo 只复用一次既有 `get_positions` 读取做 shadow 评估，不会由该路径发送平仓、撤单或改单。OKX 聚合持仓缺少 fills、当前 stop 和 stage，输出会保持实际 decision 为 `unknown`，并把单一合成 fill 的估算单独标为 `assumption_evaluation`。
 
 Stage 0 dry-run cycles also append a versioned observation-only record to `data/observations/stage0.jsonl` by default. Use `--observation-log <path>` to choose another ignored local path. This sidecar preserves the existing stdout/dashboard JSON shape and is not an `OrderIntent`, broker authorization, or execution ledger; see [docs/stage0-observations.md](docs/stage0-observations.md).
 

@@ -7,7 +7,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
+from mu_strategy.live_exit import observe_okx_position
 from mu_strategy.live.okx import OKXInstrumentSpec
 from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bundle, trust_error_payload
@@ -33,6 +35,7 @@ from mu_strategy.strategies.registry import baseline_strategy_group
 UniverseProvider = Callable[..., list[OKXSwapTicker]]
 CandleLoader = Callable[..., CandleBundle]
 Scanner = Callable[..., EntryScanResult]
+PositionSource = Callable[[], dict[str, Any]]
 BOT_CLIENT_ORDER_ID_PATTERN = re.compile(r"^OD[A-F0-9]{20}$")
 PENDING_ORDER_STATES = {"", "live", "partially_filled"}
 DEFAULT_WATCHLIST_SYMBOLS = ("MU-USDT-SWAP",)
@@ -66,6 +69,7 @@ def run_once(
     observation_repository: ObservationRepository | None = None,
     observation_clock: Clock | None = None,
     observation_id_factory: Callable[[], str] | None = None,
+    position_source: PositionSource | None = None,
 ) -> dict[str, Any]:
     config = config or DemoTradingConfig()
     if observation_repository is None and config.observation_log_path is not None:
@@ -95,6 +99,12 @@ def run_once(
     account_context: dict[str, Any] = {}
     account_error: dict[str, str] | None = None
     trusted_context: TrustedLoadContext | None = None
+    exit_position_rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
+    exit_observation_status: dict[str, Any] = {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+    }
 
     if default_trusted_loader and not config.refresh:
         try:
@@ -103,6 +113,31 @@ def run_once(
             universe_error = _universe_load_error(exc)
 
     if config.dry_run:
+        if position_source is not None:
+            try:
+                injected_positions = position_source()
+            except Exception as exc:
+                exit_observation_status = {
+                    "status": "unavailable",
+                    "source": "injected",
+                    "reason": "position_source_failed",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            else:
+                if _okx_response_failed(injected_positions):
+                    exit_observation_status = {
+                        "status": "unavailable",
+                        "source": "injected",
+                        "reason": "position_source_response_failed",
+                    }
+                else:
+                    exit_position_rows_by_inst_id = _open_position_rows_by_inst_id(injected_positions)
+                    exit_observation_status = {
+                        "status": "available",
+                        "source": "injected",
+                        "reason": None,
+                    }
         if universe_error is None:
             try:
                 tickers = _merge_watchlist_tickers(
@@ -118,6 +153,19 @@ def run_once(
         open_orders = broker.get_open_orders(inst_type="SWAP")
         account_context = {"positions": positions, "open_orders": open_orders}
         account_error = _account_context_error(account_context)
+        if _okx_response_failed(positions):
+            exit_observation_status = {
+                "status": "unavailable",
+                "source": "broker",
+                "reason": "positions_response_failed",
+            }
+        else:
+            exit_position_rows_by_inst_id = _open_position_rows_by_inst_id(positions)
+            exit_observation_status = {
+                "status": "available",
+                "source": "broker",
+                "reason": None,
+            }
         if not _okx_response_failed(open_orders):
             open_order_inst_ids = _open_order_inst_ids(open_orders)
             open_order_rows_by_inst_id = _open_order_rows_by_inst_id(open_orders)
@@ -139,44 +187,30 @@ def run_once(
     scan_results: list[EntryScanResult] = []
     orders: list[dict[str, Any]] = []
     expired_orders: list[dict[str, Any]] = []
+    exit_observations: list[dict[str, Any]] = []
     data_errors: list[dict[str, Any]] = []
     remaining_capacity = max(0, config.max_open_positions - open_exposure)
     cycle_run_id: str | None = None
+    loaded_bundles: dict[str, CandleBundle | None] = {}
+    loaded_data_errors: dict[str, dict[str, Any] | None] = {}
 
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
-        data_error = None
-        bundle = None
+        bundle, data_error = _load_cycle_bundle(
+            ticker.inst_id,
+            config=config,
+            candle_loader=candle_loader,
+            default_trusted_loader=default_trusted_loader,
+            trusted_context=trusted_context,
+        )
+        loaded_bundles[ticker.inst_id] = bundle
+        loaded_data_errors[ticker.inst_id] = data_error
         result = None
         requested_intervals = ("15m", "1h")
-        try:
-            loader_kwargs = {
-                "intervals": requested_intervals,
-                "days": config.days,
-                "data_dir": config.data_dir,
-                "refresh": config.refresh,
-            }
-            if default_trusted_loader:
-                loader_kwargs["policy"] = trading_strict_policy()
-                loader_kwargs["max_staleness_bars"] = config.max_candle_staleness_bars
-                if trusted_context is not None:
-                    loader_kwargs["context"] = trusted_context
-            bundle = candle_loader(ticker.inst_id, **loader_kwargs)
-            if not _is_plain_legacy_bundle(bundle):
-                bundle = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
-        except Exception as exc:
-            data_error = _market_data_load_error(ticker.inst_id, exc)
+        if data_error is not None:
             data_errors.append(data_error)
 
         if bundle is not None:
             cycle_run_id = cycle_run_id or bundle.run_id
-            data_error = _market_data_freshness_error(
-                symbol=ticker.inst_id,
-                bundle=bundle,
-                requested_intervals=requested_intervals,
-                max_staleness_bars=config.max_candle_staleness_bars,
-            )
-            if data_error is not None:
-                data_errors.append(data_error)
 
         strategy_group = baseline_strategy_group(ticker.inst_id)
         strategy_config = strategy_group.config
@@ -275,6 +309,46 @@ def run_once(
             if data_error is not None:
                 continue
 
+    for symbol, rows in exit_position_rows_by_inst_id.items():
+        if symbol in loaded_bundles:
+            bundle = loaded_bundles[symbol]
+            data_error = loaded_data_errors[symbol]
+        else:
+            bundle, data_error = _load_cycle_bundle(
+                symbol,
+                config=config,
+                candle_loader=candle_loader,
+                default_trusted_loader=default_trusted_loader,
+                trusted_context=trusted_context,
+            )
+            loaded_bundles[symbol] = bundle
+            loaded_data_errors[symbol] = data_error
+            if data_error is not None:
+                data_errors.append(data_error)
+            if bundle is not None:
+                cycle_run_id = cycle_run_id or bundle.run_id
+
+        candles_15m = [] if bundle is None else bundle.candles_by_interval.get("15m", [])
+        candles_1h = [] if bundle is None else bundle.candles_by_interval.get("1h", [])
+        regime = "yellow"
+        if candles_15m and candles_1h and data_error is None:
+            latest_candle = candles_15m[-1]
+            regime = build_hourly_context(candles_15m, candles_1h).get(latest_candle.open_time_ms, "yellow")
+        unavailable_reason = None if data_error is None else str(data_error.get("reason") or "market_data_invalid")
+        strategy_config = baseline_strategy_group(symbol).config
+        for row in rows:
+            observation = observe_okx_position(
+                row,
+                candles=candles_15m if data_error is None else (),
+                regime=regime,
+                config=strategy_config,
+                unavailable_reason=unavailable_reason,
+            )
+            exit_observations.append(asdict(observation))
+
+    exit_observation_status["position_count"] = sum(len(rows) for rows in exit_position_rows_by_inst_id.values())
+    exit_observation_status["observation_count"] = len(exit_observations)
+
     if stage0_recorder is not None:
         stage0_recorder.commit()
 
@@ -357,6 +431,8 @@ def run_once(
         "scans": scans,
         "orders": orders,
         "expired_orders": expired_orders,
+        "exit_observations": exit_observations,
+        "exit_observation_status": exit_observation_status,
         "universe_error": universe_error,
         "data_errors": data_errors,
     }
@@ -590,6 +666,41 @@ def _data_error_scan_payload(
     return payload
 
 
+def _load_cycle_bundle(
+    symbol: str,
+    *,
+    config: DemoTradingConfig,
+    candle_loader: CandleLoader,
+    default_trusted_loader: bool,
+    trusted_context: TrustedLoadContext | None,
+) -> tuple[CandleBundle | None, dict[str, Any] | None]:
+    requested_intervals = ("15m", "1h")
+    try:
+        loader_kwargs = {
+            "intervals": requested_intervals,
+            "days": config.days,
+            "data_dir": config.data_dir,
+            "refresh": config.refresh,
+        }
+        if default_trusted_loader:
+            loader_kwargs["policy"] = trading_strict_policy()
+            loader_kwargs["max_staleness_bars"] = config.max_candle_staleness_bars
+            if trusted_context is not None:
+                loader_kwargs["context"] = trusted_context
+        bundle = candle_loader(symbol, **loader_kwargs)
+        if not _is_plain_legacy_bundle(bundle):
+            bundle = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
+    except Exception as exc:
+        return None, _market_data_load_error(symbol, exc)
+
+    return bundle, _market_data_freshness_error(
+        symbol=symbol,
+        bundle=bundle,
+        requested_intervals=requested_intervals,
+        max_staleness_bars=config.max_candle_staleness_bars,
+    )
+
+
 def _market_data_load_error(symbol: str, exc: Exception) -> dict[str, Any]:
     return {
         "symbol": symbol,
@@ -703,6 +814,15 @@ def _open_position_inst_ids(positions: dict[str, Any]) -> set[str]:
         for row in positions.get("data") or []
         if row.get("instId") and _decimal(row.get("pos")) != 0
     }
+
+
+def _open_position_rows_by_inst_id(positions: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
+    for row in positions.get("data") or []:
+        if not isinstance(row, dict) or not row.get("instId") or _decimal(row.get("pos")) == 0:
+            continue
+        rows_by_inst_id.setdefault(str(row["instId"]), []).append(row)
+    return rows_by_inst_id
 
 
 def _open_order_inst_ids(open_orders: dict[str, Any]) -> set[str]:
