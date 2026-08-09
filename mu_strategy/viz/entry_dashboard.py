@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 from collections import Counter
 from datetime import datetime, timezone
@@ -10,6 +11,25 @@ from typing import Any
 
 
 DEFAULT_REFRESH_SECONDS = 30
+
+EXIT_OBSERVATION_TIER_WARNING = "exit_warning"
+EXIT_OBSERVATION_TIER_UNKNOWN = "position_unknown"
+EXIT_OBSERVATION_TIER_UNAVAILABLE = "position_unavailable"
+EXIT_OBSERVATION_TIER_NONE = "no_position_or_source"
+
+
+def classify_exit_observation(observation: Any) -> str:
+    """Return the stable four-tier meaning shared by dashboard consumers."""
+
+    if not isinstance(observation, dict):
+        return EXIT_OBSERVATION_TIER_NONE
+    state_quality = str(observation.get("state_quality") or "").lower()
+    if state_quality != "degraded":
+        return EXIT_OBSERVATION_TIER_UNAVAILABLE
+    evaluation = observation.get("assumption_evaluation")
+    if isinstance(evaluation, dict) and evaluation.get("exit_triggered") is True:
+        return EXIT_OBSERVATION_TIER_WARNING
+    return EXIT_OBSERVATION_TIER_UNKNOWN
 
 
 def render_entry_dashboard(
@@ -30,6 +50,14 @@ def render_entry_dashboard(
     execution_orders = submitted_orders + blocked_orders
     data_errors = _list(payload.get("data_errors"))
     expired_orders = _list(payload.get("expired_orders"))
+    exit_observations = _list(payload.get("exit_observations"))
+    exit_observation_status = payload.get("exit_observation_status")
+    if not isinstance(exit_observation_status, dict):
+        exit_observation_status = {}
+    exit_warning_count = sum(
+        classify_exit_observation(observation) == EXIT_OBSERVATION_TIER_WARNING
+        for observation in exit_observations
+    )
     mode = str(payload.get("mode") or "-")
     mode_label = _mode_label(mode)
     scope_label = _scope_label(universe, scans)
@@ -38,6 +66,11 @@ def render_entry_dashboard(
     if failed:
         headline = "扫描失败"
         headline_detail = "不可下单"
+        state_class = "state-bad"
+        headline_badge_class = "failed"
+    elif exit_warning_count:
+        headline = f"发现 {exit_warning_count} 个持仓出场警示"
+        headline_detail = "降级估计，请先核对持仓"
         state_class = "state-bad"
         headline_badge_class = "failed"
     elif planned_orders:
@@ -249,6 +282,7 @@ def render_entry_dashboard(
   </header>
 
   {_failure_section(payload) if failed else ""}
+  {_exit_observations_section(exit_observations, exit_observation_status)}
   {_orders_section(planned_orders, scans, mode, show_empty_notice=not orders)}
   {_order_results_section(execution_orders, scans, mode)}
   {_reason_summary_section(scans)}
@@ -547,6 +581,187 @@ def _scan_row(scan: dict[str, Any]) -> str:
           <td class="num">{_fmt_number(scan.get("fib_level"))}</td>
           <td class="num">{_fmt_pct(scan.get("fib_distance_pct"))}</td>
         </tr>"""
+
+
+def _exit_observations_section(
+    observations: list[dict[str, Any]],
+    status: dict[str, Any],
+) -> str:
+    cards = "\n".join(_exit_observation_card(observation) for observation in observations)
+    if not cards:
+        cards = _empty_exit_observation_status(status)
+    return f"""
+  <section>
+    <h2>持仓出场观测 · 降级估计</h2>
+    <div class="notice">
+      交易所只返回持仓均价和数量，不返回真实止损、成交明细和加仓阶段。这里没有权威的实时出场判断，下面所有数值都是基于假设推算的估计值，仅供你自己去核对，不构成“该平仓”的结论。
+    </div>
+    <div class="instruction">{cards}</div>
+  </section>"""
+
+
+def _empty_exit_observation_status(status: dict[str, Any]) -> str:
+    reason = str(status.get("reason") or "")
+    state = str(status.get("status") or "")
+    if reason == "dry_run_has_no_position_source":
+        message = "Dry-run 未读取持仓，无法确认当前是否有持仓。"
+    elif reason:
+        message = f"持仓观测不可用，无法评估。状态码：{reason}"
+    elif state == "available" and _safe_count(status.get("position_count")) == 0:
+        message = "已读取交易所持仓：本轮返回 0 个持仓。"
+    else:
+        message = "本轮没有可展示的持仓观测，无法确认当前是否有持仓。"
+    return f"""
+    <div class="status state-wait">
+      <div class="headline">
+        <strong>无持仓观测</strong>
+        <span class="badge wait">无持仓 / 无观测源</span>
+      </div>
+      <div class="subtle">{_e(message)}</div>
+    </div>"""
+
+
+def _exit_observation_card(observation: dict[str, Any]) -> str:
+    tier = classify_exit_observation(observation)
+    if tier == EXIT_OBSERVATION_TIER_UNAVAILABLE:
+        return _unavailable_exit_observation_card(observation)
+
+    evaluation_value = observation.get("assumption_evaluation")
+    evaluation = evaluation_value if isinstance(evaluation_value, dict) else None
+    warning = tier == EXIT_OBSERVATION_TIER_WARNING
+    title = "⚠️ 出场警示（降级估计）" if warning else "持仓可见但状态未知"
+    state_class = "state-bad" if warning else "state-wait"
+    badge_class = "bad" if warning else "wait"
+    badge_text = "出场警示" if warning else "状态未知"
+    if evaluation is None:
+        evaluation_html = '<div class="notice">假设评估不可用，当前没有可展示的出场数值。</div>'
+    else:
+        evaluation_html = _exit_evaluation_details(observation, evaluation)
+    return f"""
+    <div class="status {state_class}">
+      <div class="headline">
+        <strong>{title}</strong>
+        <span class="badge {badge_class}">{badge_text}</span>
+      </div>
+      <div class="subtle">symbol={_e(observation.get("symbol"))} · 持仓数量={_e(_fmt_number(observation.get("position_size")))} · 持仓均价={_e(_fmt_number(observation.get("average_entry_price")))}</div>
+      <div class="instruction">
+        <strong>这是降级估计，不是权威判断</strong>
+        <span>decision_status=unknown：缺少真实止损、成交明细和加仓阶段，因此没有权威的实时出场判断。</span>
+      </div>
+      {evaluation_html}
+      {_stop_bias_notice(observation, evaluation)}
+    </div>"""
+
+
+def _unavailable_exit_observation_card(observation: dict[str, Any]) -> str:
+    return f"""
+    <div class="status state-bad">
+      <div class="headline">
+        <strong>持仓不可评估</strong>
+        <span class="badge bad">不可评估</span>
+      </div>
+      <div class="subtle">symbol={_e(observation.get("symbol"))} · 持仓数量={_e(_fmt_number(observation.get("position_size")))} · 持仓均价={_e(_fmt_number(observation.get("average_entry_price")))}</div>
+      <div class="notice">无法生成假设评估：{_e(observation.get("unavailable_reason"))}</div>
+    </div>"""
+
+
+def _exit_evaluation_details(observation: dict[str, Any], evaluation: dict[str, Any]) -> str:
+    reason = evaluation.get("exit_reason") or "未触发"
+    trigger_basis = evaluation.get("trigger_basis") or "none"
+    return f"""
+      <div class="instruction">
+        <strong>依据：{_e(reason)} / {_e(trigger_basis)}</strong>
+        <span>stop_before_candle（本根触发线）= {_e(_fmt_number(evaluation.get("stop_before_candle")))} ← 判据：最低价 ≤ 此值</span>
+        <span>最新收盘 = {_e(_fmt_number(evaluation.get("latest_close")))}</span>
+        <span>stop_after_candle_if_open（若存续，下一根携带值）= {_e(_fmt_number(evaluation.get("stop_after_candle_if_open")))} ← 不是本根的触发线</span>
+        <span>latest_close_at_or_below_tightened_stop = {_diagnostic_bool(evaluation.get("latest_close_at_or_below_tightened_stop"))}</span>
+        <span>仅供诊断，不是本根的出场判断。本根判断只看最低价与本根触发线。</span>
+      </div>
+      {_liquidation_risk_notice(observation)}"""
+
+
+def _stop_bias_notice(
+    observation: dict[str, Any],
+    evaluation: dict[str, Any] | None,
+) -> str:
+    initial_stop_pct = _assumed_initial_stop_pct(observation, evaluation)
+    return f"""
+      <div class="notice">
+        <strong>为什么“没有警示”不等于安全</strong><br>
+        估计假设你只建了首仓（max_stage=1），止损停在均价 ×（1 − {_e(initial_stop_pct)}）。如果你实际已加仓，真实止损会被收紧到远高于这个假设值——所以止损类警示会漏报：真实已该止损的持仓，这里可能显示无警示。<br>
+        这条“只漏报、不误报”仅限于假设止损偏低这一项偏差。均价与实际加权成本有偏、持仓已平但交易所未更新、建仓时配置与当前不同，这些情况下警示仍可能误报。
+      </div>"""
+
+
+def _liquidation_risk_notice(observation: dict[str, Any]) -> str:
+    leverage = _leverage_assumption(observation)
+    if leverage is None:
+        return '<div class="notice"><strong>杠杆未知，强平线无法估计</strong></div>'
+    return f"""
+      <div class="notice">
+        <strong>强平风险已纳入估计</strong><br>
+        非美股时段，若最低价跌破均价 ×（1 − 1/杠杆）即触发，与回测同序（该判断优先于普通止损）。<br>
+        估计使用杠杆 {_e(leverage)}。若与你交易所该持仓的实际杠杆不符，上面这条强平线就是错的——杠杆越高，真实强平线越接近现价，请自行核对。<br>
+        这条路径只依赖均价，不依赖加仓阶段，估计质量高于止损路径。
+      </div>"""
+
+
+def _leverage_assumption(observation: dict[str, Any]) -> str | None:
+    assumptions = observation.get("assumptions")
+    if not isinstance(assumptions, (list, tuple)):
+        return None
+    for assumption in assumptions:
+        text = str(assumption)
+        if not text.startswith("leverage="):
+            continue
+        value_text = text.removeprefix("leverage=").split(":", 1)[0].strip()
+        try:
+            value = float(value_text)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        return _fmt_number(value)
+    return None
+
+
+def _assumed_initial_stop_pct(
+    observation: dict[str, Any],
+    evaluation: dict[str, Any] | None,
+) -> str:
+    average_entry = _finite_number(observation.get("average_entry_price"))
+    stop_before = _finite_number((evaluation or {}).get("stop_before_candle"))
+    if average_entry is None or average_entry <= 0 or stop_before is None:
+        return "策略初始止损比例"
+    ratio = 1 - (stop_before / average_entry)
+    if not math.isfinite(ratio) or ratio < 0 or ratio >= 1:
+        return "策略初始止损比例"
+    return f"{ratio:.2%}"
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _safe_count(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _diagnostic_bool(value: Any) -> str:
+    if value is True:
+        return "是"
+    if value is False:
+        return "否"
+    return "未知"
 
 
 def _account_open_orders_section(payload: dict[str, Any]) -> str:
