@@ -14,6 +14,7 @@ from mu_strategy.experiments.strategy_ladder import (
     DEFAULT_MU_INSTRUMENT,
     FEE_GRID_BPS,
     MOMENTUM_LOOKBACK_HOURS,
+    MOMENTUM_HISTORY_HOURS,
     SLIPPAGE_GRID_TICKS,
     StrategyLadderDataError,
     apply_adverse_tick_slippage,
@@ -116,6 +117,43 @@ class StrategyLadderSignalTests(unittest.TestCase):
         self.assertEqual(before_calm, before_crash)
         self.assertTrue(before_calm)
         self.assertEqual(calm_trade_bar.open_time_ms, crashing_trade_bar.open_time_ms)
+
+    def test_momentum_uses_closed_pre_window_history_at_window_boundary(self):
+        candles_15m = [
+            Candle(index * QUARTER_HOUR_MS, 100, 101, 99, 100, 1_000)
+            for index in range(96)
+        ]
+        candles_1h = [
+            _hourly_candle(hour, 500 + hour)
+            for hour in range(-MOMENTUM_HISTORY_HOURS, 24)
+        ]
+        definition = CandidateDefinition(
+            "time_series_momentum_24h",
+            "time_series_momentum",
+            "momentum",
+            "test",
+            24,
+        )
+
+        windows = run_evaluator_walk_forward_backtests(
+            candles_15m,
+            candles_1h,
+            evaluator=lambda segment_15m, hourly, _context: run_long_only_candidate(
+                hourly,
+                definition=definition,
+                fee_bps_per_side=0,
+                slippage_ticks=0,
+                instrument=DEFAULT_MU_INSTRUMENT,
+                execution_start_time_ms=segment_15m[0].open_time_ms,
+                execution_end_time_ms=segment_15m[-1].open_time_ms + QUARTER_HOUR_MS,
+            ),
+            window_days=1,
+            windows=1,
+            history_hours=MOMENTUM_HISTORY_HOURS,
+        )
+
+        self.assertEqual(1, windows[0].result.trade_count)
+        self.assertEqual(0, windows[0].result.trades[0].entry_time_ms)
 
     def test_local_candidate_emits_positive_units_and_never_a_short_state(self):
         definition = CandidateDefinition(
@@ -357,11 +395,11 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 2 * DAY_MS
+            now_ms = 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="MU-USDT-SWAP",
-                start_ms=now_ms - DAY_MS,
+                start_ms=now_ms - (9 * DAY_MS),
                 end_ms=now_ms,
             )
             paths = _artifact_paths(root)
@@ -384,11 +422,11 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 2 * DAY_MS
+            now_ms = 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="MU-USDT-SWAP",
-                start_ms=now_ms - DAY_MS,
+                start_ms=now_ms - (9 * DAY_MS),
                 end_ms=now_ms,
                 run_id="deterministic-run",
             )

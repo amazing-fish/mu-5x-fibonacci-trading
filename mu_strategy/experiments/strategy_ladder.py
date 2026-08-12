@@ -30,6 +30,8 @@ TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 FEE_GRID_BPS = (0, 5, 10)
 SLIPPAGE_GRID_TICKS = (0, 1, 2)
 MOMENTUM_LOOKBACK_HOURS = (24, 96, 168)
+MOMENTUM_HISTORY_HOURS = max(MOMENTUM_LOOKBACK_HOURS) + 1
+MOMENTUM_HISTORY_DAYS = (MOMENTUM_HISTORY_HOURS + 23) // 24
 DEFAULT_FEE_BPS = 5
 TOP_N_TRADES = 5
 PROTOCOL_VERSION = "strategy-ladder-v1"
@@ -169,21 +171,32 @@ def run_long_only_candidate(
     slippage_ticks: int,
     instrument: OKXInstrumentSpec,
     starting_equity: float = 10_000.0,
+    execution_start_time_ms: int | None = None,
+    execution_end_time_ms: int | None = None,
 ) -> BacktestResult:
     if fee_bps_per_side < 0 or slippage_ticks < 0:
         raise ValueError("fee and slippage values must be non-negative")
     ordered = sorted(candles_1h, key=lambda bar: bar.open_time_ms)
-    if len(ordered) < 2:
+    execution_indices = [
+        index
+        for index, bar in enumerate(ordered)
+        if (execution_start_time_ms is None or bar.open_time_ms >= execution_start_time_ms)
+        and (execution_end_time_ms is None or bar.open_time_ms < execution_end_time_ms)
+    ]
+    if len(ordered) < 2 or not execution_indices:
         return BacktestResult(starting_equity, starting_equity, [], [])
 
     fee_rate = fee_bps_per_side / 10_000
     slip = float(instrument.tick_size * slippage_ticks)
     equity = starting_equity
-    equity_curve: list[tuple[int, float]] = [(ordered[0].open_time_ms, equity)]
+    first_execution_bar = ordered[execution_indices[0]]
+    equity_curve: list[tuple[int, float]] = [(first_execution_bar.open_time_ms, equity)]
     trades: list[Trade] = []
     open_fill: Fill | None = None
 
-    for index in range(1, len(ordered)):
+    for index in execution_indices:
+        if index == 0:
+            continue
         trade_bar = ordered[index]
         closed = ordered[:index]
         if definition.family == "overnight_seasonality":
@@ -228,7 +241,7 @@ def run_long_only_candidate(
         equity_curve.append((trade_bar.open_time_ms + HOUR_MS, marked))
 
     if open_fill is not None:
-        final = ordered[-1]
+        final = ordered[execution_indices[-1]]
         equity, trade = _close_long_only_trade(
             open_fill,
             exit_time_ms=final.open_time_ms + HOUR_MS,
@@ -294,6 +307,11 @@ def evaluate_strategy_ladder(
                             fee_bps_per_side=_fee_bps,
                             slippage_ticks=_ticks,
                             instrument=instrument,
+                            execution_start_time_ms=_segment_15m[0].open_time_ms,
+                            execution_end_time_ms=(
+                                _segment_15m[-1].open_time_ms
+                                + _infer_interval_ms(_segment_15m)
+                            ),
                         )
 
                 window_results = tuple(run_evaluator_walk_forward_backtests(
@@ -302,6 +320,7 @@ def evaluate_strategy_ladder(
                     evaluator=evaluator,
                     window_days=window_days,
                     windows=windows,
+                    history_hours=MOMENTUM_HISTORY_HOURS,
                 ))
                 cells.append(StressCell(
                     fee_bps,
@@ -405,6 +424,7 @@ def render_strategy_ladder_report(result: StrategyLadderResult) -> str:
         f"- protocol: {PROTOCOL_VERSION}",
         f"- default cost: {DEFAULT_FEE_BPS} bp per side, 0 slippage ticks",
         f"- tick size: {format(result.instrument.tick_size, 'f')}",
+        f"- momentum pre-window history: {MOMENTUM_HISTORY_HOURS} closed-hour slots; executions remain window-local",
         f"- data files: {', '.join(str(path) for path in result.data_files) if result.data_files else '-'}",
         "- status rule: candidate only when at least one family variant trades and has non-negative return in every stress cell; otherwise stress_failed.",
         "",
@@ -457,7 +477,7 @@ def render_strategy_ladder_html(result: StrategyLadderResult) -> str:
 </head>
 <body><main>
   <h1>{html.escape(result.symbol)} Strategy Candidate Ladder</h1>
-  <div class="meta">Trusted generation: {html.escape(result.run_id or '-')} · Protocol: {PROTOCOL_VERSION} · Tick size: {html.escape(format(result.instrument.tick_size, 'f'))}</div>
+  <div class="meta">Trusted generation: {html.escape(result.run_id or '-')} · Protocol: {PROTOCOL_VERSION} · Tick size: {html.escape(format(result.instrument.tick_size, 'f'))} · Momentum history: {MOMENTUM_HISTORY_HOURS} hours, window-local executions</div>
   <div class="panel"><table><thead><tr><th>Rank</th><th>Candidate</th><th>Family</th><th>Return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th><th>Top-5 concentration</th><th>Status</th></tr></thead><tbody>{ranking_rows}</tbody></table></div>
   {candidate_sections}
   <p class="meta">Research artifact only; not financial advice.</p>
@@ -478,7 +498,7 @@ def run_strategy_ladder(
     bundle = refresh_trusted_candle_bundle(
         symbol,
         intervals=TRUSTED_REQUESTED_INTERVALS,
-        days=window_days * windows,
+        days=(window_days * windows) + MOMENTUM_HISTORY_DAYS,
         data_dir=data_dir,
         refresh=False,
     )
@@ -701,6 +721,17 @@ def _format_optional_pct(value: float | None) -> str:
 
 def _decimal_metric(value: float) -> str:
     return format(Decimal(str(value)).quantize(Decimal("0.00000001")), "f")
+
+
+def _infer_interval_ms(candles: list[Candle]) -> int:
+    if len(candles) < 2:
+        return 0
+    diffs = [
+        candles[index].open_time_ms - candles[index - 1].open_time_ms
+        for index in range(1, len(candles))
+        if candles[index].open_time_ms > candles[index - 1].open_time_ms
+    ]
+    return min(diffs) if diffs else 0
 
 
 if __name__ == "__main__":
