@@ -450,6 +450,31 @@ class EntryDashboardTests(unittest.TestCase):
         self.assertNotIn("本轮返回 0 个持仓", html)
         self.assertIn("无法确认当前是否有持仓", html)
 
+    def test_dashboard_does_not_confirm_empty_positions_from_non_integer_counts(self):
+        from mu_strategy.viz.entry_dashboard import render_entry_dashboard
+
+        for field in ("position_count", "observation_count"):
+            for malformed_count in (False, 0.0, 0.5, -0.2):
+                with self.subTest(field=field, malformed_count=malformed_count):
+                    status = {
+                        "status": "available",
+                        "reason": None,
+                        "position_count": 0,
+                        "observation_count": 0,
+                    }
+                    status[field] = malformed_count
+
+                    html = render_entry_dashboard(
+                        {
+                            "mode": "live_demo",
+                            "exit_observations": [],
+                            "exit_observation_status": status,
+                        }
+                    )
+
+                    self.assertNotIn("本轮返回 0 个持仓", html)
+                    self.assertIn("无法确认当前是否有持仓", html)
+
     def test_dashboard_preserves_confirmed_empty_and_valid_stop_warning_paths(self):
         from mu_strategy.viz.entry_dashboard import render_entry_dashboard
 

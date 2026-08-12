@@ -625,8 +625,8 @@ def _empty_exit_observation_status(
     elif (
         observations_are_list
         and state == "available"
-        and _safe_count(status.get("position_count")) == 0
-        and _safe_count(status.get("observation_count")) == rendered_observation_count
+        and _non_negative_int_count(status.get("position_count")) == 0
+        and _non_negative_int_count(status.get("observation_count")) == rendered_observation_count
     ):
         message = "已读取交易所持仓：本轮返回 0 个持仓。"
     else:
@@ -782,11 +782,10 @@ def _finite_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _safe_count(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+def _non_negative_int_count(value: Any) -> int | None:
+    if type(value) is not int or value < 0:
         return None
+    return value
 
 
 def _diagnostic_bool(value: Any) -> str:
