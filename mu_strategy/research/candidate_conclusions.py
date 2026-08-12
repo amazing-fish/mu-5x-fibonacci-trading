@@ -2,10 +2,38 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+
+STRATEGY_LADDER_PROTOCOL_VERSION = "strategy-ladder-v1"
+STRATEGY_LADDER_DEFAULT_FEE_BPS = 5
+STRATEGY_LADDER_FEE_GRID_BPS = (0, 5, 10)
+STRATEGY_LADDER_SLIPPAGE_GRID_TICKS = (0, 1, 2)
+STRATEGY_LADDER_TOP_N = 5
+STRATEGY_LADDER_FAMILY_SCHEMA = (
+    (
+        "overnight_seasonality",
+        "issue-93 overnight seasonality hypothesis",
+        ("overnight_seasonality",),
+    ),
+    (
+        "time_series_momentum",
+        "issue-93 trailing-return-sign hypothesis",
+        (
+            "time_series_momentum_24h",
+            "time_series_momentum_96h",
+            "time_series_momentum_168h",
+        ),
+    ),
+    (
+        "baseline",
+        "mu_strategy.strategies.registry:baseline",
+        ("baseline",),
+    ),
+)
 
 
 class CandidateConclusionError(ValueError):
@@ -132,12 +160,31 @@ class CandidateRobustness:
             or concentration is not None
         ):
             raise CandidateConclusionError("zero-trade evidence must contain only zero metrics and null concentration")
-        if not _matches_integer_win_count(self.win_rate, self.trade_count):
+        if not _has_compatible_win_count(self.win_rate, self.trade_count):
             raise CandidateConclusionError("win_rate must correspond to an integer win count")
+        if self.trade_count > 0 and total_return > 0 and not _has_compatible_win_count(
+            self.win_rate,
+            self.trade_count,
+            minimum=1,
+        ):
+            raise CandidateConclusionError("positive return requires at least one winning trade")
+        if self.trade_count > 0 and total_return < 0 and not _has_compatible_win_count(
+            self.win_rate,
+            self.trade_count,
+            maximum=self.trade_count - 1,
+        ):
+            raise CandidateConclusionError("negative return requires at least one non-winning trade")
+        if total_return < 0 and max_drawdown == 0:
+            raise CandidateConclusionError("negative return requires negative max_drawdown_pct")
         if (total_return > 0) != (concentration is not None):
             raise CandidateConclusionError(
                 "top_n_trade_concentration must be present exactly when total_return_pct is positive"
             )
+        if concentration is not None:
+            if self.top_n == 0 and concentration != 0:
+                raise CandidateConclusionError("zero top_n requires zero trade concentration")
+            if self.top_n > 0 and concentration == 0:
+                raise CandidateConclusionError("positive top_n and return require positive trade concentration")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -267,9 +314,30 @@ class CandidateConclusionIndex:
             not isinstance(entry, CandidateConclusion) for entry in self.entries
         ):
             raise CandidateConclusionError("conclusion entries must be CandidateConclusion values")
-        families = [entry.family for entry in self.entries]
-        if not families or len(families) != len(set(families)):
-            raise CandidateConclusionError("conclusion families must be non-empty and unique")
+        expected_families = tuple(schema[0] for schema in STRATEGY_LADDER_FAMILY_SCHEMA)
+        families = tuple(entry.family for entry in self.entries)
+        if families != expected_families:
+            raise CandidateConclusionError(
+                f"conclusion families must be exactly {expected_families} in canonical order"
+            )
+        shared_fee_assumption = self.entries[0].fee_assumption
+        if (
+            shared_fee_assumption.default_fee_bps_per_side != STRATEGY_LADDER_DEFAULT_FEE_BPS
+            or shared_fee_assumption.fee_grid_bps_per_side != STRATEGY_LADDER_FEE_GRID_BPS
+            or shared_fee_assumption.slippage_grid_ticks != STRATEGY_LADDER_SLIPPAGE_GRID_TICKS
+        ):
+            raise CandidateConclusionError("strategy-ladder-v1 requires its canonical cost grid")
+        for entry, (family, source, candidate_ids) in zip(self.entries, STRATEGY_LADDER_FAMILY_SCHEMA):
+            if entry.protocol_version != STRATEGY_LADDER_PROTOCOL_VERSION:
+                raise CandidateConclusionError("unsupported strategy ladder protocol_version")
+            if entry.source != source:
+                raise CandidateConclusionError(f"{family} source does not match strategy-ladder-v1")
+            if entry.fee_assumption != shared_fee_assumption:
+                raise CandidateConclusionError("all conclusion entries must share one fee assumption")
+            if tuple(metric.candidate_id for metric in entry.robustness_metrics) != candidate_ids:
+                raise CandidateConclusionError(f"{family} candidate ids do not match strategy-ladder-v1")
+            if any(metric.top_n != STRATEGY_LADDER_TOP_N for metric in entry.robustness_metrics):
+                raise CandidateConclusionError("strategy-ladder-v1 requires top_n=5")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,21 +440,34 @@ def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
     return parsed
 
 
-def _matches_integer_win_count(win_rate: str, trade_count: int) -> bool:
+def _has_compatible_win_count(
+    win_rate: str,
+    trade_count: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> bool:
+    maximum = trade_count if maximum is None else maximum
+    minimum = max(0, minimum)
+    maximum = min(trade_count, maximum)
+    if minimum > maximum:
+        return False
     if trade_count == 0:
-        return win_rate == "0.00000000"
-    parsed = Decimal(win_rate)
-    estimated_wins = parsed * trade_count
-    lower = int(estimated_wins.to_integral_value(rounding=ROUND_FLOOR))
-    return any(
-        0 <= win_count <= trade_count
-        and format(
-            (Decimal(win_count) / Decimal(trade_count)).quantize(Decimal("0.00000001")),
-            "f",
+        return minimum == 0 and maximum == 0 and win_rate == "0.00000000"
+    with localcontext() as context:
+        context.prec = max(28, len(str(trade_count)) + 20)
+        parsed = Decimal(win_rate)
+        estimated_wins = parsed * trade_count
+        lower = int(estimated_wins.to_integral_value(rounding=ROUND_FLOOR))
+        return any(
+            minimum <= win_count <= maximum
+            and format(
+                (Decimal(win_count) / Decimal(trade_count)).quantize(Decimal("0.00000001")),
+                "f",
+            )
+            == win_rate
+            for win_count in {lower, lower + 1, minimum, maximum}
         )
-        == win_rate
-        for win_count in (lower, lower + 1)
-    )
 
 
 def _canonical_decimal(value: str, field_name: str) -> Decimal:

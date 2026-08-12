@@ -22,6 +22,11 @@ from mu_strategy.research.candidate_conclusions import (
     CandidateRobustness,
     CandidateStatus,
     FeeAssumption,
+    STRATEGY_LADDER_DEFAULT_FEE_BPS,
+    STRATEGY_LADDER_FEE_GRID_BPS,
+    STRATEGY_LADDER_PROTOCOL_VERSION,
+    STRATEGY_LADDER_SLIPPAGE_GRID_TICKS,
+    STRATEGY_LADDER_TOP_N,
     validate_candidate_artifact_path,
     write_candidate_conclusion_index,
 )
@@ -30,14 +35,14 @@ from mu_strategy.strategies.registry import baseline_strategy_group
 
 
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
-FEE_GRID_BPS = (0, 5, 10)
-SLIPPAGE_GRID_TICKS = (0, 1, 2)
+FEE_GRID_BPS = STRATEGY_LADDER_FEE_GRID_BPS
+SLIPPAGE_GRID_TICKS = STRATEGY_LADDER_SLIPPAGE_GRID_TICKS
 MOMENTUM_LOOKBACK_HOURS = (24, 96, 168)
 MOMENTUM_HISTORY_HOURS = max(MOMENTUM_LOOKBACK_HOURS) + 1
 MOMENTUM_HISTORY_DAYS = (MOMENTUM_HISTORY_HOURS + 23) // 24
-DEFAULT_FEE_BPS = 5
-TOP_N_TRADES = 5
-PROTOCOL_VERSION = "strategy-ladder-v1"
+DEFAULT_FEE_BPS = STRATEGY_LADDER_DEFAULT_FEE_BPS
+TOP_N_TRADES = STRATEGY_LADDER_TOP_N
+PROTOCOL_VERSION = STRATEGY_LADDER_PROTOCOL_VERSION
 HOUR_MS = 3_600_000
 DEFAULT_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.md")
 DEFAULT_HTML_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.html")

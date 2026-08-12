@@ -567,6 +567,14 @@ class CandidateConclusionIndexTests(unittest.TestCase):
 
         zero_return = replace(metric, total_return_pct="0.00000000", top_n_trade_concentration=None)
         self.assertEqual(zero_return, CandidateRobustness.from_dict(zero_return.to_dict()))
+        rounded_positive = replace(
+            metric,
+            total_return_pct="0.00000000",
+            trade_count=1,
+            win_rate="1.00000000",
+            top_n_trade_concentration=None,
+        )
+        self.assertEqual(rounded_positive, CandidateRobustness.from_dict(rounded_positive.to_dict()))
 
     def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
         index = _sample_conclusion_index()
@@ -594,8 +602,99 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             robustness_metrics=(surviving_metric,),
             status=CandidateStatus.CANDIDATE,
         )
-        candidate_index = CandidateConclusionIndex((candidate_entry,))
+        candidate_index = replace(index, entries=(candidate_entry, *index.entries[1:]))
         self.assertEqual(candidate_index, CandidateConclusionIndex.from_json(candidate_index.to_json()))
+
+    def test_conclusion_rejects_impossible_return_win_and_drawdown_combinations(self):
+        metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
+        contradictions = (
+            (
+                {"trade_count": 1, "win_rate": "0.00000000"},
+                "positive return requires",
+            ),
+            (
+                {
+                    "total_return_pct": "-0.10000000",
+                    "trade_count": 1,
+                    "win_rate": "1.00000000",
+                    "top_n_trade_concentration": None,
+                },
+                "negative return requires at least one non-winning",
+            ),
+            (
+                {
+                    "total_return_pct": "-0.10000000",
+                    "max_drawdown_pct": "0.00000000",
+                    "top_n_trade_concentration": None,
+                },
+                "negative return requires",
+            ),
+        )
+
+        for changes, message in contradictions:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(CandidateConclusionError, message):
+                    replace(metric, **changes)
+
+                rejected = metric.to_dict()
+                rejected.update(changes)
+                with self.assertRaisesRegex(CandidateConclusionError, message):
+                    CandidateRobustness.from_dict(rejected)
+
+    def test_conclusion_zero_top_n_requires_zero_concentration(self):
+        metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
+
+        with self.assertRaisesRegex(CandidateConclusionError, "zero top_n"):
+            replace(metric, top_n=0, top_n_trade_concentration="1.00000000")
+
+        rejected = metric.to_dict()
+        rejected["top_n"] = 0
+        rejected["top_n_trade_concentration"] = "1.00000000"
+        with self.assertRaisesRegex(CandidateConclusionError, "zero top_n"):
+            CandidateRobustness.from_dict(rejected)
+
+        zero_concentration = replace(metric, top_n=0, top_n_trade_concentration="0.00000000")
+        self.assertEqual(zero_concentration, CandidateRobustness.from_dict(zero_concentration.to_dict()))
+
+    def test_conclusion_index_binds_one_v1_protocol_and_cost_contract(self):
+        index = _sample_conclusion_index()
+        payload = index.to_dict()
+        mutations = (
+            ("protocol", lambda item: item["entries"][1].__setitem__("protocol_version", "strategy-ladder-v2")),
+            ("fee", lambda item: item["entries"][1]["fee_assumption"].__setitem__("default_fee_bps_per_side", 10)),
+            ("fee_grid", lambda item: item["entries"][0]["fee_assumption"].__setitem__("fee_grid_bps_per_side", [0, 5])),
+            ("slippage_grid", lambda item: item["entries"][0]["fee_assumption"].__setitem__("slippage_grid_ticks", [0, 1])),
+            ("tick_size", lambda item: item["entries"][2]["fee_assumption"].__setitem__("tick_size", "0.01")),
+            ("top_n", lambda item: item["entries"][0]["robustness_metrics"][0].__setitem__("top_n", 0)),
+        )
+
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                rejected = json.loads(json.dumps(payload))
+                mutate(rejected)
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateConclusionIndex.from_dict(rejected)
+
+        mismatched_fee = replace(index.entries[1].fee_assumption, tick_size="0.01")
+        mismatched_entry = replace(index.entries[1], fee_assumption=mismatched_fee)
+        with self.assertRaisesRegex(CandidateConclusionError, "share one fee assumption"):
+            replace(index, entries=(index.entries[0], mismatched_entry, index.entries[2]))
+
+    def test_conclusion_index_requires_canonical_families_variants_and_sources(self):
+        payload = _sample_conclusion_index().to_dict()
+        mutations = (
+            lambda item: item["entries"].pop(),
+            lambda item: item["entries"].reverse(),
+            lambda item: item["entries"][0].__setitem__("source", "other"),
+            lambda item: item["entries"][1]["robustness_metrics"][0].__setitem__("candidate_id", "other"),
+        )
+
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                rejected = json.loads(json.dumps(payload))
+                mutate(rejected)
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateConclusionIndex.from_dict(rejected)
 
     def test_conclusion_rejects_contradictory_zero_trade_metrics(self):
         index = _sample_conclusion_index()
@@ -923,17 +1022,49 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
 
 def _sample_conclusion_index() -> CandidateConclusionIndex:
     fee = FeeAssumption(5, (0, 5, 10), (0, 1, 2), "0.1")
-    metric = CandidateRobustness("baseline", "0.01000000", "-0.02000000", 3, "0.33333333", 5, "1.20000000", False)
-    return CandidateConclusionIndex((
-        CandidateConclusion(
-            family="baseline",
-            source="registry",
-            protocol_version="strategy-ladder-v1",
-            fee_assumption=fee,
-            robustness_metrics=(metric,),
-            status=CandidateStatus.STRESS_FAILED,
-        ),
-    ))
+    def metric(candidate_id: str) -> CandidateRobustness:
+        return CandidateRobustness(
+            candidate_id,
+            "0.01000000",
+            "-0.02000000",
+            3,
+            "0.33333333",
+            5,
+            "1.20000000",
+            False,
+        )
+
+    return CandidateConclusionIndex(
+        (
+            CandidateConclusion(
+                family="overnight_seasonality",
+                source="issue-93 overnight seasonality hypothesis",
+                protocol_version="strategy-ladder-v1",
+                fee_assumption=fee,
+                robustness_metrics=(metric("overnight_seasonality"),),
+                status=CandidateStatus.STRESS_FAILED,
+            ),
+            CandidateConclusion(
+                family="time_series_momentum",
+                source="issue-93 trailing-return-sign hypothesis",
+                protocol_version="strategy-ladder-v1",
+                fee_assumption=fee,
+                robustness_metrics=tuple(
+                    metric(f"time_series_momentum_{lookback}h")
+                    for lookback in (24, 96, 168)
+                ),
+                status=CandidateStatus.STRESS_FAILED,
+            ),
+            CandidateConclusion(
+                family="baseline",
+                source="mu_strategy.strategies.registry:baseline",
+                protocol_version="strategy-ladder-v1",
+                fee_assumption=fee,
+                robustness_metrics=(metric("baseline"),),
+                status=CandidateStatus.STRESS_FAILED,
+            ),
+        )
+    )
 
 
 def _hourly_candle(hour: int, price: float) -> Candle:
