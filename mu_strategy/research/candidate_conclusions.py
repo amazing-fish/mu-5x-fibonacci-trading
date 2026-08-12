@@ -119,6 +119,8 @@ class CandidateRobustness:
                 self.top_n_trade_concentration,
                 "top_n_trade_concentration",
             )
+            if concentration < 0:
+                raise CandidateConclusionError("top_n_trade_concentration cannot be negative")
         if self.survives_stress_grid and self.trade_count == 0:
             raise CandidateConclusionError("surviving stress evidence requires at least one trade")
         if self.survives_stress_grid and total_return < 0:

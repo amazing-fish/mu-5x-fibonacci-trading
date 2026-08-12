@@ -515,6 +515,21 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(CandidateConclusionError, "cannot be positive"):
             CandidateConclusionIndex.from_dict(rejected)
 
+    def test_conclusion_rejects_negative_trade_concentration_without_an_upper_bound(self):
+        index = _sample_conclusion_index()
+        metric = index.entries[0].robustness_metrics[0]
+
+        with self.assertRaisesRegex(CandidateConclusionError, "cannot be negative"):
+            replace(metric, top_n_trade_concentration="-0.50000000")
+
+        rejected = index.to_dict()
+        rejected["entries"][0]["robustness_metrics"][0]["top_n_trade_concentration"] = "-0.50000000"
+        with self.assertRaisesRegex(CandidateConclusionError, "cannot be negative"):
+            CandidateConclusionIndex.from_dict(rejected)
+
+        above_one = replace(metric, top_n_trade_concentration="1.50000000")
+        self.assertEqual(above_one, CandidateRobustness.from_dict(above_one.to_dict()))
+
     def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
         index = _sample_conclusion_index()
         entry = index.entries[0]
