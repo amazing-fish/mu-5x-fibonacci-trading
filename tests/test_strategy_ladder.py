@@ -46,6 +46,7 @@ from mu_strategy.research.candidate_conclusions import (
     CandidateRobustness,
     CandidateStatus,
     FeeAssumption,
+    StressCellReturn,
     format_candidate_metric,
     read_candidate_conclusion_index,
     write_candidate_conclusion_index,
@@ -456,6 +457,9 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 rejected = json.loads(json.dumps(payload))
                 rejected["entries"][0]["status"] = status
                 rejected["entries"][0]["robustness_metrics"][0]["survives_stress_grid"] = survives_stress
+                if survives_stress:
+                    for cell in rejected["entries"][0]["robustness_metrics"][0]["stress_grid_returns"]:
+                        cell["total_return_pct"] = "0.01000000"
                 with self.assertRaisesRegex(CandidateConclusionError, "contradicts robustness metrics"):
                     CandidateConclusionIndex.from_dict(rejected)
 
@@ -575,7 +579,12 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 with self.assertRaisesRegex(CandidateConclusionError, "present exactly when"):
                     CandidateRobustness.from_dict(rejected)
 
-        zero_return = replace(metric, total_return_pct="0.00000000", top_n_trade_concentration=None)
+        zero_return = replace(
+            metric,
+            total_return_pct="0.00000000",
+            top_n_trade_concentration=None,
+            stress_grid_returns=_replace_stress_return(metric.stress_grid_returns, 5, 0, "0.00000000"),
+        )
         self.assertEqual(zero_return, CandidateRobustness.from_dict(zero_return.to_dict()))
         rounded_positive = replace(
             metric,
@@ -583,6 +592,7 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             trade_count=1,
             win_rate="1.00000000",
             top_n_trade_concentration=None,
+            stress_grid_returns=_replace_stress_return(metric.stress_grid_returns, 5, 0, "0.00000000"),
         )
         self.assertEqual(rounded_positive, CandidateRobustness.from_dict(rounded_positive.to_dict()))
 
@@ -606,6 +616,10 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             trade_count=1,
             win_rate="1.00000000",
             top_n_trade_concentration="1.00000000",
+            stress_grid_returns=tuple(
+                replace(cell, total_return_pct="0.01000000")
+                for cell in metric.stress_grid_returns
+            ),
             survives_stress_grid=True,
         )
         candidate_entry = replace(
@@ -665,6 +679,7 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             total_return_pct="-0.10000000",
             max_drawdown_pct="-0.10000000",
             top_n_trade_concentration=None,
+            stress_grid_returns=_replace_stress_return(metric.stress_grid_returns, 5, 0, "-0.10000000"),
         )
         self.assertEqual(equal_drawdown, CandidateRobustness.from_dict(equal_drawdown.to_dict()))
 
@@ -781,6 +796,44 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(CandidateConclusionError, "share one fee assumption"):
             replace(index, entries=(index.entries[0], mismatched_entry, index.entries[2]))
 
+    def test_conclusion_index_binds_instrument_generation_and_window_protocol(self):
+        index = _sample_conclusion_index()
+        payload = index.to_dict()
+        self.assertEqual("MU-USDT-SWAP", payload["instrument_id"])
+        self.assertEqual("sample-generation", payload["trusted_generation"])
+        self.assertEqual((14, 2), (payload["window_days"], payload["windows"]))
+
+        mutations = (
+            lambda item: item.__setitem__("instrument_id", "MU"),
+            lambda item: item.__setitem__("trusted_generation", ""),
+            lambda item: item.__setitem__("window_days", 0),
+            lambda item: item.__setitem__("windows", True),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                rejected = json.loads(json.dumps(payload))
+                mutate(rejected)
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateConclusionIndex.from_dict(rejected)
+
+    def test_conclusion_survival_is_derived_from_all_canonical_stress_cells(self):
+        metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
+        self.assertEqual(
+            [(fee, ticks) for fee in (0, 5, 10) for ticks in (0, 1, 2)],
+            [(cell.fee_bps_per_side, cell.slippage_ticks) for cell in metric.stress_grid_returns],
+        )
+
+        with self.assertRaisesRegex(CandidateConclusionError, "all stress cells"):
+            replace(metric, stress_grid_returns=metric.stress_grid_returns[:-1])
+
+        surviving_cells = tuple(
+            replace(cell, total_return_pct="0.01000000") for cell in metric.stress_grid_returns
+        )
+        with self.assertRaisesRegex(CandidateConclusionError, "contradicts serialized stress cells"):
+            replace(metric, stress_grid_returns=surviving_cells, survives_stress_grid=False)
+        surviving = replace(metric, stress_grid_returns=surviving_cells, survives_stress_grid=True)
+        self.assertEqual(surviving, CandidateRobustness.from_dict(surviving.to_dict()))
+
     def test_conclusion_index_requires_canonical_families_variants_and_sources(self):
         payload = _sample_conclusion_index().to_dict()
         mutations = (
@@ -807,6 +860,10 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             trade_count=0,
             win_rate="0.00000000",
             top_n_trade_concentration=None,
+            stress_grid_returns=tuple(
+                replace(cell, total_return_pct="0.00000000")
+                for cell in metric.stress_grid_returns
+            ),
         )
         self.assertEqual(
             zero_trade_metric,
@@ -891,7 +948,13 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             windows=1,
         )
 
-        index = build_conclusion_index(evaluations, DEFAULT_MU_INSTRUMENT)
+        index = build_conclusion_index(
+            evaluations,
+            DEFAULT_MU_INSTRUMENT,
+            trusted_generation="test-generation",
+            window_days=1,
+            windows=1,
+        )
 
         self.assertEqual(
             ["overnight_seasonality", "time_series_momentum", "baseline"],
@@ -1124,6 +1187,15 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
 def _sample_conclusion_index() -> CandidateConclusionIndex:
     fee = FeeAssumption(5, (0, 5, 10), (0, 1, 2), "0.1")
     def metric(candidate_id: str) -> CandidateRobustness:
+        stress_returns = tuple(
+            StressCellReturn(
+                fee_bps,
+                slippage_ticks,
+                "-0.01000000" if (fee_bps, slippage_ticks) == (10, 2) else "0.01000000",
+            )
+            for fee_bps in (0, 5, 10)
+            for slippage_ticks in (0, 1, 2)
+        )
         return CandidateRobustness(
             candidate_id,
             "0.01000000",
@@ -1132,6 +1204,7 @@ def _sample_conclusion_index() -> CandidateConclusionIndex:
             "0.33333333",
             5,
             "1.20000000",
+            stress_returns,
             False,
         )
 
@@ -1164,7 +1237,25 @@ def _sample_conclusion_index() -> CandidateConclusionIndex:
                 robustness_metrics=(metric("baseline"),),
                 status=CandidateStatus.STRESS_FAILED,
             ),
-        )
+        ),
+        instrument_id="MU-USDT-SWAP",
+        trusted_generation="sample-generation",
+        window_days=14,
+        windows=2,
+    )
+
+
+def _replace_stress_return(
+    cells: tuple[StressCellReturn, ...],
+    fee_bps: int,
+    slippage_ticks: int,
+    total_return_pct: str,
+) -> tuple[StressCellReturn, ...]:
+    return tuple(
+        replace(cell, total_return_pct=total_return_pct)
+        if (cell.fee_bps_per_side, cell.slippage_ticks) == (fee_bps, slippage_ticks)
+        else cell
+        for cell in cells
     )
 
 

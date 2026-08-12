@@ -22,6 +22,7 @@ from mu_strategy.research.candidate_conclusions import (
     CandidateRobustness,
     CandidateStatus,
     FeeAssumption,
+    StressCellReturn,
     STRATEGY_LADDER_DEFAULT_FEE_BPS,
     STRATEGY_LADDER_FEE_GRID_BPS,
     STRATEGY_LADDER_PROTOCOL_VERSION,
@@ -120,7 +121,8 @@ class CandidateEvaluation:
     @property
     def survives_stress_grid(self) -> bool:
         return self.default_cell.summary.trade_count > 0 and all(
-            cell.summary.total_return_pct >= 0 for cell in self.stress_grid
+            Decimal(format_candidate_metric(cell.summary.total_return_pct)) >= 0
+            for cell in self.stress_grid
         )
 
 
@@ -410,6 +412,10 @@ def summarize_windows(windows: tuple[WindowBacktest, ...]) -> CandidateSummary:
 def build_conclusion_index(
     evaluations: tuple[CandidateEvaluation, ...],
     instrument: OKXInstrumentSpec,
+    *,
+    trusted_generation: str,
+    window_days: int,
+    windows: int,
 ) -> CandidateConclusionIndex:
     fee_assumption = FeeAssumption(
         default_fee_bps_per_side=DEFAULT_FEE_BPS,
@@ -433,7 +439,13 @@ def build_conclusion_index(
                 else CandidateStatus.STRESS_FAILED
             ),
         ))
-    return CandidateConclusionIndex(tuple(entries))
+    return CandidateConclusionIndex(
+        tuple(entries),
+        instrument_id=instrument.inst_id,
+        trusted_generation=trusted_generation,
+        window_days=window_days,
+        windows=windows,
+    )
 
 
 def render_strategy_ladder_report(result: StrategyLadderResult) -> str:
@@ -564,7 +576,13 @@ def run_strategy_ladder(
         window_days=window_days,
         windows=windows,
     )
-    conclusion_index = build_conclusion_index(evaluations, instrument)
+    conclusion_index = build_conclusion_index(
+        evaluations,
+        instrument,
+        trusted_generation=bundle.run_id or "",
+        window_days=window_days,
+        windows=windows,
+    )
     result = StrategyLadderResult(
         symbol=bundle.symbol.inst_id,
         run_id=bundle.run_id,
@@ -708,6 +726,14 @@ def _candidate_robustness(evaluation: CandidateEvaluation) -> CandidateRobustnes
             _decimal_metric(concentration.top_n_share_of_net_pnl)
             if Decimal(total_return_pct) > 0 and concentration.top_n_share_of_net_pnl is not None
             else None
+        ),
+        stress_grid_returns=tuple(
+            StressCellReturn(
+                fee_bps_per_side=cell.fee_bps_per_side,
+                slippage_ticks=cell.slippage_ticks,
+                total_return_pct=_decimal_metric(cell.summary.total_return_pct),
+            )
+            for cell in evaluation.stress_grid
         ),
         survives_stress_grid=evaluation.survives_stress_grid,
     )

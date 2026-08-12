@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from enum import Enum
@@ -35,6 +36,12 @@ STRATEGY_LADDER_FAMILY_SCHEMA = (
         ("baseline",),
     ),
 )
+STRATEGY_LADDER_STRESS_CELL_ORDER = tuple(
+    (fee_bps, slippage_ticks)
+    for fee_bps in STRATEGY_LADDER_FEE_GRID_BPS
+    for slippage_ticks in STRATEGY_LADDER_SLIPPAGE_GRID_TICKS
+)
+_CANONICAL_OKX_SWAP_ID = re.compile(r"^[A-Z0-9]+-USDT-SWAP$")
 
 
 class CandidateConclusionError(ValueError):
@@ -44,6 +51,45 @@ class CandidateConclusionError(ValueError):
 class CandidateStatus(str, Enum):
     STRESS_FAILED = "stress_failed"
     CANDIDATE = "candidate"
+
+
+@dataclass(frozen=True)
+class StressCellReturn:
+    fee_bps_per_side: int
+    slippage_ticks: int
+    total_return_pct: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.fee_bps_per_side) is not int
+            or type(self.slippage_ticks) is not int
+            or self.fee_bps_per_side < 0
+            or self.slippage_ticks < 0
+        ):
+            raise CandidateConclusionError("stress cell costs must be non-negative integers")
+        if not isinstance(self.total_return_pct, str) or not self.total_return_pct:
+            raise CandidateConclusionError("stress cell total_return_pct is required")
+        _canonical_decimal_metric(self.total_return_pct, "stress cell total_return_pct")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fee_bps_per_side": self.fee_bps_per_side,
+            "slippage_ticks": self.slippage_ticks,
+            "total_return_pct": self.total_return_pct,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "StressCellReturn":
+        _require_exact_keys(
+            payload,
+            {"fee_bps_per_side", "slippage_ticks", "total_return_pct"},
+            "stress cell return",
+        )
+        return cls(
+            fee_bps_per_side=_require_int(payload, "fee_bps_per_side"),
+            slippage_ticks=_require_int(payload, "slippage_ticks"),
+            total_return_pct=_require_text(payload, "total_return_pct"),
+        )
 
 
 @dataclass(frozen=True)
@@ -115,6 +161,7 @@ class CandidateRobustness:
     win_rate: str
     top_n: int
     top_n_trade_concentration: str | None
+    stress_grid_returns: tuple[StressCellReturn, ...]
     survives_stress_grid: bool
 
     def __post_init__(self) -> None:
@@ -133,6 +180,10 @@ class CandidateRobustness:
             not isinstance(self.top_n_trade_concentration, str) or not self.top_n_trade_concentration
         ):
             raise CandidateConclusionError("top_n_trade_concentration must be text or null")
+        if not isinstance(self.stress_grid_returns, tuple) or any(
+            not isinstance(cell, StressCellReturn) for cell in self.stress_grid_returns
+        ):
+            raise CandidateConclusionError("stress_grid_returns must contain StressCellReturn values")
         if not isinstance(self.survives_stress_grid, bool):
             raise CandidateConclusionError("survives_stress_grid must be a boolean")
         total_return = _canonical_decimal_metric(self.total_return_pct, "total_return_pct")
@@ -198,6 +249,24 @@ class CandidateRobustness:
                 raise CandidateConclusionError("trade concentration is below the top_n coverage bound")
             if minimum_wins == self.trade_count and concentration > 1:
                 raise CandidateConclusionError("all-winning evidence cannot have concentration above one")
+        actual_cell_order = tuple(
+            (cell.fee_bps_per_side, cell.slippage_ticks) for cell in self.stress_grid_returns
+        )
+        if actual_cell_order != STRATEGY_LADDER_STRESS_CELL_ORDER:
+            raise CandidateConclusionError("strategy-ladder-v1 requires all stress cells in canonical order")
+        default_cell = next(
+            cell
+            for cell in self.stress_grid_returns
+            if (cell.fee_bps_per_side, cell.slippage_ticks)
+            == (STRATEGY_LADDER_DEFAULT_FEE_BPS, 0)
+        )
+        if default_cell.total_return_pct != self.total_return_pct:
+            raise CandidateConclusionError("default robustness return must match the default stress cell")
+        expected_survival = self.trade_count > 0 and all(
+            Decimal(cell.total_return_pct) >= 0 for cell in self.stress_grid_returns
+        )
+        if self.survives_stress_grid != expected_survival:
+            raise CandidateConclusionError("survives_stress_grid contradicts serialized stress cells")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -208,6 +277,7 @@ class CandidateRobustness:
             "win_rate": self.win_rate,
             "top_n": self.top_n,
             "top_n_trade_concentration": self.top_n_trade_concentration,
+            "stress_grid_returns": [cell.to_dict() for cell in self.stress_grid_returns],
             "survives_stress_grid": self.survives_stress_grid,
         }
 
@@ -223,6 +293,7 @@ class CandidateRobustness:
                 "win_rate",
                 "top_n",
                 "top_n_trade_concentration",
+                "stress_grid_returns",
                 "survives_stress_grid",
             },
             "robustness metric",
@@ -233,6 +304,9 @@ class CandidateRobustness:
         survives = payload["survives_stress_grid"]
         if not isinstance(survives, bool):
             raise CandidateConclusionError("survives_stress_grid must be a boolean")
+        stress_grid_returns = payload["stress_grid_returns"]
+        if not isinstance(stress_grid_returns, list):
+            raise CandidateConclusionError("stress_grid_returns must be a list")
         return cls(
             candidate_id=_require_text(payload, "candidate_id"),
             total_return_pct=_require_text(payload, "total_return_pct"),
@@ -241,6 +315,9 @@ class CandidateRobustness:
             win_rate=_require_text(payload, "win_rate"),
             top_n=_require_int(payload, "top_n"),
             top_n_trade_concentration=concentration,
+            stress_grid_returns=tuple(
+                StressCellReturn.from_dict(cell) for cell in stress_grid_returns
+            ),
             survives_stress_grid=survives,
         )
 
@@ -318,11 +395,29 @@ class CandidateConclusion:
 @dataclass(frozen=True)
 class CandidateConclusionIndex:
     entries: tuple[CandidateConclusion, ...]
+    instrument_id: str
+    trusted_generation: str
+    window_days: int
+    windows: int
     schema_version: int = 1
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise CandidateConclusionError("unsupported candidate conclusion schema_version")
+        if (
+            not isinstance(self.instrument_id, str)
+            or _CANONICAL_OKX_SWAP_ID.fullmatch(self.instrument_id) is None
+        ):
+            raise CandidateConclusionError("instrument_id must be a canonical OKX USDT swap id")
+        if not isinstance(self.trusted_generation, str) or not self.trusted_generation.strip():
+            raise CandidateConclusionError("trusted_generation must be non-empty text")
+        if (
+            type(self.window_days) is not int
+            or type(self.windows) is not int
+            or self.window_days <= 0
+            or self.windows <= 0
+        ):
+            raise CandidateConclusionError("window_days and windows must be positive integers")
         if not isinstance(self.entries, tuple) or any(
             not isinstance(entry, CandidateConclusion) for entry in self.entries
         ):
@@ -355,6 +450,10 @@ class CandidateConclusionIndex:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "instrument_id": self.instrument_id,
+            "trusted_generation": self.trusted_generation,
+            "window_days": self.window_days,
+            "windows": self.windows,
             "entries": [entry.to_dict() for entry in self.entries],
         }
 
@@ -363,12 +462,27 @@ class CandidateConclusionIndex:
 
     @classmethod
     def from_dict(cls, payload: Any) -> "CandidateConclusionIndex":
-        _require_exact_keys(payload, {"schema_version", "entries"}, "conclusion index")
+        _require_exact_keys(
+            payload,
+            {
+                "schema_version",
+                "instrument_id",
+                "trusted_generation",
+                "window_days",
+                "windows",
+                "entries",
+            },
+            "conclusion index",
+        )
         entries = payload["entries"]
         if not isinstance(entries, list):
             raise CandidateConclusionError("entries must be a list")
         return cls(
             schema_version=_require_int(payload, "schema_version"),
+            instrument_id=_require_text(payload, "instrument_id"),
+            trusted_generation=_require_text(payload, "trusted_generation"),
+            window_days=_require_int(payload, "window_days"),
+            windows=_require_int(payload, "windows"),
             entries=tuple(CandidateConclusion.from_dict(entry) for entry in entries),
         )
 
