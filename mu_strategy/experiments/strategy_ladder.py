@@ -16,10 +16,12 @@ from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
 from mu_strategy.research.candidate_conclusions import (
     CandidateConclusion,
+    CandidateConclusionError,
     CandidateConclusionIndex,
     CandidateRobustness,
     CandidateStatus,
     FeeAssumption,
+    validate_candidate_artifact_path,
     write_candidate_conclusion_index,
 )
 from mu_strategy.research.robustness import trade_concentration
@@ -48,6 +50,10 @@ class StrategyLadderDataError(RuntimeError):
     def __init__(self, reason: HealthReason, message: str | None = None) -> None:
         self.reason = reason
         super().__init__(message or f"trusted data blocked: {reason.value}")
+
+
+class StrategyLadderOutputError(ValueError):
+    """Raised before a ladder run can write outside its artifact boundary."""
 
 
 @dataclass(frozen=True)
@@ -289,7 +295,12 @@ def evaluate_strategy_ladder(
                         _ticks=slippage_ticks,
                     ) -> BacktestResult:
                         result = run_backtest(segment_15m, context, config=_config)
-                        return apply_adverse_tick_slippage(result, instrument.tick_size, _ticks)
+                        return apply_adverse_tick_slippage(
+                            result,
+                            instrument.tick_size,
+                            _ticks,
+                            leverage=_config.leverage,
+                        )
                 else:
 
                     def evaluator(
@@ -336,11 +347,13 @@ def apply_adverse_tick_slippage(
     result: BacktestResult,
     tick_size: Decimal,
     slippage_ticks: int,
+    *,
+    leverage: float = 1.0,
 ) -> BacktestResult:
     """Apply equal adverse entry/exit ticks to a fixed baseline trade path."""
 
-    if slippage_ticks < 0:
-        raise ValueError("slippage_ticks must be non-negative")
+    if slippage_ticks < 0 or leverage <= 0:
+        raise ValueError("slippage_ticks must be non-negative and leverage must be positive")
     if slippage_ticks == 0:
         return result
     slip = float(tick_size * slippage_ticks)
@@ -351,7 +364,7 @@ def apply_adverse_tick_slippage(
             raise ValueError("slipped exit price must be positive")
         units = sum(fill.units for fill in trade.fills)
         slippage_cost = 2 * slip * units
-        committed_margin = sum(fill.notional for fill in trade.fills)
+        committed_margin = sum(fill.notional for fill in trade.fills) / leverage
         adjusted_pnl = trade.pnl - slippage_cost
         adjusted_return = adjusted_pnl / committed_margin if committed_margin else 0.0
         adjusted_fills = [replace(fill, price=fill.price + slip) for fill in trade.fills]
@@ -495,6 +508,12 @@ def run_strategy_ladder(
     conclusion_path: Path = Path("reports/live/mu_okx_strategy_ladder_conclusions.json"),
     instrument: OKXInstrumentSpec = DEFAULT_MU_INSTRUMENT,
 ) -> StrategyLadderResult:
+    report_path, html_report_path, conclusion_path = _validate_output_paths(
+        data_dir=data_dir,
+        report_path=report_path,
+        html_report_path=html_report_path,
+        conclusion_path=conclusion_path,
+    )
     bundle = refresh_trusted_candle_bundle(
         symbol,
         intervals=TRUSTED_REQUESTED_INTERVALS,
@@ -565,7 +584,7 @@ def main() -> None:
             conclusion_path=args.conclusion_index,
             instrument=instrument,
         )
-    except StrategyLadderDataError as exc:
+    except (StrategyLadderDataError, StrategyLadderOutputError) as exc:
         parser.error(str(exc))
     print(render_strategy_ladder_report(result))
 
@@ -732,6 +751,28 @@ def _infer_interval_ms(candles: list[Candle]) -> int:
         if candles[index].open_time_ms > candles[index - 1].open_time_ms
     ]
     return min(diffs) if diffs else 0
+
+
+def _validate_output_paths(
+    *,
+    data_dir: Path,
+    report_path: Path,
+    html_report_path: Path,
+    conclusion_path: Path,
+) -> tuple[Path, Path, Path]:
+    data_root = Path(data_dir).resolve()
+    try:
+        outputs = tuple(
+            validate_candidate_artifact_path(path)
+            for path in (report_path, html_report_path, conclusion_path)
+        )
+    except CandidateConclusionError as exc:
+        raise StrategyLadderOutputError(str(exc)) from exc
+    if len(set(outputs)) != len(outputs):
+        raise StrategyLadderOutputError("strategy ladder output paths must be distinct")
+    if any(path == data_root or path.is_relative_to(data_root) for path in outputs):
+        raise StrategyLadderOutputError("strategy ladder outputs cannot write inside the trusted data store")
+    return outputs
 
 
 if __name__ == "__main__":

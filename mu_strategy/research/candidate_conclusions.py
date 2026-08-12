@@ -147,6 +147,13 @@ class CandidateConclusion:
         candidate_ids = [metric.candidate_id for metric in self.robustness_metrics]
         if len(candidate_ids) != len(set(candidate_ids)):
             raise CandidateConclusionError("candidate ids must be unique within a family")
+        expected_status = (
+            CandidateStatus.CANDIDATE
+            if any(metric.survives_stress_grid for metric in self.robustness_metrics)
+            else CandidateStatus.STRESS_FAILED
+        )
+        if self.status is not expected_status:
+            raise CandidateConclusionError("candidate status contradicts robustness metrics")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -226,12 +233,19 @@ class CandidateConclusionIndex:
         return cls.from_dict(payload)
 
 
+def validate_candidate_artifact_path(path: Path) -> Path:
+    """Reject targets that could be mistaken for strategy release provenance."""
+
+    target = Path(path).resolve()
+    if any(part.lower().replace("_", "-") == "strategy-releases" for part in target.parts):
+        raise CandidateConclusionError("candidate conclusions cannot write strategy release provenance")
+    return target
+
+
 def write_candidate_conclusion_index(path: Path, index: CandidateConclusionIndex) -> None:
     """Write only the explicit index target; directory ownership stays with the caller."""
 
-    target = Path(path)
-    if any(part.lower().replace("_", "-") == "strategy-releases" for part in target.parts):
-        raise CandidateConclusionError("candidate conclusions cannot write strategy release provenance")
+    target = validate_candidate_artifact_path(path)
     target.write_text(index.to_json(), encoding="utf-8", newline="\n")
 
 

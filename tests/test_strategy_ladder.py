@@ -17,6 +17,7 @@ from mu_strategy.experiments.strategy_ladder import (
     MOMENTUM_HISTORY_HOURS,
     SLIPPAGE_GRID_TICKS,
     StrategyLadderDataError,
+    StrategyLadderOutputError,
     apply_adverse_tick_slippage,
     build_conclusion_index,
     candidate_definitions,
@@ -277,6 +278,22 @@ class StrategyLadderCostTests(unittest.TestCase):
         self.assertAlmostEqual(109.8, adjusted.trades[0].exit_price)
         self.assertEqual([(0, 9_980), (HOUR_MS, 10_960)], adjusted.equity_curve)
 
+    def test_baseline_slippage_preserves_leveraged_return_semantics_for_multiple_fills(self):
+        fills = [
+            Fill(0, 100, 0.1, 10_000, 100, 2),
+            Fill(HOUR_MS, 110, 0.1, 5_500, 50, 1),
+        ]
+        trade = Trade(0, 2 * HOUR_MS, 103.333333, 120, fills, 1_000, 3, 1_000 / 3_100, 2, "signal_flat")
+        result = BacktestResult(10_000, 11_000, [trade], [(0, 10_000), (HOUR_MS, 10_500), (2 * HOUR_MS, 11_000)])
+
+        adjusted = apply_adverse_tick_slippage(result, Decimal("0.1"), 2, leverage=5)
+
+        self.assertAlmostEqual(940, adjusted.trades[0].pnl)
+        self.assertAlmostEqual(940 / 3_100, adjusted.trades[0].return_pct)
+        self.assertEqual(3, adjusted.trades[0].fees)
+        self.assertAlmostEqual(10_940, adjusted.ending_equity)
+        self.assertEqual([(0, 9_980), (HOUR_MS, 10_470), (2 * HOUR_MS, 10_940)], adjusted.equity_curve)
+
 
 class CandidateConclusionIndexTests(unittest.TestCase):
     def test_conclusion_index_round_trips_canonically(self):
@@ -294,6 +311,20 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 rejected = json.loads(json.dumps(payload))
                 rejected["entries"][0]["status"] = status
                 with self.assertRaisesRegex(CandidateConclusionError, "unsupported candidate status"):
+                    CandidateConclusionIndex.from_dict(rejected)
+
+    def test_conclusion_index_rejects_status_that_contradicts_robustness_metrics(self):
+        payload = _sample_conclusion_index().to_dict()
+        contradictions = (
+            ("candidate", False),
+            ("stress_failed", True),
+        )
+        for status, survives_stress in contradictions:
+            with self.subTest(status=status, survives_stress=survives_stress):
+                rejected = json.loads(json.dumps(payload))
+                rejected["entries"][0]["status"] = status
+                rejected["entries"][0]["robustness_metrics"][0]["survives_stress_grid"] = survives_stress
+                with self.assertRaisesRegex(CandidateConclusionError, "contradicts robustness metrics"):
                     CandidateConclusionIndex.from_dict(rejected)
 
     def test_conclusion_index_rejects_missing_empty_and_malformed_files(self):
@@ -353,7 +384,12 @@ class CandidateConclusionIndexTests(unittest.TestCase):
 
 class StrategyLadderTrustedDataTests(unittest.TestCase):
     def test_missing_stale_and_invalid_generations_fail_closed_with_typed_reason_and_no_outputs(self):
-        for state in ("missing", "stale", "invalid"):
+        expected_reasons = {
+            "missing": HealthReason.MANIFEST_MISSING,
+            "stale": HealthReason.STALE_BY_CLOCK,
+            "invalid": HealthReason.MANIFEST_INVALID,
+        }
+        for state, expected_reason in expected_reasons.items():
             with self.subTest(state=state), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 data_dir = root / "data" / "live"
@@ -387,8 +423,7 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
                             conclusion_path=paths[2],
                         )
 
-                self.assertIn(raised.exception.reason, set(HealthReason))
-                self.assertNotEqual(HealthReason.OK, raised.exception.reason)
+                self.assertEqual(expected_reason, raised.exception.reason)
                 self.assertTrue(all(not path.exists() for path in paths))
 
     def test_cache_only_ladder_run_blocks_network_and_trusted_csv_writes(self):
@@ -417,6 +452,66 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
 
             self.assertEqual("run-coverage", result.run_id)
             self.assertTrue(all(path.exists() for path in paths))
+
+    def test_forbidden_conclusion_target_fails_before_any_output_or_data_access(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_path = root / "reports" / "ladder.md"
+            html_report_path = root / "reports" / "ladder.html"
+            conclusion_path = root / "config" / "strategy-releases" / "candidate.json"
+
+            with self.assertRaisesRegex(StrategyLadderOutputError, "cannot write strategy release provenance"):
+                run_strategy_ladder(
+                    data_dir=root / "missing-data",
+                    window_days=1,
+                    windows=1,
+                    report_path=report_path,
+                    html_report_path=html_report_path,
+                    conclusion_path=conclusion_path,
+                )
+
+            self.assertFalse(report_path.parent.exists())
+            self.assertFalse(conclusion_path.parent.exists())
+
+    def test_all_output_options_reject_trusted_or_release_targets_without_writes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "live"
+            protected_targets = (
+                ("report_path", data_dir / "current.json"),
+                ("html_report_path", data_dir / "generations" / "run" / "15m.csv"),
+                ("conclusion_path", root / "config" / "strategy-releases" / "candidate.json"),
+            )
+            for option, protected in protected_targets:
+                with self.subTest(option=option):
+                    protected.parent.mkdir(parents=True, exist_ok=True)
+                    protected.write_bytes(b"sentinel")
+                    paths = _artifact_paths(root / option)
+                    kwargs = dict(zip(("report_path", "html_report_path", "conclusion_path"), paths))
+                    kwargs[option] = protected
+
+                    with self.assertRaises(StrategyLadderOutputError):
+                        run_strategy_ladder(data_dir=data_dir, window_days=1, windows=1, **kwargs)
+
+                    self.assertEqual(b"sentinel", protected.read_bytes())
+                    self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_output_paths_must_be_distinct_before_data_access(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            duplicate = root / "reports" / "ladder"
+
+            with self.assertRaisesRegex(StrategyLadderOutputError, "must be distinct"):
+                run_strategy_ladder(
+                    data_dir=root / "missing-data",
+                    window_days=1,
+                    windows=1,
+                    report_path=duplicate,
+                    html_report_path=duplicate,
+                    conclusion_path=root / "reports" / "conclusions.json",
+                )
+
+            self.assertFalse(duplicate.parent.exists())
 
     def test_same_trusted_generation_produces_byte_identical_outputs(self):
         with TemporaryDirectory() as tmp:
