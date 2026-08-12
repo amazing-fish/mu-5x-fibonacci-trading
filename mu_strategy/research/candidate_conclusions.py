@@ -41,6 +41,9 @@ class FeeAssumption:
             raise CandidateConclusionError("slippage grid must contain non-negative values")
         if not isinstance(self.tick_size, str) or not self.tick_size:
             raise CandidateConclusionError("tick_size is required")
+        tick_size = _canonical_decimal(self.tick_size, "tick_size")
+        if tick_size <= 0:
+            raise CandidateConclusionError("tick_size must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -340,5 +343,15 @@ def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
     except (InvalidOperation, ValueError) as exc:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal") from exc
     if not parsed.is_finite() or canonical != value:
+        raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal")
+    return parsed
+
+
+def _canonical_decimal(value: str, field_name: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal") from exc
+    if not parsed.is_finite() or format(parsed, "f") != value:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal")
     return parsed

@@ -19,6 +19,7 @@ from mu_strategy.experiments.strategy_ladder import (
     StrategyLadderDataError,
     StrategyLadderOutputError,
     apply_adverse_tick_slippage,
+    build_cli_instrument,
     build_conclusion_index,
     candidate_definitions,
     evaluate_strategy_ladder,
@@ -59,6 +60,17 @@ QUARTER_HOUR_MS = 900_000
 
 
 class StrategyLadderSignalTests(unittest.TestCase):
+    def test_cli_instrument_canonicalizes_aliases_and_requires_non_mu_tick_size(self):
+        mu = build_cli_instrument("MU", None)
+        btc = build_cli_instrument("BTCUSDT", Decimal("0.01"))
+
+        self.assertEqual("MU-USDT-SWAP", mu.inst_id)
+        self.assertEqual(DEFAULT_MU_INSTRUMENT.tick_size, mu.tick_size)
+        self.assertEqual("BTC-USDT-SWAP", btc.inst_id)
+        self.assertEqual(Decimal("0.01"), btc.tick_size)
+        with self.assertRaisesRegex(ValueError, "--tick-size is required"):
+            build_cli_instrument("BTCUSDT", None)
+
     def test_candidate_definitions_are_deterministic_and_long_only_families(self):
         first = candidate_definitions()
         second = candidate_definitions()
@@ -404,6 +416,21 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             with self.subTest(factory=factory):
                 with self.assertRaises(CandidateConclusionError):
                     factory()
+
+    def test_conclusion_rejects_invalid_tick_size_values(self):
+        index = _sample_conclusion_index()
+        fee = index.entries[0].fee_assumption
+        invalid_values = ("garbage", "NaN", "-0.1", "0", "1E-1")
+
+        for tick_size in invalid_values:
+            with self.subTest(tick_size=tick_size):
+                with self.assertRaises(CandidateConclusionError):
+                    replace(fee, tick_size=tick_size)
+
+                rejected = index.to_dict()
+                rejected["entries"][0]["fee_assumption"]["tick_size"] = tick_size
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateConclusionIndex.from_dict(rejected)
 
     def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
         index = _sample_conclusion_index()

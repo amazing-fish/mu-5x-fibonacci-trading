@@ -11,6 +11,7 @@ from mu_strategy.backtest import run_backtest
 from mu_strategy.execution.instruments import OKXInstrumentSpec
 from mu_strategy.experiments.walk_forward import WindowBacktest, run_evaluator_walk_forward_backtests
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
@@ -581,10 +582,10 @@ def main() -> None:
         type=Path,
         default=Path("reports/live/mu_okx_strategy_ladder_conclusions.json"),
     )
-    parser.add_argument("--tick-size", type=Decimal, default=DEFAULT_MU_INSTRUMENT.tick_size)
+    parser.add_argument("--tick-size", type=Decimal)
     args = parser.parse_args()
-    instrument = OKXInstrumentSpec(args.symbol, args.tick_size, Decimal("1"), Decimal("1"))
     try:
+        instrument = build_cli_instrument(args.symbol, args.tick_size)
         result = run_strategy_ladder(
             symbol=args.symbol,
             window_days=args.window_days,
@@ -595,7 +596,7 @@ def main() -> None:
             conclusion_path=args.conclusion_index,
             instrument=instrument,
         )
-    except (StrategyLadderDataError, StrategyLadderOutputError) as exc:
+    except (StrategyLadderDataError, StrategyLadderOutputError, ValueError) as exc:
         parser.error(str(exc))
     print(render_strategy_ladder_report(result))
 
@@ -628,6 +629,15 @@ def _close_long_only_trade(
         exit_reason=reason,
     )
     return equity + net_pnl, trade
+
+
+def build_cli_instrument(symbol: str, tick_size: Decimal | None) -> OKXInstrumentSpec:
+    resolved = resolve_okx_swap_symbol(symbol)
+    if tick_size is None:
+        if resolved.inst_id != DEFAULT_MU_INSTRUMENT.inst_id:
+            raise ValueError("--tick-size is required when --symbol is not MU-USDT-SWAP")
+        tick_size = DEFAULT_MU_INSTRUMENT.tick_size
+    return OKXInstrumentSpec(resolved.inst_id, tick_size, Decimal("1"), Decimal("1"))
 
 
 def _slippage_cost_at(trades: list[Trade], time_ms: int, slip: float) -> float:
