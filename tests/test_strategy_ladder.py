@@ -530,6 +530,44 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         above_one = replace(metric, top_n_trade_concentration="1.50000000")
         self.assertEqual(above_one, CandidateRobustness.from_dict(above_one.to_dict()))
 
+    def test_conclusion_win_rate_requires_an_integer_win_count(self):
+        index = _sample_conclusion_index()
+        metric = index.entries[0].robustness_metrics[0]
+
+        with self.assertRaisesRegex(CandidateConclusionError, "integer win count"):
+            replace(metric, trade_count=1, win_rate="0.50000000")
+
+        rejected = index.to_dict()
+        rejected["entries"][0]["robustness_metrics"][0]["trade_count"] = 1
+        rejected["entries"][0]["robustness_metrics"][0]["win_rate"] = "0.50000000"
+        with self.assertRaisesRegex(CandidateConclusionError, "integer win count"):
+            CandidateConclusionIndex.from_dict(rejected)
+
+        rounded_fraction = replace(metric, trade_count=6, win_rate="0.16666667")
+        self.assertEqual(rounded_fraction, CandidateRobustness.from_dict(rounded_fraction.to_dict()))
+
+    def test_conclusion_concentration_presence_matches_return_sign(self):
+        index = _sample_conclusion_index()
+        metric = index.entries[0].robustness_metrics[0]
+        contradictions = (
+            {"total_return_pct": "-0.01000000"},
+            {"top_n_trade_concentration": None},
+            {"total_return_pct": "0.00000000"},
+        )
+
+        for changes in contradictions:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(CandidateConclusionError, "present exactly when"):
+                    replace(metric, **changes)
+
+                rejected = metric.to_dict()
+                rejected.update(changes)
+                with self.assertRaisesRegex(CandidateConclusionError, "present exactly when"):
+                    CandidateRobustness.from_dict(rejected)
+
+        zero_return = replace(metric, total_return_pct="0.00000000", top_n_trade_concentration=None)
+        self.assertEqual(zero_return, CandidateRobustness.from_dict(zero_return.to_dict()))
+
     def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
         index = _sample_conclusion_index()
         entry = index.entries[0]
@@ -545,7 +583,12 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(CandidateConclusionError, "requires at least one trade"):
             CandidateConclusionIndex.from_dict(rejected)
 
-        surviving_metric = replace(metric, trade_count=1, survives_stress_grid=True)
+        surviving_metric = replace(
+            metric,
+            trade_count=1,
+            win_rate="1.00000000",
+            survives_stress_grid=True,
+        )
         candidate_entry = replace(
             entry,
             robustness_metrics=(surviving_metric,),

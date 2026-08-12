@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -132,6 +132,12 @@ class CandidateRobustness:
             or concentration is not None
         ):
             raise CandidateConclusionError("zero-trade evidence must contain only zero metrics and null concentration")
+        if not _matches_integer_win_count(self.win_rate, self.trade_count):
+            raise CandidateConclusionError("win_rate must correspond to an integer win count")
+        if (total_return > 0) != (concentration is not None):
+            raise CandidateConclusionError(
+                "top_n_trade_concentration must be present exactly when total_return_pct is positive"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -364,6 +370,23 @@ def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
     if not parsed.is_finite() or canonical != value:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal")
     return parsed
+
+
+def _matches_integer_win_count(win_rate: str, trade_count: int) -> bool:
+    if trade_count == 0:
+        return win_rate == "0.00000000"
+    parsed = Decimal(win_rate)
+    estimated_wins = parsed * trade_count
+    lower = int(estimated_wins.to_integral_value(rounding=ROUND_FLOOR))
+    return any(
+        0 <= win_count <= trade_count
+        and format(
+            (Decimal(win_count) / Decimal(trade_count)).quantize(Decimal("0.00000001")),
+            "f",
+        )
+        == win_rate
+        for win_count in (lower, lower + 1)
+    )
 
 
 def _canonical_decimal(value: str, field_name: str) -> Decimal:

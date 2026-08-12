@@ -690,16 +690,17 @@ def _slippage_cost_at(trades: list[Trade], time_ms: int, slip: float) -> float:
 def _candidate_robustness(evaluation: CandidateEvaluation) -> CandidateRobustness:
     summary = evaluation.default_cell.summary
     concentration = trade_concentration(summary.trades, top_n=TOP_N_TRADES)
+    total_return_pct = _decimal_metric(summary.total_return_pct)
     return CandidateRobustness(
         candidate_id=evaluation.definition.candidate_id,
-        total_return_pct=_decimal_metric(summary.total_return_pct),
+        total_return_pct=total_return_pct,
         max_drawdown_pct=_decimal_metric(summary.max_drawdown_pct),
         trade_count=summary.trade_count,
         win_rate=_decimal_metric(summary.win_rate),
         top_n=TOP_N_TRADES,
         top_n_trade_concentration=(
             _decimal_metric(concentration.top_n_share_of_net_pnl)
-            if concentration.top_n_share_of_net_pnl is not None
+            if Decimal(total_return_pct) > 0 and concentration.top_n_share_of_net_pnl is not None
             else None
         ),
         survives_stress_grid=evaluation.survives_stress_grid,
