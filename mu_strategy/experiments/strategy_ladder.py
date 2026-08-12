@@ -508,11 +508,17 @@ def run_strategy_ladder(
     window_days: int = 14,
     windows: int = 2,
     data_dir: Path = Path("data/live"),
-    report_path: Path = DEFAULT_REPORT_PATH,
-    html_report_path: Path = DEFAULT_HTML_REPORT_PATH,
-    conclusion_path: Path = DEFAULT_CONCLUSION_PATH,
+    report_path: Path | None = None,
+    html_report_path: Path | None = None,
+    conclusion_path: Path | None = None,
     instrument: OKXInstrumentSpec = DEFAULT_MU_INSTRUMENT,
 ) -> StrategyLadderResult:
+    report_path, html_report_path, conclusion_path = build_cli_output_paths(
+        instrument.inst_id,
+        report_path=report_path,
+        html_report_path=html_report_path,
+        conclusion_path=conclusion_path,
+    )
     report_path, html_report_path, conclusion_path = _validate_output_paths(
         data_dir=data_dir,
         report_path=report_path,

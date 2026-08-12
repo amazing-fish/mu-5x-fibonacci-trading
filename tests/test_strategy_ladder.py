@@ -1,6 +1,6 @@
 import json
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, chdir, contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +12,7 @@ from mu_strategy.execution.instruments import OKXInstrumentSpec
 from mu_strategy.experiments.strategy_ladder import (
     CandidateDefinition,
     DEFAULT_MU_INSTRUMENT,
+    DEFAULT_REPORT_PATH,
     FEE_GRID_BPS,
     MOMENTUM_LOOKBACK_HOURS,
     MOMENTUM_HISTORY_HOURS,
@@ -103,6 +104,35 @@ class StrategyLadderSignalTests(unittest.TestCase):
             btc_paths,
         )
         self.assertTrue(set(mu_paths).isdisjoint(btc_paths))
+
+    def test_direct_non_mu_run_uses_symbol_specific_default_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "live"
+            now_ms = 10 * DAY_MS
+            write_generation_publication(
+                data_dir,
+                symbol="BTC-USDT-SWAP",
+                start_ms=now_ms - (9 * DAY_MS),
+                end_ms=now_ms,
+            )
+            instrument = OKXInstrumentSpec("BTC-USDT-SWAP", Decimal("0.01"), Decimal("1"), Decimal("1"))
+
+            with chdir(root):
+                with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=now_ms):
+                    result = run_strategy_ladder(
+                        symbol="BTCUSDT",
+                        data_dir=data_dir,
+                        window_days=1,
+                        windows=1,
+                        instrument=instrument,
+                    )
+
+            self.assertEqual("BTC-USDT-SWAP", result.symbol)
+            self.assertTrue((root / "reports/live/btc_usdt_swap_strategy_ladder.md").exists())
+            self.assertTrue((root / "reports/live/btc_usdt_swap_strategy_ladder.html").exists())
+            self.assertTrue((root / "reports/live/btc_usdt_swap_strategy_ladder_conclusions.json").exists())
+            self.assertFalse((root / DEFAULT_REPORT_PATH).exists())
 
     def test_candidate_definitions_are_deterministic_and_long_only_families(self):
         first = candidate_definitions()
