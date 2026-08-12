@@ -39,6 +39,10 @@ class FeeAssumption:
             or any(type(value) is not int or value < 0 for value in self.slippage_grid_ticks)
         ):
             raise CandidateConclusionError("slippage grid must contain non-negative values")
+        if self.default_fee_bps_per_side not in self.fee_grid_bps_per_side:
+            raise CandidateConclusionError("default fee must be present in the fee grid")
+        if 0 not in self.slippage_grid_ticks:
+            raise CandidateConclusionError("zero slippage must be present in the slippage grid")
         if not isinstance(self.tick_size, str) or not self.tick_size:
             raise CandidateConclusionError("tick_size is required")
         tick_size = _canonical_decimal(self.tick_size, "tick_size")
@@ -103,7 +107,9 @@ class CandidateRobustness:
         if not isinstance(self.survives_stress_grid, bool):
             raise CandidateConclusionError("survives_stress_grid must be a boolean")
         total_return = _canonical_decimal_metric(self.total_return_pct, "total_return_pct")
-        _canonical_decimal_metric(self.max_drawdown_pct, "max_drawdown_pct")
+        max_drawdown = _canonical_decimal_metric(self.max_drawdown_pct, "max_drawdown_pct")
+        if max_drawdown > 0:
+            raise CandidateConclusionError("max_drawdown_pct cannot be positive")
         win_rate = _canonical_decimal_metric(self.win_rate, "win_rate")
         if not Decimal("0") <= win_rate <= Decimal("1"):
             raise CandidateConclusionError("win_rate must be between zero and one")

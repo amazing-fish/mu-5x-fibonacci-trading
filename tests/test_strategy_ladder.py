@@ -432,6 +432,26 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 with self.assertRaises(CandidateConclusionError):
                     CandidateConclusionIndex.from_dict(rejected)
 
+    def test_conclusion_fee_grid_contains_default_cost_cell(self):
+        fee = _sample_conclusion_index().entries[0].fee_assumption
+
+        with self.assertRaisesRegex(CandidateConclusionError, "default fee must be present"):
+            replace(fee, fee_grid_bps_per_side=(0, 10))
+        with self.assertRaisesRegex(CandidateConclusionError, "zero slippage must be present"):
+            replace(fee, slippage_grid_ticks=(1, 2))
+
+    def test_conclusion_rejects_positive_max_drawdown(self):
+        index = _sample_conclusion_index()
+        metric = index.entries[0].robustness_metrics[0]
+
+        with self.assertRaisesRegex(CandidateConclusionError, "cannot be positive"):
+            replace(metric, max_drawdown_pct="0.50000000")
+
+        rejected = index.to_dict()
+        rejected["entries"][0]["robustness_metrics"][0]["max_drawdown_pct"] = "0.50000000"
+        with self.assertRaisesRegex(CandidateConclusionError, "cannot be positive"):
+            CandidateConclusionIndex.from_dict(rejected)
+
     def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
         index = _sample_conclusion_index()
         entry = index.entries[0]
