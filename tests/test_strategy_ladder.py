@@ -20,6 +20,7 @@ from mu_strategy.experiments.strategy_ladder import (
     StrategyLadderOutputError,
     apply_adverse_tick_slippage,
     build_cli_instrument,
+    build_cli_output_paths,
     build_conclusion_index,
     candidate_definitions,
     evaluate_strategy_ladder,
@@ -70,6 +71,38 @@ class StrategyLadderSignalTests(unittest.TestCase):
         self.assertEqual(Decimal("0.01"), btc.tick_size)
         with self.assertRaisesRegex(ValueError, "--tick-size is required"):
             build_cli_instrument("BTCUSDT", None)
+
+    def test_cli_output_defaults_are_symbol_specific_without_changing_mu_paths(self):
+        mu_paths = build_cli_output_paths(
+            "MU",
+            report_path=None,
+            html_report_path=None,
+            conclusion_path=None,
+        )
+        btc_paths = build_cli_output_paths(
+            "BTCUSDT",
+            report_path=None,
+            html_report_path=None,
+            conclusion_path=None,
+        )
+
+        self.assertEqual(
+            (
+                Path("reports/live/mu_okx_strategy_ladder.md"),
+                Path("reports/live/mu_okx_strategy_ladder.html"),
+                Path("reports/live/mu_okx_strategy_ladder_conclusions.json"),
+            ),
+            mu_paths,
+        )
+        self.assertEqual(
+            (
+                Path("reports/live/btc_usdt_swap_strategy_ladder.md"),
+                Path("reports/live/btc_usdt_swap_strategy_ladder.html"),
+                Path("reports/live/btc_usdt_swap_strategy_ladder_conclusions.json"),
+            ),
+            btc_paths,
+        )
+        self.assertTrue(set(mu_paths).isdisjoint(btc_paths))
 
     def test_candidate_definitions_are_deterministic_and_long_only_families(self):
         first = candidate_definitions()

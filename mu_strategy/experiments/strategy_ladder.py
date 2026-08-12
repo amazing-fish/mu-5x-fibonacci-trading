@@ -39,6 +39,9 @@ DEFAULT_FEE_BPS = 5
 TOP_N_TRADES = 5
 PROTOCOL_VERSION = "strategy-ladder-v1"
 HOUR_MS = 3_600_000
+DEFAULT_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.md")
+DEFAULT_HTML_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.html")
+DEFAULT_CONCLUSION_PATH = Path("reports/live/mu_okx_strategy_ladder_conclusions.json")
 DEFAULT_MU_INSTRUMENT = OKXInstrumentSpec(
     "MU-USDT-SWAP",
     Decimal("0.1"),
@@ -505,9 +508,9 @@ def run_strategy_ladder(
     window_days: int = 14,
     windows: int = 2,
     data_dir: Path = Path("data/live"),
-    report_path: Path = Path("reports/live/mu_okx_strategy_ladder.md"),
-    html_report_path: Path = Path("reports/live/mu_okx_strategy_ladder.html"),
-    conclusion_path: Path = Path("reports/live/mu_okx_strategy_ladder_conclusions.json"),
+    report_path: Path = DEFAULT_REPORT_PATH,
+    html_report_path: Path = DEFAULT_HTML_REPORT_PATH,
+    conclusion_path: Path = DEFAULT_CONCLUSION_PATH,
     instrument: OKXInstrumentSpec = DEFAULT_MU_INSTRUMENT,
 ) -> StrategyLadderResult:
     report_path, html_report_path, conclusion_path = _validate_output_paths(
@@ -575,25 +578,30 @@ def main() -> None:
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--windows", type=int, default=2)
     parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
-    parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_strategy_ladder.md"))
-    parser.add_argument("--html-report", type=Path, default=Path("reports/live/mu_okx_strategy_ladder.html"))
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--html-report", type=Path)
     parser.add_argument(
         "--conclusion-index",
         type=Path,
-        default=Path("reports/live/mu_okx_strategy_ladder_conclusions.json"),
     )
     parser.add_argument("--tick-size", type=Decimal)
     args = parser.parse_args()
     try:
         instrument = build_cli_instrument(args.symbol, args.tick_size)
+        report_path, html_report_path, conclusion_path = build_cli_output_paths(
+            instrument.inst_id,
+            report_path=args.report,
+            html_report_path=args.html_report,
+            conclusion_path=args.conclusion_index,
+        )
         result = run_strategy_ladder(
             symbol=args.symbol,
             window_days=args.window_days,
             windows=args.windows,
             data_dir=args.data_dir or Path("data/live"),
-            report_path=args.report,
-            html_report_path=args.html_report,
-            conclusion_path=args.conclusion_index,
+            report_path=report_path,
+            html_report_path=html_report_path,
+            conclusion_path=conclusion_path,
             instrument=instrument,
         )
     except (StrategyLadderDataError, StrategyLadderOutputError, ValueError) as exc:
@@ -638,6 +646,29 @@ def build_cli_instrument(symbol: str, tick_size: Decimal | None) -> OKXInstrumen
             raise ValueError("--tick-size is required when --symbol is not MU-USDT-SWAP")
         tick_size = DEFAULT_MU_INSTRUMENT.tick_size
     return OKXInstrumentSpec(resolved.inst_id, tick_size, Decimal("1"), Decimal("1"))
+
+
+def build_cli_output_paths(
+    symbol: str,
+    *,
+    report_path: Path | None,
+    html_report_path: Path | None,
+    conclusion_path: Path | None,
+) -> tuple[Path, Path, Path]:
+    resolved = resolve_okx_swap_symbol(symbol)
+    if resolved.inst_id == DEFAULT_MU_INSTRUMENT.inst_id:
+        defaults = (DEFAULT_REPORT_PATH, DEFAULT_HTML_REPORT_PATH, DEFAULT_CONCLUSION_PATH)
+    else:
+        stem = resolved.inst_id.lower().replace("-", "_")
+        defaults = (
+            Path(f"reports/live/{stem}_strategy_ladder.md"),
+            Path(f"reports/live/{stem}_strategy_ladder.html"),
+            Path(f"reports/live/{stem}_strategy_ladder_conclusions.json"),
+        )
+    return tuple(
+        supplied or default
+        for supplied, default in zip((report_path, html_report_path, conclusion_path), defaults)
+    )
 
 
 def _slippage_cost_at(trades: list[Trade], time_ms: int, slip: float) -> float:
