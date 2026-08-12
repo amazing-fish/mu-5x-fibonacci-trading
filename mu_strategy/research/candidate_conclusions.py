@@ -113,12 +113,23 @@ class CandidateRobustness:
         win_rate = _canonical_decimal_metric(self.win_rate, "win_rate")
         if not Decimal("0") <= win_rate <= Decimal("1"):
             raise CandidateConclusionError("win_rate must be between zero and one")
+        concentration = None
         if self.top_n_trade_concentration is not None:
-            _canonical_decimal_metric(self.top_n_trade_concentration, "top_n_trade_concentration")
+            concentration = _canonical_decimal_metric(
+                self.top_n_trade_concentration,
+                "top_n_trade_concentration",
+            )
         if self.survives_stress_grid and self.trade_count == 0:
             raise CandidateConclusionError("surviving stress evidence requires at least one trade")
         if self.survives_stress_grid and total_return < 0:
             raise CandidateConclusionError("surviving stress evidence cannot have negative return")
+        if self.trade_count == 0 and (
+            total_return != 0
+            or max_drawdown != 0
+            or win_rate != 0
+            or concentration is not None
+        ):
+            raise CandidateConclusionError("zero-trade evidence must contain only zero metrics and null concentration")
 
     def to_dict(self) -> dict[str, Any]:
         return {

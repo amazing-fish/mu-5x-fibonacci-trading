@@ -539,6 +539,38 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         candidate_index = CandidateConclusionIndex((candidate_entry,))
         self.assertEqual(candidate_index, CandidateConclusionIndex.from_json(candidate_index.to_json()))
 
+    def test_conclusion_rejects_contradictory_zero_trade_metrics(self):
+        index = _sample_conclusion_index()
+        metric = index.entries[0].robustness_metrics[0]
+        zero_trade_metric = replace(
+            metric,
+            total_return_pct="0.00000000",
+            max_drawdown_pct="0.00000000",
+            trade_count=0,
+            win_rate="0.00000000",
+            top_n_trade_concentration=None,
+        )
+        self.assertEqual(
+            zero_trade_metric,
+            CandidateRobustness.from_dict(zero_trade_metric.to_dict()),
+        )
+
+        invalid_fields = {
+            "total_return_pct": "0.01000000",
+            "max_drawdown_pct": "-0.01000000",
+            "win_rate": "0.01000000",
+            "top_n_trade_concentration": "0.00000000",
+        }
+        for field_name, value in invalid_fields.items():
+            with self.subTest(field_name=field_name):
+                with self.assertRaisesRegex(CandidateConclusionError, "zero-trade evidence"):
+                    replace(zero_trade_metric, **{field_name: value})
+
+                rejected = zero_trade_metric.to_dict()
+                rejected[field_name] = value
+                with self.assertRaisesRegex(CandidateConclusionError, "zero-trade evidence"):
+                    CandidateRobustness.from_dict(rejected)
+
     def test_conclusion_rejects_negative_or_noncanonical_surviving_returns(self):
         index = _sample_conclusion_index()
         entry = index.entries[0]
