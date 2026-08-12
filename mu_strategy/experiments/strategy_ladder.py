@@ -188,6 +188,7 @@ def run_long_only_candidate(
         for index, bar in enumerate(ordered)
         if (execution_start_time_ms is None or bar.open_time_ms >= execution_start_time_ms)
         and (execution_end_time_ms is None or bar.open_time_ms < execution_end_time_ms)
+        and (execution_end_time_ms is None or bar.open_time_ms + HOUR_MS <= execution_end_time_ms)
     ]
     if len(ordered) < 2 or not execution_indices:
         return BacktestResult(starting_equity, starting_equity, [], [])

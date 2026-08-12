@@ -182,6 +182,34 @@ class StrategyLadderSignalTests(unittest.TestCase):
         self.assertTrue(all(fill.units > 0 for trade in result.trades for fill in trade.fills))
         self.assertTrue(all(trade.max_stage == 1 for trade in result.trades))
 
+    def test_forced_exit_does_not_use_hourly_close_beyond_window_boundary(self):
+        definition = CandidateDefinition(
+            "overnight_seasonality",
+            "overnight_seasonality",
+            "overnight",
+            "test",
+        )
+        boundary_ms = (23 * HOUR_MS) + QUARTER_HOUR_MS
+        calm = [_hourly_candle(21, 100), _hourly_candle(22, 100), _hourly_candle(23, 100)]
+        future_spike = [*calm[:2], Candle(23 * HOUR_MS, 100, 10_000, 1, 9_000, 1_000)]
+
+        results = [
+            run_long_only_candidate(
+                candles,
+                definition=definition,
+                fee_bps_per_side=0,
+                slippage_ticks=0,
+                instrument=DEFAULT_MU_INSTRUMENT,
+                execution_start_time_ms=22 * HOUR_MS,
+                execution_end_time_ms=boundary_ms,
+            )
+            for candles in (calm, future_spike)
+        ]
+
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(23 * HOUR_MS, results[0].trades[0].exit_time_ms)
+        self.assertLessEqual(results[0].trades[0].exit_time_ms, boundary_ms)
+
 
 class StrategyLadderCostTests(unittest.TestCase):
     def test_fee_slippage_grid_has_all_nine_cells_in_stable_order(self):
