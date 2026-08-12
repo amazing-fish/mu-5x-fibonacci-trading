@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation, localcontext
+from decimal import ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -444,7 +444,7 @@ def _raise_integer(field_name: str) -> int:
 def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
     try:
         parsed = Decimal(value)
-        canonical = format(parsed.quantize(Decimal("0.00000001")), "f")
+        canonical = format(parsed.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN), "f")
     except (InvalidOperation, ValueError) as exc:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal") from exc
     if not parsed.is_finite() or canonical != value:
@@ -496,7 +496,10 @@ def _compatible_win_count_bounds(
             for win_count in sorted(candidates)
             if minimum <= win_count <= maximum
             and format(
-                (Decimal(win_count) / Decimal(trade_count)).quantize(Decimal("0.00000001")),
+                (Decimal(win_count) / Decimal(trade_count)).quantize(
+                    Decimal("0.00000001"),
+                    rounding=ROUND_HALF_EVEN,
+                ),
                 "f",
             )
             == win_rate
@@ -507,7 +510,10 @@ def _compatible_win_count_bounds(
 def _quantized_fraction(numerator: int, denominator: int) -> Decimal:
     with localcontext() as context:
         context.prec = max(28, len(str(max(numerator, denominator))) + 20)
-        return (Decimal(numerator) / Decimal(denominator)).quantize(Decimal("0.00000001"))
+        return (Decimal(numerator) / Decimal(denominator)).quantize(
+            Decimal("0.00000001"),
+            rounding=ROUND_HALF_EVEN,
+        )
 
 
 def _canonical_decimal(value: str, field_name: str) -> Decimal:

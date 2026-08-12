@@ -2,7 +2,7 @@ import json
 import unittest
 from contextlib import ExitStack, chdir, contextmanager
 from dataclasses import replace
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -739,6 +739,19 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             six_all_wins_at_lower_bound,
             CandidateRobustness.from_dict(six_all_wins_at_lower_bound.to_dict()),
         )
+
+    def test_conclusion_half_even_rounding_ignores_ambient_decimal_context(self):
+        metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
+        half_tie = replace(
+            metric,
+            trade_count=200_000_000,
+            win_rate="0.00000000",
+        )
+        with localcontext() as context:
+            context.rounding = ROUND_HALF_UP
+            self.assertEqual(half_tie, CandidateRobustness.from_dict(half_tie.to_dict()))
+            index = _sample_conclusion_index()
+            self.assertEqual(index.to_json(), CandidateConclusionIndex.from_json(index.to_json()).to_json())
 
     def test_conclusion_index_binds_one_v1_protocol_and_cost_contract(self):
         index = _sample_conclusion_index()
