@@ -185,20 +185,18 @@ class CandidateRobustness:
         if concentration is not None:
             if self.top_n == 0 and concentration != 0:
                 raise CandidateConclusionError("zero top_n requires zero trade concentration")
-            if self.top_n > 0 and concentration == 0:
-                raise CandidateConclusionError("positive top_n and return require positive trade concentration")
             compatible_wins = _compatible_win_count_bounds(self.win_rate, self.trade_count)
             if compatible_wins is None:
                 raise CandidateConclusionError("win_rate must correspond to an integer win count")
             minimum_wins, maximum_wins = compatible_wins
-            if maximum_wins <= self.top_n and concentration < 1:
-                raise CandidateConclusionError("top_n covering all winners requires concentration at least one")
-            if (
-                minimum_wins == self.trade_count
-                and self.top_n >= self.trade_count
-                and concentration != 1
-            ):
-                raise CandidateConclusionError("all-winning evidence requires concentration exactly one")
+            minimum_concentration = _quantized_fraction(
+                min(self.top_n, maximum_wins),
+                maximum_wins,
+            )
+            if concentration < minimum_concentration:
+                raise CandidateConclusionError("trade concentration is below the top_n coverage bound")
+            if minimum_wins == self.trade_count and concentration > 1:
+                raise CandidateConclusionError("all-winning evidence cannot have concentration above one")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -504,6 +502,12 @@ def _compatible_win_count_bounds(
             == win_rate
         )
         return (compatible[0], compatible[-1]) if compatible else None
+
+
+def _quantized_fraction(numerator: int, denominator: int) -> Decimal:
+    with localcontext() as context:
+        context.prec = max(28, len(str(max(numerator, denominator))) + 20)
+        return (Decimal(numerator) / Decimal(denominator)).quantize(Decimal("0.00000001"))
 
 
 def _canonical_decimal(value: str, field_name: str) -> Decimal:

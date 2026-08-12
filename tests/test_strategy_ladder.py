@@ -700,6 +700,16 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 "win_rate": "1.00000000",
                 "top_n_trade_concentration": "1.50000000",
             },
+            {
+                "trade_count": 6,
+                "win_rate": "1.00000000",
+                "top_n_trade_concentration": "0.50000000",
+            },
+            {
+                "trade_count": 6,
+                "win_rate": "1.00000000",
+                "top_n_trade_concentration": "1.50000000",
+            },
         )
 
         for changes in contradictions:
@@ -719,6 +729,16 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             top_n_trade_concentration="1.00000000",
         )
         self.assertEqual(all_wins, CandidateRobustness.from_dict(all_wins.to_dict()))
+        six_all_wins_at_lower_bound = replace(
+            metric,
+            trade_count=6,
+            win_rate="1.00000000",
+            top_n_trade_concentration="0.83333333",
+        )
+        self.assertEqual(
+            six_all_wins_at_lower_bound,
+            CandidateRobustness.from_dict(six_all_wins_at_lower_bound.to_dict()),
+        )
 
     def test_conclusion_index_binds_one_v1_protocol_and_cost_contract(self):
         index = _sample_conclusion_index()
