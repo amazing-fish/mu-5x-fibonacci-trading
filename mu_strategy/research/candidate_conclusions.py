@@ -13,6 +13,7 @@ STRATEGY_LADDER_DEFAULT_FEE_BPS = 5
 STRATEGY_LADDER_FEE_GRID_BPS = (0, 5, 10)
 STRATEGY_LADDER_SLIPPAGE_GRID_TICKS = (0, 1, 2)
 STRATEGY_LADDER_TOP_N = 5
+STRATEGY_LADDER_METRIC_QUANTUM = Decimal("0.00000001")
 STRATEGY_LADDER_FAMILY_SCHEMA = (
     (
         "overnight_seasonality",
@@ -444,12 +445,34 @@ def _raise_integer(field_name: str) -> int:
 def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
     try:
         parsed = Decimal(value)
-        canonical = format(parsed.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN), "f")
-    except (InvalidOperation, ValueError) as exc:
+        canonical = format_candidate_metric(parsed)
+    except (CandidateConclusionError, InvalidOperation, ValueError) as exc:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal") from exc
-    if not parsed.is_finite() or canonical != value:
+    if canonical != value:
         raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal")
     return parsed
+
+
+def format_candidate_metric(value: Decimal | float | str) -> str:
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise CandidateConclusionError("metric must be a finite decimal") from exc
+    if not parsed.is_finite():
+        raise CandidateConclusionError("metric must be a finite decimal")
+    integer_digits = max(1, parsed.adjusted() + 1)
+    with localcontext() as context:
+        context.prec = max(
+            28,
+            integer_digits + 10,
+            len(parsed.as_tuple().digits) + 10,
+        )
+        context.rounding = ROUND_HALF_EVEN
+        try:
+            quantized = parsed.quantize(STRATEGY_LADDER_METRIC_QUANTUM)
+        except InvalidOperation as exc:
+            raise CandidateConclusionError("metric must be a finite decimal") from exc
+    return format(quantized, "f")
 
 
 def _has_compatible_win_count(
@@ -497,7 +520,7 @@ def _compatible_win_count_bounds(
             if minimum <= win_count <= maximum
             and format(
                 (Decimal(win_count) / Decimal(trade_count)).quantize(
-                    Decimal("0.00000001"),
+                    STRATEGY_LADDER_METRIC_QUANTUM,
                     rounding=ROUND_HALF_EVEN,
                 ),
                 "f",
@@ -511,7 +534,7 @@ def _quantized_fraction(numerator: int, denominator: int) -> Decimal:
     with localcontext() as context:
         context.prec = max(28, len(str(max(numerator, denominator))) + 20)
         return (Decimal(numerator) / Decimal(denominator)).quantize(
-            Decimal("0.00000001"),
+            STRATEGY_LADDER_METRIC_QUANTUM,
             rounding=ROUND_HALF_EVEN,
         )
 

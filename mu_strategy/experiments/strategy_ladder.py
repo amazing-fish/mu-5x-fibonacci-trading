@@ -4,7 +4,7 @@ import argparse
 import html
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
@@ -27,6 +27,7 @@ from mu_strategy.research.candidate_conclusions import (
     STRATEGY_LADDER_PROTOCOL_VERSION,
     STRATEGY_LADDER_SLIPPAGE_GRID_TICKS,
     STRATEGY_LADDER_TOP_N,
+    format_candidate_metric,
     validate_candidate_artifact_path,
     write_candidate_conclusion_index,
 )
@@ -803,10 +804,7 @@ def _format_optional_pct(value: float | None) -> str:
 
 
 def _decimal_metric(value: float) -> str:
-    return format(
-        Decimal(str(value)).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_EVEN),
-        "f",
-    )
+    return format_candidate_metric(value)
 
 
 def _infer_interval_ms(candles: list[Candle]) -> int:

@@ -46,6 +46,7 @@ from mu_strategy.research.candidate_conclusions import (
     CandidateRobustness,
     CandidateStatus,
     FeeAssumption,
+    format_candidate_metric,
     read_candidate_conclusion_index,
     write_candidate_conclusion_index,
 )
@@ -748,10 +749,13 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             win_rate="0.00000000",
         )
         with localcontext() as context:
+            context.prec = 5
             context.rounding = ROUND_HALF_UP
             self.assertEqual(half_tie, CandidateRobustness.from_dict(half_tie.to_dict()))
             index = _sample_conclusion_index()
             self.assertEqual(index.to_json(), CandidateConclusionIndex.from_json(index.to_json()).to_json())
+            self.assertEqual("0.01000000", format_candidate_metric(0.01))
+            self.assertEqual("0.00000000", format_candidate_metric("0.000000005"))
 
     def test_conclusion_index_binds_one_v1_protocol_and_cost_contract(self):
         index = _sample_conclusion_index()
