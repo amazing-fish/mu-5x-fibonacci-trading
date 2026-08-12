@@ -545,6 +545,15 @@ class CandidateConclusionIndexTests(unittest.TestCase):
 
         rounded_fraction = replace(metric, trade_count=6, win_rate="0.16666667")
         self.assertEqual(rounded_fraction, CandidateRobustness.from_dict(rounded_fraction.to_dict()))
+        rounded_one_with_non_winners = replace(
+            metric,
+            trade_count=300_000_000,
+            win_rate="1.00000000",
+        )
+        self.assertEqual(
+            rounded_one_with_non_winners,
+            CandidateRobustness.from_dict(rounded_one_with_non_winners.to_dict()),
+        )
 
     def test_conclusion_concentration_presence_matches_return_sign(self):
         index = _sample_conclusion_index()
@@ -595,6 +604,7 @@ class CandidateConclusionIndexTests(unittest.TestCase):
             metric,
             trade_count=1,
             win_rate="1.00000000",
+            top_n_trade_concentration="1.00000000",
             survives_stress_grid=True,
         )
         candidate_entry = replace(
@@ -627,7 +637,15 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                     "max_drawdown_pct": "0.00000000",
                     "top_n_trade_concentration": None,
                 },
-                "negative return requires",
+                "cannot be shallower",
+            ),
+            (
+                {
+                    "total_return_pct": "-0.10000000",
+                    "max_drawdown_pct": "-0.01000000",
+                    "top_n_trade_concentration": None,
+                },
+                "cannot be shallower",
             ),
         )
 
@@ -640,6 +658,14 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 rejected.update(changes)
                 with self.assertRaisesRegex(CandidateConclusionError, message):
                     CandidateRobustness.from_dict(rejected)
+
+        equal_drawdown = replace(
+            metric,
+            total_return_pct="-0.10000000",
+            max_drawdown_pct="-0.10000000",
+            top_n_trade_concentration=None,
+        )
+        self.assertEqual(equal_drawdown, CandidateRobustness.from_dict(equal_drawdown.to_dict()))
 
     def test_conclusion_zero_top_n_requires_zero_concentration(self):
         metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
@@ -655,6 +681,44 @@ class CandidateConclusionIndexTests(unittest.TestCase):
 
         zero_concentration = replace(metric, top_n=0, top_n_trade_concentration="0.00000000")
         self.assertEqual(zero_concentration, CandidateRobustness.from_dict(zero_concentration.to_dict()))
+
+    def test_conclusion_concentration_respects_top_n_coverage_bounds(self):
+        metric = _sample_conclusion_index().entries[0].robustness_metrics[0]
+        contradictions = (
+            {
+                "trade_count": 1,
+                "win_rate": "1.00000000",
+                "top_n_trade_concentration": "0.50000000",
+            },
+            {
+                "trade_count": 6,
+                "win_rate": "0.16666667",
+                "top_n_trade_concentration": "0.50000000",
+            },
+            {
+                "trade_count": 1,
+                "win_rate": "1.00000000",
+                "top_n_trade_concentration": "1.50000000",
+            },
+        )
+
+        for changes in contradictions:
+            with self.subTest(changes=changes):
+                with self.assertRaises(CandidateConclusionError):
+                    replace(metric, **changes)
+
+                rejected = metric.to_dict()
+                rejected.update(changes)
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateRobustness.from_dict(rejected)
+
+        all_wins = replace(
+            metric,
+            trade_count=1,
+            win_rate="1.00000000",
+            top_n_trade_concentration="1.00000000",
+        )
+        self.assertEqual(all_wins, CandidateRobustness.from_dict(all_wins.to_dict()))
 
     def test_conclusion_index_binds_one_v1_protocol_and_cost_contract(self):
         index = _sample_conclusion_index()

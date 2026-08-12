@@ -174,8 +174,10 @@ class CandidateRobustness:
             maximum=self.trade_count - 1,
         ):
             raise CandidateConclusionError("negative return requires at least one non-winning trade")
-        if total_return < 0 and max_drawdown == 0:
-            raise CandidateConclusionError("negative return requires negative max_drawdown_pct")
+        if total_return < 0 and max_drawdown > total_return:
+            raise CandidateConclusionError(
+                "max_drawdown_pct cannot be shallower than negative total_return_pct"
+            )
         if (total_return > 0) != (concentration is not None):
             raise CandidateConclusionError(
                 "top_n_trade_concentration must be present exactly when total_return_pct is positive"
@@ -185,6 +187,18 @@ class CandidateRobustness:
                 raise CandidateConclusionError("zero top_n requires zero trade concentration")
             if self.top_n > 0 and concentration == 0:
                 raise CandidateConclusionError("positive top_n and return require positive trade concentration")
+            compatible_wins = _compatible_win_count_bounds(self.win_rate, self.trade_count)
+            if compatible_wins is None:
+                raise CandidateConclusionError("win_rate must correspond to an integer win count")
+            minimum_wins, maximum_wins = compatible_wins
+            if maximum_wins <= self.top_n and concentration < 1:
+                raise CandidateConclusionError("top_n covering all winners requires concentration at least one")
+            if (
+                minimum_wins == self.trade_count
+                and self.top_n >= self.trade_count
+                and concentration != 1
+            ):
+                raise CandidateConclusionError("all-winning evidence requires concentration exactly one")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -447,27 +461,49 @@ def _has_compatible_win_count(
     minimum: int = 0,
     maximum: int | None = None,
 ) -> bool:
+    return _compatible_win_count_bounds(
+        win_rate,
+        trade_count,
+        minimum=minimum,
+        maximum=maximum,
+    ) is not None
+
+
+def _compatible_win_count_bounds(
+    win_rate: str,
+    trade_count: int,
+    *,
+    minimum: int = 0,
+    maximum: int | None = None,
+) -> tuple[int, int] | None:
     maximum = trade_count if maximum is None else maximum
     minimum = max(0, minimum)
     maximum = min(trade_count, maximum)
     if minimum > maximum:
-        return False
+        return None
     if trade_count == 0:
-        return minimum == 0 and maximum == 0 and win_rate == "0.00000000"
+        return (0, 0) if minimum == 0 and maximum == 0 and win_rate == "0.00000000" else None
     with localcontext() as context:
         context.prec = max(28, len(str(trade_count)) + 20)
         parsed = Decimal(win_rate)
-        estimated_wins = parsed * trade_count
-        lower = int(estimated_wins.to_integral_value(rounding=ROUND_FLOOR))
-        return any(
-            minimum <= win_count <= maximum
+        half_unit = Decimal("0.000000005")
+        lower_estimate = (parsed - half_unit) * trade_count
+        upper_estimate = (parsed + half_unit) * trade_count
+        candidates = {minimum, maximum}
+        for estimate in (lower_estimate, upper_estimate):
+            boundary = int(estimate.to_integral_value(rounding=ROUND_FLOOR))
+            candidates.update(range(boundary - 2, boundary + 3))
+        compatible = tuple(
+            win_count
+            for win_count in sorted(candidates)
+            if minimum <= win_count <= maximum
             and format(
                 (Decimal(win_count) / Decimal(trade_count)).quantize(Decimal("0.00000001")),
                 "f",
             )
             == win_rate
-            for win_count in {lower, lower + 1, minimum, maximum}
         )
+        return (compatible[0], compatible[-1]) if compatible else None
 
 
 def _canonical_decimal(value: str, field_name: str) -> Decimal:
