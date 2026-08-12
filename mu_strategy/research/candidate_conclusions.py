@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -98,8 +99,17 @@ class CandidateRobustness:
             raise CandidateConclusionError("top_n_trade_concentration must be text or null")
         if not isinstance(self.survives_stress_grid, bool):
             raise CandidateConclusionError("survives_stress_grid must be a boolean")
+        total_return = _canonical_decimal_metric(self.total_return_pct, "total_return_pct")
+        _canonical_decimal_metric(self.max_drawdown_pct, "max_drawdown_pct")
+        win_rate = _canonical_decimal_metric(self.win_rate, "win_rate")
+        if not Decimal("0") <= win_rate <= Decimal("1"):
+            raise CandidateConclusionError("win_rate must be between zero and one")
+        if self.top_n_trade_concentration is not None:
+            _canonical_decimal_metric(self.top_n_trade_concentration, "top_n_trade_concentration")
         if self.survives_stress_grid and self.trade_count == 0:
             raise CandidateConclusionError("surviving stress evidence requires at least one trade")
+        if self.survives_stress_grid and total_return < 0:
+            raise CandidateConclusionError("surviving stress evidence cannot have negative return")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,3 +331,14 @@ def _require_int_tuple(payload: dict[str, Any], field_name: str) -> tuple[int, .
 
 def _raise_integer(field_name: str) -> int:
     raise CandidateConclusionError(f"{field_name} values must be integers")
+
+
+def _canonical_decimal_metric(value: str, field_name: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+        canonical = format(parsed.quantize(Decimal("0.00000001")), "f")
+    except (InvalidOperation, ValueError) as exc:
+        raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal") from exc
+    if not parsed.is_finite() or canonical != value:
+        raise CandidateConclusionError(f"{field_name} must be a finite canonical decimal")
+    return parsed

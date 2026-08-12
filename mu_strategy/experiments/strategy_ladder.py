@@ -527,6 +527,16 @@ def run_strategy_ladder(
         decision = bundle.trust_decision
         reason = decision.reason if decision is not None else HealthReason.MANIFEST_BLOCKED
         raise StrategyLadderDataError(reason, status_error)
+    incomplete_intervals = tuple(
+        interval
+        for interval in TRUSTED_REQUESTED_INTERVALS
+        if bundle.statuses_by_interval[interval].coverage_state != "complete"
+    )
+    if incomplete_intervals:
+        raise StrategyLadderDataError(
+            HealthReason.INSUFFICIENT_COVERAGE,
+            f"trusted data blocked: insufficient_coverage:{','.join(incomplete_intervals)}",
+        )
     if instrument.inst_id != bundle.symbol.inst_id:
         raise ValueError("instrument metadata does not match trusted symbol")
 

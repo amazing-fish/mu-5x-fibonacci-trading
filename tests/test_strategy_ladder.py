@@ -429,6 +429,24 @@ class CandidateConclusionIndexTests(unittest.TestCase):
         candidate_index = CandidateConclusionIndex((candidate_entry,))
         self.assertEqual(candidate_index, CandidateConclusionIndex.from_json(candidate_index.to_json()))
 
+    def test_conclusion_rejects_negative_or_noncanonical_surviving_returns(self):
+        index = _sample_conclusion_index()
+        entry = index.entries[0]
+        metric = entry.robustness_metrics[0]
+        invalid_returns = ("-0.50000000", "not-a-number", "NaN", "0.1")
+
+        for total_return in invalid_returns:
+            with self.subTest(total_return=total_return):
+                with self.assertRaises(CandidateConclusionError):
+                    replace(metric, total_return_pct=total_return, survives_stress_grid=True)
+
+                rejected = index.to_dict()
+                rejected["entries"][0]["status"] = "candidate"
+                rejected["entries"][0]["robustness_metrics"][0]["total_return_pct"] = total_return
+                rejected["entries"][0]["robustness_metrics"][0]["survives_stress_grid"] = True
+                with self.assertRaises(CandidateConclusionError):
+                    CandidateConclusionIndex.from_dict(rejected)
+
     def test_conclusion_index_rejects_missing_empty_and_malformed_files(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -554,6 +572,33 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
 
             self.assertEqual("run-coverage", result.run_id)
             self.assertTrue(all(path.exists() for path in paths))
+
+    def test_partial_available_history_fails_closed_before_outputs(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "data" / "live"
+            now_ms = 10 * DAY_MS
+            write_generation_publication(
+                data_dir,
+                symbol="MU-USDT-SWAP",
+                start_ms=now_ms - DAY_MS,
+                end_ms=now_ms,
+            )
+            paths = _artifact_paths(root)
+
+            with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=now_ms):
+                with self.assertRaises(StrategyLadderDataError) as raised:
+                    run_strategy_ladder(
+                        data_dir=data_dir,
+                        window_days=1,
+                        windows=1,
+                        report_path=paths[0],
+                        html_report_path=paths[1],
+                        conclusion_path=paths[2],
+                    )
+
+            self.assertEqual(HealthReason.INSUFFICIENT_COVERAGE, raised.exception.reason)
+            self.assertTrue(all(not path.exists() for path in paths))
 
     def test_forbidden_conclusion_target_fails_before_any_output_or_data_access(self):
         with TemporaryDirectory() as tmp:
