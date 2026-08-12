@@ -27,10 +27,14 @@ def classify_exit_observation(observation: Any) -> str:
     if state_quality != "degraded":
         return EXIT_OBSERVATION_TIER_UNAVAILABLE
     evaluation = observation.get("assumption_evaluation")
-    if isinstance(evaluation, dict) and evaluation.get("exit_triggered") is True:
-        if evaluation.get("exit_reason") in {"stop", "non_session_liquidation_risk"}:
-            return EXIT_OBSERVATION_TIER_WARNING
-        return EXIT_OBSERVATION_TIER_UNAVAILABLE
+    if isinstance(evaluation, dict):
+        exit_reason = evaluation.get("exit_reason")
+        if evaluation.get("exit_triggered") is True:
+            if exit_reason in {"stop", "non_session_liquidation_risk"}:
+                return EXIT_OBSERVATION_TIER_WARNING
+            return EXIT_OBSERVATION_TIER_UNAVAILABLE
+        if exit_reason is not None:
+            return EXIT_OBSERVATION_TIER_UNAVAILABLE
     return EXIT_OBSERVATION_TIER_UNKNOWN
 
 
@@ -677,15 +681,21 @@ def _unavailable_exit_observation_card(observation: dict[str, Any]) -> str:
     unavailable_reason = observation.get("unavailable_reason")
     if not unavailable_reason:
         evaluation = observation.get("assumption_evaluation")
-        if isinstance(evaluation, dict) and evaluation.get("exit_triggered") is True:
-            exit_reason = _fmt(evaluation.get("exit_reason"))
-            trigger_basis = _fmt(evaluation.get("trigger_basis"))
-            unavailable_reason = (
-                "assumption_evaluation 字段矛盾：exit_triggered=true，"
-                f"但 exit_reason={exit_reason} 不是受支持的触发原因"
-                f"（trigger_basis={trigger_basis}），无法评估。"
-            )
-        else:
+        if isinstance(evaluation, dict):
+            exit_reason = evaluation.get("exit_reason")
+            if evaluation.get("exit_triggered") is True:
+                trigger_basis = _fmt(evaluation.get("trigger_basis"))
+                unavailable_reason = (
+                    "assumption_evaluation 字段矛盾：exit_triggered=true，"
+                    f"但 exit_reason={_fmt(exit_reason)} 不是受支持的触发原因"
+                    f"（trigger_basis={trigger_basis}），无法评估。"
+                )
+            elif exit_reason is not None:
+                unavailable_reason = (
+                    "assumption_evaluation 字段矛盾：exit_triggered 不为 true，"
+                    f"却带有 exit_reason={_fmt(exit_reason)}，无法评估。"
+                )
+        if not unavailable_reason:
             unavailable_reason = "未提供不可评估原因。"
     return f"""
     <div class="status state-bad">

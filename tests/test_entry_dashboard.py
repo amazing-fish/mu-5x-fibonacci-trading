@@ -366,6 +366,10 @@ class EntryDashboardTests(unittest.TestCase):
                 EXIT_OBSERVATION_TIER_WARNING,
             ),
             (_degraded_exit_observation(triggered=True), EXIT_OBSERVATION_TIER_UNAVAILABLE),
+            (
+                _degraded_exit_observation(triggered=False, exit_reason="stop"),
+                EXIT_OBSERVATION_TIER_UNAVAILABLE,
+            ),
             (_degraded_exit_observation(triggered=False), EXIT_OBSERVATION_TIER_UNKNOWN),
             (
                 {"state_quality": "unavailable", "assumption_evaluation": {"exit_triggered": True}},
@@ -633,6 +637,7 @@ class EntryDashboardTests(unittest.TestCase):
             [],
             {"exit_triggered": True},
             {"exit_triggered": True, "exit_reason": "unexpected"},
+            {"exit_triggered": False, "exit_reason": "stop"},
         ):
             with self.subTest(evaluation=evaluation):
                 observation = _degraded_exit_observation()
