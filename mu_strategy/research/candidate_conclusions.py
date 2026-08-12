@@ -98,6 +98,8 @@ class CandidateRobustness:
             raise CandidateConclusionError("top_n_trade_concentration must be text or null")
         if not isinstance(self.survives_stress_grid, bool):
             raise CandidateConclusionError("survives_stress_grid must be a boolean")
+        if self.survives_stress_grid and self.trade_count == 0:
+            raise CandidateConclusionError("surviving stress evidence requires at least one trade")
 
     def to_dict(self) -> dict[str, Any]:
         return {

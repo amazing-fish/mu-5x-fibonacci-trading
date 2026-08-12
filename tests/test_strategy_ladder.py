@@ -405,6 +405,30 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 with self.assertRaises(CandidateConclusionError):
                     factory()
 
+    def test_conclusion_rejects_zero_trade_survival_and_accepts_traded_candidate(self):
+        index = _sample_conclusion_index()
+        entry = index.entries[0]
+        metric = entry.robustness_metrics[0]
+
+        with self.assertRaisesRegex(CandidateConclusionError, "requires at least one trade"):
+            replace(metric, trade_count=0, survives_stress_grid=True)
+
+        rejected = index.to_dict()
+        rejected["entries"][0]["status"] = "candidate"
+        rejected["entries"][0]["robustness_metrics"][0]["trade_count"] = 0
+        rejected["entries"][0]["robustness_metrics"][0]["survives_stress_grid"] = True
+        with self.assertRaisesRegex(CandidateConclusionError, "requires at least one trade"):
+            CandidateConclusionIndex.from_dict(rejected)
+
+        surviving_metric = replace(metric, trade_count=1, survives_stress_grid=True)
+        candidate_entry = replace(
+            entry,
+            robustness_metrics=(surviving_metric,),
+            status=CandidateStatus.CANDIDATE,
+        )
+        candidate_index = CandidateConclusionIndex((candidate_entry,))
+        self.assertEqual(candidate_index, CandidateConclusionIndex.from_json(candidate_index.to_json()))
+
     def test_conclusion_index_rejects_missing_empty_and_malformed_files(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
