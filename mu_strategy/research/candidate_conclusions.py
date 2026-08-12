@@ -24,13 +24,21 @@ class FeeAssumption:
     tick_size: str
 
     def __post_init__(self) -> None:
-        if self.default_fee_bps_per_side < 0:
+        if type(self.default_fee_bps_per_side) is not int or self.default_fee_bps_per_side < 0:
             raise CandidateConclusionError("default fee must be non-negative")
-        if not self.fee_grid_bps_per_side or any(value < 0 for value in self.fee_grid_bps_per_side):
+        if (
+            not isinstance(self.fee_grid_bps_per_side, tuple)
+            or not self.fee_grid_bps_per_side
+            or any(type(value) is not int or value < 0 for value in self.fee_grid_bps_per_side)
+        ):
             raise CandidateConclusionError("fee grid must contain non-negative values")
-        if not self.slippage_grid_ticks or any(value < 0 for value in self.slippage_grid_ticks):
+        if (
+            not isinstance(self.slippage_grid_ticks, tuple)
+            or not self.slippage_grid_ticks
+            or any(type(value) is not int or value < 0 for value in self.slippage_grid_ticks)
+        ):
             raise CandidateConclusionError("slippage grid must contain non-negative values")
-        if not self.tick_size:
+        if not isinstance(self.tick_size, str) or not self.tick_size:
             raise CandidateConclusionError("tick_size is required")
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,12 +82,22 @@ class CandidateRobustness:
 
     def __post_init__(self) -> None:
         for field_name in ("candidate_id", "total_return_pct", "max_drawdown_pct", "win_rate"):
-            if not getattr(self, field_name):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
                 raise CandidateConclusionError(f"{field_name} is required")
-        if self.trade_count < 0 or self.top_n < 0:
+        if (
+            type(self.trade_count) is not int
+            or type(self.top_n) is not int
+            or self.trade_count < 0
+            or self.top_n < 0
+        ):
             raise CandidateConclusionError("trade_count and top_n must be non-negative")
-        if self.top_n_trade_concentration is not None and not self.top_n_trade_concentration:
+        if self.top_n_trade_concentration is not None and (
+            not isinstance(self.top_n_trade_concentration, str) or not self.top_n_trade_concentration
+        ):
             raise CandidateConclusionError("top_n_trade_concentration must be text or null")
+        if not isinstance(self.survives_stress_grid, bool):
+            raise CandidateConclusionError("survives_stress_grid must be a boolean")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,11 +156,18 @@ class CandidateConclusion:
 
     def __post_init__(self) -> None:
         for field_name in ("family", "source", "protocol_version"):
-            if not getattr(self, field_name):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
                 raise CandidateConclusionError(f"{field_name} is required")
+        if not isinstance(self.fee_assumption, FeeAssumption):
+            raise CandidateConclusionError("fee_assumption must be FeeAssumption")
         if not isinstance(self.status, CandidateStatus):
             raise CandidateConclusionError("status must be stress_failed or candidate")
-        if not self.robustness_metrics:
+        if (
+            not isinstance(self.robustness_metrics, tuple)
+            or not self.robustness_metrics
+            or any(not isinstance(metric, CandidateRobustness) for metric in self.robustness_metrics)
+        ):
             raise CandidateConclusionError("robustness_metrics must not be empty")
         candidate_ids = [metric.candidate_id for metric in self.robustness_metrics]
         if len(candidate_ids) != len(set(candidate_ids)):
@@ -196,8 +221,12 @@ class CandidateConclusionIndex:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version != 1:
             raise CandidateConclusionError("unsupported candidate conclusion schema_version")
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, CandidateConclusion) for entry in self.entries
+        ):
+            raise CandidateConclusionError("conclusion entries must be CandidateConclusion values")
         families = [entry.family for entry in self.entries]
         if not families or len(families) != len(set(families)):
             raise CandidateConclusionError("conclusion families must be non-empty and unique")

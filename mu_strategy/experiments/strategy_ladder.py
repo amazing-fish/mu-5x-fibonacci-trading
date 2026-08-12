@@ -215,7 +215,7 @@ def run_long_only_candidate(
         else:
             raise ValueError(f"unsupported local candidate family: {definition.family}")
 
-        if target_long and open_fill is None:
+        if target_long and open_fill is None and equity > 0:
             entry_price = trade_bar.open + slip
             if entry_price <= 0:
                 raise ValueError("slipped entry price must be positive")

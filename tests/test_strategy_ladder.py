@@ -210,6 +210,34 @@ class StrategyLadderSignalTests(unittest.TestCase):
         self.assertEqual(23 * HOUR_MS, results[0].trades[0].exit_time_ms)
         self.assertLessEqual(results[0].trades[0].exit_time_ms, boundary_ms)
 
+    def test_insolvent_candidate_stays_flat_instead_of_opening_non_positive_units(self):
+        definition = CandidateDefinition(
+            "overnight_seasonality",
+            "overnight_seasonality",
+            "overnight",
+            "test",
+        )
+        candles = [
+            _hourly_candle(21, 100),
+            _hourly_candle(22, 100),
+            _hourly_candle(24, 0.1),
+            _hourly_candle(45, 100),
+            _hourly_candle(46, 100),
+            _hourly_candle(48, 100),
+        ]
+
+        result = run_long_only_candidate(
+            candles,
+            definition=definition,
+            fee_bps_per_side=10,
+            slippage_ticks=0,
+            instrument=DEFAULT_MU_INSTRUMENT,
+        )
+
+        self.assertLessEqual(result.ending_equity, 0)
+        self.assertEqual(1, result.trade_count)
+        self.assertTrue(all(fill.notional > 0 and fill.units > 0 and fill.fee >= 0 for fill in result.trades[0].fills))
+
 
 class StrategyLadderCostTests(unittest.TestCase):
     def test_fee_slippage_grid_has_all_nine_cells_in_stable_order(self):
@@ -354,6 +382,28 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 rejected["entries"][0]["robustness_metrics"][0]["survives_stress_grid"] = survives_stress
                 with self.assertRaisesRegex(CandidateConclusionError, "contradicts robustness metrics"):
                     CandidateConclusionIndex.from_dict(rejected)
+
+    def test_conclusion_runtime_types_match_strict_reader_contract(self):
+        index = _sample_conclusion_index()
+        entry = index.entries[0]
+        metric = entry.robustness_metrics[0]
+        invalid_factories = (
+            lambda: replace(index, schema_version=True),
+            lambda: replace(index, entries=list(index.entries)),
+            lambda: replace(entry.fee_assumption, default_fee_bps_per_side=True),
+            lambda: replace(entry.fee_assumption, fee_grid_bps_per_side=(False,)),
+            lambda: replace(entry.fee_assumption, tick_size=Decimal("0.1")),
+            lambda: replace(metric, trade_count=True),
+            lambda: replace(metric, total_return_pct=1.0),
+            lambda: replace(metric, survives_stress_grid=1),
+            lambda: replace(entry, family=1),
+            lambda: replace(entry, robustness_metrics=list(entry.robustness_metrics)),
+        )
+
+        for factory in invalid_factories:
+            with self.subTest(factory=factory):
+                with self.assertRaises(CandidateConclusionError):
+                    factory()
 
     def test_conclusion_index_rejects_missing_empty_and_malformed_files(self):
         with TemporaryDirectory() as tmp:
