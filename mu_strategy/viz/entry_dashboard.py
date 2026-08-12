@@ -28,7 +28,9 @@ def classify_exit_observation(observation: Any) -> str:
         return EXIT_OBSERVATION_TIER_UNAVAILABLE
     evaluation = observation.get("assumption_evaluation")
     if isinstance(evaluation, dict) and evaluation.get("exit_triggered") is True:
-        return EXIT_OBSERVATION_TIER_WARNING
+        if evaluation.get("exit_reason") in {"stop", "non_session_liquidation_risk"}:
+            return EXIT_OBSERVATION_TIER_WARNING
+        return EXIT_OBSERVATION_TIER_UNAVAILABLE
     return EXIT_OBSERVATION_TIER_UNKNOWN
 
 
@@ -50,7 +52,9 @@ def render_entry_dashboard(
     execution_orders = submitted_orders + blocked_orders
     data_errors = _list(payload.get("data_errors"))
     expired_orders = _list(payload.get("expired_orders"))
-    exit_observations = _list(payload.get("exit_observations"))
+    exit_observations_value = payload.get("exit_observations")
+    exit_observations_are_list = isinstance(exit_observations_value, list)
+    exit_observations = _list(exit_observations_value)
     exit_observation_status = payload.get("exit_observation_status")
     if not isinstance(exit_observation_status, dict):
         exit_observation_status = {}
@@ -282,7 +286,7 @@ def render_entry_dashboard(
   </header>
 
   {_failure_section(payload) if failed else ""}
-  {_exit_observations_section(exit_observations, exit_observation_status)}
+  {_exit_observations_section(exit_observations, exit_observation_status, observations_are_list=exit_observations_are_list)}
   {_orders_section(planned_orders, scans, mode, show_empty_notice=not orders)}
   {_order_results_section(execution_orders, scans, mode)}
   {_reason_summary_section(scans)}
@@ -586,10 +590,16 @@ def _scan_row(scan: dict[str, Any]) -> str:
 def _exit_observations_section(
     observations: list[dict[str, Any]],
     status: dict[str, Any],
+    *,
+    observations_are_list: bool,
 ) -> str:
     cards = "\n".join(_exit_observation_card(observation) for observation in observations)
     if not cards:
-        cards = _empty_exit_observation_status(status)
+        cards = _empty_exit_observation_status(
+            status,
+            observations_are_list=observations_are_list,
+            rendered_observation_count=len(observations),
+        )
     return f"""
   <section>
     <h2>持仓出场观测 · 降级估计</h2>
@@ -600,14 +610,24 @@ def _exit_observations_section(
   </section>"""
 
 
-def _empty_exit_observation_status(status: dict[str, Any]) -> str:
+def _empty_exit_observation_status(
+    status: dict[str, Any],
+    *,
+    observations_are_list: bool,
+    rendered_observation_count: int,
+) -> str:
     reason = str(status.get("reason") or "")
     state = str(status.get("status") or "")
     if reason == "dry_run_has_no_position_source":
         message = "Dry-run 未读取持仓，无法确认当前是否有持仓。"
     elif reason:
         message = f"持仓观测不可用，无法评估。状态码：{reason}"
-    elif state == "available" and _safe_count(status.get("position_count")) == 0:
+    elif (
+        observations_are_list
+        and state == "available"
+        and _safe_count(status.get("position_count")) == 0
+        and _safe_count(status.get("observation_count")) == rendered_observation_count
+    ):
         message = "已读取交易所持仓：本轮返回 0 个持仓。"
     else:
         message = "本轮没有可展示的持仓观测，无法确认当前是否有持仓。"
@@ -654,6 +674,19 @@ def _exit_observation_card(observation: dict[str, Any]) -> str:
 
 
 def _unavailable_exit_observation_card(observation: dict[str, Any]) -> str:
+    unavailable_reason = observation.get("unavailable_reason")
+    if not unavailable_reason:
+        evaluation = observation.get("assumption_evaluation")
+        if isinstance(evaluation, dict) and evaluation.get("exit_triggered") is True:
+            exit_reason = _fmt(evaluation.get("exit_reason"))
+            trigger_basis = _fmt(evaluation.get("trigger_basis"))
+            unavailable_reason = (
+                "assumption_evaluation 字段矛盾：exit_triggered=true，"
+                f"但 exit_reason={exit_reason} 不是受支持的触发原因"
+                f"（trigger_basis={trigger_basis}），无法评估。"
+            )
+        else:
+            unavailable_reason = "未提供不可评估原因。"
     return f"""
     <div class="status state-bad">
       <div class="headline">
@@ -661,7 +694,7 @@ def _unavailable_exit_observation_card(observation: dict[str, Any]) -> str:
         <span class="badge bad">不可评估</span>
       </div>
       <div class="subtle">symbol={_e(observation.get("symbol"))} · 持仓数量={_e(_fmt_number(observation.get("position_size")))} · 持仓均价={_e(_fmt_number(observation.get("average_entry_price")))}</div>
-      <div class="notice">无法生成假设评估：{_e(observation.get("unavailable_reason"))}</div>
+      <div class="notice">无法生成假设评估：{_e(unavailable_reason)}</div>
     </div>"""
 
 

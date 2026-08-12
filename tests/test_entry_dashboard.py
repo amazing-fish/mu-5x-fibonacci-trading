@@ -361,7 +361,11 @@ class EntryDashboardTests(unittest.TestCase):
 
         cases = [
             (None, EXIT_OBSERVATION_TIER_NONE),
-            (_degraded_exit_observation(triggered=True), EXIT_OBSERVATION_TIER_WARNING),
+            (
+                _degraded_exit_observation(triggered=True, exit_reason="stop"),
+                EXIT_OBSERVATION_TIER_WARNING,
+            ),
+            (_degraded_exit_observation(triggered=True), EXIT_OBSERVATION_TIER_UNAVAILABLE),
             (_degraded_exit_observation(triggered=False), EXIT_OBSERVATION_TIER_UNKNOWN),
             (
                 {"state_quality": "unavailable", "assumption_evaluation": {"exit_triggered": True}},
@@ -407,6 +411,72 @@ class EntryDashboardTests(unittest.TestCase):
         self.assertNotIn("本轮返回 0 个持仓", dry_run_html)
         self.assertIn("已读取交易所持仓", confirmed_empty_html)
         self.assertIn("本轮返回 0 个持仓", confirmed_empty_html)
+
+    def test_dashboard_does_not_confirm_empty_positions_from_non_list_observations(self):
+        from mu_strategy.viz.entry_dashboard import render_entry_dashboard
+
+        html = render_entry_dashboard(
+            {
+                "mode": "live_demo",
+                "exit_observations": {"broken": 1},
+                "exit_observation_status": {
+                    "status": "available",
+                    "reason": None,
+                    "position_count": 0,
+                    "observation_count": 1,
+                },
+            }
+        )
+
+        self.assertNotIn("本轮返回 0 个持仓", html)
+        self.assertIn("无法确认当前是否有持仓", html)
+
+    def test_dashboard_does_not_confirm_empty_positions_when_observation_count_disagrees(self):
+        from mu_strategy.viz.entry_dashboard import render_entry_dashboard
+
+        html = render_entry_dashboard(
+            {
+                "mode": "live_demo",
+                "exit_observations": [],
+                "exit_observation_status": {
+                    "status": "available",
+                    "reason": None,
+                    "position_count": 0,
+                    "observation_count": 1,
+                },
+            }
+        )
+
+        self.assertNotIn("本轮返回 0 个持仓", html)
+        self.assertIn("无法确认当前是否有持仓", html)
+
+    def test_dashboard_preserves_confirmed_empty_and_valid_stop_warning_paths(self):
+        from mu_strategy.viz.entry_dashboard import render_entry_dashboard
+
+        confirmed_empty_html = render_entry_dashboard(
+            {
+                "mode": "live_demo",
+                "exit_observations": [],
+                "exit_observation_status": {
+                    "status": "available",
+                    "reason": None,
+                    "position_count": 0,
+                    "observation_count": 0,
+                },
+            }
+        )
+        stop_warning_html = render_entry_dashboard(
+            {
+                "mode": "live_demo",
+                "exit_observations": [
+                    _degraded_exit_observation(triggered=True, exit_reason="stop")
+                ],
+            }
+        )
+
+        self.assertIn("本轮返回 0 个持仓", confirmed_empty_html)
+        self.assertIn("发现 1 个持仓出场警示", stop_warning_html)
+        self.assertIn("⚠️ 出场警示（降级估计）", stop_warning_html)
 
     def test_dashboard_exit_warning_renders_degraded_stop_semantics_next_to_values(self):
         from mu_strategy.viz.entry_dashboard import render_entry_dashboard
@@ -532,7 +602,13 @@ class EntryDashboardTests(unittest.TestCase):
     def test_dashboard_tolerates_missing_none_and_malformed_assumption_evaluation(self):
         from mu_strategy.viz.entry_dashboard import render_entry_dashboard
 
-        for evaluation in (None, "invalid", [], {"exit_triggered": True}):
+        for evaluation in (
+            None,
+            "invalid",
+            [],
+            {"exit_triggered": True},
+            {"exit_triggered": True, "exit_reason": "unexpected"},
+        ):
             with self.subTest(evaluation=evaluation):
                 observation = _degraded_exit_observation()
                 observation["assumption_evaluation"] = evaluation
@@ -545,6 +621,11 @@ class EntryDashboardTests(unittest.TestCase):
                 )
 
                 self.assertIn("持仓出场观测 · 降级估计", html)
+                self.assertNotIn("发现 1 个持仓出场警示", html)
+                if isinstance(evaluation, dict):
+                    self.assertIn("持仓不可评估", html)
+                    self.assertIn("assumption_evaluation 字段矛盾", html)
+                    self.assertNotIn("无法生成假设评估：-", html)
 
     def test_dashboard_unknown_leverage_degrades_liquidation_copy_without_guessing(self):
         from mu_strategy.viz.entry_dashboard import render_entry_dashboard
