@@ -520,6 +520,8 @@ def read_candidate_conclusion_index(path: Path) -> CandidateConclusionIndex:
         raise CandidateConclusionError("candidate conclusion index is missing") from exc
     except OSError as exc:
         raise CandidateConclusionError(f"candidate conclusion index cannot be read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise CandidateConclusionError(f"candidate conclusion index is not valid UTF-8: {exc}") from exc
     return CandidateConclusionIndex.from_json(text)
 
 

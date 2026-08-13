@@ -915,6 +915,14 @@ class CandidateConclusionIndexTests(unittest.TestCase):
                 with self.assertRaises(CandidateConclusionError):
                     read_candidate_conclusion_index(path)
 
+    def test_conclusion_rejects_non_utf8_index_file(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid-utf8.json"
+            path.write_bytes(b"\xff\xfe\xfa")
+
+            with self.assertRaises(CandidateConclusionError):
+                read_candidate_conclusion_index(path)
+
     def test_conclusion_writer_changes_only_its_explicit_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
