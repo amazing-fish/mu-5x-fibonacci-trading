@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ from mu_strategy.strategies.registry import StrategyGroup, selected_strategy_gro
 
 DAY_MS = 86_400_000
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
+
+WalkForwardEvaluator = Callable[[list[Candle], list[Candle], dict[int, str]], BacktestResult]
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,28 @@ def run_walk_forward_backtests(
     window_days: int = 14,
     windows: int = 2,
 ) -> list[WindowBacktest]:
+    return run_evaluator_walk_forward_backtests(
+        candles_15m,
+        candles_1h,
+        evaluator=lambda segment_15m, _segment_1h, context: run_backtest(segment_15m, context, config=config),
+        window_days=window_days,
+        windows=windows,
+    )
+
+
+def run_evaluator_walk_forward_backtests(
+    candles_15m: list[Candle],
+    candles_1h: list[Candle],
+    *,
+    evaluator: WalkForwardEvaluator,
+    window_days: int = 14,
+    windows: int = 2,
+    history_hours: int = 0,
+) -> list[WindowBacktest]:
+    """Run any strategy evaluator through the canonical walk-forward protocol."""
+
+    if history_hours < 0:
+        raise ValueError("history_hours must be non-negative")
     ordered_15m = sorted(candles_15m, key=lambda bar: bar.open_time_ms)
     ordered_1h = sorted(candles_1h, key=lambda bar: bar.open_time_ms)
     segments = split_into_windows(ordered_15m, window_days=window_days, windows=windows)
@@ -102,7 +127,9 @@ def run_walk_forward_backtests(
         start_time_ms = segment[0].open_time_ms
         end_time_ms = segment[-1].open_time_ms + interval_ms
         context = {bar.open_time_ms: full_context[bar.open_time_ms] for bar in segment}
-        result = run_backtest(segment, context, config=config)
+        history_start_time_ms = start_time_ms - (history_hours * 3_600_000)
+        segment_1h = [bar for bar in ordered_1h if history_start_time_ms <= bar.open_time_ms < end_time_ms]
+        result = evaluator(segment, segment_1h, context)
         results.append(WindowBacktest(index, start_time_ms, end_time_ms, result, len(segment)))
     return results
 
