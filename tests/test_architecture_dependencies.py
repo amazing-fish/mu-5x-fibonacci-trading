@@ -21,6 +21,22 @@ LOW_LEVEL_DEPENDENCY_RULES = (
 
 
 class ArchitectureDependencyTests(unittest.TestCase):
+    def test_scan_cycle_and_observation_writer_do_not_import_broker_or_application_adapters(self):
+        violations = []
+        for relative_path in ("scan_cycle.py", "stage0.py"):
+            for line, statement in _forbidden_import_statements(
+                (PACKAGE_ROOT / relative_path).read_text(encoding="utf-8"),
+                package="mu_strategy",
+                forbidden_imports=FORBIDDEN_IMPORTS + (
+                    "mu_strategy.market_data.service",
+                    "mu_strategy.market_data.trusted_data.refresh",
+                    "mu_strategy.execution.intents",
+                    "mu_strategy.execution.store",
+                ),
+            ):
+                violations.append(f"{relative_path}:{line}: {statement}")
+        self.assertEqual([], violations)
+
     def test_domain_packages_do_not_import_application_layers(self):
         violations: list[str] = []
         for package_name in SCANNED_PACKAGES:

@@ -19,7 +19,7 @@ The default local path is `data/observations/stage0.jsonl`. Use `--observation-l
 
 ## Outcomes
 
-Each symbol in a persisted cycle has exactly one closed `ObservationOutcome`:
+`scan_cycle.ScanCycle` evaluates each distinct dry-run symbol once and builds one typed `ScanCycleOutcome` containing the existing immutable observation. This happens with or without a log repository. The demo presentation adapter consumes the result/error once; `stage0.persist_observation_cycle` only writes the completed observation cycle and has no scanner or policy entry point. Each symbol has exactly one closed `ObservationOutcome`:
 
 | Outcome | Meaning | Scanner called? | Later-stage authorization? |
 |---|---|---:|---:|
@@ -48,7 +48,9 @@ Each immutable observation records:
 - the full typed scan result or a typed failure with sanitized exception fields;
 - a deterministic result fingerprint and one closed outcome.
 
-Allowed observations require a matching manifest `run_id`/generation identity and complete `5m/15m/1h` dependency hashes. Plain or legacy custom bundles can continue through the versionless compatibility path when the sidecar is disabled, but they are rejected as Stage 0 promotion evidence when versioned persistence is enabled.
+Allowed dry-run scans require a matching manifest `run_id`/generation identity and complete `5m/15m/1h` dependency hashes, regardless of persistence. Custom loaders must supply a canonical `CandleBundle` and custom scanners must return a valid, non-`UNKNOWN` typed `EntryScanResult`. A plain/legacy bundle or missing provenance is blocked before scanning even when the sidecar is disabled; turning off logging cannot relax the gate. This tightens the former custom-loader compatibility path; the default CLI already uses canonical trusted data. Confirmed Demo retains its existing compatibility behavior and remains outside this Stage 0 boundary.
+
+Load and freshness failures carry typed failure codes and health reasons from their producer. Compatibility `reason`/`status_reason` strings are presentation only and are never parsed back into control decisions. The cycle clock and IDs describe observations in both persistence modes; they do not replace the trusted loader's freshness clock.
 
 ## Canonical identity and sanitization
 
@@ -71,10 +73,10 @@ This cycle-sized commit boundary prevents a later symbol write failure from expo
 - result fingerprints that do not match canonical content;
 - malformed UTF-8/JSON and incomplete trailing lines.
 
-Any corrupt line or unresolved failed-write marker makes the repository read fail closed; corrupt, partial, or ambiguously durable data is never returned as promotion evidence. Any marker, append, flush, `fsync`, or marker-removal failure raises an invalid-cycle error, and the current cycle returns no consumable observation or legacy result. Recovery requires explicit inspection/repair; a later append will not silently clear an unresolved marker.
+Any corrupt line or unresolved failed-write marker makes the repository read fail closed; corrupt, partial, or ambiguously durable data is never returned as promotion evidence. Any marker, append, flush, `fsync`, or marker-removal failure raises `ObservationCycleInvalidError` with the write exception as its cause, and the current cycle returns no consumable observation or legacy result. The already evaluated outcomes remain unchanged: a READY scan is not relabeled as a scan failure, the scanner is not called again, and dry-run order planning does not begin. Recovery requires explicit inspection/repair; a later append will not silently clear an unresolved marker.
 
 ## Compatibility and safety boundary
 
-The existing versionless stdout/dashboard JSON is assembled independently and keeps its exact keys and values. Observation enums, decision metadata, schema fields, and fingerprints do not leak into it.
+The existing versionless stdout/dashboard JSON uses one presentation path for both persistence modes and keeps its exact field set. Valid canonical results preserve their values; scanner exceptions and invalid results now produce the same failure payload whether logging is enabled or disabled. Observation enums, decision metadata, schema fields, and fingerprints do not leak into it. The observation schema remains version 1.
 
 The Stage 0 integration runs only with `DemoTradingConfig.dry_run=True`. It does not require private credentials, refresh trusted data, publish a canonical generation, create an intent, set leverage, submit an order, or cancel an order. Public instrument metadata reads used by the existing dry-run sizing path remain outside the observation authorization model.
