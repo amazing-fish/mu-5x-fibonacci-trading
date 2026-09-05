@@ -150,6 +150,8 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 
 Stage 0 dry-run cycles also append a versioned observation-only record to `data/observations/stage0.jsonl` by default. Use `--observation-log <path>` to choose another ignored local path. This sidecar preserves the existing stdout/dashboard JSON shape and is not an `OrderIntent`, broker authorization, or execution ledger; see [docs/stage0-observations.md](docs/stage0-observations.md).
 
+持续刷新与信号健康可使用 `python -B -m mu_strategy.commands.signal_service run --once --data-dir data/live` 验证单轮，再用 `status --data-dir data/live` 查询停止/故障状态。该入口默认只做 MU 的公共行情刷新与观测扫描，分别记录数据门禁、刷新、扫描、写盘及故障恢复事件。持续运行、Windows 单实例与中断恢复、日志轮转见 [运行手册](docs/signal-service.md)。实际启用常驻任务及网易邮件接入另行交付。
+
 程序化调用 `run_once(dry_run=True)` 时，是否配置观测日志不影响扫描结果：数据阻断、扫描失败、无信号与 READY 使用同一分类，每个允许扫描的标的只扫描一次。自定义 loader 必须提供 canonical generation/hash 来源，自定义 scanner 必须返回有效且非 `UNKNOWN` 的类型化结果；关闭日志不能放宽这些要求。写盘失败单独报错，保留已计算的信号含义，不重扫，也不返回本轮订单计划。
 
 刷新可信 OKX 数据层，默认维护 OKX Top10 热门币和本地配置池中的 OKX 股票概念代币 Top10，周期固定为 `5m/15m/1h`。这是发布 `data/live/generations/<run_id>/` 并原子替换 `data/live/current.json` 的唯一流程：

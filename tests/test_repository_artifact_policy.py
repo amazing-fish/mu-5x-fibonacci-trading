@@ -20,6 +20,10 @@ class RepositoryArtifactPolicyTests(unittest.TestCase):
     def test_trusted_live_runtime_artifacts_remain_ignored(self):
         for path in (
             "data/live/refresh_runs.jsonl",
+            "data/live-signal-service/health.json",
+            "data/live-signal-service/observations.jsonl",
+            "data/live-signal-service/service.lock",
+            "data/live-signal-service/supervisor.lock",
             "data/live/generations/new-run/tmp.json",
             "data/live/generations/new-run/okx/MU-USDT-SWAP/15m.tmp",
         ):

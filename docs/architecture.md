@@ -320,6 +320,8 @@ These rules apply to every stage:
 
 The implemented 30-A schema, canonical fingerprint, cycle-sized JSONL commit, strict reader, and non-authorization boundary are documented in [stage0-observations.md](stage0-observations.md).
 
+The observation-only service supervisor (`signal_service.py`) runs the sole refresh command and a cache-only watchlist scan in separate bounded processes. `service_health.py` owns the strict atomic health snapshot, event cursor and per-data-directory OS instance lock. Scanner policy remains in `ScanCycle`; the service records refresh, data gate, scan and persistence as separate evidence. An interrupted active worker phase requires explicit operator recovery before another worker can start. See [signal-service.md](signal-service.md) for health semantics and Windows operations; merging this runtime does not activate a scheduled task or email delivery.
+
 **Failure, stop, and rollback.**
 
 - `DATA_GATE_BLOCKED`: report and stop before scanner.
