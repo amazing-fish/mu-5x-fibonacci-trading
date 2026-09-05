@@ -15,6 +15,7 @@ from mu_strategy.service_health import HealthStore
 SCHEMA = (
     "CREATE TABLE metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE streams (symbol TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE consumed_cycles (cycle_id TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL)",
     "CREATE TABLE outbox (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL "
     "CHECK(state IN ('pending','confirmed','failed','unknown')), attempts INTEGER NOT NULL CHECK(attempts >= 0), "
     "next_attempt_ms INTEGER NOT NULL CHECK(next_attempt_ms >= 0), retryable INTEGER NOT NULL CHECK(retryable IN (0,1)), "
@@ -143,6 +144,13 @@ class NotificationStore:
 
     def symbols(self, db) -> tuple[str, ...]:
         return tuple(row[0] for row in db.execute("SELECT symbol FROM streams ORDER BY symbol"))
+
+    def cycle_digest(self, db, cycle_id: str) -> str | None:
+        row = db.execute("SELECT content_sha256 FROM consumed_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+        return None if row is None else digest(row[0])
+
+    def record_cycle(self, db, cycle_id: str, content_sha256: str) -> None:
+        db.execute("INSERT INTO consumed_cycles VALUES (?,?)", (cycle_id, digest(content_sha256)))
 
     def enqueue(self, db, event: AlertEvent, *, now_ms: int, suppressed_reason: str | None = None) -> None:
         canonical = AlertEvent.from_json(event.to_json())

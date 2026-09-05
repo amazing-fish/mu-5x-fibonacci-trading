@@ -162,6 +162,70 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertEqual(0, self.alerts.deliver(self.transport))
         self.transport.send.assert_not_called()
 
+    def test_committed_log_tail_before_health_publication_blocks_pre_send(self):
+        self.publish()
+        self.alerts.collect()
+        old_health = self.state
+        self.clock.value += 1
+        self.publish("wait")
+        self.state = old_health
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_unreadable_log_tail_during_pre_send_is_retryable_without_network(self):
+        self.publish()
+        self.alerts.collect()
+        with patch.object(self.alerts.observations, "read_batch", side_effect=ObservationCorruptionError("retry")):
+            self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+
+    def test_authoritative_failed_scan_or_persistence_withdraws_previous_entry(self):
+        for status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.SUCCEEDED):
+            with self.subTest(status=status):
+                self.clock.value += 100
+                self.publish(signal=self.clock.value)
+                self.alerts.collect()
+                self.alerts.deliver(self.transport)
+                current_id = self.entry_id()
+                self.clock.value += 1
+                uncommitted = self.publish(append=False)
+                scan = ScanHealth(status, uncommitted, StepStatus.FAILED) if status is StepStatus.SUCCEEDED else ScanHealth(status)
+                self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=scan))
+                self.assertFalse(self.alerts.collect()["caught_up"])
+                self.assertEqual("source_unavailable", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+
+    def test_previous_failed_scan_does_not_withdraw_newer_log_awaiting_health(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        previous = self.state
+        self.clock.value += 1
+        self.publish()
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.state = current
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_health_snapshot_io_failure_follows_source_fault_path(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.snapshot.side_effect = PermissionError("private details")
+        output = io.StringIO()
+        self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                factory=Mock(return_value=self.alerts)))
+        self.assertEqual("notification_source_unavailable_or_cursor_gap", json.loads(output.getvalue())["error_code"])
+        self.assertNotIn("private details", output.getvalue())
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.assertEqual("source_unavailable", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
     def test_same_ready_new_cycle_defers_then_sends_original_event_after_catching_up(self):
         self.publish()
         self.alerts.collect()
@@ -362,17 +426,56 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual(3, len(self.records(AlertKind.ENTRY_REVIEW)))
 
-    def test_duplicate_and_out_of_order_records_do_not_resurrect_old_signal(self):
-        original = self.publish()
+    def test_new_out_of_order_record_does_not_resurrect_old_signal(self):
+        self.publish()
         self.alerts.collect()
         self.clock.value += 10
         self.publish("wait")
         self.alerts.collect()
-        self.alerts.observations.append_cycle(original)
+        self.publish(at=self.clock.value - 10)
         self.alerts.collect()
         self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
         with self.alerts.store.connection() as db:
             self.assertEqual(1, self.alerts.store.get_meta(db, "out_of_order_observations"))
+
+    def test_old_run_duplicate_within_current_time_window_cannot_change_new_run(self):
+        self.clock.value = 550_000
+        old_wait = self.publish("wait")
+        self.alerts.collect()
+        self.clock.value = 1_000_000
+        self.publish()
+        self.alerts.collect()
+        self.clock.value = 500_000
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        current_id = self.entry_id()
+        self.clock.value = 600_000
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.alerts.observations.append_cycle(old_wait)
+        self.alerts.collect()
+        self.assertIsNone(self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+        self.publish(run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(current_id, self.entry_id())
+        self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.clock.value += 1
+        self.publish("wait", run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+
+    def test_reused_cycle_identity_with_conflicting_content_is_source_corruption(self):
+        cycle = self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        other = self.publish("wait", append=False)
+        reused = replace(other, cycle_id=cycle.cycle_id,
+                         observations=tuple(replace(item, cycle_id=cycle.cycle_id) for item in other.observations))
+        self.alerts.observations.append_cycle(reused)
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.collect()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
 
     def test_identical_duplicate_is_ignored(self):
         cycle = self.publish()

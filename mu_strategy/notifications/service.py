@@ -6,8 +6,8 @@ from mu_strategy.canonical import canonical_sha256
 from mu_strategy.market_data.trusted_data.contracts import Clock, SystemClock
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError, integer
 from mu_strategy.notifications.store import NotificationStore
-from mu_strategy.observations import JsonlObservationRepository, ObservationOutcome, Stage0Observation
-from mu_strategy.service_health import HealthStateError, HealthStore, health_view
+from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError, ObservationOutcome, Stage0Observation
+from mu_strategy.service_health import HealthStateError, HealthStore, StepStatus, health_view
 
 
 class EmailAlerts:
@@ -29,6 +29,12 @@ class EmailAlerts:
                 raise NotificationError("review window differs from persisted notification policy")
             self.store.set_meta(db, "review_ms", self.review_ms)
 
+    def _snapshot(self):
+        try:
+            return self.health.snapshot()
+        except OSError as exc:
+            raise HealthStateError("notification health source unreadable") from exc
+
     def collect(self) -> dict:
         """Commit a bounded log batch, its cursor and all resulting reminders together."""
         with self.store.connection() as db, self.store.transaction(db):
@@ -37,7 +43,7 @@ class EmailAlerts:
             if not isinstance(cursor, list) or len(cursor) != 3:
                 raise NotificationError("invalid persisted observation cursor")
             cycles, next_cursor = self.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2], limit=1000)
-            state, running = self.health.snapshot()
+            state, running = self._snapshot()
             now = self.clock.now_ms()
             view = health_view(state, running=running, now_ms=now)
             current = state.last_cycle.scan.cycle if state and state.last_cycle else None
@@ -45,8 +51,13 @@ class EmailAlerts:
             current_run = state.run_id if current and state.last_cycle.service_run_id == state.run_id else None
             for cycle in cycles:
                 cycle_hash = canonical_sha256(cycle.to_dict())
-                for observation in cycle.observations:
-                    self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None)
+                previous_hash = self.store.cycle_digest(db, cycle.cycle_id)
+                if previous_hash is not None and previous_hash != cycle_hash:
+                    raise ObservationCorruptionError("observation cycle identity reused with different content")
+                if previous_hash is None:
+                    self.store.record_cycle(db, cycle.cycle_id, cycle_hash)
+                    for observation in cycle.observations:
+                        self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None)
                 self.store.set_meta(db, "last_cycle_sha256", cycle_hash)
             self.store.set_meta(db, "observation_cursor", list(next_cursor))
             caught_up = current is not None and self.store.get_meta(db, "last_cycle_sha256") == current_hash
@@ -54,7 +65,8 @@ class EmailAlerts:
             # on a later poll with no new log bytes, including after clock rollback.
             if caught_up and current_run is not None:
                 for observation in current.observations:
-                    self._observe(db, observation, now, service_run_id=current_run)
+                    if self.store.stream(db, observation.symbol)["service_run_id"] != current_run:
+                        self._observe(db, observation, now, service_run_id=current_run)
             self._health_events(db, state, now)
             if view["runtime"] != "running" or view["healthy"]:
                 self._runtime(db, view["runtime"], state.run_id if state else None, now)
@@ -62,7 +74,14 @@ class EmailAlerts:
                 stream = self.store.stream(db, symbol)
                 if stream["active_event_id"] is None:
                     continue
-                if caught_up and (not view["healthy"] or symbol not in state.symbols):
+                latest = state.last_cycle if state else None
+                # A completed failed scan/write has no committed cycle to match.
+                # It invalidates evidence preceding that attempt, not newer log
+                # results awaiting their own health publication.
+                failed_attempt = (latest is not None and latest.service_run_id == state.run_id
+                                  and (latest.scan.status is not StepStatus.SUCCEEDED or latest.scan.persistence is not StepStatus.SUCCEEDED)
+                                  and max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms)
+                if failed_attempt or (caught_up and (not view["healthy"] or symbol not in state.symbols)):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
                 elif now < stream["last_seen_ms"] or now >= stream["last_seen_ms"] + self.review_ms:
                     self._invalidate(db, symbol, stream, "review_expired", now)
@@ -173,7 +192,7 @@ class EmailAlerts:
         self.store.set_meta(db, "runtime", key)
 
     def reconcile_health(self) -> None:
-        state, _ = self.health.snapshot()
+        state, _ = self._snapshot()
         if state is None:
             raise NotificationError("no current health snapshot to reconcile")
         with self.store.connection() as db, self.store.transaction(db):
@@ -267,7 +286,7 @@ class EmailAlerts:
         if not event.occurred_at_ms <= now < event.review_until_ms:
             return suppress("review_expired")
         try:
-            state, running = self.health.snapshot()
+            state, running = self._snapshot()
         except (HealthStateError, OSError):
             self.store.defer_unstarted(db, event.event_id, now_ms=now)
             return False
@@ -277,6 +296,14 @@ class EmailAlerts:
         # definitive invalidation. Let collect reconcile the full transition first.
         caught_up = latest is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(latest.to_dict())
         if not view["healthy"] or not self.store.get_meta(db, "source_ready", False) or not caught_up:
+            self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="source_not_caught_up")
+            return False
+        cursor = self.store.get_meta(db, "observation_cursor", [0, 0, None])
+        try:
+            remaining, _ = self.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2], limit=1)
+        except ObservationCorruptionError:
+            remaining = True
+        if remaining:
             self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="source_not_caught_up")
             return False
         symbol = event.observation.symbol
