@@ -162,6 +162,30 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertEqual(0, self.alerts.deliver(self.transport))
         self.transport.send.assert_not_called()
 
+    def test_same_ready_new_cycle_defers_then_sends_original_event_after_catching_up(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 1
+        self.publish(generation="new-generation")
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        record = self.alerts.store.status(event_id=original)["records"][0]
+        self.assertEqual(("pending", 0, None), (record["state"], record["attempts"], record["suppressed_reason"]))
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_temporarily_unreadable_log_defers_delivery_without_terminal_suppression(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.observation_unavailable()
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertIsNone(self.records()[0]["suppressed_reason"])
+        self.clock.value += 30_000
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
     def test_removed_symbol_pending_entry_is_suppressed_after_valid_service_restart(self):
         self.publish()
         self.alerts.collect()

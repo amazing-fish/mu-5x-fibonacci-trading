@@ -205,14 +205,16 @@ class NotificationStore:
                    (state.value, int(retryable and state is DeliveryState.FAILED), integer(now_ms) + delay, event_id))
         self.history(db, event_id, now_ms, "attempt_finished", code)
 
-    def defer_unstarted(self, db, event_id: str, *, now_ms: int) -> None:
+    def defer_unstarted(self, db, event_id: str, *, now_ms: int, reason: str = "source_snapshot_unavailable") -> None:
         """Release only a reservation whose transport has provably not been called."""
         record = self.record(db, event_id)
         if record is None or record.state is not DeliveryState.UNKNOWN or record.attempts < 1:
             raise NotificationError("invalid unstarted delivery reservation")
+        if reason not in {"source_snapshot_unavailable", "source_not_caught_up", "entry_not_reviewable"}:
+            raise NotificationError("invalid unstarted delivery reason")
         db.execute("UPDATE outbox SET state='pending',attempts=attempts-1,retryable=0,next_attempt_ms=? WHERE event_id=?",
                    (integer(now_ms) + 30_000, event_id))
-        self.history(db, event_id, now_ms, "attempt_not_started", "source_snapshot_unavailable")
+        self.history(db, event_id, now_ms, "attempt_not_started", reason)
 
     def resolve(self, event_id: str, *, outcome: DeliveryState, now_ms: int) -> None:
         if outcome not in {DeliveryState.CONFIRMED, DeliveryState.FAILED}:

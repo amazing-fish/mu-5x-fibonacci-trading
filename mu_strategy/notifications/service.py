@@ -224,31 +224,44 @@ class EmailAlerts:
                     if current.state is not DeliveryState.UNKNOWN or current.attempts != claimed.attempts:
                         continue
                     now = self.clock.now_ms()
-                    if current.event.kind is AlertKind.ENTRY_REVIEW:
-                        try:
-                            state, running = self.health.snapshot()
-                        except (HealthStateError, OSError):
-                            # This is before transport.send. No SMTP operation
-                            # can have happened; retry without spending its budget.
-                            self.store.defer_unstarted(db, current.event.event_id, now_ms=now)
-                            continue
-                        view = health_view(state, running=running, now_ms=now)
-                        stream = self.store.stream(db, current.event.observation.symbol)
-                        latest = state.last_cycle.scan.cycle if state and state.last_cycle else None
-                        symbol = current.event.observation.symbol
-                        evidence = next((item for item in latest.observations if item.symbol == symbol), None) if latest else None
-                        allowed = (view["healthy"] and self.store.get_meta(db, "source_ready", False)
-                                   and latest is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(latest.to_dict())
-                                   and symbol in state.symbols and evidence is not None
-                                   and self._signal_key(evidence) == stream["signal_key"]
-                                   and stream["active_event_id"] == current.event.event_id
-                                   and current.event.occurred_at_ms <= now < current.event.review_until_ms)
-                        if not allowed or current.suppressed_reason is not None:
-                            self.store.finish(db, current.event.event_id, state=DeliveryState.FAILED, now_ms=now, code="entry_no_longer_reviewable")
-                            self.store.suppress(db, current.event.event_id, "review_expired", now)
-                            continue
+                    if current.event.kind is AlertKind.ENTRY_REVIEW and not self._prepare_entry(db, current, now):
+                        continue
                     result = transport.send(current.event)
                     self.store.finish(db, current.event.event_id, state=result.state, now_ms=self.clock.now_ms(),
                                       code=result.code, retryable=result.retryable)
                     delivered += 1
         return delivered
+
+    def _prepare_entry(self, db, current, now: int) -> bool:
+        event = current.event
+
+        def suppress(reason):
+            self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="entry_not_reviewable")
+            self.store.suppress(db, event.event_id, reason, now)
+            return False
+
+        if current.suppressed_reason is not None:
+            return suppress(current.suppressed_reason)
+        if not event.occurred_at_ms <= now < event.review_until_ms:
+            return suppress("review_expired")
+        try:
+            state, running = self.health.snapshot()
+        except (HealthStateError, OSError):
+            self.store.defer_unstarted(db, event.event_id, now_ms=now)
+            return False
+        view = health_view(state, running=running, now_ms=now)
+        latest = state.last_cycle.scan.cycle if state and state.last_cycle else None
+        # A newer or temporarily unreadable source is missing evidence, not a
+        # definitive invalidation. Let collect reconcile the full transition first.
+        caught_up = latest is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(latest.to_dict())
+        if not view["healthy"] or not self.store.get_meta(db, "source_ready", False) or not caught_up:
+            self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="source_not_caught_up")
+            return False
+        symbol = event.observation.symbol
+        stream = self.store.stream(db, symbol)
+        evidence = next((item for item in latest.observations if item.symbol == symbol), None)
+        if symbol not in state.symbols or evidence is None:
+            return suppress("source_unavailable")
+        if self._signal_key(evidence) != stream["signal_key"] or stream["active_event_id"] != event.event_id:
+            return suppress("decision_changed")
+        return True
