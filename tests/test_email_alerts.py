@@ -198,6 +198,37 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertEqual(0, self.alerts.deliver(self.transport))
         self.transport.send.assert_not_called()
 
+    def test_dry_run_records_email_expiry_without_clearing_signal_identity(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 300_000
+        self.alerts.collect()
+        record = self.records(AlertKind.ENTRY_REVIEW)[0]
+        self.assertEqual(("pending", 0, "review_expired"),
+                         (record["state"], record["attempts"], record["suppressed_reason"]))
+        with self.alerts.store.connection() as db:
+            self.assertEqual(original, self.alerts.store.stream(db, SYMBOL)["active_event_id"])
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value += 1
+        self.publish(generation="next-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.transport.send.assert_not_called()
+
+    def test_expired_dry_run_entry_does_not_spend_send_limit_before_health_alert(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 300_000
+        self.publish(events=self.state.events + (HealthEvent(2, self.clock.value, "fault", ("refresh.failed",)),))
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport, limit=1))
+        self.assertEqual(AlertKind.SERVICE_FAULT, self.transport.send.call_args.args[0].kind)
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
+
     def test_continuity_expires_at_service_deadline_instead_of_email_deadline(self):
         self.publish()
         self.alerts.collect()

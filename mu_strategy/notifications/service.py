@@ -77,6 +77,11 @@ class EmailAlerts:
                 stream = self.store.stream(db, symbol)
                 if stream["active_event_id"] is None:
                     continue
+                entry = self.store.record(db, stream["active_event_id"])
+                if entry is None:
+                    raise NotificationError("active reminder has no persisted entry")
+                if now >= entry.event.review_until_ms:
+                    self.store.suppress(db, entry.event.event_id, "review_expired", now)
                 latest = state.last_cycle if state else None
                 # A completed failed scan/write has no committed cycle to match.
                 # It invalidates evidence preceding that attempt, not newer log
