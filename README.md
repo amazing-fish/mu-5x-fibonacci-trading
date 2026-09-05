@@ -84,6 +84,31 @@ Fibonacci 参数扫描和 walk-forward 消融仍保留在 `mu_strategy.experimen
 排名按原始账户收益排列，未按杠杆或风险归一化；配置杠杆不等于持续实际敞口，baseline 仍使用分阶段仓位。
 因此排名只能辅助研究复核，不能直接证明同风险预算下哪种策略更优，`candidate` 也不是交易资格。
 
+### 固定历史 generation 回放
+
+普通回测、HTML 可视化和候选 ladder 可显式传入 `--generation-id`，离线读取指定可信快照。
+历史模式不读取 `current.json`，也不按当前时钟判过期；默认不传该参数时仍执行原有 freshness gate。
+
+```powershell
+python -m mu_strategy.cli --generation-id e702be27d2de4b2d92b12bf01c70d02d --days 14 --report reports/live/replay.md
+python -m mu_strategy.visualize --generation-id e702be27d2de4b2d92b12bf01c70d02d --days 14 --output reports/live/replay.html
+python -m mu_strategy.experiments.strategy_ladder --generation-id e702be27d2de4b2d92b12bf01c70d02d --window-days 14 --windows 2 --report reports/live/ladder-replay.md --html-report reports/live/ladder-replay.html --conclusion-index reports/live/ladder-replay.json
+```
+
+窗口结束于该 generation 所有有效周期共同覆盖的最后一个完整小时，结束时间不包含在窗口内。
+`--days` 必须完整覆盖；ladder 另需 8 天输入历史供最长 169 小时动量预热，报告分别记录输入与执行区间。
+因此回放边界可能比默认 current 模式的最后一根 15m K 线更早，不能把两者的差异当成策略变化。
+
+报告中的 `historical_replay` provenance 记录 generation、原始与选中数据的内容哈希、发布时间、历史 freshness、窗口和实际配置。
+`code_sha256` 绑定当前 `mu_strategy/**/*.py` 源码内容（路径稳定、换行统一为 LF），不是 Git commit ID；
+`configuration_sha256` 绑定报告中完整配置。保持这些输入不变，重放产物不含运行时钟或本机数据目录，重复运行字节一致。
+未知 ID、非法路径、manifest/内容哈希错误、时序错误、未收盘数据与覆盖不足都直接失败，不会联网补齐或回退到 current。
+
+历史读取复用 `research.historical_data` 的唯一 reader；旧 `experiments.release_candidate` 导入路径继续兼容。
+schema-v3 flat 与 schema-v4 segmented 数据仍由 `TrustedDataStore` 验证，不增加数据格式或写入路径。
+tracked `data/live/current.json` 会由刷新改变：不要用 checkout/reset 恢复旧 pointer 来“固定回测”，应保留快照文件并显式选择 ID。
+本次不调整 artifact policy；Demo/scanner 不接受此参数，历史研究结论不代表当前行情可交易或获得执行授权。
+
 OKX API 只读检查：
 
 ```powershell
