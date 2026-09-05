@@ -126,23 +126,24 @@ class ScanCycleTests(unittest.TestCase):
         self.assertIs(ObservationOutcome.READY_FOR_REVIEW, actual.observations[0].outcome)
         self.assertIsNone(actual.observations[0].failure_code)
 
-    def test_each_distinct_symbol_is_scanned_once_despite_watchlist_overlap(self):
+    def test_each_symbol_is_scanned_once_despite_provider_duplicates_and_watchlist_overlap(self):
         for persist in (False, True):
             with self.subTest(persist=persist):
                 scanner = Mock(side_effect=lambda symbol, *args, **kwargs: scan_result(
-                    EntryDecisionCode.WAITING_SECOND_PULLBACK, symbol=symbol,
+                    EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, symbol=symbol,
                 ))
                 loader = Mock(side_effect=lambda symbol, **kwargs: trusted_scan_bundle(symbol=symbol))
                 repository = Mock() if persist else None
                 payload = run_once(
-                    DemoTradingConfig(universe_limit=2, watchlist_symbols=("BTC-USDT-SWAP",)), broker=None,
+                    DemoTradingConfig(universe_limit=3, watchlist_symbols=("BTC-USDT-SWAP",)), broker=None,
                     universe_provider=lambda limit: [OKXSwapTicker(symbol, 100, 1000)
-                                                     for symbol in ("BTC-USDT-SWAP", "ETH-USDT-SWAP")],
+                                                     for symbol in ("BTC-USDT-SWAP", "BTC-USDT-SWAP", "ETH-USDT-SWAP")],
                     candle_loader=loader, scanner=scanner, observation_repository=repository,
                 )
                 self.assertEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"], [call.args[0] for call in scanner.call_args_list])
                 self.assertEqual(2, loader.call_count)
                 self.assertEqual(2, len(payload["scans"]))
+                self.assertEqual(2, len(payload["orders"]))
                 if repository is not None:
                     self.assertEqual(2, len(repository.append_cycle.call_args.args[0].observations))
 

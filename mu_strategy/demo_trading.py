@@ -450,7 +450,7 @@ def _tickers_from_universe_snapshot(snapshot: UniverseSnapshot, *, limit: int) -
         return []
     crypto = _tickers_from_universe_rows(snapshot.crypto_top, limit=limit)
     stocks = _tickers_from_universe_rows(snapshot.stock_token_top, limit=limit)
-    return _dedupe_manifest_tickers([*crypto, *stocks])
+    return _dedupe_tickers([*crypto, *stocks])
 
 
 def _tickers_from_universe_rows(rows: tuple[dict, ...], *, limit: int) -> list[OKXSwapTicker]:
@@ -475,7 +475,7 @@ def _tickers_from_universe_rows(rows: tuple[dict, ...], *, limit: int) -> list[O
     return tickers
 
 
-def _dedupe_manifest_tickers(tickers: list[OKXSwapTicker]) -> list[OKXSwapTicker]:
+def _dedupe_tickers(tickers: list[OKXSwapTicker]) -> list[OKXSwapTicker]:
     deduped: list[OKXSwapTicker] = []
     seen: set[str] = set()
     for ticker in tickers:
@@ -499,7 +499,7 @@ def _load_universe(
         if context is not None:
             return _tickers_from_universe_snapshot(context.manifest.universe_snapshot, limit=limit)
         return trusted_manifest_universe_provider(limit=limit, data_dir=config.data_dir)
-    return universe_provider(limit=limit)
+    return _dedupe_tickers(universe_provider(limit=limit))
 
 
 def validate_universe_limit(limit: int) -> int:
