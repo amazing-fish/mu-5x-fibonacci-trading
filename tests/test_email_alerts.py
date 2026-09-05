@@ -269,6 +269,42 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual([original], [record["event_id"] for record in self.records(AlertKind.ENTRY_REVIEW)])
 
+    def assert_restart_runtime_failure_invalidates(self, runtime, outcome):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value += 1
+        events = self.state.events + (HealthEvent(2, self.clock.value, "restarted", ()),)
+        self.state = replace(self.state, run_id="service-2", phase=Phase.REFRESH,
+                             updated_at_ms=self.clock.value, deadline_ms=self.clock.value + 10,
+                             events=events, event_sequence=2)
+        if runtime == "stopped":
+            self.state = replace(self.state, running=False, phase=Phase.IDLE,
+                                 events=events + (HealthEvent(3, self.clock.value, "stopped", ()),), event_sequence=3)
+            self.running = False
+        elif runtime == "interrupted":
+            self.running = False
+        else:
+            self.clock.value += 11
+        self.state = ServiceState.from_dict(self.state.to_dict())
+        self.assertEqual(runtime, self.alerts.collect()["runtime"])
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertIsNone(invalidations[0]["suppressed_reason"])
+
+    def test_restart_stopped_before_first_cycle_withdraws_confirmed_entry(self):
+        self.assert_restart_runtime_failure_invalidates("stopped", DeliveryState.CONFIRMED)
+
+    def test_restart_interrupted_before_first_cycle_withdraws_unknown_entry(self):
+        self.assert_restart_runtime_failure_invalidates("interrupted", DeliveryState.UNKNOWN)
+
+    def test_restart_unresponsive_before_first_cycle_withdraws_confirmed_entry(self):
+        self.assert_restart_runtime_failure_invalidates("unresponsive", DeliveryState.CONFIRMED)
+
     def test_authoritative_failed_scan_or_persistence_withdraws_previous_entry(self):
         for status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.SUCCEEDED):
             with self.subTest(status=status):
