@@ -19,6 +19,7 @@ from mu_strategy.experiments.strategy_ladder import (
     SLIPPAGE_GRID_TICKS,
     StrategyLadderDataError,
     StrategyLadderOutputError,
+    StrategyLadderResult,
     apply_adverse_tick_slippage,
     build_cli_instrument,
     build_cli_output_paths,
@@ -27,6 +28,8 @@ from mu_strategy.experiments.strategy_ladder import (
     evaluate_strategy_ladder,
     momentum_target_long,
     overnight_target_long,
+    render_strategy_ladder_html,
+    render_strategy_ladder_report,
     run_long_only_candidate,
     run_strategy_ladder,
     summarize_windows,
@@ -395,6 +398,64 @@ class StrategyLadderCostTests(unittest.TestCase):
         self.assertEqual(
             [window.result.trade_count for window in existing],
             [window.result.trade_count for window in ladder_baseline.default_cell.windows],
+        )
+
+    def test_reports_disclose_evaluated_leverage_and_account_return_basis(self):
+        candles_15m, candles_1h = _walk_forward_candles(days=2)
+        registered = baseline_strategy_group("MU-USDT-SWAP")
+        evaluated = replace(registered, config=replace(registered.config, leverage=3.0))
+        with patch("mu_strategy.experiments.strategy_ladder.baseline_strategy_group", return_value=evaluated):
+            evaluations = evaluate_strategy_ladder(
+                candles_15m,
+                candles_1h,
+                symbol="MU-USDT-SWAP",
+                instrument=DEFAULT_MU_INSTRUMENT,
+                window_days=1,
+                windows=1,
+            )
+        index = build_conclusion_index(
+            evaluations, DEFAULT_MU_INSTRUMENT,
+            trusted_generation="report-generation", window_days=1, windows=1,
+        )
+        result = StrategyLadderResult(
+            "MU-USDT-SWAP", "report-generation", (), DEFAULT_MU_INSTRUMENT, evaluations, index,
+        )
+        original_index = index.to_json()
+        with patch(
+            "mu_strategy.experiments.strategy_ladder.baseline_strategy_group",
+            side_effect=AssertionError("rendering must use evaluated configuration"),
+        ):
+            markdown = render_strategy_ladder_report(result)
+            dashboard = render_strategy_ladder_html(result)
+
+        for output in (markdown, dashboard):
+            self.assertIn("Configured leverage", output)
+            self.assertIn("Account return", output)
+            self.assertIn("sum(window ending equity) / sum(window starting equity) - 1", output)
+            self.assertIn("not compounded across windows", output)
+            self.assertIn("not leverage- or risk-normalized", output)
+            self.assertIn("baseline uses staged position sizing", output)
+        for evaluation in evaluations:
+            candidate_id = evaluation.definition.candidate_id
+            family = evaluation.definition.family
+            leverage = "3x" if family == "baseline" else "1x"
+            self.assertIn(f"| {candidate_id} | {family} | {leverage} |", markdown)
+            self.assertIn(
+                f'<td>{candidate_id}</td><td>{family}</td><td class="num">{leverage}</td>',
+                dashboard,
+            )
+        self.assertEqual(original_index, index.to_json())
+        self.assertEqual(5.0, registered.config.leverage)
+
+    def test_default_report_discloses_five_x_baseline_and_one_x_local_candidates(self):
+        candles_15m, candles_1h = _walk_forward_candles(days=2)
+        evaluations = evaluate_strategy_ladder(
+            candles_15m, candles_1h, symbol="MU-USDT-SWAP", instrument=DEFAULT_MU_INSTRUMENT,
+            window_days=1, windows=1,
+        )
+        self.assertEqual(
+            [1.0, 1.0, 1.0, 1.0, 5.0],
+            [evaluation.configured_leverage for evaluation in evaluations],
         )
 
     def test_baseline_slippage_overlay_preserves_zero_tick_result_and_debits_two_sides(self):

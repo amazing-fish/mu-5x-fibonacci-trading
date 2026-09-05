@@ -45,6 +45,17 @@ MOMENTUM_HISTORY_DAYS = (MOMENTUM_HISTORY_HOURS + 23) // 24
 DEFAULT_FEE_BPS = STRATEGY_LADDER_DEFAULT_FEE_BPS
 TOP_N_TRADES = STRATEGY_LADDER_TOP_N
 PROTOCOL_VERSION = STRATEGY_LADDER_PROTOCOL_VERSION
+LOCAL_CANDIDATE_LEVERAGE = 1.0
+ACCOUNT_RETURN_BASIS = (
+    "Account return = sum(window ending equity) / sum(window starting equity) - 1. "
+    "Windows start independently; returns are not compounded across windows. "
+    "This is not a trade's return on committed margin."
+)
+RANKING_BASIS = (
+    "Ranks order raw account returns at each candidate's configured leverage; "
+    "they are not leverage- or risk-normalized. "
+    "Configured leverage is not constant exposure: baseline uses staged position sizing."
+)
 HOUR_MS = 3_600_000
 DEFAULT_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.md")
 DEFAULT_HTML_REPORT_PATH = Path("reports/live/mu_okx_strategy_ladder.html")
@@ -110,6 +121,7 @@ class StressCell:
 class CandidateEvaluation:
     definition: CandidateDefinition
     stress_grid: tuple[StressCell, ...]
+    configured_leverage: float
 
     @property
     def default_cell(self) -> StressCell:
@@ -231,7 +243,7 @@ def run_long_only_candidate(
             entry_price = trade_bar.open + slip
             if entry_price <= 0:
                 raise ValueError("slipped entry price must be positive")
-            notional = equity
+            notional = equity * LOCAL_CANDIDATE_LEVERAGE
             units = notional / entry_price
             open_fill = Fill(
                 time_ms=trade_bar.open_time_ms,
@@ -352,7 +364,10 @@ def evaluate_strategy_ladder(
                     window_results,
                     summarize_windows(window_results),
                 ))
-        evaluations.append(CandidateEvaluation(definition, tuple(cells)))
+        configured_leverage = (
+            baseline_config.leverage if definition.family == "baseline" else LOCAL_CANDIDATE_LEVERAGE
+        )
+        evaluations.append(CandidateEvaluation(definition, tuple(cells), configured_leverage))
     return tuple(evaluations)
 
 
@@ -462,18 +477,21 @@ def render_strategy_ladder_report(result: StrategyLadderResult) -> str:
         f"- tick size: {format(result.instrument.tick_size, 'f')}",
         f"- momentum pre-window history: {MOMENTUM_HISTORY_HOURS} closed-hour slots; executions remain window-local",
         f"- data files: {', '.join(str(path) for path in result.data_files) if result.data_files else '-'}",
+        f"- {ACCOUNT_RETURN_BASIS}",
+        f"- {RANKING_BASIS}",
         "- status rule: candidate only when at least one family variant trades and has non-negative return in every stress cell; otherwise stress_failed.",
         "",
-        "## Ranking",
+        "## Raw account-return ranking",
         "",
-        "| Rank | Candidate | Family | Return | Max drawdown | Trades | Win rate | Top-5 trade concentration | Stress status |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---|",
+        "| Rank | Candidate | Family | Configured leverage | Account return | Max drawdown | Trades | Win rate | Top-5 trade concentration | Stress status |",
+        "|---:|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for rank, evaluation in enumerate(ranked, start=1):
         summary = evaluation.default_cell.summary
         concentration = trade_concentration(summary.trades, top_n=TOP_N_TRADES)
         lines.append(
             f"| {rank} | {evaluation.definition.candidate_id} | {evaluation.definition.family} | "
+            f"{evaluation.configured_leverage:g}x | "
             f"{summary.total_return_pct:.4%} | {summary.max_drawdown_pct:.4%} | {summary.trade_count} | "
             f"{summary.win_rate:.4%} | {_format_optional_pct(concentration.top_n_share_of_net_pnl)} | "
             f"{'candidate' if evaluation.survives_stress_grid else 'stress_failed'} |"
@@ -514,7 +532,10 @@ def render_strategy_ladder_html(result: StrategyLadderResult) -> str:
 <body><main>
   <h1>{html.escape(result.symbol)} Strategy Candidate Ladder</h1>
   <div class="meta">Trusted generation: {html.escape(result.run_id or '-')} · Protocol: {PROTOCOL_VERSION} · Tick size: {html.escape(format(result.instrument.tick_size, 'f'))} · Momentum history: {MOMENTUM_HISTORY_HOURS} hours, window-local executions</div>
-  <div class="panel"><table><thead><tr><th>Rank</th><th>Candidate</th><th>Family</th><th>Return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th><th>Top-5 concentration</th><th>Status</th></tr></thead><tbody>{ranking_rows}</tbody></table></div>
+  <p>{html.escape(ACCOUNT_RETURN_BASIS)}</p>
+  <p>{html.escape(RANKING_BASIS)}</p>
+  <h2>Raw account-return ranking</h2>
+  <div class="panel"><table><thead><tr><th>Rank</th><th>Candidate</th><th>Family</th><th>Configured leverage</th><th>Account return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th><th>Top-5 concentration</th><th>Status</th></tr></thead><tbody>{ranking_rows}</tbody></table></div>
   {candidate_sections}
   <p class="meta">Research artifact only; not financial advice.</p>
 </main></body></html>"""
@@ -746,11 +767,12 @@ def _candidate_report_lines(evaluation: CandidateEvaluation) -> list[str]:
         "",
         f"- family: {evaluation.definition.family}",
         f"- source: {evaluation.definition.source}",
+        f"- Configured leverage: {evaluation.configured_leverage:g}x",
         f"- stress status: {'candidate' if evaluation.survives_stress_grid else 'stress_failed'}",
         "",
         "### Per-window results (default cost)",
         "",
-        "| Window | UTC range | Candles | Return | Max drawdown | Trades | Win rate |",
+        "| Window | UTC range | Candles | Account return | Max drawdown | Trades | Win rate |",
         "|---:|---|---:|---:|---:|---:|---:|",
     ]
     for window in evaluation.default_cell.windows:
@@ -763,7 +785,7 @@ def _candidate_report_lines(evaluation: CandidateEvaluation) -> list[str]:
         "",
         "### Fee × slippage stress grid",
         "",
-        "| Fee (bp/side) | Slippage (ticks/side) | Return | Max drawdown | Trades | Win rate |",
+        "| Fee (bp/side) | Slippage (ticks/side) | Account return | Max drawdown | Trades | Win rate |",
         "|---:|---:|---:|---:|---:|---:|",
     ])
     for cell in evaluation.stress_grid:
@@ -781,6 +803,7 @@ def _ranking_html_row(rank: int, evaluation: CandidateEvaluation) -> str:
         "<tr>"
         f"<td class=\"num\">{rank}</td><td>{html.escape(evaluation.definition.candidate_id)}</td>"
         f"<td>{html.escape(evaluation.definition.family)}</td>"
+        f"<td class=\"num\">{evaluation.configured_leverage:g}x</td>"
         f"<td class=\"num\">{summary.total_return_pct:.4%}</td>"
         f"<td class=\"num\">{summary.max_drawdown_pct:.4%}</td>"
         f"<td class=\"num\">{summary.trade_count}</td><td class=\"num\">{summary.win_rate:.4%}</td>"
@@ -807,12 +830,12 @@ def _candidate_html_section(evaluation: CandidateEvaluation) -> str:
     )
     return (
         f"<h2>{html.escape(evaluation.definition.candidate_id)}</h2>"
-        f"<div class=\"meta\">{html.escape(evaluation.definition.label)} · Source: {html.escape(evaluation.definition.source)}</div>"
+        f"<div class=\"meta\">{html.escape(evaluation.definition.label)} · Source: {html.escape(evaluation.definition.source)} · Configured leverage: {evaluation.configured_leverage:g}x</div>"
         "<h3>Per-window results (default cost)</h3><div class=\"panel\"><table><thead><tr>"
-        "<th>Window</th><th>UTC range</th><th>Candles</th><th>Return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th>"
+        "<th>Window</th><th>UTC range</th><th>Candles</th><th>Account return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th>"
         f"</tr></thead><tbody>{window_rows}</tbody></table></div>"
         "<h3>Fee × slippage stress grid</h3><div class=\"panel\"><table><thead><tr>"
-        "<th>Fee (bp/side)</th><th>Slippage (ticks/side)</th><th>Return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th>"
+        "<th>Fee (bp/side)</th><th>Slippage (ticks/side)</th><th>Account return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th>"
         f"</tr></thead><tbody>{stress_rows}</tbody></table></div>"
     )
 
