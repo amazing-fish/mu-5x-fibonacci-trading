@@ -1,7 +1,7 @@
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mu_strategy.demo_trading import DemoTradingConfig, run_once
 from mu_strategy.entry.scanner import EntryScanResult
@@ -13,7 +13,29 @@ from mu_strategy.models import Candle
 
 
 class DataHealthConsumerTests(unittest.TestCase):
-    def test_live_demo_scans_fresh_shared_bundle_with_empty_statuses_as_legacy(self):
+    def test_confirmed_demo_retains_fresh_legacy_bundle_and_unknown_result_compatibility(self):
+        bundle = _empty_status_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=900_000)
+        broker = Mock()
+        broker.get_positions.return_value = {"code": "0", "data": []}
+        broker.get_open_orders.return_value = {"code": "0", "data": []}
+        broker.get_instruments.return_value = {
+            "code": "0", "data": [{"instId": "BTC-USDT-SWAP", "tickSz": "0.1", "lotSz": "0.01", "ctVal": "0.01"}],
+        }
+        broker.set_leverage.return_value = {"code": "0", "data": []}
+        broker.place_limit_buy.return_value = {"code": "0", "data": [{"ordId": "fake", "sCode": "0"}]}
+        scanner = Mock(return_value=_entry("BTC-USDT-SWAP"))
+        with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1_800_000):
+            payload = run_once(
+                DemoTradingConfig(dry_run=False, universe_limit=1, watchlist_symbols=()), broker=broker,
+                universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 100, 1000)],
+                candle_loader=lambda symbol, **kwargs: bundle, scanner=scanner,
+            )
+        scanner.assert_called_once()
+        self.assertEqual([], payload["data_errors"])
+        self.assertEqual("submitted", payload["orders"][0]["status"])
+        broker.place_limit_buy.assert_called_once()
+
+    def test_dry_run_blocks_fresh_legacy_bundle_without_canonical_provenance(self):
         scanned = []
         bundle = _empty_status_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=900_000)
 
@@ -34,10 +56,10 @@ class DataHealthConsumerTests(unittest.TestCase):
                 or _entry(symbol),
             )
 
-        self.assertEqual([("BTC-USDT-SWAP", 1, 1)], scanned)
-        self.assertEqual([], result["data_errors"])
-        self.assertEqual("enter", result["scans"][0]["action"])
-        self.assertEqual("planned", result["orders"][0]["status"])
+        self.assertEqual([], scanned)
+        self.assertEqual("trusted_provenance_incomplete", result["data_errors"][0]["reason"])
+        self.assertEqual("skip", result["scans"][0]["action"])
+        self.assertEqual([], result["orders"])
 
     def test_live_demo_blocks_stale_shared_bundle_with_empty_statuses_by_legacy_age_fallback(self):
         bundle = _empty_status_legacy_bundle("BTC-USDT-SWAP", last_open_time_ms=0)

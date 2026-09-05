@@ -2,6 +2,7 @@ import io
 import json
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,7 @@ from mu_strategy.market_data.trusted_data.contracts import TrustedConsumerRefres
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import Candle, EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.strategies.registry import baseline_strategy_group
+from tests.factories.scan_cycle import trusted_scan_bundle
 
 
 class StubBroker:
@@ -1107,21 +1109,7 @@ class OKXDemoLoopTests(unittest.TestCase):
 
 
 def _bundle(symbol: str) -> CandleBundle:
-    from mu_strategy.market_data.trusted_data.contracts import HealthReason, TrustDecision
-
-    last_open_time_ms = int(time.time() * 1000) - 900_000
-    first_open_time_ms = last_open_time_ms - (39 * 900_000)
-    candles = [
-        Candle(first_open_time_ms + index * 900_000, 100.0, 101.0, 99.0, 100.0 + index * 0.01, 1000.0)
-        for index in range(40)
-    ]
-    return CandleBundle(
-        symbol=ResolvedSymbol(requested=symbol, inst_id=symbol, source="okx"),
-        candles_by_interval={"15m": candles, "1h": candles},
-        files_by_interval={},
-        days=28,
-        trust_decision=TrustDecision(True, HealthReason.OK),
-    )
+    return replace(trusted_scan_bundle(symbol=symbol), run_id=None, observed_at_ms=None, files_by_interval={})
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:
@@ -1204,6 +1192,11 @@ def _scan_result(symbol: str, *, action: str, trigger_price: float = 100.0) -> E
         trigger_price=trigger_price,
         initial_stop=98.0,
         signal_time_ms=123,
+        decision_code={
+            "enter": EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY,
+            "wait": EntryDecisionCode.WAITING_SECOND_PULLBACK,
+            "watch": EntryDecisionCode.UNKNOWN,
+        }[action],
     )
 
 

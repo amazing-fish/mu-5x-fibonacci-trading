@@ -3,7 +3,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mu_strategy.models import Candle
 
@@ -214,6 +214,7 @@ class TrustedStateSeparationTests(unittest.TestCase):
                 universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 100.0, 1.0)],
                 candle_loader=lambda symbol, **kwargs: legacy_bundle,
                 scanner=lambda *args, **kwargs: self.fail("legacy loader must be adapted and blocked"),
+                observation_clock=Mock(now_ms=lambda: 1_800_000),
             )
 
         self.assertEqual([], result["orders"])

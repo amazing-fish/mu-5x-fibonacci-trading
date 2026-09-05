@@ -16,6 +16,7 @@ from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bu
 from mu_strategy.market_data.trusted_data.contracts import (
     Clock,
     FreshnessState,
+    HealthReason,
     SystemClock,
     TrustedConsumerRefreshError,
     TrustedLoadContext,
@@ -27,8 +28,9 @@ from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import EntryDecisionCode
-from mu_strategy.observations import JsonlObservationRepository, ObservationRepository
-from mu_strategy.stage0 import Stage0CycleRecorder
+from mu_strategy.observations import JsonlObservationRepository, ObservationFailureCode, ObservationRepository
+from mu_strategy.scan_cycle import ScanCycle, ScanDataFailure
+from mu_strategy.stage0 import persist_observation_cycle
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -76,13 +78,9 @@ def run_once(
         observation_repository = JsonlObservationRepository(config.observation_log_path)
     if observation_repository is not None and not config.dry_run:
         raise ValueError("Stage 0 observation persistence is available only for dry-run cycles")
-    stage0_recorder = (
-        Stage0CycleRecorder(
-            observation_repository,
-            clock=observation_clock,
-            id_factory=observation_id_factory,
-        )
-        if observation_repository is not None
+    scan_cycle = (
+        ScanCycle(clock=observation_clock, id_factory=observation_id_factory)
+        if config.dry_run
         else None
     )
     default_trusted_loader = candle_loader is None
@@ -195,27 +193,25 @@ def run_once(
     loaded_data_errors: dict[str, dict[str, Any] | None] = {}
 
     for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
-        bundle, data_error = _load_cycle_bundle(
+        bundle, data_failure = _load_cycle_bundle(
             ticker.inst_id,
             config=config,
             candle_loader=candle_loader,
             default_trusted_loader=default_trusted_loader,
             trusted_context=trusted_context,
         )
+        data_error = data_failure.payload if data_failure is not None else None
         loaded_bundles[ticker.inst_id] = bundle
         loaded_data_errors[ticker.inst_id] = data_error
         result = None
         requested_intervals = ("15m", "1h")
-        if data_error is not None:
-            data_errors.append(data_error)
-
         if bundle is not None:
             cycle_run_id = cycle_run_id or bundle.run_id
 
         strategy_group = baseline_strategy_group(ticker.inst_id)
         strategy_config = strategy_group.config
-        if stage0_recorder is not None:
-            staged = stage0_recorder.observe_symbol(
+        if scan_cycle is not None:
+            outcome = scan_cycle.scan_symbol(
                 symbol=ticker.inst_id,
                 source=ticker.source,
                 bundle=bundle,
@@ -223,59 +219,40 @@ def run_once(
                 strategy_name=strategy_group.name,
                 strategy_config=strategy_config,
                 scanner=scanner,
-                data_error=data_error,
+                data_failure=data_failure,
             )
-            if data_error is None and staged.data_error is not None:
-                data_errors.append(staged.data_error)
-            data_error = staged.data_error
-            result = staged.scan_result
-            if result is None:
-                result = (
-                    _stale_scan_result(ticker.inst_id, bundle, data_error)
-                    if bundle is not None
-                    else _data_error_scan_result(ticker.inst_id, data_error)
-                )
-                if bundle is not None:
-                    scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
-                else:
-                    scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
+            result = outcome.scan_result
+            data_error = outcome.data_error
+        elif bundle is not None and data_error is None:
+            # Confirmed Demo retains its existing compatibility boundary.
+            result = scanner(
+                ticker.inst_id,
+                bundle.candles_by_interval.get("15m", []),
+                bundle.candles_by_interval.get("1h", []),
+                config=strategy_config,
+            )
+
+        if data_error is not None:
+            data_errors.append(data_error)
+            result = (
+                _stale_scan_result(ticker.inst_id, bundle, data_error)
+                if bundle is not None
+                else _data_error_scan_result(ticker.inst_id, data_error)
+            )
+            if bundle is not None:
+                scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
             else:
-                scan_results.append(result)
-                scans.append(
-                    _scan_payload(
-                        result,
-                        bundle,
-                        source=ticker.source,
-                        second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
-                    )
-                )
+                scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
         else:
-            if data_error is not None:
-                result = (
-                    _stale_scan_result(ticker.inst_id, bundle, data_error)
-                    if bundle is not None
-                    else _data_error_scan_result(ticker.inst_id, data_error)
+            scan_results.append(result)
+            scans.append(
+                _scan_payload(
+                    result,
+                    bundle,
+                    source=ticker.source,
+                    second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
                 )
-                if bundle is not None:
-                    scans.append(_stale_scan_payload(result, bundle, data_error, source=ticker.source))
-                else:
-                    scans.append(_data_error_scan_payload(result, data_error, source=ticker.source))
-            if bundle is not None and data_error is None:
-                result = scanner(
-                    ticker.inst_id,
-                    bundle.candles_by_interval.get("15m", []),
-                    bundle.candles_by_interval.get("1h", []),
-                    config=strategy_config,
-                )
-                scan_results.append(result)
-                scans.append(
-                    _scan_payload(
-                        result,
-                        bundle,
-                        source=ticker.source,
-                        second_pullback_wait_bars=strategy_config.second_pullback_wait_bars,
-                    )
-                )
+            )
 
         if not config.dry_run:
             stale_orders = _expire_stale_limit_orders(
@@ -314,13 +291,14 @@ def run_once(
             bundle = loaded_bundles[symbol]
             data_error = loaded_data_errors[symbol]
         else:
-            bundle, data_error = _load_cycle_bundle(
+            bundle, data_failure = _load_cycle_bundle(
                 symbol,
                 config=config,
                 candle_loader=candle_loader,
                 default_trusted_loader=default_trusted_loader,
                 trusted_context=trusted_context,
             )
+            data_error = data_failure.payload if data_failure is not None else None
             loaded_bundles[symbol] = bundle
             loaded_data_errors[symbol] = data_error
             if data_error is not None:
@@ -351,8 +329,10 @@ def run_once(
     exit_observation_status["position_count"] = sum(len(rows) for rows in exit_position_rows_by_inst_id.values())
     exit_observation_status["observation_count"] = len(exit_observations)
 
-    if stage0_recorder is not None:
-        stage0_recorder.commit()
+    if scan_cycle is not None:
+        cycle = scan_cycle.observations()
+        if observation_repository is not None:
+            persist_observation_cycle(observation_repository, cycle)
 
     for result in scan_results:
         if result.symbol not in entry_eligible_inst_ids:
@@ -675,7 +655,7 @@ def _load_cycle_bundle(
     candle_loader: CandleLoader,
     default_trusted_loader: bool,
     trusted_context: TrustedLoadContext | None,
-) -> tuple[CandleBundle | None, dict[str, Any] | None]:
+) -> tuple[CandleBundle | None, ScanDataFailure | None]:
     requested_intervals = ("15m", "1h")
     try:
         loader_kwargs = {
@@ -693,7 +673,11 @@ def _load_cycle_bundle(
         if not _is_plain_legacy_bundle(bundle):
             bundle = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
     except Exception as exc:
-        return None, _market_data_load_error(symbol, exc)
+        return None, ScanDataFailure(
+            ObservationFailureCode.TRUSTED_DATA_LOAD_FAILED,
+            HealthReason.CACHE_READ_FAILED,
+            _market_data_load_error(symbol, exc),
+        )
 
     return bundle, _market_data_freshness_error(
         symbol=symbol,
@@ -726,7 +710,7 @@ def _market_data_freshness_error(
     bundle: CandleBundle,
     requested_intervals: tuple[str, ...],
     max_staleness_bars: int,
-) -> dict[str, Any] | None:
+) -> ScanDataFailure | None:
     if _is_plain_legacy_bundle(bundle):
         legacy_error = _plain_legacy_market_data_staleness_error(
             symbol=symbol,
@@ -739,17 +723,25 @@ def _market_data_freshness_error(
     else:
         trust_error = trust_error_payload(symbol, bundle, requested_intervals=requested_intervals)
         if trust_error is not None:
-            return trust_error
+            return ScanDataFailure(
+                ObservationFailureCode.TRUSTED_DATA_BLOCKED,
+                bundle.trust_decision.reason,
+                trust_error,
+            )
     for interval in requested_intervals:
         candles = bundle.candles_by_interval.get(interval) or []
         if not candles:
-            return {
-                "symbol": symbol,
-                "reason": "market_data_missing",
-                "interval": interval,
-                "latest_open_time_ms": None,
-                "source_file": str(bundle.files_by_interval.get(interval, "")),
-            }
+            return ScanDataFailure(
+                ObservationFailureCode.TRUSTED_DATA_BLOCKED,
+                HealthReason.CACHE_MISSING,
+                {
+                    "symbol": symbol,
+                    "reason": "market_data_missing",
+                    "interval": interval,
+                    "latest_open_time_ms": None,
+                    "source_file": str(bundle.files_by_interval.get(interval, "")),
+                },
+            )
     return None
 
 
@@ -768,7 +760,7 @@ def _plain_legacy_market_data_staleness_error(
     bundle: Any,
     requested_intervals: tuple[str, ...],
     max_staleness_bars: int,
-) -> dict[str, Any] | None:
+) -> ScanDataFailure | None:
     policy = FreshnessPolicy(max_staleness_bars=max_staleness_bars)
     now_ms = SystemClock().now_ms()
     for interval in requested_intervals:
@@ -783,14 +775,18 @@ def _plain_legacy_market_data_staleness_error(
         )
         if freshness.state == FreshnessState.FRESH:
             continue
-        return {
-            "symbol": symbol,
-            "reason": "market_data_stale",
-            "interval": interval,
-            "status_reason": freshness.reason.value,
-            "latest_open_time_ms": latest.open_time_ms,
-            "source_file": str(getattr(bundle, "files_by_interval", {}).get(interval, "")),
-        }
+        return ScanDataFailure(
+            ObservationFailureCode.TRUSTED_DATA_BLOCKED,
+            freshness.reason,
+            {
+                "symbol": symbol,
+                "reason": "market_data_stale",
+                "interval": interval,
+                "status_reason": freshness.reason.value,
+                "latest_open_time_ms": latest.open_time_ms,
+                "source_file": str(getattr(bundle, "files_by_interval", {}).get(interval, "")),
+            },
+        )
     return None
 
 
