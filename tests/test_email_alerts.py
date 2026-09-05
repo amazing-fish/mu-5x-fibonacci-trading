@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -29,6 +31,11 @@ from tests.factories.scan_cycle import scan_result, trusted_scan_bundle
 
 SYMBOL = "MU-USDT-SWAP"
 CONFIG = SmtpConfig("smtp.126.com", "sender@example.test", "reader@example.test", "fake-test-authorization")
+
+
+def smtp_client():
+    return Mock(mail=Mock(return_value=(250, b"OK")), rcpt=Mock(return_value=(250, b"OK")),
+                docmd=Mock(return_value=(354, b"continue")), getreply=Mock(return_value=(250, b"accepted")))
 
 
 class Clock:
@@ -321,7 +328,7 @@ class EmailAlertsTests(unittest.TestCase):
         self.state = previous
         writer = []
         with ThreadPoolExecutor(max_workers=1) as pool:
-            def during_send(event):
+            def during_send(event, **kwargs):
                 with self.assertRaises(FileLockBusyError):
                     with self.alerts.observations.publication_fence(wait=False):
                         self.fail("send must retain the publication fence")
@@ -356,7 +363,7 @@ class EmailAlertsTests(unittest.TestCase):
         stopped = replace(self.state, running=False)
         writer = []
         with ThreadPoolExecutor(max_workers=1) as pool:
-            def during_send(event):
+            def during_send(event, **kwargs):
                 with self.assertRaises(FileLockBusyError):
                     with locked_file(self.health.publication_lock_path, wait=False):
                         self.fail("health publisher could bypass send fence")
@@ -504,7 +511,7 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
 
-    def test_unmatched_equal_timestamp_cycle_does_not_inherit_observation_run(self):
+    def test_unmatched_equal_timestamp_cycle_does_not_inherit_collection_run(self):
         self.publish()
         self.alerts.collect()
         self.alerts.deliver(self.transport)
@@ -521,29 +528,83 @@ class EmailAlertsTests(unittest.TestCase):
         with self.alerts.store.connection() as db:
             stream = self.alerts.store.stream(db, SYMBOL)
             self.assertEqual("service-1", stream["service_run_id"])
-            self.assertIsNone(stream["observed_run_id"])
+            self.assertEqual("service-2", stream["collection_run_id"])
         self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
         self.state = current
         self.assertTrue(self.alerts.collect()["caught_up"])
         self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
 
-    def test_observation_run_binding_roundtrip_and_invalid_values(self):
+    def test_collection_run_roundtrip_and_invalid_values(self):
         self.publish()
         self.alerts.collect()
         with self.alerts.store.connection() as db:
             original = self.alerts.store.stream(db, SYMBOL)
-            for run_id in (None, "service-1"):
-                value = dict(original, observed_run_id=run_id)
+            for run_id in (None, "service-1", "different-run"):
+                value = dict(original, collection_run_id=run_id)
                 self.alerts.store.save_stream(db, SYMBOL, value)
                 self.assertEqual(value, self.alerts.store.stream(db, SYMBOL))
-            for run_id in ("", 1, True, [], {}, "different-run"):
+            for run_id in ("", 1, True, [], {}):
                 with self.subTest(run_id=run_id), self.assertRaises(NotificationError):
                     with self.alerts.store.transaction(db):
-                        self.alerts.store.save_stream(db, SYMBOL, dict(original, observed_run_id=run_id))
+                        self.alerts.store.save_stream(db, SYMBOL, dict(original, collection_run_id=run_id))
             with self.assertRaises(NotificationError), self.alerts.store.transaction(db):
                 value = dict(original)
-                del value["observed_run_id"]
+                del value["collection_run_id"]
                 self.alerts.store.save_stream(db, SYMBOL, value)
+
+    def assert_prior_run_consumption_proves_order(self, outcome):
+        self.publish()
+        self.alerts.collect()
+        if outcome is not DeliveryState.PENDING:
+            self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+            self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        previous = self.state
+        self.clock.value += 100
+        self.publish(generation="new-generation")
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertEqual("historical_event" if outcome is DeliveryState.PENDING else None, invalidations[0]["suppressed_reason"])
+
+    def test_prior_run_consumption_proves_order_without_health_catching_up(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.CONFIRMED)
+
+    def test_prior_run_unknown_entry_is_withdrawn_after_failed_restart(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.UNKNOWN)
+
+    def test_prior_run_unsent_entry_is_suppressed_after_failed_restart(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.PENDING)
+
+    def test_unknown_cross_run_order_blocks_entry_and_reports_authoritative_fault(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 100
+        self.publish(generation="unmatched-generation")
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2", events=self.state.events +
+                     (HealthEvent(2, self.clock.value, "fault", ("scan.failed",)),))
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        view = self.alerts.collect()
+        self.assertFalse(view["source_healthy"])
+        self.assertFalse(view["caught_up"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.transport.send.assert_called_once()
+        self.assertEqual(AlertKind.SERVICE_FAULT, self.transport.send.call_args.args[0].kind)
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
 
     def test_health_snapshot_io_failure_follows_source_fault_path(self):
         self.publish()
@@ -950,7 +1011,7 @@ class EmailAlertsTests(unittest.TestCase):
     def test_send_holds_write_fence_but_status_can_read_unknown(self):
         self.publish()
         self.alerts.collect()
-        def send(event):
+        def send(event, **kwargs):
             self.assertEqual("unknown", self.alerts.store.status()["records"][0]["state"])
             with self.alerts.store.connection() as db:
                 db.execute("PRAGMA busy_timeout=0")
@@ -1216,11 +1277,87 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         with self.alerts.store.connection() as db:
             event = self.alerts.store.record(db, self.entry_id()).event
-        client = Mock(send_message=Mock(return_value={}))
+        client = smtp_client()
         client.login.side_effect = lambda *args: setattr(self.clock, "value", event.review_until_ms)
-        result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(event)
+        result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(event, source_is_current=lambda: True)
         self.assertEqual((DeliveryState.FAILED, "entry_review_expired"), (result.state, result.code))
-        client.send_message.assert_not_called()
+        client.send.assert_not_called()
+
+    def test_smtp_rechecks_runtime_after_all_setup_waits(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        for phase in ("login", "mail", "rcpt", "docmd"):
+            with self.subTest(phase=phase):
+                self.state = replace(self.state, deadline_ms=self.clock.value + 10)
+                client = smtp_client()
+                response = getattr(client, phase).return_value
+                def slow(*args):
+                    self.clock.value += 11
+                    return response
+                getattr(client, phase).side_effect = slow
+                result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(
+                    event, source_is_current=self.alerts._source_current_before_data)
+                self.assertEqual((DeliveryState.FAILED, "entry_source_unavailable", True),
+                                 (result.state, result.code, result.retryable))
+                client.send.assert_not_called()
+                client.close.assert_called_once()
+
+    def test_sender_rechecks_supervisor_liveness_after_data_354(self):
+        self.publish()
+        self.alerts.collect()
+        client = smtp_client()
+        def stopped(*args):
+            self.running = False
+            return (354, b"continue")
+        client.docmd.side_effect = stopped
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        self.assertEqual(1, self.alerts.deliver(transport))
+        client.send.assert_not_called()
+        self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.assertEqual("entry_source_unavailable", self.alerts.store.status(event_id=self.entry_id())["history"][-1]["result"])
+        with self.alerts.observations.publication_fence(wait=False):
+            pass
+
+    def test_post_354_health_read_failure_is_definite_unsent(self):
+        self.publish()
+        self.alerts.collect()
+        client = smtp_client()
+        def unreadable(*args):
+            self.snapshot.side_effect = HealthSnapshotUnstableError("private diagnostic")
+            return (354, b"continue")
+        client.docmd.side_effect = unreadable
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        self.alerts.deliver(transport)
+        client.send.assert_not_called()
+        self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.assertNotIn("private diagnostic", str(self.alerts.store.status(event_id=self.entry_id())))
+
+    def test_smtp_rechecks_email_deadline_after_354_response(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        client = smtp_client()
+        def delayed(*args):
+            self.clock.value = event.review_until_ms
+            return (354, b"continue")
+        client.docmd.side_effect = delayed
+        result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(
+            event, source_is_current=lambda: True)
+        self.assertEqual("entry_review_expired", result.code)
+        client.send.assert_not_called()
+
+    def test_entry_transport_requires_current_source_validation(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        factory = Mock()
+        with self.assertRaises(NotificationError):
+            SmtpTransport(CONFIG, factory=factory, clock=self.clock).send(event)
+        factory.assert_not_called()
 
     def test_signal_service_committed_cycle_to_fake_smtp_end_to_end(self):
         cycle = self.publish(append=False)
@@ -1233,7 +1370,7 @@ class EmailAlertsTests(unittest.TestCase):
                 alerts.observations.append_cycle(cycle)
                 return subprocess.CompletedProcess(argv, 0, json.dumps(scan), "")
             return subprocess.CompletedProcess(argv, 0, json.dumps(refresh), "")
-        client = Mock(send_message=Mock(return_value={}))
+        client = smtp_client()
         transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
         def on_cycle(view):
             self.assertTrue(view["healthy"])
@@ -1241,7 +1378,7 @@ class EmailAlertsTests(unittest.TestCase):
             self.assertEqual(1, alerts.deliver(transport))
         SignalService(ServiceConfig(data_dir=self.data_dir), clock=self.clock,
                       processes=Mock(run=Mock(side_effect=run))).run(cycles=1, on_cycle=on_cycle)
-        self.assertEqual(1, client.send_message.call_count)
+        self.assertEqual(1, client.send.call_count)
         self.assertEqual("confirmed", alerts.store.status()["records"][0]["state"])
         alerts.collect()
         self.assertEqual(1, len([row for row in alerts.store.status()["records"] if row["kind"] == "service_fault"]))
@@ -1279,7 +1416,7 @@ class SmtpAndCommandTests(unittest.TestCase):
         return AlertEvent(AlertKind.SERVICE_FAULT, "a" * 64, 1000, None, "health_event", problems=("refresh.failed",))
 
     def client(self):
-        return Mock(send_message=Mock(return_value={}))
+        return smtp_client()
 
     def test_ssl_authentication_and_single_recipient_with_fixed_message_id(self):
         client = self.client()
@@ -1289,8 +1426,8 @@ class SmtpAndCommandTests(unittest.TestCase):
         self.assertEqual(("smtp.126.com", 465), factory.call_args.args)
         self.assertTrue(factory.call_args.kwargs["context"].check_hostname)
         self.assertEqual(ssl.CERT_REQUIRED, factory.call_args.kwargs["context"].verify_mode)
-        self.assertEqual([CONFIG.recipient], client.send_message.call_args.kwargs["to_addrs"])
-        message = client.send_message.call_args.args[0]
+        client.rcpt.assert_called_once_with(CONFIG.recipient)
+        message = BytesParser(policy=default).parsebytes(client.send.call_args.args[0][:-3])
         self.assertIn(self.event().event_id, message["Message-ID"])
         self.assertEqual("text/plain", message.get_content_type())
         self.assertNotIn(CONFIG.authorization_code, message.as_string())
@@ -1311,7 +1448,7 @@ class SmtpAndCommandTests(unittest.TestCase):
                 if phase == "connect":
                     factory.side_effect = error
                 else:
-                    (client.login if phase == "login" else client.send_message).side_effect = error
+                    (client.login if phase == "login" else client.send).side_effect = error
                 result = SmtpTransport(CONFIG, factory=factory).send(self.event())
                 self.assertEqual((expected, retryable), (result.state, result.retryable))
                 self.assertNotIn("secret", repr(result))
@@ -1320,6 +1457,31 @@ class SmtpAndCommandTests(unittest.TestCase):
         client = self.client()
         client.close.side_effect = OSError("close")
         self.assertEqual(DeliveryState.CONFIRMED, SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event()).state)
+
+    def test_smtp_envelope_and_final_response_rejections(self):
+        for phase, code, retryable in (("mail", 550, False), ("rcpt", 450, True),
+                                       ("docmd", 550, False), ("getreply", 451, True)):
+            with self.subTest(phase=phase):
+                client = self.client()
+                getattr(client, phase).return_value = (code, b"private diagnostic")
+                result = SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event())
+                self.assertEqual((DeliveryState.FAILED, retryable), (result.state, result.retryable))
+                if phase != "getreply":
+                    client.send.assert_not_called()
+                self.assertNotIn("private diagnostic", repr(result))
+
+    def test_smtp_data_framing_uses_crlf_and_dot_stuffing(self):
+        from email.message import EmailMessage
+        message = EmailMessage()
+        message.set_content(".first\n.\n..last\n", cte="quoted-printable")
+        client = self.client()
+        with patch("mu_strategy.notifications.smtp.render_message", return_value=message):
+            result = SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event())
+        self.assertEqual(DeliveryState.CONFIRMED, result.state)
+        payload = client.send.call_args.args[0]
+        self.assertTrue(payload.endswith(b"\r\n..first\r\n..\r\n...last\r\n.\r\n"))
+        self.assertNotIn(b"\n", payload.replace(b"\r\n", b""))
+        client.docmd.assert_called_once_with("DATA")
 
     def test_missing_credentials_and_header_injection_rejected(self):
         with self.assertRaises(NotificationError):

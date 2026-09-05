@@ -59,7 +59,8 @@ class EmailAlerts:
                 if previous_hash is None:
                     self.store.record_cycle(db, cycle.cycle_id, cycle_hash)
                     for observation in cycle.observations:
-                        self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None)
+                        self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None,
+                                      collection_run_id=state.run_id if state else None)
                     self.store.set_meta(db, "last_cycle_sha256", cycle_hash)
             self.store.set_meta(db, "observation_cursor", list(next_cursor))
             caught_up = current is not None and self.store.get_meta(db, "last_cycle_sha256") == current_hash
@@ -67,8 +68,8 @@ class EmailAlerts:
             # on a later poll with no new log bytes, including after clock rollback.
             if caught_up and current_run is not None:
                 for observation in current.observations:
-                    if self.store.stream(db, observation.symbol)["observed_run_id"] != current_run:
-                        self._observe(db, observation, now, service_run_id=current_run)
+                    if self.store.stream(db, observation.symbol)["service_run_id"] != current_run:
+                        self._observe(db, observation, now, service_run_id=current_run, collection_run_id=state.run_id)
             self._health_events(db, state, now)
             if view["runtime"] != "running" or view["healthy"]:
                 self._runtime(db, view["runtime"], state.run_id if state else None, now)
@@ -84,12 +85,12 @@ class EmailAlerts:
                     self.store.suppress(db, entry.event.event_id, "review_expired", now)
                 latest = state.last_cycle if state else None
                 # A completed failed scan/write has no committed cycle to match.
-                # Known evidence from a previous run precedes this attempt even
-                # across clock rollback. An unmatched new log has no run binding
-                # yet; do not infer its provenance from the ordering epoch.
+                # Evidence already consumed under a previous health run predates
+                # this new run's attempt even across clock rollback. This causal
+                # bound is not the log's source owner or its ordering epoch.
                 failed_attempt = (latest is not None and latest.service_run_id == state.run_id
                                   and (latest.scan.status is not StepStatus.SUCCEEDED or latest.scan.persistence is not StepStatus.SUCCEEDED)
-                                  and (stream["observed_run_id"] not in {None, latest.service_run_id}
+                                  and (stream["collection_run_id"] not in {None, latest.service_run_id}
                                        or max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms))
                 if runtime_failed or failed_attempt or (caught_up and current_run is not None and (not view["healthy"] or symbol not in state.symbols)):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
@@ -104,7 +105,8 @@ class EmailAlerts:
         return {"runtime": view["runtime"], "source_healthy": view["healthy"], "caught_up": caught_up,
                 "cycles_consumed": len(cycles), "position_alerts": "unavailable_until_issue_85"}
 
-    def _observe(self, db, observation: Stage0Observation, now: int, *, service_run_id: str | None = None) -> None:
+    def _observe(self, db, observation: Stage0Observation, now: int, *, service_run_id: str | None,
+                 collection_run_id: str | None) -> None:
         observation = Stage0Observation.from_dict(observation.to_dict())
         stream = self.store.stream(db, observation.symbol)
         if service_run_id is not None and stream["service_run_id"] != service_run_id:
@@ -122,11 +124,11 @@ class EmailAlerts:
         if stream["last_result"] is not None and observation.created_at_ms == stream["created_at_ms"] and observation.observed_at_ms == stream["observed_at_ms"]:
             if stream["last_result"] != observation.result_fingerprint:
                 raise NotificationError("conflicting observations at identical timestamps")
-            stream["observed_run_id"] = service_run_id
+            stream["collection_run_id"] = collection_run_id
             self.store.save_stream(db, observation.symbol, stream)
             return
         stream.update(created_at_ms=observation.created_at_ms, observed_at_ms=observation.observed_at_ms,
-                      last_result=observation.result_fingerprint, observed_run_id=service_run_id)
+                      last_result=observation.result_fingerprint, collection_run_id=collection_run_id)
         if observation.outcome is ObservationOutcome.READY_FOR_REVIEW:
             result = observation.scan_result
             if result is None or result.signal_time_ms is None:
@@ -289,11 +291,20 @@ class EmailAlerts:
                             continue
                         if not self._prepare_entry(db, current, now):
                             continue
-                    result = transport.send(current.event)
+                    result = (transport.send(current.event, source_is_current=self._source_current_before_data)
+                              if current.event.kind is AlertKind.ENTRY_REVIEW else transport.send(current.event))
                     self.store.finish(db, current.event.event_id, state=result.state, now_ms=self.clock.now_ms(),
                                       code=result.code, retryable=result.retryable)
                     delivered += 1
         return delivered
+
+    def _source_current_before_data(self) -> bool:
+        # Publication is still fenced, but time and supervisor liveness can change.
+        try:
+            state, running = self._snapshot()
+        except HealthStateError:
+            return False
+        return bool(health_view(state, running=running, now_ms=self.clock.now_ms())["healthy"])
 
     def _prepare_entry(self, db, current, now: int) -> bool:
         event = current.event

@@ -6,7 +6,8 @@ import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from typing import Mapping
+from email.policy import SMTP
+from typing import Callable, Mapping
 
 from mu_strategy.canonical import canonical_sha256
 from mu_strategy.market_data.trusted_data.contracts import Clock, SystemClock
@@ -49,7 +50,7 @@ class SendResult:
 
     def __post_init__(self) -> None:
         codes = {"smtp_accepted", "smtp_recipient_refused", "smtp_authentication_failed", "smtp_rejected",
-                 "smtp_tls_error", "smtp_result_unknown", "smtp_connection_failed", "entry_review_expired"}
+                 "smtp_tls_error", "smtp_result_unknown", "smtp_connection_failed", "entry_review_expired", "entry_source_unavailable"}
         if self.state not in {DeliveryState.CONFIRMED, DeliveryState.FAILED, DeliveryState.UNKNOWN} or self.code not in codes:
             raise NotificationError("invalid SMTP result")
         if type(self.retryable) is not bool or (self.retryable and self.state is not DeliveryState.FAILED):
@@ -63,19 +64,39 @@ class SmtpTransport:
         self.target_fingerprint = config.target_fingerprint
         self.clock = clock or SystemClock()
 
-    def send(self, event: AlertEvent) -> SendResult:
+    def send(self, event: AlertEvent, *, source_is_current: Callable[[], bool] | None = None) -> SendResult:
+        if event.kind is AlertKind.ENTRY_REVIEW and source_is_current is None:
+            raise NotificationError("entry delivery requires current source validation")
         message = render_message(event, self.config)
+        payload = re.sub(br"(?m)^\.", b"..", message.as_bytes(policy=SMTP))
+        if not payload.endswith(b"\r\n"):
+            payload += b"\r\n"
+        payload += b".\r\n"
         client = None
         sending = False
         try:
             client = self.factory(self.config.host, 465, timeout=20, context=ssl.create_default_context())
             client.login(self.config.sender, self.config.authorization_code)
+            code, response = client.mail(self.config.sender)
+            if code != 250:
+                raise smtplib.SMTPSenderRefused(code, response, self.config.sender)
+            code, response = client.rcpt(self.config.recipient)
+            if code not in {250, 251}:
+                raise smtplib.SMTPRecipientsRefused({self.config.recipient: (code, response)})
+            code, response = client.docmd("DATA")
+            if code != 354:
+                raise smtplib.SMTPDataError(code, response)
+            # Check after all envelope/354 waits, immediately before body bytes.
+            # Closing this connection without a body is a definite non-send.
+            if event.kind is AlertKind.ENTRY_REVIEW and not source_is_current():
+                return SendResult(DeliveryState.FAILED, "entry_source_unavailable", True)
             if event.review_until_ms is not None and not event.occurred_at_ms <= self.clock.now_ms() < event.review_until_ms:
                 return SendResult(DeliveryState.FAILED, "entry_review_expired")
             sending = True
-            refused = client.send_message(message, from_addr=self.config.sender, to_addrs=[self.config.recipient])
-            if refused:
-                return SendResult(DeliveryState.FAILED, "smtp_recipient_refused", all(400 <= value[0] < 500 for value in refused.values()))
+            client.send(payload)
+            code, response = client.getreply()
+            if code != 250:
+                raise smtplib.SMTPDataError(code, response)
             return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
         except smtplib.SMTPAuthenticationError:
             return SendResult(DeliveryState.FAILED, "smtp_authentication_failed")
@@ -148,5 +169,5 @@ def render_message(event: AlertEvent, config: SmtpConfig) -> EmailMessage:
     message["To"] = config.recipient
     message["Subject"] = "[MU] " + title
     message["Message-ID"] = f"<mu-{event.event_id}@alerts.invalid>"
-    message.set_content("\n".join(lines))
+    message.set_content("\n".join(lines), cte="quoted-printable")
     return message
