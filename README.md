@@ -19,6 +19,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 ## 架构
 
 当前包结构见 [docs/architecture.md](docs/architecture.md)。
+当前产品路线和交付依赖见 [信号提醒与模拟盘路线](docs/product-roadmap.md)。
 
 - `mu_strategy.market_data`：OKX/Binance 数据提供方、缓存策略、Top USDT-SWAP 标的池、可信数据刷新状态与 `5m/15m/1h` K 线包。
 - `mu_strategy.entry`：统一入场扫描服务，输出固定结构的 `EntryScanResult`。
@@ -76,6 +77,12 @@ python -m mu_strategy.experiments.fibonacci_pullback --days 60 --report reports\
 ```
 
 Fibonacci 参数扫描和 walk-forward 消融仍保留在 `mu_strategy.experiments`，但它们不是当前 trusted baseline 的标准验收链路。需要重新做参数研究时，先明确数据来源和输出目录，再把生成报告写到 `reports/live/` 或用户指定的 ignored 路径。
+
+候选策略梯队可用 `python -m mu_strategy.experiments.strategy_ladder` 运行，默认比较两个独立的 14 天窗口。
+其 Markdown/HTML 报告逐行显示评估实际使用的配置杠杆：local candidates 为 `1x`，当前 registry baseline 为 `5x`。
+`Account return` 是窗口期末权益之和除以期初权益之和再减一，不是单笔保证金收益，也不是将窗口收益复利拼接。
+排名按原始账户收益排列，未按杠杆或风险归一化；配置杠杆不等于持续实际敞口，baseline 仍使用分阶段仓位。
+因此排名只能辅助研究复核，不能直接证明同风险预算下哪种策略更优，`candidate` 也不是交易资格。
 
 OKX API 只读检查：
 
