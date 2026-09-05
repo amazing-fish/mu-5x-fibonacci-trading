@@ -156,6 +156,61 @@ class EmailAlertsTests(unittest.TestCase):
         self.transport.send.assert_not_called()
         self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
 
+    def test_continuous_ready_survives_idle_refresh_scan_latency_without_duplicate(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.alerts.deliver(self.transport)
+        started = self.clock.value
+        for phase, updated, poll, deadline in ((Phase.IDLE, 0, 310_000, 330_000),
+                                               (Phase.REFRESH, 310_000, 360_000, 580_000),
+                                               (Phase.SCAN, 550_000, 600_000, 640_000)):
+            with self.subTest(phase=phase):
+                self.clock.value = started + poll
+                self.state = replace(self.state, phase=phase, updated_at_ms=started + updated,
+                                     deadline_ms=started + deadline)
+                self.state = ServiceState.from_dict(self.state.to_dict())
+                self.assertTrue(self.alerts.collect()["source_healthy"])
+                self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+                self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.publish(generation="next-slow-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_called_once()
+
+    def test_slow_continuous_ready_does_not_extend_unsent_email_deadline(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 310_000
+        self.state = replace(self.state, phase=Phase.REFRESH, updated_at_ms=self.clock.value,
+                             deadline_ms=self.clock.value + 270_000)
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.clock.value += 50_000
+        self.publish(generation="next-slow-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_continuity_expires_at_service_deadline_instead_of_email_deadline(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value = self.state.deadline_ms
+        self.assertEqual("running", self.alerts.collect()["runtime"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.clock.value += 1
+        self.assertEqual("unresponsive", self.alerts.collect()["runtime"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=invalidations[0]["event_id"])["event"]["reason"])
+
     def test_no_delivery_when_newer_health_cycle_has_not_been_consumed(self):
         self.publish()
         self.alerts.collect()

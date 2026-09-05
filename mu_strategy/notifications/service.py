@@ -86,8 +86,11 @@ class EmailAlerts:
                                   and max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms)
                 if runtime_failed or failed_attempt or (caught_up and current_run is not None and (not view["healthy"] or symbol not in state.symbols)):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
-                elif now < stream["last_seen_ms"] or now >= stream["last_seen_ms"] + self.review_ms:
-                    self._invalidate(db, symbol, stream, "review_expired", now)
+                elif now < stream["last_seen_ms"]:
+                    self._invalidate(db, symbol, stream, "source_unavailable", now)
+                # Signal continuity follows the service's phase/deadline and
+                # committed decisions. The email deadline only limits sending;
+                # applying it here would create a new signal each slow cycle.
             self.store.set_meta(db, "source_ready", bool(view["healthy"] and caught_up))
             self.store.set_meta(db, "last_collection_ms", now)
             self.store.set_meta(db, "log_unavailable_since_ms", None)
