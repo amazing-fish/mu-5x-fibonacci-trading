@@ -186,6 +186,106 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual(1, self.alerts.deliver(self.transport))
 
+    def test_new_ready_log_waits_for_health_publication_without_being_withdrawn(self):
+        self.publish("failed")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        self.publish()
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        original = self.entry_id()
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.state = current
+        self.clock.value += 30_000
+        self.assertEqual(0, self.alerts.collect()["cycles_consumed"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_new_scope_log_is_not_withdrawn_using_previous_scope_health(self):
+        self.publish("wait")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        self.publish(symbol="BTC-USDT-SWAP", run_id="service-2")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+        self.state = current
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_collection_clock_is_read_after_new_log_and_health(self):
+        original_read = self.alerts.observations.read_batch
+        def publish_during_read(**kwargs):
+            self.clock.value += 1
+            self.publish()
+            return original_read(**kwargs)
+        with patch.object(self.alerts.observations, "read_batch", side_effect=publish_during_read):
+            self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_backlog_larger_than_batch_advances_without_premature_scope_invalidation(self):
+        cycles = []
+        for index in range(1001):
+            self.clock.value += 1
+            cycles.append(self.publish("wait" if index < 1000 else "ready", append=False))
+        self.alerts.observations.path.write_text("".join(json.dumps(cycle.to_dict()) + "\n" for cycle in cycles), encoding="utf-8")
+        first = self.alerts.collect()
+        self.assertEqual((1000, False), (first["cycles_consumed"], first["caught_up"]))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        second = self.alerts.collect()
+        self.assertEqual((1, True), (second["cycles_consumed"], second["caught_up"]))
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_clock_rollback_new_run_accepts_current_cycle_and_keeps_old_log_ordering(self):
+        old = self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value -= 500_000
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        entries = self.records(AlertKind.ENTRY_REVIEW)
+        self.assertEqual(2, len(entries))
+        self.assertIsNone(entries[0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.alerts.observations.append_cycle(old)
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+
+    def test_clock_rollback_log_before_health_is_reconciled_without_new_log_bytes(self):
+        self.publish("wait")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value -= 500_000
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertEqual([], self.records(AlertKind.ENTRY_REVIEW))
+        self.state = current
+        self.assertEqual(0, self.alerts.collect()["cycles_consumed"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+
+    def test_same_signal_new_service_run_without_rollback_is_not_duplicated(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+
     def test_removed_symbol_pending_entry_is_suppressed_after_valid_service_restart(self):
         self.publish()
         self.alerts.collect()
@@ -310,6 +410,35 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
         self.running = True
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
+
+    def test_durable_stop_restart_between_polls_emits_fault_and_healthy_recovery_once(self):
+        self.publish("wait")
+        self.alerts.collect()
+        events = self.state.events + (HealthEvent(2, self.clock.value, "stopped", ()),
+                                      HealthEvent(3, self.clock.value + 1, "restarted", ()))
+        self.clock.value += 2
+        self.publish("wait", run_id="service-2", events=events)
+        self.alerts.collect()
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
+
+    def test_durable_stop_does_not_duplicate_runtime_fault_or_recover_before_healthy(self):
+        self.publish("wait")
+        self.alerts.collect()
+        events = self.state.events + (HealthEvent(2, self.clock.value, "stopped", ()),)
+        self.state = replace(self.state, running=False, events=events, event_sequence=2)
+        self.running = False
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.state = replace(self.state, running=True, run_id="service-2", last_cycle=None)
+        self.alerts.collect()
+        self.assertEqual([], self.records(AlertKind.SERVICE_RECOVERED))
+        self.clock.value += 1
+        self.running = True
+        self.publish("wait", run_id="service-2", events=events)
         self.alerts.collect()
         self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
 
@@ -503,6 +632,39 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertTrue(self.alerts.observation_unavailable())
         self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
         self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+
+    def test_log_permission_error_uses_source_retry_and_persistent_fault_path(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original_open = Path.open
+        def log_denied(path, *args, **kwargs):
+            if path == self.alerts.observations.path:
+                raise PermissionError("private diagnostic must not appear")
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, "open", new=log_denied):
+            for delay, code in ((0, "observation_append_pending_retry"), (30_000, "observation_source_unavailable")):
+                self.clock.value += delay
+                output = io.StringIO()
+                self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                        factory=Mock(return_value=self.alerts)))
+                self.assertEqual(code, json.loads(output.getvalue())["error_code"])
+                self.assertNotIn("private diagnostic", output.getvalue())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+
+    def test_log_seek_and_read_io_errors_are_normalized(self):
+        self.publish()
+        _, cursor = self.alerts.observations.read_batch()
+        for operation in ("seek", "readline"):
+            with self.subTest(operation=operation):
+                handle = Mock()
+                handle.__enter__ = Mock(return_value=handle)
+                handle.__exit__ = Mock(return_value=False)
+                getattr(handle, operation).side_effect = OSError("device unavailable")
+                with patch.object(Path, "open", return_value=handle):
+                    with self.assertRaises(ObservationCorruptionError):
+                        self.alerts.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2])
 
     def test_conflicting_equal_timestamp_observation_rolls_back_cursor(self):
         self.publish()

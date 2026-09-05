@@ -31,20 +31,30 @@ class EmailAlerts:
 
     def collect(self) -> dict:
         """Commit a bounded log batch, its cursor and all resulting reminders together."""
-        now = self.clock.now_ms()
-        state, running = self.health.snapshot()
-        view = health_view(state, running=running, now_ms=now)
         with self.store.connection() as db, self.store.transaction(db):
             self.store.validate(db)
             cursor = self.store.get_meta(db, "observation_cursor", [0, 0, None])
             if not isinstance(cursor, list) or len(cursor) != 3:
                 raise NotificationError("invalid persisted observation cursor")
             cycles, next_cursor = self.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2], limit=1000)
+            state, running = self.health.snapshot()
+            now = self.clock.now_ms()
+            view = health_view(state, running=running, now_ms=now)
+            current = state.last_cycle.scan.cycle if state and state.last_cycle else None
+            current_hash = canonical_sha256(current.to_dict()) if current else None
+            current_run = state.run_id if current and state.last_cycle.service_run_id == state.run_id else None
             for cycle in cycles:
+                cycle_hash = canonical_sha256(cycle.to_dict())
                 for observation in cycle.observations:
-                    self._observe(db, observation, now)
-                self.store.set_meta(db, "last_cycle_sha256", canonical_sha256(cycle.to_dict()))
+                    self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None)
+                self.store.set_meta(db, "last_cycle_sha256", cycle_hash)
             self.store.set_meta(db, "observation_cursor", list(next_cursor))
+            caught_up = current is not None and self.store.get_meta(db, "last_cycle_sha256") == current_hash
+            # The log commits before health. A matching health cycle may arrive
+            # on a later poll with no new log bytes, including after clock rollback.
+            if caught_up and current_run is not None:
+                for observation in current.observations:
+                    self._observe(db, observation, now, service_run_id=current_run)
             self._health_events(db, state, now)
             if view["runtime"] != "running" or view["healthy"]:
                 self._runtime(db, view["runtime"], state.run_id if state else None, now)
@@ -52,21 +62,25 @@ class EmailAlerts:
                 stream = self.store.stream(db, symbol)
                 if stream["active_event_id"] is None:
                     continue
-                if not view["healthy"] or symbol not in state.symbols:
+                if caught_up and (not view["healthy"] or symbol not in state.symbols):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
                 elif now < stream["last_seen_ms"] or now >= stream["last_seen_ms"] + self.review_ms:
                     self._invalidate(db, symbol, stream, "review_expired", now)
-            current = state.last_cycle.scan.cycle if state and state.last_cycle else None
-            caught_up = (current is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(current.to_dict()))
             self.store.set_meta(db, "source_ready", bool(view["healthy"] and caught_up))
             self.store.set_meta(db, "last_collection_ms", now)
             self.store.set_meta(db, "log_unavailable_since_ms", None)
         return {"runtime": view["runtime"], "source_healthy": view["healthy"], "caught_up": caught_up,
                 "cycles_consumed": len(cycles), "position_alerts": "unavailable_until_issue_85"}
 
-    def _observe(self, db, observation: Stage0Observation, now: int) -> None:
+    def _observe(self, db, observation: Stage0Observation, now: int, *, service_run_id: str | None = None) -> None:
         observation = Stage0Observation.from_dict(observation.to_dict())
         stream = self.store.stream(db, observation.symbol)
+        if service_run_id is not None and stream["service_run_id"] != service_run_id:
+            # Only a matching authoritative cycle can establish a new ordering
+            # epoch. Historical log records carry no service run identity.
+            if stream["active_event_id"] and observation.observed_at_ms < stream["last_seen_ms"]:
+                self._invalidate(db, observation.symbol, stream, "source_unavailable", now)
+            stream.update(service_run_id=service_run_id, created_at_ms=0, observed_at_ms=0, last_result=None)
         if observation.created_at_ms < stream["created_at_ms"] or observation.observed_at_ms < stream["observed_at_ms"]:
             self.store.set_meta(db, "out_of_order_observations", integer(self.store.get_meta(db, "out_of_order_observations", 0)) + 1)
             return
@@ -126,11 +140,16 @@ class EmailAlerts:
                 raise HealthStateError("service health history disappeared")
             return
         for event in state.events_since(cursor):
-            if event.kind in {"fault", "recovered"}:
-                kind = AlertKind.SERVICE_FAULT if event.kind == "fault" else AlertKind.SERVICE_RECOVERED
+            if event.kind in {"fault", "recovered", "stopped"}:
+                kind = AlertKind.SERVICE_RECOVERED if event.kind == "recovered" else AlertKind.SERVICE_FAULT
                 alert = AlertEvent(kind, canonical_sha256({"source": str(self.health.data_dir), "event": event.to_dict()}),
-                                   event.at_ms, None, "health_event", problems=event.problems)
+                                   event.at_ms, None, "health_event",
+                                   problems=("runtime.stopped",) if event.kind == "stopped" else event.problems)
                 self.store.enqueue(db, alert, now_ms=now)
+                if event.kind == "stopped":
+                    # Sampling may miss a complete stop/restart between polls.
+                    # Recovery is emitted only once a current healthy run exists.
+                    self.store.set_meta(db, "runtime", ["stopped", state.run_id])
         self.store.set_meta(db, "health_cursor", state.event_sequence)
 
     def _runtime(self, db, runtime: str, run_id: str | None, now: int) -> None:

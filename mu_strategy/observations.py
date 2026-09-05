@@ -455,43 +455,46 @@ class JsonlObservationRepository:
                 or (offset > 0 and (anchor_start >= offset or not isinstance(anchor_sha256, str)
                                    or not _SHA256_PATTERN.fullmatch(anchor_sha256)))):
             raise ObservationCorruptionError("invalid observation cursor")
-        self._reject_invalid_marker()
-        cursor = (offset, anchor_start, anchor_sha256)
         try:
-            handle = self.path.open("rb")
-        except FileNotFoundError:
             self._reject_invalid_marker()
-            if offset:
-                raise ObservationCorruptionError("observation log missing at persisted cursor")
-            return (), cursor
-        cycles = []
-        def unique_fields(pairs):
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ObservationCorruptionError("duplicate observation field")
-                result[key] = value
-            return result
-        with handle:
-            if offset:
-                handle.seek(anchor_start)
-                anchor = handle.readline(4 * 1024 * 1024 + 1)
-                if handle.tell() != offset or not anchor.endswith(b"\n") or hashlib.sha256(anchor).hexdigest() != anchor_sha256:
-                    raise ObservationCorruptionError("observation cursor boundary changed")
-            for _ in range(limit):
-                start = handle.tell()
-                raw = handle.readline(4 * 1024 * 1024 + 1)
-                if not raw:
-                    break
-                if len(raw) > 4 * 1024 * 1024 or not raw.endswith(b"\n"):
-                    raise ObservationCorruptionError("observation record incomplete or oversized")
-                try:
-                    cycles.append(Stage0ObservationCycle.from_dict(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)))
-                except (UnicodeDecodeError, ValueError, TypeError) as exc:
-                    raise ObservationCorruptionError("invalid observation record") from exc
-                cursor = (handle.tell(), start, hashlib.sha256(raw).hexdigest())
-        self._reject_invalid_marker()
-        return tuple(cycles), cursor
+            cursor = (offset, anchor_start, anchor_sha256)
+            try:
+                handle = self.path.open("rb")
+            except FileNotFoundError:
+                self._reject_invalid_marker()
+                if offset:
+                    raise ObservationCorruptionError("observation log missing at persisted cursor")
+                return (), cursor
+            cycles = []
+            def unique_fields(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ObservationCorruptionError("duplicate observation field")
+                    result[key] = value
+                return result
+            with handle:
+                if offset:
+                    handle.seek(anchor_start)
+                    anchor = handle.readline(4 * 1024 * 1024 + 1)
+                    if handle.tell() != offset or not anchor.endswith(b"\n") or hashlib.sha256(anchor).hexdigest() != anchor_sha256:
+                        raise ObservationCorruptionError("observation cursor boundary changed")
+                for _ in range(limit):
+                    start = handle.tell()
+                    raw = handle.readline(4 * 1024 * 1024 + 1)
+                    if not raw:
+                        break
+                    if len(raw) > 4 * 1024 * 1024 or not raw.endswith(b"\n"):
+                        raise ObservationCorruptionError("observation record incomplete or oversized")
+                    try:
+                        cycles.append(Stage0ObservationCycle.from_dict(json.loads(raw.decode("utf-8"), object_pairs_hook=unique_fields)))
+                    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+                        raise ObservationCorruptionError("invalid observation record") from exc
+                    cursor = (handle.tell(), start, hashlib.sha256(raw).hexdigest())
+            self._reject_invalid_marker()
+            return tuple(cycles), cursor
+        except OSError as exc:
+            raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
     def _reject_invalid_marker(self) -> None:
         if self.invalid_marker_path.exists():

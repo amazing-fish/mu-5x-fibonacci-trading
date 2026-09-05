@@ -121,10 +121,12 @@ class NotificationStore:
         row = db.execute("SELECT value FROM streams WHERE symbol=?", (symbol,)).fetchone()
         if row is None:
             return {"counter": 0, "created_at_ms": 0, "observed_at_ms": 0,
-                    "active_event_id": None, "signal_key": None, "last_seen_ms": 0, "last_result": None}
+                    "active_event_id": None, "signal_key": None, "last_seen_ms": 0, "last_result": None, "service_run_id": None}
         result = decode(row[0])
-        if not isinstance(result, dict) or set(result) != {"counter", "created_at_ms", "observed_at_ms", "active_event_id", "signal_key", "last_seen_ms", "last_result"}:
+        if not isinstance(result, dict) or set(result) != {"counter", "created_at_ms", "observed_at_ms", "active_event_id", "signal_key", "last_seen_ms", "last_result", "service_run_id"}:
             raise NotificationError("invalid signal stream")
+        if result["service_run_id"] is not None and (not isinstance(result["service_run_id"], str) or not result["service_run_id"]):
+            raise NotificationError("invalid service run identity")
         for key in ("counter", "created_at_ms", "observed_at_ms", "last_seen_ms"):
             integer(result[key])
         for key in ("active_event_id", "signal_key", "last_result"):
