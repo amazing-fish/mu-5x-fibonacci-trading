@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, unique
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any, Mapping, Protocol
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
+from mu_strategy.file_locks import lock_file, unlock_file
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
@@ -389,33 +391,45 @@ class JsonlObservationRepository:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.invalid_marker_path = Path(f"{self.path}.invalid")
+        self.lock_path = Path(f"{self.path}.lock")
+
+    @contextmanager
+    def publication_fence(self, *, wait: bool = True):
+        """Serialize committed appends with a consumer's final send decision."""
+        with self.lock_path.open("a+b") as stream:
+            lock_file(stream, wait=wait)
+            try:
+                yield
+            finally:
+                unlock_file(stream)
 
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")
         try:
             created_directories = self._create_parent_directories()
-            if self.invalid_marker_path.exists():
-                raise OSError("observation repository has an unresolved invalid marker")
-            self._write_invalid_marker(cycle.cycle_id, exclusive=True)
-            self._fsync_created_directory_entries(created_directories)
-            log_existed = self.path.exists()
-            with self.path.open("ab") as handle:
-                written = handle.write(encoded)
-                if written != len(encoded):
-                    raise OSError(f"short observation write: {written}/{len(encoded)} bytes")
-                handle.flush()
-                os.fsync(handle.fileno())
-            if not log_existed:
-                self._fsync_parent_directory()
-            self.invalid_marker_path.unlink()
-            try:
-                self._fsync_parent_directory()
-            except OSError:
+            with self.publication_fence():
+                if self.invalid_marker_path.exists():
+                    raise OSError("observation repository has an unresolved invalid marker")
+                self._write_invalid_marker(cycle.cycle_id, exclusive=True)
+                self._fsync_created_directory_entries(created_directories)
+                log_existed = self.path.exists()
+                with self.path.open("ab") as handle:
+                    written = handle.write(encoded)
+                    if written != len(encoded):
+                        raise OSError(f"short observation write: {written}/{len(encoded)} bytes")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if not log_existed:
+                    self._fsync_parent_directory()
+                self.invalid_marker_path.unlink()
                 try:
-                    self._write_invalid_marker(cycle.cycle_id, exclusive=False)
+                    self._fsync_parent_directory()
                 except OSError:
-                    pass
-                raise
+                    try:
+                        self._write_invalid_marker(cycle.cycle_id, exclusive=False)
+                    except OSError:
+                        pass
+                    raise
         except OSError as exc:
             raise ObservationWriteError(f"observation cycle write failed: {type(exc).__name__}") from exc
 

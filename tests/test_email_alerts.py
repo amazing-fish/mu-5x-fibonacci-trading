@@ -6,11 +6,13 @@ import ssl
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from mu_strategy.commands.email_alerts import main
+from mu_strategy.file_locks import FileLockBusyError
 from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
 from mu_strategy.models import EntryDecisionCode
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError
@@ -182,6 +184,52 @@ class EmailAlertsTests(unittest.TestCase):
             self.assertEqual(0, self.alerts.deliver(self.transport))
         self.transport.send.assert_not_called()
         self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+
+    def test_writer_holding_publication_fence_defers_sender_without_network(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.observations.publication_fence():
+            self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.clock.value += 30_000
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_final_validation_and_transport_exclude_observation_append(self):
+        self.publish()
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        next_cycle = self.publish("wait", append=False)
+        self.state = previous
+        writer = []
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def during_send(event):
+                with self.assertRaises(FileLockBusyError):
+                    with self.alerts.observations.publication_fence(wait=False):
+                        self.fail("send must retain the publication fence")
+                writer.append(pool.submit(self.alerts.observations.append_cycle, next_cycle))
+                self.assertEqual(1, len(self.alerts.observations.read_cycles()))
+                return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+            self.transport.send.side_effect = during_send
+            self.assertEqual(1, self.alerts.deliver(self.transport))
+            writer[0].result(timeout=5)
+        self.assertEqual(2, len(self.alerts.observations.read_cycles()))
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_final_log_check_itself_holds_the_writer_fence(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.alerts.observations.read_batch
+        def checked_tail(**kwargs):
+            result = original(**kwargs)
+            with self.assertRaises(FileLockBusyError):
+                with self.alerts.observations.publication_fence(wait=False):
+                    self.fail("writer could commit after the tail check")
+            return result
+        with patch.object(self.alerts.observations, "read_batch", side_effect=checked_tail):
+            self.assertEqual(1, self.alerts.deliver(self.transport))
 
     def test_authoritative_failed_scan_or_persistence_withdraws_previous_entry(self):
         for status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.SUCCEEDED):
@@ -787,6 +835,8 @@ class EmailAlertsTests(unittest.TestCase):
                                   transport_factory=Mock(return_value=self.transport)))
         self.assertEqual("notification_interrupted", json.loads(output.getvalue())["error_code"])
         self.assertEqual("unknown", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        with self.alerts.observations.publication_fence(wait=False):
+            pass
         self.transport.send.side_effect = None
         self.assertEqual(0, self.alerts.deliver(self.transport))
 

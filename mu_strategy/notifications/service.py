@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from pathlib import Path
 
 from mu_strategy.canonical import canonical_sha256
@@ -260,13 +261,19 @@ class EmailAlerts:
                     claimed = self.store.claim(db, now_ms=self.clock.now_ms())
                 if claimed is None:
                     break
-                with self.store.transaction(db):
+                with self.store.transaction(db), ExitStack() as fence:
                     current = self.store.record(db, claimed.event.event_id)
                     if current.state is not DeliveryState.UNKNOWN or current.attempts != claimed.attempts:
                         continue
                     now = self.clock.now_ms()
-                    if current.event.kind is AlertKind.ENTRY_REVIEW and not self._prepare_entry(db, current, now):
-                        continue
+                    if current.event.kind is AlertKind.ENTRY_REVIEW:
+                        try:
+                            fence.enter_context(self.observations.publication_fence(wait=False))
+                        except OSError:
+                            self.store.defer_unstarted(db, current.event.event_id, now_ms=now, reason="source_not_caught_up")
+                            continue
+                        if not self._prepare_entry(db, current, now):
+                            continue
                     result = transport.send(current.event)
                     self.store.finish(db, current.event.event_id, state=result.state, now_ms=self.clock.now_ms(),
                                       code=result.code, retryable=result.retryable)
