@@ -257,9 +257,21 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertIsNone(entries[0]["suppressed_reason"])
         self.alerts.deliver(self.transport)
         self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        current_id = self.entry_id()
         self.alerts.observations.append_cycle(old)
         self.assertFalse(self.alerts.collect()["caught_up"])
         self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.assertIsNone(self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+        with self.alerts.store.connection() as db:
+            self.assertEqual(self.clock.value, self.alerts.store.stream(db, SYMBOL)["observed_at_ms"])
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(current_id, self.entry_id())
+        self.clock.value += 1
+        self.publish("wait", run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual("decision_changed", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
 
     def test_clock_rollback_log_before_health_is_reconciled_without_new_log_bytes(self):
         self.publish("wait")

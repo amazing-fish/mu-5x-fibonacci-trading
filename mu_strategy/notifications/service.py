@@ -81,7 +81,10 @@ class EmailAlerts:
             if stream["active_event_id"] and observation.observed_at_ms < stream["last_seen_ms"]:
                 self._invalidate(db, observation.symbol, stream, "source_unavailable", now)
             stream.update(service_run_id=service_run_id, created_at_ms=0, observed_at_ms=0, last_result=None)
-        if observation.created_at_ms < stream["created_at_ms"] or observation.observed_at_ms < stream["observed_at_ms"]:
+        # Future-dated history can belong to a run before clock rollback. It
+        # cannot establish the current ordering watermark or a signal lifetime.
+        if (observation.created_at_ms > now or observation.observed_at_ms > now
+                or observation.created_at_ms < stream["created_at_ms"] or observation.observed_at_ms < stream["observed_at_ms"]):
             self.store.set_meta(db, "out_of_order_observations", integer(self.store.get_meta(db, "out_of_order_observations", 0)) + 1)
             return
         if stream["last_result"] is not None and observation.created_at_ms == stream["created_at_ms"] and observation.observed_at_ms == stream["observed_at_ms"]:
