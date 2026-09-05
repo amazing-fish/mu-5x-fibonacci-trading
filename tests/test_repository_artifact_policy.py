@@ -23,6 +23,7 @@ class RepositoryArtifactPolicyTests(unittest.TestCase):
             "data/live-signal-service/health.json",
             "data/live-signal-service/observations.jsonl",
             "data/live-signal-service/service.lock",
+            "data/live-signal-service/supervisor.lock",
             "data/live/generations/new-run/tmp.json",
             "data/live/generations/new-run/okx/MU-USDT-SWAP/15m.tmp",
         ):

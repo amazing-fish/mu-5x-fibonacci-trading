@@ -3,7 +3,9 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -262,7 +264,10 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.store.write(new)
         self.assertEqual(old, self.store.read())
-        with patch("mu_strategy.service_health.fsync_directory", side_effect=OSError("after commit")):
+        def sync(directory):
+            if directory == self.store.root:
+                raise OSError("after commit")
+        with patch("mu_strategy.service_health.fsync_directory", side_effect=sync):
             with self.assertRaises(OSError):
                 self.store.write(new)
         self.assertEqual(new, self.store.read())
@@ -457,6 +462,106 @@ class ServiceTests(unittest.TestCase):
         payload = {"schema_version": 1, "scan": ScanHealth(StepStatus.SUCCEEDED, empty, StepStatus.SUCCEEDED).to_dict()}
         actual = self.service([subprocess.CompletedProcess([], 0, json.dumps(payload), "")])._scan([])
         self.assertIs(StepStatus.FAILED, actual.status)
+
+    def test_concurrent_status_probes_cannot_impersonate_a_dead_supervisor(self):
+        import mu_strategy.service_health as health
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        self.store.write(replace(self.store.read(), running=True, deadline_ms=2000))
+        acquired, release = threading.Event(), threading.Event()
+        original_lock = health._lock
+        def lock(stream, **kwargs):
+            original_lock(stream, **kwargs)
+            if kwargs.get("shared") and threading.current_thread().name.startswith("first-probe"):
+                acquired.set()
+                if not release.wait(10):
+                    raise AssertionError("test probe was not released")
+        def query():
+            output = io.StringIO()
+            code = main(["status", "--data-dir", str(self.config.data_dir)], stdout=output)
+            return code, json.loads(output.getvalue())
+        with patch.object(health, "_lock", side_effect=lock), patch(
+            "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1000
+        ), ThreadPoolExecutor(max_workers=1, thread_name_prefix="first-probe") as pool:
+            first = pool.submit(query)
+            try:
+                self.assertTrue(acquired.wait(10))
+                code, result = query()
+                self.assertEqual(2, code)
+                self.assertEqual("interrupted", result["runtime"])
+                self.assertFalse(result["healthy"])
+            finally:
+                release.set()
+            self.assertEqual(2, first.result(timeout=10)[0])
+
+    def test_first_start_waits_for_read_probe_without_false_instance_conflict(self):
+        import mu_strategy.service_health as health
+        self.store.prepare()
+        waiting = threading.Event()
+        original_lock = health._lock
+        def lock(stream, **kwargs):
+            if kwargs.get("wait"):
+                waiting.set()
+            return original_lock(stream, **kwargs)
+        with self.store.liveness_path.open("a+b") as probe:
+            original_lock(probe, shared=True)
+            with patch.object(health, "_lock", side_effect=lock), ThreadPoolExecutor(max_workers=1) as pool:
+                service = pool.submit(self.service([refresh_result(), scan_result_process()]).run, cycles=1)
+                try:
+                    self.assertTrue(waiting.wait(10))
+                    self.assertFalse(self.store.is_running())
+                    self.assertFalse(service.done())
+                finally:
+                    health._unlock(probe)
+                service.result(timeout=10)
+        self.assertEqual(1, self.store.read().last_cycle.number)
+
+    def test_long_window_configuration_reaches_real_scan_worker(self):
+        config = replace(self.config, refresh_days=365, scan_days=200)
+        def run(argv, *, timeout):
+            if argv[3] == "mu_strategy.commands.refresh_market_data":
+                return refresh_result()
+            return ProcessRunner().run(argv, timeout=timeout)
+        SignalService(config, processes=Mock(run=run), clock=self.time).run(cycles=1)
+        scan = self.store.read().last_cycle.scan
+        self.assertIs(StepStatus.SUCCEEDED, scan.status)
+        self.assertIs(StepStatus.SUCCEEDED, scan.persistence)
+        self.assertIs(ObservationOutcome.DATA_GATE_BLOCKED, scan.cycle.observations[0].outcome)
+
+    def test_new_nested_directory_entries_are_synced_before_any_worker(self):
+        import mu_strategy.service_health as health
+        nested = Path(self.temp.name) / "new-parent" / "nested"
+        self.config = replace(self.config, data_dir=nested / "live")
+        self.store = HealthStore(self.config.data_dir)
+        synced = []
+        def sync(directory):
+            synced.append(directory)
+        def inspect(argv, timeout):
+            self.assertEqual([Path(self.temp.name).parent, Path(self.temp.name), nested.parent, nested], synced[:4])
+        with patch.object(health, "fsync_directory", side_effect=sync):
+            self.service([refresh_result(), scan_result_process()], on_process=inspect).run(cycles=1)
+
+    def test_parent_sync_failure_prevents_first_worker_and_health_publication(self):
+        service = self.service([refresh_result(), scan_result_process()])
+        with patch("mu_strategy.service_health.fsync_directory", side_effect=OSError("directory sync failed")):
+            with self.assertRaises(OSError):
+                service.run(cycles=1)
+        service.processes.run.assert_not_called()
+        self.assertFalse(self.store.path.exists())
+
+    def test_retry_repairs_last_directory_entry_after_partial_prepare_failure(self):
+        nested = Path(self.temp.name) / "new-parent" / "nested"
+        store = HealthStore(nested / "live")
+        def fail_at_new_parent(directory):
+            if directory == Path(self.temp.name):
+                raise OSError("new parent entry not synced")
+        with patch("mu_strategy.service_health.fsync_directory", side_effect=fail_at_new_parent):
+            with self.assertRaises(OSError):
+                store.prepare()
+        self.assertTrue(nested.parent.exists())
+        self.assertFalse(nested.exists())
+        with patch("mu_strategy.service_health.fsync_directory") as sync:
+            store.prepare()
+        self.assertEqual(Path(self.temp.name), sync.call_args_list[0].args[0])
 
 
 if __name__ == "__main__":

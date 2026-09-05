@@ -41,10 +41,12 @@ deadline 是当前子进程超时或下一轮计划时间，加 30 秒状态更�
 
 ## 存储与通知接入
 
+首次运行会同步每个新建目录项的父目录，确认状态目录可持久化后才启动 worker；父目录同步失败会停止本次运行。
+
 路径由解析后的绝对数据目录唯一派生。例如 `data/live` 对应同级 `data/live-signal-service/`，默认被 Git 忽略：
 
 - `health.json`：schema v1 权威快照，严格读取；损坏、未知字段/版本、重复 JSON 字段、错误 watchlist 覆盖或跨数据目录状态均拒绝。
-- `service.lock`：OS 独占文件锁，进程退出由 OS 释放；文件存在不代表仍在运行，不应删除锁文件“解锁”。
+- `service.lock`：实例排他锁；`supervisor.lock`：存活检测锁，由 supervisor 独占、查询共享探测。并发查询不会把另一个查询当成 supervisor，首次启动可等待短暂探测结束。进程退出由 OS 释放锁；文件存在不代表仍在运行，不应删除锁文件“解锁”。
 - `observations.jsonl`：现有 Stage 0 cycle 日志及其 `.invalid` 标记协议。
 - `service.log`：诊断日志，5 MiB 自动轮转，最多 3 个备份。
 - `data-health.html`：刷新命令生成的数据健康页面。

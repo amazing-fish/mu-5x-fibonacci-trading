@@ -245,6 +245,21 @@ class HealthStore:
         self.root = self.data_dir.parent / f"{self.data_dir.name}-signal-service"
         self.path = self.root / "health.json"
         self.lock_path = self.root / "service.lock"
+        self.liveness_path = self.root / "supervisor.lock"
+
+    def prepare(self) -> None:
+        missing = []
+        directory = self.root
+        while not directory.exists():
+            missing.append(directory)
+            directory = directory.parent
+        # Repair the deepest existing entry before extending it: it may be the
+        # last mkdir from an earlier attempt whose parent fsync failed.
+        if directory != directory.parent:
+            fsync_directory(directory.parent)
+        for directory in reversed(missing):
+            directory.mkdir(exist_ok=True)
+            fsync_directory(directory.parent)
 
     def read(self) -> ServiceState | None:
         try:
@@ -269,8 +284,8 @@ class HealthStore:
         raw = canonical_json(canonical.to_dict()).encode("utf-8") + b"\n"
         if len(raw) > MAX_STATE_BYTES:
             raise HealthStateError("health state exceeds size limit")
-        self.root.mkdir(parents=True, exist_ok=True)
         temporary = None
+        self.prepare()
         try:
             with tempfile.NamedTemporaryFile(dir=self.root, prefix="health-", suffix=".tmp", delete=False) as stream:
                 temporary = Path(stream.name)
@@ -285,25 +300,29 @@ class HealthStore:
 
     @contextmanager
     def exclusive(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.prepare()
         with self.lock_path.open("a+b") as stream:
-            if stream.seek(0, os.SEEK_END) == 0:
-                stream.write(b"\0")
-                stream.flush()
             _lock(stream)
             try:
-                yield
+                with self.liveness_path.open("a+b") as liveness:
+                    # Queries share this second lock. Waiting behind those brief
+                    # probes cannot turn a first start into an instance conflict.
+                    _lock(liveness, wait=True)
+                    try:
+                        yield
+                    finally:
+                        _unlock(liveness)
             finally:
                 _unlock(stream)
 
     def is_running(self) -> bool:
         try:
-            stream = self.lock_path.open("r+b")
+            stream = self.liveness_path.open("r+b")
         except FileNotFoundError:
             return False
         with stream:
             try:
-                _lock(stream)
+                _lock(stream, shared=True)
             except ServiceBusyError:
                 return True
             _unlock(stream)
@@ -340,19 +359,16 @@ def health_view(state: ServiceState | None, *, running: bool, now_ms: int) -> di
     }
 
 
-def _lock(stream) -> None:
+def _lock(stream, *, shared: bool = False, wait: bool = False) -> None:
     stream.seek(0)
     try:
         if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            _windows_lock(stream, shared=shared, wait=wait)
         else:
             import fcntl
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if isinstance(exc, (BlockingIOError, PermissionError)):
-            raise ServiceBusyError("signal service already owns this data directory") from exc
-        raise
+            fcntl.flock(stream.fileno(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError as exc:
+        raise ServiceBusyError("signal service already owns this data directory") from exc
 
 
 def decode_health_json(raw: str | bytes) -> Any:
@@ -370,11 +386,38 @@ def decode_health_json(raw: str | bytes) -> Any:
 def _unlock(stream) -> None:
     stream.seek(0)
     if os.name == "nt":
-        import msvcrt
-        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        _windows_lock(stream, release=True)
     else:
         import fcntl
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _windows_lock(stream, *, shared: bool = False, wait: bool = False, release: bool = False) -> None:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    operation = api.UnlockFileEx if release else api.LockFileEx
+    operation.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+    if not release:
+        operation.argtypes += [wintypes.DWORD]
+    operation.argtypes += [ctypes.POINTER(Overlapped)]
+    operation.restype = wintypes.BOOL
+    handle = msvcrt.get_osfhandle(stream.fileno())
+    overlap = Overlapped()
+    args = [handle, 0, 1, 0, ctypes.byref(overlap)] if release else [
+        handle, (0 if wait else 1) | (0 if shared else 2), 0, 1, 0, ctypes.byref(overlap),
+    ]
+    if not operation(*args):
+        code = ctypes.get_last_error()
+        if not release and code == 33:  # ERROR_LOCK_VIOLATION
+            raise ServiceBusyError("signal service already owns this data directory")
+        raise ctypes.WinError(code)
 
 
 def _object(value: Any, cls) -> dict[str, Any]:

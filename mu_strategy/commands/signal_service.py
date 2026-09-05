@@ -22,8 +22,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, service
     run.add_argument("--interval-seconds", type=int, default=300)
     run.add_argument("--refresh-timeout-seconds", type=int, default=240)
     run.add_argument("--scan-timeout-seconds", type=int, default=60)
-    run.add_argument("--refresh-days", type=int, default=180)
     for command in (run, subparsers.add_parser("scan-once", help="Run a cache-only scan worker without broker calls.")):
+        command.add_argument("--refresh-days", type=int, default=180)
         command.add_argument("--symbol", action="append")
         command.add_argument("--scan-days", type=int, default=28)
         command.add_argument("--data-dir", type=Path, default=Path("data/live"))
@@ -49,16 +49,17 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, service
             state = recover_interrupted(store)
             _emit(stdout, health_view(state, running=False, now_ms=SystemClock().now_ms()))
             return 0
-        kwargs = {"data_dir": args.data_dir, "symbols": tuple(args.symbol or ("MU-USDT-SWAP",)), "scan_days": args.scan_days}
+        kwargs = {"data_dir": args.data_dir, "symbols": tuple(args.symbol or ("MU-USDT-SWAP",)),
+                  "scan_days": args.scan_days, "refresh_days": args.refresh_days}
         if args.command == "run":
             kwargs.update(interval_seconds=args.interval_seconds, refresh_timeout_seconds=args.refresh_timeout_seconds,
-                          scan_timeout_seconds=args.scan_timeout_seconds, refresh_days=args.refresh_days)
+                          scan_timeout_seconds=args.scan_timeout_seconds)
         config = ServiceConfig(**kwargs)
         if args.command == "scan-once":
             scan = scanner(config)
             _emit(stdout, {"schema_version": 1, "scan": scan.to_dict()})
             return 0 if scan.status is StepStatus.SUCCEEDED and scan.persistence is StepStatus.SUCCEEDED else 1
-        store.root.mkdir(parents=True, exist_ok=True)
+        store.prepare()
         handler = RotatingFileHandler(store.root / "service.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
         logger = logging.Logger("mu-signal-service")
         logger.addHandler(handler)

@@ -139,7 +139,7 @@ class SignalService:
         # may find a still-allowed previous generation; both facts remain visible.
         self._phase(Phase.SCAN, self.config.scan_timeout_seconds)
         scan_args = [sys.executable, "-B", "-m", "mu_strategy.commands.signal_service", "scan-once", "--data-dir", str(self.config.data_dir),
-                     "--scan-days", str(self.config.scan_days)]
+                     "--scan-days", str(self.config.scan_days), "--refresh-days", str(self.config.refresh_days)]
         for symbol in self.config.symbols:
             scan_args.extend(("--symbol", symbol))
         scan = self._scan(scan_args)
