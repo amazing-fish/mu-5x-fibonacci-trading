@@ -195,6 +195,37 @@ class EmailAlertsTests(unittest.TestCase):
         self.clock.value += 30_000
         self.assertEqual(1, self.alerts.deliver(self.transport))
 
+    def assert_publication_lock_error_is_reported(self, patcher):
+        self.publish()
+        output = io.StringIO()
+        environment = {"MU_SMTP_HOST": CONFIG.host, "MU_SMTP_SENDER": CONFIG.sender,
+                       "MU_SMTP_RECIPIENT": CONFIG.recipient, "MU_SMTP_AUTHORIZATION_CODE": "test-only"}
+        with patcher:
+            code = main(["run", "--once", "--send", "--data-dir", str(self.data_dir)],
+                        stdout=output, environment=environment, factory=Mock(return_value=self.alerts),
+                        transport_factory=Mock(return_value=self.transport))
+        self.assertEqual(2, code)
+        self.assertEqual({"error_code": "notification_state_or_delivery_error", "retryable": False},
+                         json.loads(output.getvalue()))
+        self.assertNotIn("private diagnostic", output.getvalue())
+        self.transport.send.assert_not_called()
+        self.assertEqual(("unknown", 1), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.clock.value += 30_000
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_publication_lock_open_permission_error_is_not_contention(self):
+        original_open = Path.open
+        def denied(path, *args, **kwargs):
+            if path == self.alerts.observations.lock_path:
+                raise PermissionError("private diagnostic must not appear")
+            return original_open(path, *args, **kwargs)
+        self.assert_publication_lock_error_is_reported(patch.object(Path, "open", new=denied))
+
+    def test_publication_lock_io_error_is_not_contention(self):
+        self.assert_publication_lock_error_is_reported(
+            patch("mu_strategy.file_locks.lock_file", side_effect=OSError("private diagnostic must not appear")))
+
     def test_final_validation_and_transport_exclude_observation_append(self):
         self.publish()
         self.alerts.collect()

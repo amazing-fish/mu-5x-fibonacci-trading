@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from mu_strategy.canonical import canonical_sha256
+from mu_strategy.file_locks import FileLockBusyError
 from mu_strategy.market_data.trusted_data.contracts import Clock, SystemClock
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError, integer
 from mu_strategy.notifications.store import NotificationStore
@@ -270,7 +271,7 @@ class EmailAlerts:
                     if current.event.kind is AlertKind.ENTRY_REVIEW:
                         try:
                             fence.enter_context(self.observations.publication_fence(wait=False))
-                        except OSError:
+                        except FileLockBusyError:
                             self.store.defer_unstarted(db, current.event.event_id, now_ms=now, reason="source_not_caught_up")
                             continue
                         if not self._prepare_entry(db, current, now):

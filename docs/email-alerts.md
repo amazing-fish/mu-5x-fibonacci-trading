@@ -34,6 +34,8 @@ python -B -m mu_strategy.commands.email_alerts show <event-id> --data-dir data\l
 
 重启携带的上一运行 cycle 只作历史证据，不能据其暂不健康撤销当前提醒；首次当前运行 cycle 完成后才应用新的扫描健康和扫描名单。明确停止、中断或失去响应属于独立运行事实，即使首轮尚未完成也会立即使旧提醒失效。等待期间禁止入场发送，原复核期限仍有效。
 
+只有明确的锁占用会自动延后。锁文件权限、磁盘或其他锁 I/O 错误通过 `notification_state_or_delivery_error` 报告，返回 2 且 `retryable=false`，不会伪装成正常等待。此时已提交的预留保守保留为 unknown，查询并核对后再恢复，不能仅因修好锁文件便自动重发。
+
 ## SMTP 配置与受控启用
 
 通过启动进程的本地环境提供：
