@@ -20,6 +20,7 @@ data/live/generations/**
 !data/live/generations/*/okx/*/*.csv
 data/*.csv
 data/observations/
+data/*-signal-service/
 data/strategy-release-candidates/
 reports/live/
 reports/*.html
