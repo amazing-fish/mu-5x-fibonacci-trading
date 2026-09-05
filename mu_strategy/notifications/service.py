@@ -7,7 +7,7 @@ from mu_strategy.market_data.trusted_data.contracts import Clock, SystemClock
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError, integer
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.observations import JsonlObservationRepository, ObservationOutcome, Stage0Observation
-from mu_strategy.service_health import HealthSnapshotUnstableError, HealthStateError, HealthStore, health_view
+from mu_strategy.service_health import HealthStateError, HealthStore, health_view
 
 
 class EmailAlerts:
@@ -52,7 +52,7 @@ class EmailAlerts:
                 stream = self.store.stream(db, symbol)
                 if stream["active_event_id"] is None:
                     continue
-                if not view["healthy"]:
+                if not view["healthy"] or symbol not in state.symbols:
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
                 elif now < stream["last_seen_ms"] or now >= stream["last_seen_ms"] + self.review_ms:
                     self._invalidate(db, symbol, stream, "review_expired", now)
@@ -60,6 +60,7 @@ class EmailAlerts:
             caught_up = (current is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(current.to_dict()))
             self.store.set_meta(db, "source_ready", bool(view["healthy"] and caught_up))
             self.store.set_meta(db, "last_collection_ms", now)
+            self.store.set_meta(db, "log_unavailable_since_ms", None)
         return {"runtime": view["runtime"], "source_healthy": view["healthy"], "caught_up": caught_up,
                 "cycles_consumed": len(cycles), "position_alerts": "unavailable_until_issue_85"}
 
@@ -78,9 +79,7 @@ class EmailAlerts:
             result = observation.scan_result
             if result is None or result.signal_time_ms is None:
                 raise NotificationError("ready observation lacks signal identity")
-            key = canonical_sha256({"symbol": observation.symbol, "strategy": observation.strategy_name,
-                                    "config": observation.strategy_config_fingerprint, "signal_time_ms": result.signal_time_ms,
-                                    "decision": observation.decision_code.value})
+            key = self._signal_key(observation)
             if stream["signal_key"] == key:
                 stream["last_seen_ms"] = observation.observed_at_ms
             else:
@@ -96,6 +95,15 @@ class EmailAlerts:
             reason = "decision_changed" if observation.outcome is ObservationOutcome.NORMAL_NO_ACTION else "source_unavailable"
             self._invalidate(db, observation.symbol, stream, reason, now, observation=observation)
         self.store.save_stream(db, observation.symbol, stream)
+
+    @staticmethod
+    def _signal_key(observation: Stage0Observation) -> str | None:
+        if observation.outcome is not ObservationOutcome.READY_FOR_REVIEW or observation.scan_result is None:
+            return None
+        return canonical_sha256({"symbol": observation.symbol, "strategy": observation.strategy_name,
+                                 "config": observation.strategy_config_fingerprint,
+                                 "signal_time_ms": observation.scan_result.signal_time_ms,
+                                 "decision": observation.decision_code.value})
 
     def _invalidate(self, db, symbol, stream, reason: str, now: int, *, observation=None) -> None:
         entry = self.store.record(db, stream["active_event_id"])
@@ -171,6 +179,26 @@ class EmailAlerts:
                 if stream["active_event_id"]:
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
 
+    def observation_unavailable(self) -> bool:
+        """Defer lifecycle changes for a possibly in-progress append, never sending entries.
+
+        The existing writer marks every append invalid until its fsync completes.
+        Persist a 30-second retry window so one overlapping poll does not withdraw
+        a valid signal; an unresolved marker/corruption still becomes a fault.
+        """
+        now = self.clock.now_ms()
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.validate(db)
+            since = self.store.get_meta(db, "log_unavailable_since_ms")
+            if since is None:
+                since = now
+                self.store.set_meta(db, "log_unavailable_since_ms", since)
+            self.store.set_meta(db, "source_ready", False)
+        if since <= now < since + 30_000:
+            return False
+        self.source_unavailable()
+        return True
+
     def deliver(self, transport, *, limit: int = 20) -> int:
         """Reserve UNKNOWN durably before network; serialize result/manual reconciliation.
 
@@ -197,12 +225,22 @@ class EmailAlerts:
                         continue
                     now = self.clock.now_ms()
                     if current.event.kind is AlertKind.ENTRY_REVIEW:
-                        state, running = self.health.snapshot()
+                        try:
+                            state, running = self.health.snapshot()
+                        except (HealthStateError, OSError):
+                            # This is before transport.send. No SMTP operation
+                            # can have happened; retry without spending its budget.
+                            self.store.defer_unstarted(db, current.event.event_id, now_ms=now)
+                            continue
                         view = health_view(state, running=running, now_ms=now)
                         stream = self.store.stream(db, current.event.observation.symbol)
                         latest = state.last_cycle.scan.cycle if state and state.last_cycle else None
+                        symbol = current.event.observation.symbol
+                        evidence = next((item for item in latest.observations if item.symbol == symbol), None) if latest else None
                         allowed = (view["healthy"] and self.store.get_meta(db, "source_ready", False)
                                    and latest is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(latest.to_dict())
+                                   and symbol in state.symbols and evidence is not None
+                                   and self._signal_key(evidence) == stream["signal_key"]
                                    and stream["active_event_id"] == current.event.event_id
                                    and current.event.occurred_at_ms <= now < current.event.review_until_ms)
                         if not allowed or current.suppressed_reason is not None:

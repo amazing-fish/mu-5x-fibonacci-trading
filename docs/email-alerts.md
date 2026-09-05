@@ -60,7 +60,7 @@ python -B -m mu_strategy.commands.email_alerts run --once --send --data-dir data
 | `failed` | 确定未被接受；临时错误以 60 秒、120 秒间隔重试，每事件最多 3 次 |
 | `unknown` | 可能已发送；禁止自动重发，等待人工核对 |
 
-发送前提交 unknown 预留，再在另一个写事务内调用 SMTP 并记录结果。进程中断、发送后超时或结果写盘失败会留下 unknown，另一发送者不会领取。发送期间其他写入及人工处理受 SQLite 写锁排除，status 仍可读。慢 SMTP 会增加消费延迟，原始日志继续由独立信号服务记录。`Message-ID` 只用于关联，不能宣称 exactly-once。
+发送前提交 unknown 预留，再在另一个写事务内调用 SMTP 并记录结果。若仅发送前的健康快照读取失败、尚未调用 transport，则记录未开始并回到 pending，30 秒后可重试且不消耗 SMTP 次数。进程中断、发送后超时或结果写盘失败会留下 unknown，另一发送者不会领取。当前扫描名单移除标的也会撤销旧提醒，其他标的的健康结果不能为其背书。发送期间其他写入及人工处理受 SQLite 写锁排除，status 仍可读。慢 SMTP 会增加消费延迟，原始日志继续由独立信号服务记录。`Message-ID` 只用于关联，不能宣称 exactly-once。
 
 授权失败/永久拒收需修正原因；结果不明必须核对服务器证据。先 show，再按实际证据操作：
 
@@ -70,9 +70,9 @@ python -B -m mu_strategy.commands.email_alerts resolve <event-id> --outcome fail
 python -B -m mu_strategy.commands.email_alerts retry <event-id> --confirm-cause-fixed --data-dir data\live
 ```
 
-resolve 仅适用于 unknown，只有核实未接受才选 failed。retry 仅适用于已知失败、未抑制且未达到 3 次上限的事件，不绕过期限或增加上限。操作均进入持久历史。渠道错误时原信号服务健康仍可查询，通知状态和固定错误码也保留在本地。
+resolve 仅适用于 unknown，只有核实未接受才选 failed；这不会自动重发，确认失败原因已修正后还需显式 retry。retry 仅适用于已知失败、未抑制且未达到 3 次上限的事件，不绕过期限或增加上限。操作均进入持久历史。渠道错误时原信号服务健康仍可查询，通知状态和固定错误码也保留在本地。
 
-健康源只保留最近 100 个事件。游标缺口会报告 `runtime.source_unavailable` 并停止入场提醒。检查 `signal_service status` 和丢失范围后，显式执行 `email_alerts reconcile-health --confirm-history-gap --data-dir data\live`；该操作记录缺口确认并推进健康游标，不改行情、扫描游标或送达状态。扫描日志截断、替换、`.invalid` 标记也会阻断；先处理日志，不删除去重库来恢复发信。
+健康源只保留最近 100 个事件。游标缺口会报告 `runtime.source_unavailable` 并停止入场提醒。检查 `signal_service status` 和丢失范围后，显式执行 `email_alerts reconcile-health --confirm-history-gap --data-dir data\live`；该操作记录缺口确认并推进健康游标，不改行情、扫描游标或送达状态。扫描日志截断、替换、`.invalid` 标记也阻断入场发送。由于 writer 正常追加期间也会短暂创建标记，首次不可读只记录起始时间并稍后重试，不立即撤销信号；成功读取即清除，持续至少 30 秒仍不可读才撤销并通知。该等待跨通知进程重启保留，不放宽日志完整性检查。先处理日志，不删除去重库来恢复发信。
 
 前瞻期间保留源日志和通知库。首版不提供在线归档/游标迁移；离线备份时同时停止信号服务、通知消费和发送，确认写入结束，整体备份日志、健康快照、库及 SQLite journal。不能用空日志替换已绑定游标的日志。
 

@@ -101,6 +101,8 @@ class NotificationStore:
             integer(value)
         elif name == "review_ms":
             integer(value, minimum=1)
+        elif name == "log_unavailable_since_ms" and value is not None:
+            integer(value)
         elif name in {"delivery_target", "last_cycle_sha256"}:
             digest(value)
         elif name == "source_ready" and type(value) is not bool:
@@ -203,12 +205,21 @@ class NotificationStore:
                    (state.value, int(retryable and state is DeliveryState.FAILED), integer(now_ms) + delay, event_id))
         self.history(db, event_id, now_ms, "attempt_finished", code)
 
+    def defer_unstarted(self, db, event_id: str, *, now_ms: int) -> None:
+        """Release only a reservation whose transport has provably not been called."""
+        record = self.record(db, event_id)
+        if record is None or record.state is not DeliveryState.UNKNOWN or record.attempts < 1:
+            raise NotificationError("invalid unstarted delivery reservation")
+        db.execute("UPDATE outbox SET state='pending',attempts=attempts-1,retryable=0,next_attempt_ms=? WHERE event_id=?",
+                   (integer(now_ms) + 30_000, event_id))
+        self.history(db, event_id, now_ms, "attempt_not_started", "source_snapshot_unavailable")
+
     def resolve(self, event_id: str, *, outcome: DeliveryState, now_ms: int) -> None:
         if outcome not in {DeliveryState.CONFIRMED, DeliveryState.FAILED}:
             raise NotificationError("operator resolution must be confirmed or failed")
         with self.connection() as db, self.transaction(db):
             self.validate(db)
-            self.finish(db, event_id, state=outcome, now_ms=now_ms, code="operator_checked", retryable=outcome is DeliveryState.FAILED)
+            self.finish(db, event_id, state=outcome, now_ms=now_ms, code="operator_checked")
 
     def retry_failed(self, event_id: str, *, now_ms: int) -> None:
         with self.connection() as db, self.transaction(db):
@@ -235,6 +246,7 @@ class NotificationStore:
             result = {"initialized": True, "position_alerts": "unavailable_until_issue_85",
                       "last_collection_ms": self.get_meta(db, "last_collection_ms"),
                       "out_of_order_observations": self.get_meta(db, "out_of_order_observations", 0),
+                      "log_unavailable_since_ms": self.get_meta(db, "log_unavailable_since_ms"),
                       "counts": {row[0]: row[1] for row in db.execute("SELECT state, COUNT(*) FROM outbox GROUP BY state")},
                       "suppressed": db.execute("SELECT COUNT(*) FROM outbox WHERE suppressed_reason IS NOT NULL").fetchone()[0],
                       "records": [row.summary() for row in rows]}

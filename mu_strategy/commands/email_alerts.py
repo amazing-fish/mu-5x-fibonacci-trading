@@ -80,7 +80,14 @@ def main(argv=None, *, stdout=None, environment=None, factory=EmailAlerts, trans
             except HealthSnapshotUnstableError:
                 emit({"error_code": "health_snapshot_unstable", "retryable": True})
                 code = 2
-            except (HealthStateError, ObservationCorruptionError):
+            except ObservationCorruptionError:
+                actionable = alerts.observation_unavailable()
+                if actionable and transport:
+                    alerts.deliver(transport)
+                emit({"error_code": "observation_source_unavailable" if actionable else "observation_append_pending_retry",
+                      "retryable": True, "entry_delivery_allowed": False})
+                code = 2
+            except HealthStateError:
                 alerts.source_unavailable()
                 if transport:
                     alerts.deliver(transport)

@@ -53,28 +53,28 @@ class EmailAlertsTests(unittest.TestCase):
         self.transport = Mock(target_fingerprint=CONFIG.target_fingerprint,
                               send=Mock(return_value=SendResult(DeliveryState.CONFIRMED, "smtp_accepted")))
 
-    def publish(self, kind="ready", *, signal=42, generation="trusted-run", events=None, at=None, append=True, config=None):
+    def publish(self, kind="ready", *, signal=42, generation="trusted-run", events=None, at=None, append=True, config=None, symbol=SYMBOL, run_id="service-1"):
         self.sequence += 1
         at = self.clock.value if at is None else at
-        group = baseline_strategy_group(SYMBOL)
+        group = baseline_strategy_group(symbol)
         clock = Mock(now_ms=Mock(return_value=at))
         cycle = ScanCycle(clock=clock, id_factory=iter((f"cycle-{self.sequence}", f"observation-{self.sequence}")).__next__)
-        bundle = trusted_scan_bundle(symbol=SYMBOL, allowed=kind != "blocked", reason=HealthReason.STALE_BY_CLOCK if kind == "blocked" else HealthReason.OK)
+        bundle = trusted_scan_bundle(symbol=symbol, allowed=kind != "blocked", reason=HealthReason.STALE_BY_CLOCK if kind == "blocked" else HealthReason.OK)
         manifest = replace(bundle.load_context.manifest, run_id=generation)
         bundle = replace(bundle, run_id=generation, observed_at_ms=at,
                          load_context=replace(bundle.load_context, manifest=manifest, generation_id=generation))
         code = EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY if kind == "ready" else EntryDecisionCode.WAITING_SECOND_PULLBACK
-        result = replace(scan_result(code, symbol=SYMBOL), signal_time_ms=signal)
+        result = replace(scan_result(code, symbol=symbol), signal_time_ms=signal)
         scanner = Mock(side_effect=RuntimeError("failure")) if kind == "failed" else Mock(return_value=result)
-        cycle.scan_symbol(symbol=SYMBOL, source="watchlist", bundle=bundle, requested_intervals=("15m", "1h"),
+        cycle.scan_symbol(symbol=symbol, source="watchlist", bundle=bundle, requested_intervals=("15m", "1h"),
                           strategy_name=group.name, strategy_config=config or group.config, scanner=scanner, data_failure=None)
         observed = cycle.observations()
         if append:
             self.alerts.observations.append_cycle(observed)
         events = events if events is not None else (HealthEvent(1, 900_000, "started", ()),)
-        self.state = ServiceState(str(self.data_dir.resolve()), (SYMBOL,), "service-1", True, Phase.IDLE,
+        self.state = ServiceState(str(self.data_dir.resolve()), (symbol,), run_id, True, Phase.IDLE,
                                   min(900_000, at), at, at + 330_000,
-                                  CycleHealth(self.sequence, "service-1", at, at,
+                                  CycleHealth(self.sequence, run_id, at, at,
                                               RefreshHealth(StepStatus.SUCCEEDED, generation, RefreshAttemptStatus.SUCCESS, SnapshotUsability.USABLE, 0),
                                               ScanHealth(StepStatus.SUCCEEDED, observed, StepStatus.SUCCEEDED)),
                                   0, events, events[-1].sequence)
@@ -161,6 +161,58 @@ class EmailAlertsTests(unittest.TestCase):
         self.publish("wait")
         self.assertEqual(0, self.alerts.deliver(self.transport))
         self.transport.send.assert_not_called()
+
+    def test_removed_symbol_pending_entry_is_suppressed_after_valid_service_restart(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 1
+        self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+
+    def test_removed_symbol_with_confirmed_or_unknown_entry_gets_invalidation(self):
+        for outcome in (DeliveryState.CONFIRMED, DeliveryState.UNKNOWN):
+            with self.subTest(outcome=outcome):
+                self.clock.value += 100
+                self.publish(signal=self.clock.value, run_id="service-3")
+                self.alerts.collect()
+                original = self.entry_id()
+                self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+                self.alerts.deliver(self.transport)
+                self.clock.value += 1
+                self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-4")
+                self.alerts.collect()
+                related = [row for row in self.records(AlertKind.SIGNAL_INVALIDATED)
+                           if self.alerts.store.status(event_id=row["event_id"])["event"]["related_event_id"] == original]
+                self.assertEqual(1, len(related))
+                self.assertIsNone(related[0]["suppressed_reason"])
+
+    def test_send_time_symbol_check_does_not_trust_global_caught_up_flag(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        current = self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-2")
+        from mu_strategy.canonical import canonical_sha256
+        with self.alerts.store.connection() as db, self.alerts.store.transaction(db):
+            self.alerts.store.set_meta(db, "last_cycle_sha256", canonical_sha256(current.to_dict()))
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+
+    def test_unstable_pre_send_snapshot_defers_without_spending_smtp_attempt(self):
+        self.publish()
+        self.alerts.collect()
+        self.snapshot.side_effect = HealthSnapshotUnstableError("retry")
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.transport.send.assert_not_called()
+        self.snapshot.side_effect = lambda: (self.state, self.running)
+        self.clock.value += 30_000
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records()[0]["state"])
 
     def test_new_signal_and_config_changes_get_new_identities(self):
         self.publish()
@@ -377,6 +429,56 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.deliver(self.transport)
         with self.assertRaises(NotificationError):
             self.alerts.store.retry_failed(self.entry_id(), now_ms=self.clock.value)
+
+    def test_resolving_unknown_failed_does_not_implicitly_confirm_cause_fixed(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.UNKNOWN, "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        event_id = self.entry_id()
+        self.alerts.store.resolve(event_id, outcome=DeliveryState.FAILED, now_ms=self.clock.value)
+        self.clock.value += 60_000
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertFalse(self.records()[0]["retryable"])
+        self.alerts.store.retry_failed(event_id, now_ms=self.clock.value)
+        self.transport.send.return_value = SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records()[0]["state"])
+
+    def test_normal_writer_marker_overlap_defers_without_false_withdrawal(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original_id = self.entry_id()
+        self.clock.value += 1
+        cycle = self.publish(append=False)
+        original_marker = self.alerts.observations._write_invalid_marker
+        def while_appending(*args, **kwargs):
+            original_marker(*args, **kwargs)
+            output = io.StringIO()
+            self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                    factory=Mock(return_value=self.alerts)))
+            self.assertEqual("observation_append_pending_retry", json.loads(output.getvalue())["error_code"])
+            self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+            self.assertIsNone(self.alerts.store.status(event_id=original_id)["records"][0]["suppressed_reason"])
+        with patch.object(self.alerts.observations, "_write_invalid_marker", side_effect=while_appending):
+            self.alerts.observations.append_cycle(cycle)
+        self.alerts.collect()
+        self.assertEqual([original_id], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertIsNone(self.alerts.store.status()["log_unavailable_since_ms"])
+
+    def test_persistent_log_error_eventually_invalidates_and_survives_notifier_restart(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.observation_unavailable())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
 
     def test_conflicting_equal_timestamp_observation_rolls_back_cursor(self):
         self.publish()
