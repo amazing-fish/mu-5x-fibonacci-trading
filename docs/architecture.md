@@ -9,6 +9,8 @@ created: 2026-06-14
 
 This project is organized as a research-first trading strategy workbench. It also contains a guarded OKX Demo application layer. Production live trading is not implemented.
 
+The observation-only email consumer is `mu_strategy.notifications`: it reads committed Stage 0 records and consistent service-health snapshots, persists event identities/cursors and delivery attempts in a separate SQLite outbox, and uses explicit NetEase SMTP configuration only with `email_alerts run --send`. It does not import a broker or re-evaluate strategy rules. See [email reminders and forward-evidence preparation](email-alerts.md) for deadlines, unknown delivery outcomes, operator reconciliation and source-history boundaries.
+
 ## Filesystem durability
 
 Module: `mu_strategy.fs_durability`

@@ -29,6 +29,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 - `mu_strategy.research`：当前研究结论入口。
 - `mu_strategy.research.strategy_releases`：内容寻址的策略候选、SCM 审批快照和 strict exact-ID release resolver；详见 [docs/strategy-release-provenance.md](docs/strategy-release-provenance.md)。
 - `mu_strategy.selection`：固定策略下的候选标的排序。
+- `mu_strategy.notifications`：消费已提交的信号及健康状态，提供默认 dry-run 的网易邮件、持久去重和送达证据；见 [邮件提醒手册](docs/email-alerts.md)。
 - `mu_strategy.execution`：非交易的入场与风险规划，以及不连接 Broker 的本地 SQLite intent/audit/idempotency 事务存储。
 - `mu_strategy.live`：OKX API 执行准备工具；默认只读或 dry-run，不接入回测主流程。
 - `mu_strategy.demo_trading`：OKX Demo 自动化应用层；动态 Top10 扫描、只读出场观测、风险上限、`clOrdId` 幂等和小额限价单。

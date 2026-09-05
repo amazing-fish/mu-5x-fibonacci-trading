@@ -1,0 +1,87 @@
+# 网易邮件提醒
+
+`mu_strategy.commands.email_alerts` 消费信号服务已提交的 Stage 0 日志及健康快照，保存提醒和送达证据。默认 dry-run，不读取 SMTP 配置、不发邮件。它只辅助人工复核，不下单、不重新扫描、不计算策略，也不修改行情。
+
+## 离线预检与查询
+
+```powershell
+python -B -m mu_strategy.commands.email_alerts run --once --data-dir data\live
+python -B -m mu_strategy.commands.email_alerts status --data-dir data\live
+python -B -m mu_strategy.commands.email_alerts show <event-id> --data-dir data\live
+```
+
+`run --once` 创建本地 outbox 并消费已有记录；dry-run 的 pending 不是已发送。没有源数据时不会凭空生成信号。`status` / `show` 不创建文件或读取邮箱凭据。`last_collection_ms` 是最近成功消费时间，不证明通知进程当前存活。`counts` 按送达状态计数，`suppressed` 另列抑制数；pending 可能被抑制，必须同时查看 `suppressed_reason`。
+
+普通 `run` 每 30 秒消费一批，`--poll-seconds` 可配置；每批最多 1000 个 cycle。游标绑定上一记录的字节范围及 SHA-256，单记录上限 4 MiB。正常无信号、失败与阻断保留在原日志；通知库保存提醒、失效及送达记录。重复与过旧观测不产生新提醒，乱序计数可查询；相同时点的冲突结果明确失败。
+
+## 信号和有效期
+
+首版支持入场复核、先前入场提醒失效、服务故障及恢复。没有可信持仓输入时，加仓、止损调整及退出提醒显示 `unavailable_until_issue_85`，不把影子持仓或估算当实际成交。
+
+入场身份绑定策略名称、配置指纹、标的、信号 K 线时间、typed decision 和持久状态转换序号。同一机会持续 READY 时，刷新 generation、重复轮询和通知进程重启不重发；失效后再恢复 READY 是新的状态变化。每条提醒保留首次证据的 generation、数据哈希、观察时间和 typed result。
+
+源观测没有独立到期字段或策略源代码版本。本模块采用明确的**人工复核期限**：首次观察起 300 秒，到期边界不包含；`--review-seconds` 可在新通知库首次启动时配置，后续必须一致。这只是提醒时效上限，不改变 scanner 的策略生命周期。重复 READY 可更新来源的最近确认时间，但不会延长原邮件截止时间或补发过期的入场邮件。
+
+后续不再 READY、信号/配置替换、数据/服务不可用、最近确认超过期限，都会使原提醒失去可采信状态。数据不可用不能表述为策略确定反转。未发送的历史入场及其撤销保留但抑制发信；已确认或结果不明的入场随后失效会通知。
+
+发送入场前再次读取一致健康快照，要求服务健康、源日志已追上该 cycle、原提醒仍有效。代码版本显示 `unknown`，配置指纹不能冒充代码版本；正式前瞻观察需固定部署版本。
+
+## SMTP 配置与受控启用
+
+通过启动进程的本地环境提供：
+
+| 环境变量 | 用途 |
+|---|---|
+| `MU_SMTP_HOST` | `smtp.126.com`、`smtp.163.com` 或 `smtp.yeah.net` |
+| `MU_SMTP_SENDER` | 一个纯邮箱地址，同时作为 SMTP 登录账号 |
+| `MU_SMTP_RECIPIENT` | 一个纯收件地址，不接受列表或显示名称 |
+| `MU_SMTP_AUTHORIZATION_CODE` | 网易网页设置中开启 SMTP 后取得的客户端授权码，不是网页登录密码 |
+
+使用标准库 `SMTP_SSL`，端口 465、证书与主机名校验开启，每项网络操作超时 20 秒。不降低 TLS 校验，不读取 `.env`，不将地址或授权码写入数据库、普通 stdout 或诊断日志；库中只保存通道身份哈希。收发地址或主机变化默认拒绝复用旧通道状态，授权码更新不改变通道身份。配置缺失时，在创建/推进 outbox 前明确报错。
+
+先查看 dry-run 的 `show` 内容；操作者确认发件账户、收件人和发送授权后，才启用传输：
+
+```powershell
+python -B -m mu_strategy.commands.email_alerts run --once --send --data-dir data\live
+```
+
+此命令可能发送最多 20 条待处理提醒，不是单封测试信。单封受控验收应使用隔离测试数据目录及一条已审核的健康事件，再确认服务器接受与收件箱实际到达；不要复制正式 pending 入场来验收。自动化测试只使用 fake SMTP，本文不代表已发过邮件。
+
+稳定后分别以前台运行信号服务和通知消费者；后者不是第二个 refresh writer。Windows 计划任务需另行配置，参考 [信号服务手册](signal-service.md)，通知进程参数为 `email_alerts run --send`。实现不注册、启用或改变系统任务。人工停机也会产生停止提醒；短暂 starting 和一致快照暂不可用不会冒充已确认停机。
+
+## 送达及恢复
+
+库固定为 `<data-dir 同级>/<目录名>-signal-service/email.sqlite3`，绑定规范化绝对数据目录，沿用目录的 Git 忽略规则。schema v1 只接受当前定义；损坏、跨目录复制、未知 schema 均拒绝。事务将源游标、状态转换和提醒一起提交。
+
+| 状态 | 含义和处理 |
+|---|---|
+| `pending` | 尚未尝试；另查是否已抑制 |
+| `confirmed` | SMTP 接受，或操作者核实接受；不证明进入收件箱或已读 |
+| `failed` | 确定未被接受；临时错误以 60 秒、120 秒间隔重试，每事件最多 3 次 |
+| `unknown` | 可能已发送；禁止自动重发，等待人工核对 |
+
+发送前提交 unknown 预留，再在另一个写事务内调用 SMTP 并记录结果。进程中断、发送后超时或结果写盘失败会留下 unknown，另一发送者不会领取。发送期间其他写入及人工处理受 SQLite 写锁排除，status 仍可读。慢 SMTP 会增加消费延迟，原始日志继续由独立信号服务记录。`Message-ID` 只用于关联，不能宣称 exactly-once。
+
+授权失败/永久拒收需修正原因；结果不明必须核对服务器证据。先 show，再按实际证据操作：
+
+```powershell
+python -B -m mu_strategy.commands.email_alerts resolve <event-id> --outcome confirmed --confirm-checked --data-dir data\live
+python -B -m mu_strategy.commands.email_alerts resolve <event-id> --outcome failed --confirm-checked --data-dir data\live
+python -B -m mu_strategy.commands.email_alerts retry <event-id> --confirm-cause-fixed --data-dir data\live
+```
+
+resolve 仅适用于 unknown，只有核实未接受才选 failed。retry 仅适用于已知失败、未抑制且未达到 3 次上限的事件，不绕过期限或增加上限。操作均进入持久历史。渠道错误时原信号服务健康仍可查询，通知状态和固定错误码也保留在本地。
+
+健康源只保留最近 100 个事件。游标缺口会报告 `runtime.source_unavailable` 并停止入场提醒。检查 `signal_service status` 和丢失范围后，显式执行 `email_alerts reconcile-health --confirm-history-gap --data-dir data\live`；该操作记录缺口确认并推进健康游标，不改行情、扫描游标或送达状态。扫描日志截断、替换、`.invalid` 标记也会阻断；先处理日志，不删除去重库来恢复发信。
+
+前瞻期间保留源日志和通知库。首版不提供在线归档/游标迁移；离线备份时同时停止信号服务、通知消费和发送，确认写入结束，整体备份日志、健康快照、库及 SQLite journal。不能用空日志替换已绑定游标的日志。
+
+退出码：查询/成功消费为 0；配置、存储、来源错误为 2；实际发送模式存在 failed/unknown 记录也返回 2。循环输出错误后下一轮重试读取，`retryable=false` 表示需要人工处理。退出码及 pending 数不证明信号质量或真实送达。
+
+## 前瞻准备（#99）
+
+正式观察前记录部署 Git commit、工作树是否干净、baseline 完整配置及指纹、成本假设、观察起止时间、未参与调参的样本外窗口。实时 generation 持续更新并保留来源；冻结实验配置不是固定实时行情。代码或策略变化后另开实验窗口，避免混合绩效。
+
+原日志保留全部扫描，通知库保留入场、失效、抑制、发送尝试、送达状态和人工处理。show 提供事件完整证据及关联入场 ID。另行记录人工看到/确认时间、真实成交或未成交及其依据，不能从 confirmed 推断成交。每周分别复盘策略效果、数据质量、通知延迟/失败与人工执行偏差。
+
+本次提供记录基础和启动协议，没有开展样本外实验、真实发信或连续运行验收。至少 20 个交易日工程证据、6–12 周起步前瞻观察、可信持仓接入仍由 #99/#85 跟踪。
