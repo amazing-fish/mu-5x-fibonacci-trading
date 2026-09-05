@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +12,7 @@ from mu_strategy.execution.instruments import OKXInstrumentSpec
 from mu_strategy.experiments.walk_forward import WindowBacktest, run_evaluator_walk_forward_backtests
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
+from mu_strategy.market_data.utils import DAY_MS
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
@@ -33,6 +34,9 @@ from mu_strategy.research.candidate_conclusions import (
     write_candidate_conclusion_index,
 )
 from mu_strategy.research.robustness import trade_concentration
+from mu_strategy.research.historical_data import load_historical_window, replay_html, replay_markdown
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.strategy import StrategyConfig
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
@@ -146,6 +150,7 @@ class StrategyLadderResult:
     instrument: OKXInstrumentSpec
     evaluations: tuple[CandidateEvaluation, ...]
     conclusion_index: CandidateConclusionIndex
+    replay_provenance: str | None = None
 
 
 def candidate_definitions() -> tuple[CandidateDefinition, ...]:
@@ -295,9 +300,11 @@ def evaluate_strategy_ladder(
     instrument: OKXInstrumentSpec,
     window_days: int = 14,
     windows: int = 2,
+    baseline_config: StrategyConfig | None = None,
 ) -> tuple[CandidateEvaluation, ...]:
     definitions = candidate_definitions()
-    baseline_config = baseline_strategy_group(symbol).config
+    if baseline_config is None:
+        baseline_config = baseline_strategy_group(symbol).config
     evaluations: list[CandidateEvaluation] = []
 
     for definition in definitions:
@@ -500,7 +507,7 @@ def render_strategy_ladder_report(result: StrategyLadderResult) -> str:
     for evaluation in result.evaluations:
         lines.extend(_candidate_report_lines(evaluation))
     lines.extend(["", "Research artifact only; not financial advice."])
-    return "\n".join(lines)
+    return "\n".join(lines) + replay_markdown(result.replay_provenance)
 
 
 def render_strategy_ladder_html(result: StrategyLadderResult) -> str:
@@ -537,6 +544,7 @@ def render_strategy_ladder_html(result: StrategyLadderResult) -> str:
   <h2>Raw account-return ranking</h2>
   <div class="panel"><table><thead><tr><th>Rank</th><th>Candidate</th><th>Family</th><th>Configured leverage</th><th>Account return</th><th>Max drawdown</th><th>Trades</th><th>Win rate</th><th>Top-5 concentration</th><th>Status</th></tr></thead><tbody>{ranking_rows}</tbody></table></div>
   {candidate_sections}
+  {replay_html(result.replay_provenance)}
   <p class="meta">Research artifact only; not financial advice.</p>
 </main></body></html>"""
 
@@ -551,6 +559,7 @@ def run_strategy_ladder(
     html_report_path: Path | None = None,
     conclusion_path: Path | None = None,
     instrument: OKXInstrumentSpec = DEFAULT_MU_INSTRUMENT,
+    generation_id: str | None = None,
 ) -> StrategyLadderResult:
     report_path, html_report_path, conclusion_path = build_cli_output_paths(
         instrument.inst_id,
@@ -564,53 +573,94 @@ def run_strategy_ladder(
         html_report_path=html_report_path,
         conclusion_path=conclusion_path,
     )
-    bundle = refresh_trusted_candle_bundle(
-        symbol,
-        intervals=TRUSTED_REQUESTED_INTERVALS,
-        days=(window_days * windows) + MOMENTUM_HISTORY_DAYS,
-        data_dir=data_dir,
-        refresh=False,
-    )
-    status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
-    if status_error:
-        decision = bundle.trust_decision
-        reason = decision.reason if decision is not None else HealthReason.MANIFEST_BLOCKED
-        raise StrategyLadderDataError(reason, status_error)
-    incomplete_intervals = tuple(
-        interval
-        for interval in TRUSTED_REQUESTED_INTERVALS
-        if bundle.statuses_by_interval[interval].coverage_state != "complete"
-    )
-    if incomplete_intervals:
-        raise StrategyLadderDataError(
-            HealthReason.INSUFFICIENT_COVERAGE,
-            f"trusted data blocked: insufficient_coverage:{','.join(incomplete_intervals)}",
-        )
-    if instrument.inst_id != bundle.symbol.inst_id:
+    resolved = resolve_okx_swap_symbol(symbol)
+    if instrument.inst_id != resolved.inst_id:
         raise ValueError("instrument metadata does not match trusted symbol")
+    if window_days <= 0 or windows <= 0:
+        raise ValueError("window_days and windows must be positive")
+    provenance = None
+    if generation_id is not None:
+        window = load_historical_window(
+            data_dir=data_dir,
+            generation_id=generation_id,
+            symbol=resolved.inst_id,
+            days=window_days * windows + MOMENTUM_HISTORY_DAYS,
+        )
+        candles_15m = list(window.candles_by_interval["15m"])
+        candles_1h = list(window.candles_by_interval["1h"])
+        run_id = window.generation.reference.run_id
+        data_files = window.data_files
+    else:
+        bundle = refresh_trusted_candle_bundle(
+            symbol,
+            intervals=TRUSTED_REQUESTED_INTERVALS,
+            days=(window_days * windows) + MOMENTUM_HISTORY_DAYS,
+            data_dir=data_dir,
+            refresh=False,
+        )
+        status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+        if status_error:
+            decision = bundle.trust_decision
+            reason = decision.reason if decision is not None else HealthReason.MANIFEST_BLOCKED
+            raise StrategyLadderDataError(reason, status_error)
+        incomplete_intervals = tuple(
+            interval
+            for interval in TRUSTED_REQUESTED_INTERVALS
+            if bundle.statuses_by_interval[interval].coverage_state != "complete"
+        )
+        if incomplete_intervals:
+            raise StrategyLadderDataError(
+                HealthReason.INSUFFICIENT_COVERAGE,
+                f"trusted data blocked: insufficient_coverage:{','.join(incomplete_intervals)}",
+            )
 
+        candles_15m = bundle.candles_by_interval["15m"]
+        candles_1h = bundle.candles_by_interval["1h"]
+        run_id = bundle.run_id
+        data_files = (bundle.files_by_interval["15m"], bundle.files_by_interval["1h"])
+        if instrument.inst_id != bundle.symbol.inst_id:
+            raise ValueError("instrument metadata does not match trusted symbol")
+
+    baseline_config = baseline_strategy_group(resolved.inst_id).config
     evaluations = evaluate_strategy_ladder(
-        bundle.candles_by_interval["15m"],
-        bundle.candles_by_interval["1h"],
-        symbol=bundle.symbol.inst_id,
+        candles_15m,
+        candles_1h,
+        symbol=resolved.inst_id,
         instrument=instrument,
         window_days=window_days,
         windows=windows,
+        baseline_config=baseline_config,
     )
+    if generation_id is not None:
+        provenance = window.provenance({
+            "protocol": PROTOCOL_VERSION,
+            "baseline_config": StrategyConfigPayloadV1.from_config(baseline_config).to_dict(),
+            "candidates": [asdict(item.definition) for item in evaluations],
+            "local_candidate_leverage": LOCAL_CANDIDATE_LEVERAGE,
+            "window_days": window_days, "windows": windows,
+            "history_hours": MOMENTUM_HISTORY_HOURS,
+            "execution_start_ms": window.end_ms - window_days * windows * DAY_MS,
+            "execution_end_ms": window.end_ms,
+            "fee_grid_bps_per_side": FEE_GRID_BPS,
+            "slippage_grid_ticks_per_side": SLIPPAGE_GRID_TICKS,
+            "instrument": {key: str(value) for key, value in asdict(instrument).items()},
+            "starting_equity_per_window": 10000,
+        })
     conclusion_index = build_conclusion_index(
         evaluations,
         instrument,
-        trusted_generation=bundle.run_id or "",
+        trusted_generation=run_id or "",
         window_days=window_days,
         windows=windows,
     )
     result = StrategyLadderResult(
-        symbol=bundle.symbol.inst_id,
-        run_id=bundle.run_id,
-        data_files=(bundle.files_by_interval["15m"], bundle.files_by_interval["1h"]),
+        symbol=resolved.inst_id,
+        run_id=run_id,
+        data_files=data_files,
         instrument=instrument,
         evaluations=evaluations,
         conclusion_index=conclusion_index,
+        replay_provenance=provenance,
     )
     report = render_strategy_ladder_report(result)
     dashboard = render_strategy_ladder_html(result)
@@ -626,6 +676,7 @@ def run_strategy_ladder(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the trusted cache-only strategy candidate ladder.")
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
+    parser.add_argument("--generation-id", help="Explicit trusted historical generation; research replay only.")
     parser.add_argument("--window-days", type=int, default=14)
     parser.add_argument("--windows", type=int, default=2)
     parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
@@ -647,6 +698,7 @@ def main() -> None:
         )
         result = run_strategy_ladder(
             symbol=args.symbol,
+            generation_id=args.generation_id,
             window_days=args.window_days,
             windows=args.windows,
             data_dir=args.data_dir or Path("data/live"),

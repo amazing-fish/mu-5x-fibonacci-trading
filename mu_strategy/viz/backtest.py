@@ -10,6 +10,14 @@ from mu_strategy.backtest import run_backtest
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
+from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
+from mu_strategy.research.historical_data import (
+    HistoricalGenerationError,
+    load_historical_window,
+    replay_html,
+    validate_replay_outputs,
+)
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -22,6 +30,7 @@ TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate an HTML visualization from trusted cached market data.")
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
+    parser.add_argument("--generation-id", help="Explicit trusted historical generation; research replay only.")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
     parser.add_argument("--output", type=Path, default=Path("reports/live/mu_okx_baseline_backtest.html"))
@@ -44,19 +53,46 @@ def main() -> None:
     group = groups[0]
     config = with_fee_profile(group.config, args.fee_profile)
     data_dir = args.data_dir or Path("data/live")
-    bundle = refresh_trusted_candle_bundle(
-        args.symbol,
-        intervals=TRUSTED_REQUESTED_INTERVALS,
-        days=args.days,
-        data_dir=data_dir,
-        refresh=False,
+    provenance = None
+    if args.generation_id is not None:
+        try:
+            validate_replay_outputs(data_dir, args.output)
+            window = load_historical_window(
+                data_dir=data_dir,
+                generation_id=args.generation_id,
+                symbol=resolve_okx_swap_symbol(args.symbol).inst_id,
+                days=args.days,
+            )
+            provenance = window.provenance({
+                "strategy": args.strategy,
+                "strategy_config": StrategyConfigPayloadV1.from_config(config).to_dict(),
+                "days": args.days,
+                "chart_interval": args.chart_interval,
+                "starting_equity": 10000,
+                "slippage": "not modeled",
+                "partial_fills": "not modeled",
+            })
+        except HistoricalGenerationError as exc:
+            parser.error(str(exc))
+        candles_15m = list(window.candles_by_interval["15m"])
+        candles_1h = list(window.candles_by_interval["1h"])
+    else:
+        bundle = refresh_trusted_candle_bundle(
+            args.symbol,
+            intervals=TRUSTED_REQUESTED_INTERVALS,
+            days=args.days,
+            data_dir=data_dir,
+            refresh=False,
+        )
+        status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
+        if status_error:
+            parser.error(status_error)
+        candles_15m = bundle.candles_by_interval["15m"]
+        candles_1h = bundle.candles_by_interval["1h"]
+    data_source_note = (
+        "historical_replay; fixed trusted generation, not live freshness"
+        if provenance is not None else "trusted OKX data layer (CSV + TrustDecision gate)"
     )
-    status_error = trusted_bundle_error(bundle, requested_intervals=TRUSTED_REQUESTED_INTERVALS)
-    if status_error:
-        parser.error(status_error)
-    candles_15m = bundle.candles_by_interval["15m"]
-    candles_1h = bundle.candles_by_interval["1h"]
-    data_source_note = "trusted OKX data layer (CSV + TrustDecision gate)"
     context = build_hourly_context(candles_15m, candles_1h)
     result = run_backtest(candles_15m, context, config=config)
     chart_candles = candles_1h if args.chart_interval == "1h" else candles_15m
@@ -70,6 +106,7 @@ def main() -> None:
         strategy_label=group.label,
         strategy_components=group.components,
         data_source_note=data_source_note,
+        replay_provenance=provenance,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_text, encoding="utf-8")
@@ -87,6 +124,7 @@ def render_html_visualization(
     strategy_label: str | None = None,
     strategy_components: StrategyComponents | None = None,
     data_source_note: str | None = None,
+    replay_provenance: str | None = None,
 ) -> str:
     interval_label = "1h" if chart_interval == "1h" else "15m"
     strategy_title = f" {html.escape(strategy_name)}" if strategy_name else ""
@@ -326,6 +364,7 @@ def render_html_visualization(
     {trade_table}
   </section>
   <p class="note">研究用途。页面展示历史规则执行，不预测未来收益。价格图、成交量图和权益图支持同步缩放；鼠标悬停时三图会显示同一时间点的竖向虚线。</p>
+  {replay_html(replay_provenance)}
 </main>
 <script>
 const chartData = {payload};
