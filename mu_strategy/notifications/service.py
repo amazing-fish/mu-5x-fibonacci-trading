@@ -67,7 +67,7 @@ class EmailAlerts:
             # on a later poll with no new log bytes, including after clock rollback.
             if caught_up and current_run is not None:
                 for observation in current.observations:
-                    if self.store.stream(db, observation.symbol)["service_run_id"] != current_run:
+                    if self.store.stream(db, observation.symbol)["observed_run_id"] != current_run:
                         self._observe(db, observation, now, service_run_id=current_run)
             self._health_events(db, state, now)
             if view["runtime"] != "running" or view["healthy"]:
@@ -84,11 +84,13 @@ class EmailAlerts:
                     self.store.suppress(db, entry.event.event_id, "review_expired", now)
                 latest = state.last_cycle if state else None
                 # A completed failed scan/write has no committed cycle to match.
-                # It invalidates evidence preceding that attempt, not newer log
-                # results awaiting their own health publication.
+                # Known evidence from a previous run precedes this attempt even
+                # across clock rollback. An unmatched new log has no run binding
+                # yet; do not infer its provenance from the ordering epoch.
                 failed_attempt = (latest is not None and latest.service_run_id == state.run_id
                                   and (latest.scan.status is not StepStatus.SUCCEEDED or latest.scan.persistence is not StepStatus.SUCCEEDED)
-                                  and max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms)
+                                  and (stream["observed_run_id"] not in {None, latest.service_run_id}
+                                       or max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms))
                 if runtime_failed or failed_attempt or (caught_up and current_run is not None and (not view["healthy"] or symbol not in state.symbols)):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
                 elif now < stream["last_seen_ms"]:
@@ -120,8 +122,11 @@ class EmailAlerts:
         if stream["last_result"] is not None and observation.created_at_ms == stream["created_at_ms"] and observation.observed_at_ms == stream["observed_at_ms"]:
             if stream["last_result"] != observation.result_fingerprint:
                 raise NotificationError("conflicting observations at identical timestamps")
+            stream["observed_run_id"] = service_run_id
+            self.store.save_stream(db, observation.symbol, stream)
             return
-        stream.update(created_at_ms=observation.created_at_ms, observed_at_ms=observation.observed_at_ms, last_result=observation.result_fingerprint)
+        stream.update(created_at_ms=observation.created_at_ms, observed_at_ms=observation.observed_at_ms,
+                      last_result=observation.result_fingerprint, observed_run_id=service_run_id)
         if observation.outcome is ObservationOutcome.READY_FOR_REVIEW:
             result = observation.scan_result
             if result is None or result.signal_time_ms is None:

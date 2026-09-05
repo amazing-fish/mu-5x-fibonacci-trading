@@ -452,6 +452,99 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.collect()
         self.assertEqual(1, self.alerts.deliver(self.transport))
 
+    def test_failed_new_run_with_small_clock_rollback_withdraws_old_confirmed_entry(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.assertFalse(self.alerts.collect()["source_healthy"])
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+
+    def test_failed_new_run_does_not_withdraw_new_log_using_previous_ordering_epoch(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        failed = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = failed
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        original = self.entry_id()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_same_run_health_catchup_binds_latest_evidence_before_failed_restart(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        previous = self.state
+        self.clock.value += 100
+        self.publish(generation="new-generation")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+
+    def test_unmatched_equal_timestamp_cycle_does_not_inherit_observation_run(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        failed = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 50
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = failed
+        self.clock.value += 10
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        with self.alerts.store.connection() as db:
+            stream = self.alerts.store.stream(db, SYMBOL)
+            self.assertEqual("service-1", stream["service_run_id"])
+            self.assertIsNone(stream["observed_run_id"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+
+    def test_observation_run_binding_roundtrip_and_invalid_values(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            original = self.alerts.store.stream(db, SYMBOL)
+            for run_id in (None, "service-1"):
+                value = dict(original, observed_run_id=run_id)
+                self.alerts.store.save_stream(db, SYMBOL, value)
+                self.assertEqual(value, self.alerts.store.stream(db, SYMBOL))
+            for run_id in ("", 1, True, [], {}, "different-run"):
+                with self.subTest(run_id=run_id), self.assertRaises(NotificationError):
+                    with self.alerts.store.transaction(db):
+                        self.alerts.store.save_stream(db, SYMBOL, dict(original, observed_run_id=run_id))
+            with self.assertRaises(NotificationError), self.alerts.store.transaction(db):
+                value = dict(original)
+                del value["observed_run_id"]
+                self.alerts.store.save_stream(db, SYMBOL, value)
+
     def test_health_snapshot_io_failure_follows_source_fault_path(self):
         self.publish()
         self.alerts.collect()
