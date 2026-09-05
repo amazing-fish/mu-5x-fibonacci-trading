@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -81,7 +82,7 @@ class SignalService:
     def run(self, *, cycles: int | None = None, on_cycle: Callable[[dict], None] = lambda value: None) -> None:
         if cycles is not None and cycles <= 0:
             raise ValueError("cycles must be positive")
-        with self.store.exclusive():
+        with self.store.exclusive(), ExitStack() as liveness:
             previous = self.store.read()
             if previous is not None and previous.running and previous.phase is not Phase.IDLE:
                 raise InterruptedCycleError("interrupted child phase; confirm all prior workers stopped before recovery")
@@ -95,6 +96,9 @@ class SignalService:
             )
             self._event("restarted" if previous else "started", ())
             self.store.write(self.state)
+            # Publish the new run identity before acquiring liveness. A query
+            # must never use this run's lock to endorse the previous run's scan.
+            liveness.enter_context(self.store.supervising())
             next_tick = self.monotonic()
             completed = 0
             try:
@@ -143,7 +147,8 @@ class SignalService:
         for symbol in self.config.symbols:
             scan_args.extend(("--symbol", symbol))
         scan = self._scan(scan_args)
-        cycle = CycleHealth(1 if previous is None else previous.number + 1, started, self.clock.now_ms(), refresh, scan)
+        cycle = CycleHealth(1 if previous is None else previous.number + 1, self.state.run_id,
+                            started, self.clock.now_ms(), refresh, scan)
         problems = cycle.problems()
         prior_problems = previous.problems() if previous else ()
         self.state = replace(self.state, last_cycle=cycle, updated_at_ms=cycle.completed_at_ms,

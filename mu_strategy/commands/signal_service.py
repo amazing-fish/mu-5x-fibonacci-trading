@@ -37,8 +37,9 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, service
     try:
         store = HealthStore(args.data_dir)
         if args.command == "status":
+            running = store.is_running()
             state = store.read()
-            payload = health_view(state, running=store.is_running(), now_ms=SystemClock().now_ms())
+            payload = health_view(state, running=running, now_ms=SystemClock().now_ms())
             if args.after_event is not None:
                 if state is None and args.after_event != 0:
                     raise HealthStateError("no event history available")

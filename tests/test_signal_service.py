@@ -78,8 +78,11 @@ class ServiceTests(unittest.TestCase):
         self.config = ServiceConfig(data_dir=Path(self.temp.name) / "live", interval_seconds=10)
         self.store = HealthStore(self.config.data_dir)
         self.time = FakeTime()
+        self.run_number = 0
 
     def service(self, results, *, on_process=None):
+        self.run_number += 1
+        run_id = f"service-run-{self.run_number}"
         def run(argv, *, timeout):
             if on_process:
                 on_process(argv, timeout)
@@ -89,7 +92,7 @@ class ServiceTests(unittest.TestCase):
             return result
         iterator = iter(results)
         return SignalService(self.config, store=self.store, processes=Mock(run=Mock(side_effect=run)), clock=self.time,
-                             monotonic=self.time.monotonic, sleeper=self.time.sleep, id_factory=lambda: "service-run")
+                             monotonic=self.time.monotonic, sleeper=self.time.sleep, id_factory=lambda: run_id)
 
     def test_refresh_precedes_cache_only_scan_with_active_phase_persisted_before_spawn(self):
         seen = []
@@ -178,7 +181,6 @@ class ServiceTests(unittest.TestCase):
 
     def test_clean_restart_retains_counter_and_recovers_after_first_new_scan(self):
         self.service([refresh_result(), scan_result_process("blocked")]).run(cycles=1)
-        self.time.sleep(1)
         startup = []
         def inspect(argv, timeout):
             startup.append(health_view(self.store.read(), running=True, now_ms=self.time.now_ms()))
@@ -191,7 +193,7 @@ class ServiceTests(unittest.TestCase):
     def test_single_instance_excludes_second_runner_without_overwriting_state(self):
         self.service([refresh_result(), scan_result_process()]).run(cycles=1)
         before = self.store.path.read_bytes()
-        with self.store.exclusive():
+        with self.store.exclusive(), self.store.supervising():
             with self.assertRaises(ServiceBusyError):
                 self.service([]).run(cycles=1)
             self.assertTrue(self.store.is_running())
@@ -426,7 +428,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIs(StepStatus.SUCCEEDED, scan.persistence)
 
     def test_os_lock_releases_after_owning_process_dies(self):
-        script = "from pathlib import Path; import sys; from mu_strategy.service_health import HealthStore\nwith HealthStore(Path(sys.argv[1])).exclusive():\n print('locked', flush=True)\n sys.stdin.readline()\n"
+        script = "from pathlib import Path; import sys; from mu_strategy.service_health import HealthStore\nstore = HealthStore(Path(sys.argv[1]))\nwith store.exclusive(), store.supervising():\n print('locked', flush=True)\n sys.stdin.readline()\n"
         process = subprocess.Popen([sys.executable, "-B", "-c", script, str(self.config.data_dir)],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -562,6 +564,65 @@ class ServiceTests(unittest.TestCase):
         with patch("mu_strategy.service_health.fsync_directory") as sync:
             store.prepare()
         self.assertEqual(Path(self.temp.name), sync.call_args_list[0].args[0])
+
+    def test_status_cannot_bind_interrupted_old_snapshot_to_restarted_service(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        old = replace(self.store.read(), running=True, deadline_ms=2000)
+        self.store.write(old)
+        read_old, resume_query, worker_started, resume_worker = (threading.Event() for _ in range(4))
+        original_read = HealthStore.read
+        def read(store):
+            result = original_read(store)
+            if threading.current_thread().name.startswith("status-query"):
+                read_old.set()
+                if not resume_query.wait(10):
+                    raise AssertionError("query not resumed")
+            return result
+        def query():
+            output = io.StringIO()
+            code = main(["status", "--data-dir", str(self.config.data_dir)], stdout=output)
+            return code, json.loads(output.getvalue())
+        def worker(argv, timeout):
+            if not worker_started.is_set():
+                worker_started.set()
+                if not resume_worker.wait(10):
+                    raise AssertionError("worker not resumed")
+        service = self.service([refresh_result(), scan_result_process()], on_process=worker)
+        with patch.object(HealthStore, "read", autospec=True, side_effect=read), patch(
+            "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1000
+        ), ThreadPoolExecutor(max_workers=1, thread_name_prefix="status-query") as queries, ThreadPoolExecutor(max_workers=1) as workers:
+            queried = queries.submit(query)
+            try:
+                self.assertTrue(read_old.wait(10))
+                running = workers.submit(service.run, cycles=1)
+                self.assertTrue(worker_started.wait(10))
+                current = health_view(original_read(self.store), running=True, now_ms=1000)
+                self.assertFalse(current["healthy"])
+                self.assertNotEqual(old.run_id, current["run_id"])
+                resume_query.set()
+                code, result = queried.result(timeout=10)
+                self.assertEqual(2, code)
+                self.assertFalse(result["healthy"])
+            finally:
+                resume_query.set()
+                resume_worker.set()
+            running.result(timeout=10)
+
+    def test_new_run_identity_is_published_before_its_liveness_lock(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        self.store.write(replace(self.store.read(), running=True, deadline_ms=2000))
+        original_write = self.store.write
+        checked = []
+        def write(state):
+            original_write(state)
+            if state.running and state.phase is Phase.IDLE and not checked:
+                self.assertFalse(self.store.is_running())
+                self.assertNotEqual(state.run_id, state.last_cycle.service_run_id)
+                self.assertFalse(health_view(state, running=True, now_ms=1000)["healthy"])
+                checked.append(True)
+        with patch.object(self.store, "write", side_effect=write):
+            self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        self.assertEqual([True], checked)
 
 
 if __name__ == "__main__":

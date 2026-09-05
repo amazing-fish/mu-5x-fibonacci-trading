@@ -113,6 +113,7 @@ class ScanHealth:
 @dataclass(frozen=True)
 class CycleHealth:
     number: int
+    service_run_id: str
     started_at_ms: int
     completed_at_ms: int
     refresh: RefreshHealth
@@ -139,13 +140,14 @@ class CycleHealth:
         return tuple(problems)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"number": self.number, "started_at_ms": self.started_at_ms, "completed_at_ms": self.completed_at_ms,
+        return {"number": self.number, "service_run_id": self.service_run_id,
+                "started_at_ms": self.started_at_ms, "completed_at_ms": self.completed_at_ms,
                 "refresh": self.refresh.to_dict(), "scan": self.scan.to_dict()}
 
     @classmethod
     def from_dict(cls, value: Any) -> CycleHealth:
         value = _object(value, cls)
-        result = cls(_integer(value["number"], minimum=1), _integer(value["started_at_ms"]),
+        result = cls(_integer(value["number"], minimum=1), _text(value["service_run_id"]), _integer(value["started_at_ms"]),
                      _integer(value["completed_at_ms"]), RefreshHealth.from_dict(value["refresh"]), ScanHealth.from_dict(value["scan"]))
         if result.completed_at_ms < result.started_at_ms:
             raise HealthStateError("cycle completion precedes start")
@@ -224,6 +226,8 @@ class ServiceState:
         if result.last_cycle is not None:
             if result.last_cycle.completed_at_ms > result.updated_at_ms:
                 raise HealthStateError("last cycle is newer than service state")
+            if result.last_cycle.service_run_id == result.run_id and result.last_cycle.started_at_ms < result.started_at_ms:
+                raise HealthStateError("current run cycle precedes service start")
             cycle = result.last_cycle.scan.cycle
             if cycle is not None and sorted(item.symbol for item in cycle.observations) != sorted(result.symbols):
                 raise HealthStateError("scan cycle must cover each configured symbol exactly once")
@@ -304,14 +308,17 @@ class HealthStore:
         with self.lock_path.open("a+b") as stream:
             _lock(stream)
             try:
-                with self.liveness_path.open("a+b") as liveness:
-                    # Queries share this second lock. Waiting behind those brief
-                    # probes cannot turn a first start into an instance conflict.
-                    _lock(liveness, wait=True)
-                    try:
-                        yield
-                    finally:
-                        _unlock(liveness)
+                yield
+            finally:
+                _unlock(stream)
+
+    @contextmanager
+    def supervising(self) -> Iterator[None]:
+        """Claim liveness only after publishing this run's initial state under exclusive()."""
+        with self.liveness_path.open("a+b") as stream:
+            _lock(stream, wait=True)
+            try:
+                yield
             finally:
                 _unlock(stream)
 
@@ -341,7 +348,7 @@ def health_view(state: ServiceState | None, *, running: bool, now_ms: int) -> di
     else:
         runtime = "running"
     problems = list(state.last_cycle.problems()) if state.last_cycle else ["no_completed_cycle"]
-    if state.last_cycle and state.last_cycle.started_at_ms < state.started_at_ms:
+    if state.last_cycle and state.last_cycle.service_run_id != state.run_id:
         problems.append("no_completed_cycle_in_current_run")
     if runtime != "running":
         problems.append(f"runtime.{runtime}")
