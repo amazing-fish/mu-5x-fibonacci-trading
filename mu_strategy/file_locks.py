@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 
 class FileLockBusyError(BlockingIOError):
     pass
+
+
+@contextmanager
+def locked_file(path, *, wait: bool = True):
+    with path.open("a+b") as stream:
+        lock_file(stream, wait=wait)
+        try:
+            yield
+        finally:
+            unlock_file(stream)
 
 
 def lock_file(stream, *, shared: bool = False, wait: bool = False) -> None:
@@ -54,4 +65,3 @@ def _windows_lock(stream, *, shared: bool = False, wait: bool = False, release: 
         if not release and code == 33:  # ERROR_LOCK_VIOLATION
             raise FileLockBusyError("file is locked")
         raise ctypes.WinError(code)
-

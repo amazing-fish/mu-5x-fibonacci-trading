@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from mu_strategy.commands.email_alerts import main
-from mu_strategy.file_locks import FileLockBusyError
+from mu_strategy.file_locks import FileLockBusyError, locked_file
 from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
 from mu_strategy.models import EntryDecisionCode
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError
@@ -230,6 +230,44 @@ class EmailAlertsTests(unittest.TestCase):
             return result
         with patch.object(self.alerts.observations, "read_batch", side_effect=checked_tail):
             self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_final_validation_and_transport_exclude_health_only_publication(self):
+        self.publish()
+        self.health.write(self.state)
+        self.snapshot.side_effect = lambda: (self.health.read(), True)
+        self.alerts.collect()
+        stopped = replace(self.state, running=False)
+        writer = []
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def during_send(event):
+                with self.assertRaises(FileLockBusyError):
+                    with locked_file(self.health.publication_lock_path, wait=False):
+                        self.fail("health publisher could bypass send fence")
+                writer.append(pool.submit(self.health.write, stopped))
+                self.assertTrue(self.health.read().running)
+                return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+            self.transport.send.side_effect = during_send
+            self.assertEqual(1, self.alerts.deliver(self.transport))
+            writer[0].result(timeout=5)
+        self.assertFalse(self.health.read().running)
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_restart_before_first_new_cycle_does_not_withdraw_existing_signal(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value += 1
+        self.state = replace(self.state, run_id="service-2", phase=Phase.REFRESH,
+                             updated_at_ms=self.clock.value, deadline_ms=self.clock.value + 240_000)
+        self.assertFalse(self.alerts.collect()["source_healthy"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual([original], [record["event_id"] for record in self.records(AlertKind.ENTRY_REVIEW)])
 
     def test_authoritative_failed_scan_or_persistence_withdraws_previous_entry(self):
         for status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.SUCCEEDED):

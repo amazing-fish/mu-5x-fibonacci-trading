@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, unique
 from pathlib import Path
@@ -14,7 +13,7 @@ from typing import Any, Mapping, Protocol
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
-from mu_strategy.file_locks import lock_file, unlock_file
+from mu_strategy.file_locks import locked_file
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
@@ -393,15 +392,9 @@ class JsonlObservationRepository:
         self.invalid_marker_path = Path(f"{self.path}.invalid")
         self.lock_path = Path(f"{self.path}.lock")
 
-    @contextmanager
     def publication_fence(self, *, wait: bool = True):
         """Serialize committed appends with a consumer's final send decision."""
-        with self.lock_path.open("a+b") as stream:
-            lock_file(stream, wait=wait)
-            try:
-                yield
-            finally:
-                unlock_file(stream)
+        return locked_file(self.lock_path, wait=wait)
 
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")

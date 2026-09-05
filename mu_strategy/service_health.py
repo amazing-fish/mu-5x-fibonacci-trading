@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
-from mu_strategy.file_locks import FileLockBusyError, lock_file, unlock_file
+from mu_strategy.file_locks import FileLockBusyError, lock_file, locked_file, unlock_file
 from mu_strategy.canonical import canonical_json
 from mu_strategy.fs_durability import fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -255,6 +255,7 @@ class HealthStore:
         self.path = self.root / "health.json"
         self.lock_path = self.root / "service.lock"
         self.liveness_path = self.root / "supervisor.lock"
+        self.publication_lock_path = self.root / "observations.jsonl.lock"
 
     def prepare(self) -> None:
         missing = []
@@ -295,17 +296,18 @@ class HealthStore:
             raise HealthStateError("health state exceeds size limit")
         temporary = None
         self.prepare()
-        try:
-            with tempfile.NamedTemporaryFile(dir=self.root, prefix="health-", suffix=".tmp", delete=False) as stream:
-                temporary = Path(stream.name)
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-            fsync_directory(self.root)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        with locked_file(self.publication_lock_path):
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.root, prefix="health-", suffix=".tmp", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+                fsync_directory(self.root)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
 
     @contextmanager
     def exclusive(self) -> Iterator[None]:

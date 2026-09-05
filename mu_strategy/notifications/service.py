@@ -82,7 +82,7 @@ class EmailAlerts:
                 failed_attempt = (latest is not None and latest.service_run_id == state.run_id
                                   and (latest.scan.status is not StepStatus.SUCCEEDED or latest.scan.persistence is not StepStatus.SUCCEEDED)
                                   and max(stream["created_at_ms"], stream["observed_at_ms"]) <= latest.started_at_ms)
-                if failed_attempt or (caught_up and (not view["healthy"] or symbol not in state.symbols)):
+                if failed_attempt or (caught_up and current_run is not None and (not view["healthy"] or symbol not in state.symbols)):
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
                 elif now < stream["last_seen_ms"] or now >= stream["last_seen_ms"] + self.review_ms:
                     self._invalidate(db, symbol, stream, "review_expired", now)
