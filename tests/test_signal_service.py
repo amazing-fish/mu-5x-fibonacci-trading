@@ -17,7 +17,7 @@ from mu_strategy.models import EntryDecisionCode
 from mu_strategy.observations import JsonlObservationRepository, ObservationOutcome
 from mu_strategy.scan_cycle import ScanCycle
 from mu_strategy.service_health import (
-    EVENT_LIMIT, CycleHealth, HealthEvent, HealthStateError, HealthStore, Phase,
+    EVENT_LIMIT, CycleHealth, HealthEvent, HealthSnapshotUnstableError, HealthStateError, HealthStore, Phase,
     RefreshHealth, ScanHealth, ServiceBusyError, ServiceState, StepStatus, health_view,
 )
 from mu_strategy.signal_service import (
@@ -656,9 +656,10 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(at_cycle.wait(10))
                 def probe(store):
                     result = original_probe(store)
-                    self.assertTrue(result)
-                    resume.set()
-                    service.result(timeout=10)
+                    if not resume.is_set():
+                        self.assertTrue(result)
+                        resume.set()
+                        service.result(timeout=10)
                     return result
                 output = io.StringIO()
                 with patch.object(HealthStore, "is_running", autospec=True, side_effect=probe):
@@ -680,6 +681,63 @@ class ServiceTests(unittest.TestCase):
         self.service([refresh_result(), scan_result_process()]).run(cycles=1)
         self.assertEqual(900, self.store.read().started_at_ms)
         self.assertEqual(900, self.store.read().last_cycle.completed_at_ms)
+
+    def test_status_retries_when_a_healthy_service_starts_after_the_first_probe(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        ready, resume = threading.Event(), threading.Event()
+        def on_cycle(view):
+            ready.set()
+            if not resume.wait(10):
+                raise AssertionError("service not released")
+        original_probe = HealthStore.is_running
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            service = None
+            def probe(store):
+                nonlocal service
+                result = original_probe(store)
+                if service is None:
+                    self.assertFalse(result)
+                    service = pool.submit(self.service([refresh_result(), scan_result_process()]).run, cycles=1, on_cycle=on_cycle)
+                    self.assertTrue(ready.wait(10))
+                return result
+            output = io.StringIO()
+            try:
+                with patch.object(HealthStore, "is_running", autospec=True, side_effect=probe) as probes, patch(
+                    "mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=1000
+                ):
+                    code = main(["status", "--data-dir", str(self.config.data_dir)], stdout=output)
+                self.assertEqual(0, code)
+                result = json.loads(output.getvalue())
+                self.assertEqual("running", result["runtime"])
+                self.assertEqual(self.store.read().run_id, result["run_id"])
+                self.assertEqual(2, probes.call_count)
+            finally:
+                resume.set()
+            service.result(timeout=10)
+
+    def test_continuously_changing_health_snapshot_is_unavailable_not_an_outage(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        state = self.store.read()
+        with patch.object(self.store, "read", side_effect=[replace(state, run_id=f"run-{i}") for i in range(4)]), patch.object(
+            self.store, "is_running", return_value=True
+        ) as probe:
+            with self.assertRaisesRegex(HealthStateError, "snapshot changed repeatedly"):
+                self.store.snapshot()
+        self.assertEqual(3, probe.call_count)
+        output = io.StringIO()
+        with patch.object(HealthStore, "snapshot", side_effect=HealthSnapshotUnstableError("retry")):
+            code = main(["status", "--data-dir", str(self.config.data_dir)], stdout=output)
+        self.assertEqual(2, code)
+        self.assertEqual("unavailable", json.loads(output.getvalue())["runtime"])
+        self.assertEqual("health_snapshot_unstable", json.loads(output.getvalue())["error_code"])
+
+    def test_bootstrap_without_liveness_has_bounded_starting_state(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        state = replace(self.store.read(), run_id="new-run", running=True, deadline_ms=2000)
+        view = health_view(state, running=False, now_ms=1500)
+        self.assertEqual("starting", view["runtime"])
+        self.assertFalse(view["healthy"])
+        self.assertEqual("interrupted", health_view(state, running=False, now_ms=2001)["runtime"])
 
 
 if __name__ == "__main__":

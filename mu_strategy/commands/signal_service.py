@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TextIO
 
 from mu_strategy.market_data.trusted_data.contracts import SystemClock
-from mu_strategy.service_health import HealthStateError, HealthStore, ServiceBusyError, StepStatus, health_view
+from mu_strategy.service_health import HealthSnapshotUnstableError, HealthStateError, HealthStore, ServiceBusyError, StepStatus, health_view
 from mu_strategy.signal_service import InterruptedCycleError, ServiceConfig, SignalService, recover_interrupted, scan_once
 
 
@@ -37,8 +37,7 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, service
     try:
         store = HealthStore(args.data_dir)
         if args.command == "status":
-            running = store.is_running()
-            state = store.read()
+            state, running = store.snapshot()
             payload = health_view(state, running=running, now_ms=SystemClock().now_ms())
             if args.after_event is not None:
                 if state is None and args.after_event != 0:
@@ -84,6 +83,9 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, service
         return 3
     except InterruptedCycleError:
         _emit(stdout, {"healthy": False, "error_code": "interrupted_cycle_requires_recovery"})
+        return 2
+    except HealthSnapshotUnstableError:
+        _emit(stdout, {"runtime": "unavailable", "healthy": False, "error_code": "health_snapshot_unstable"})
         return 2
     except (HealthStateError, OSError, ValueError):
         _emit(stdout, {"healthy": False, "error_code": "health_or_configuration_error"})

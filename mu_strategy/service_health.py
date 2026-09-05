@@ -42,6 +42,10 @@ class HealthStateError(ValueError):
     pass
 
 
+class HealthSnapshotUnstableError(HealthStateError):
+    pass
+
+
 @dataclass(frozen=True)
 class RefreshHealth:
     status: StepStatus
@@ -335,6 +339,17 @@ class HealthStore:
             _unlock(stream)
             return False
 
+    def snapshot(self) -> tuple[ServiceState | None, bool]:
+        """Bind the liveness observation to one unchanged journal snapshot."""
+        before = self.read()
+        for _ in range(3):
+            running = self.is_running()
+            after = self.read()
+            if before == after:
+                return after, running
+            before = after
+        raise HealthSnapshotUnstableError("health snapshot changed repeatedly; retry status")
+
 
 def health_view(state: ServiceState | None, *, running: bool, now_ms: int) -> dict[str, Any]:
     if state is None:
@@ -342,7 +357,9 @@ def health_view(state: ServiceState | None, *, running: bool, now_ms: int) -> di
     if not state.running:
         runtime = "stopped"
     elif not running:
-        runtime = "interrupted"
+        current_cycle = state.last_cycle is not None and state.last_cycle.service_run_id == state.run_id
+        bootstrapping = state.phase is Phase.IDLE and not current_cycle and state.updated_at_ms <= now_ms <= state.deadline_ms
+        runtime = "starting" if bootstrapping else "interrupted"
     elif now_ms < state.updated_at_ms or now_ms > state.deadline_ms:
         runtime = "unresponsive"
     else:

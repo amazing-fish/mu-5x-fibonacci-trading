@@ -29,7 +29,7 @@ python -B -m mu_strategy.commands.signal_service status --data-dir data\live
 
 | 维度 | 含义 |
 |---|---|
-| `runtime` | `not_started`、`running`、`stopped`、`interrupted`、`unresponsive`；锁、持久化阶段与 deadline 共同判定 |
+| `runtime` | `not_started`、`starting`、`running`、`stopped`、`interrupted`、`unresponsive`；锁、持久化阶段与 deadline 共同判定 |
 | `last_cycle.refresh` | 正常发布、降级发布、失败或超时，保留 run ID、attempt/usability 和退出码 |
 | `data_at_last_scan` | **上次扫描时**的 trusted gate、原因和检查时间；不是查询时重新证明数据新鲜 |
 | `last_cycle.scan` | worker 完成状态及 Stage 0 cycle；逐标的区分数据阻断、扫描失败、正常无信号、READY |
@@ -41,7 +41,11 @@ deadline 是当前子进程超时或下一轮计划时间，加 30 秒状态更�
 
 ## 存储与通知接入
 
-首次运行会同步每个新建目录项的父目录，确认状态目录可持久化后才启动 worker；父目录同步失败会停止本次运行。启动先取得实例锁、发布新 run identity，再取得存活锁；查询先探测存活、再读健康快照。完成轮次绑定 `service_run_id`，重启不能用新进程的锁为旧轮次背书，即使两次启动的毫秒时间相同。
+首次运行会同步每个新建目录项的父目录，确认状态目录可持久化后才启动 worker；父目录同步失败会停止本次运行。启动先取得实例锁、发布新 run identity，再取得存活锁。查询以两份相同的 journal 快照夹住存活探测；发现变化则重取，最多探测 3 次，持续变化会返回暂不可用而不报告停机。完成轮次绑定 `service_run_id`，重启不能用新进程的锁为旧轮次背书，即使两次启动的毫秒时间相同。
+
+初始 journal 已发布但尚未取得存活锁、尚无本次完成轮次的 idle 阶段，在 30 秒启动 deadline 内为不健康的 `starting`；超过 deadline 仍未取得存活则为 `interrupted`。这个短暂阶段不应触发已运行服务的故障通知。
+
+`HealthStore.snapshot()` 提供上述一致性读取。持续变化导致查询返回 `runtime=unavailable`、`error_code=health_snapshot_unstable`、退出码 2；消费者应稍后重新查询，不将其当作已确认停机。
 
 路径由解析后的绝对数据目录唯一派生。例如 `data/live` 对应同级 `data/live-signal-service/`，默认被 Git 忽略：
 
