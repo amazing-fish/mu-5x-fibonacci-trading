@@ -101,7 +101,8 @@ def main(argv=None, *, stdout=None, environment=None, factory=EmailAlerts, trans
                 return code
             sleeper(args.poll_seconds)
     except KeyboardInterrupt:
-        return 0
+        emit({"error_code": "notification_interrupted", "action": "inspect status/show before resuming delivery"})
+        return 130
     except NotificationError as exc:
         emit({"error_code": "notification_configuration_or_state_error", "message": str(exc)})
         return 2

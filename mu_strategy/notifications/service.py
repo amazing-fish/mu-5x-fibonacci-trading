@@ -58,7 +58,7 @@ class EmailAlerts:
                     self.store.record_cycle(db, cycle.cycle_id, cycle_hash)
                     for observation in cycle.observations:
                         self._observe(db, observation, now, service_run_id=current_run if cycle_hash == current_hash else None)
-                self.store.set_meta(db, "last_cycle_sha256", cycle_hash)
+                    self.store.set_meta(db, "last_cycle_sha256", cycle_hash)
             self.store.set_meta(db, "observation_cursor", list(next_cursor))
             caught_up = current is not None and self.store.get_meta(db, "last_cycle_sha256") == current_hash
             # The log commits before health. A matching health cycle may arrive
@@ -231,7 +231,7 @@ class EmailAlerts:
         with self.store.connection() as db, self.store.transaction(db):
             self.store.validate(db)
             since = self.store.get_meta(db, "log_unavailable_since_ms")
-            if since is None:
+            if since is None or now < since:
                 since = now
                 self.store.set_meta(db, "log_unavailable_since_ms", since)
             self.store.set_meta(db, "source_ready", False)

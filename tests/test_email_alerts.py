@@ -323,7 +323,7 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
         current_id = self.entry_id()
         self.alerts.observations.append_cycle(old)
-        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertTrue(self.alerts.collect()["caught_up"])
         self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
         self.assertIsNone(self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
         with self.alerts.store.connection() as db:
@@ -483,6 +483,18 @@ class EmailAlertsTests(unittest.TestCase):
         self.alerts.observations.append_cycle(cycle)
         self.alerts.collect()
         self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
+
+    def test_old_duplicate_does_not_move_current_watermark_or_delay_pending_entry(self):
+        old = self.publish("wait")
+        self.alerts.collect()
+        self.clock.value += 1
+        self.publish()
+        self.alerts.collect()
+        self.alerts.observations.append_cycle(old)
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
 
     def test_input_cursor_and_outbox_commit_or_rollback_together(self):
         self.publish()
@@ -747,6 +759,36 @@ class EmailAlertsTests(unittest.TestCase):
         self.assertTrue(self.alerts.observation_unavailable())
         self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
         self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+
+    def test_log_retry_grace_restarts_after_clock_rollback(self):
+        self.publish()
+        self.alerts.collect()
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.clock.value -= 50_000
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.assertEqual(self.clock.value, self.alerts.store.status()["log_unavailable_since_ms"])
+        self.clock.value += 29_999
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.clock.value += 1
+        self.assertTrue(self.alerts.observation_unavailable())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+
+    def test_cli_interrupted_send_returns_failure_and_keeps_unknown(self):
+        self.publish()
+        self.transport.send.side_effect = KeyboardInterrupt()
+        output = io.StringIO()
+        environment = {"MU_SMTP_HOST": CONFIG.host, "MU_SMTP_SENDER": CONFIG.sender,
+                       "MU_SMTP_RECIPIENT": CONFIG.recipient, "MU_SMTP_AUTHORIZATION_CODE": "test-only"}
+        self.assertEqual(130, main(["run", "--once", "--send", "--data-dir", str(self.data_dir)],
+                                  stdout=output, environment=environment, factory=Mock(return_value=self.alerts),
+                                  transport_factory=Mock(return_value=self.transport)))
+        self.assertEqual("notification_interrupted", json.loads(output.getvalue())["error_code"])
+        self.assertEqual("unknown", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.transport.send.side_effect = None
+        self.assertEqual(0, self.alerts.deliver(self.transport))
 
     def test_log_permission_error_uses_source_retry_and_persistent_fault_path(self):
         self.publish()
