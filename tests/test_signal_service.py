@@ -624,6 +624,63 @@ class ServiceTests(unittest.TestCase):
             self.service([refresh_result(), scan_result_process()]).run(cycles=1)
         self.assertEqual([True], checked)
 
+    def test_clock_rollback_between_clean_runs_preserves_history_and_allows_restart(self):
+        self.service([refresh_result(), scan_result_process("blocked")]).run(cycles=1)
+        previous = self.store.read().last_cycle
+        self.time.value = 900
+        startup = []
+        def inspect(argv, timeout):
+            startup.append(self.store.read())
+        self.service([refresh_result(), scan_result_process()], on_process=inspect).run(cycles=1)
+        self.assertEqual(previous, startup[0].last_cycle)
+        self.assertEqual(900, startup[0].started_at_ms)
+        self.assertFalse(health_view(startup[0], running=True, now_ms=900)["healthy"])
+        state = self.store.read()
+        self.assertEqual(900, state.last_cycle.completed_at_ms)
+        self.assertEqual(state.run_id, state.last_cycle.service_run_id)
+        self.assertEqual(0, state.consecutive_failures)
+        self.assertIn("recovered", [event.kind for event in state.events])
+        with self.assertRaises(HealthStateError):
+            self.store.write(replace(state, last_cycle=replace(state.last_cycle, completed_at_ms=1001)))
+
+    def test_status_reports_clean_stop_when_supervisor_exits_after_liveness_probe(self):
+        at_cycle, resume = threading.Event(), threading.Event()
+        def on_cycle(view):
+            at_cycle.set()
+            if not resume.wait(10):
+                raise AssertionError("service stop not released")
+        original_probe = HealthStore.is_running
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            service = pool.submit(self.service([refresh_result(), scan_result_process()]).run, cycles=1, on_cycle=on_cycle)
+            try:
+                self.assertTrue(at_cycle.wait(10))
+                def probe(store):
+                    result = original_probe(store)
+                    self.assertTrue(result)
+                    resume.set()
+                    service.result(timeout=10)
+                    return result
+                output = io.StringIO()
+                with patch.object(HealthStore, "is_running", autospec=True, side_effect=probe):
+                    code = main(["status", "--data-dir", str(self.config.data_dir)], stdout=output)
+                self.assertEqual(2, code)
+                self.assertEqual("stopped", json.loads(output.getvalue())["runtime"])
+            finally:
+                resume.set()
+            service.result(timeout=10)
+
+    def test_clock_rollback_does_not_block_explicit_interruption_recovery(self):
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        self.store.write(replace(self.store.read(), running=True, phase=Phase.REFRESH))
+        self.time.value = 900
+        recovered = recover_interrupted(self.store, clock=self.time)
+        self.assertFalse(recovered.running)
+        self.assertEqual(1000, recovered.updated_at_ms)
+        self.assertEqual(900, recovered.events[-1].at_ms)
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        self.assertEqual(900, self.store.read().started_at_ms)
+        self.assertEqual(900, self.store.read().last_cycle.completed_at_ms)
+
 
 if __name__ == "__main__":
     unittest.main()

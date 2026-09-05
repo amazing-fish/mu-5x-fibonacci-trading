@@ -29,7 +29,7 @@ python -B -m mu_strategy.commands.signal_service status --data-dir data\live
 
 | 维度 | 含义 |
 |---|---|
-| `runtime` | `not_started`、`starting`、`running`、`stopped`、`interrupted`、`unresponsive`；锁、持久化阶段与 deadline 共同判定 |
+| `runtime` | `not_started`、`running`、`stopped`、`interrupted`、`unresponsive`；锁、持久化阶段与 deadline 共同判定 |
 | `last_cycle.refresh` | 正常发布、降级发布、失败或超时，保留 run ID、attempt/usability 和退出码 |
 | `data_at_last_scan` | **上次扫描时**的 trusted gate、原因和检查时间；不是查询时重新证明数据新鲜 |
 | `last_cycle.scan` | worker 完成状态及 Stage 0 cycle；逐标的区分数据阻断、扫描失败、正常无信号、READY |
@@ -58,6 +58,10 @@ deadline 是当前子进程超时或下一轮计划时间，加 30 秒状态更�
 状态是服务健康证据，观测日志是扫描证据，诊断日志不是权威提交点。邮件消费者还需自己的去重和送达状态（#98）。不能将健康、READY 或事件当下单授权，也不能把上次门禁判定当永久有效信号。
 
 ## Windows 常驻操作手册
+
+系统时钟在两次运行之间倒退时，旧轮次仍按原始时间保留，新运行使用当前时钟并凭 `service_run_id` 区分历史。事件顺序以 `sequence` 为准，不以墙上时钟排序；不会改写 trusted freshness 判定。当前运行内部的时钟倒退仍导致不响应或校验失败，需停止后重新启动。
+
+显式 `recover` 收尾旧 journal 时，只将记账更新时间保持不小于旧值，恢复事件保留当前墙上时钟。随后新运行仍取实际当前时钟，不会等旧时间追平才启动。
 
 先按 `--once` 验证一次。确认解释器、仓库路径、数据目录可写，旧刷新调度已停止，再选择前台持续运行：
 

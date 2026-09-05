@@ -219,9 +219,12 @@ def recover_interrupted(store: HealthStore, *, clock: Clock | None = None) -> Se
         if state is None or not state.running or state.phase is Phase.IDLE:
             raise InterruptedCycleError("no interrupted child phase to acknowledge")
         now = (clock or SystemClock()).now_ms()
+        # Recovery closes the old run's journal. Keep its bookkeeping ordered if
+        # the wall clock rolled back; a subsequent new run uses the actual clock.
+        updated = max(now, state.updated_at_ms)
         sequence = state.event_sequence + 1
         event = HealthEvent(sequence, now, "interruption_acknowledged", ("runtime.interrupted",))
-        state = replace(state, running=False, phase=Phase.IDLE, updated_at_ms=now, deadline_ms=now,
+        state = replace(state, running=False, phase=Phase.IDLE, updated_at_ms=updated, deadline_ms=updated,
                         event_sequence=sequence, events=(*state.events, event)[-EVENT_LIMIT:])
         store.write(state)
         return state

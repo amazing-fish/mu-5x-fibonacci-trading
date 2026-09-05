@@ -224,7 +224,7 @@ class ServiceState:
         if [event.sequence for event in result.events] != expected or bool(result.events) != bool(result.event_sequence):
             raise HealthStateError("non-contiguous event sequence")
         if result.last_cycle is not None:
-            if result.last_cycle.completed_at_ms > result.updated_at_ms:
+            if result.last_cycle.service_run_id == result.run_id and result.last_cycle.completed_at_ms > result.updated_at_ms:
                 raise HealthStateError("last cycle is newer than service state")
             if result.last_cycle.service_run_id == result.run_id and result.last_cycle.started_at_ms < result.started_at_ms:
                 raise HealthStateError("current run cycle precedes service start")
@@ -339,10 +339,10 @@ class HealthStore:
 def health_view(state: ServiceState | None, *, running: bool, now_ms: int) -> dict[str, Any]:
     if state is None:
         return {"runtime": "not_started", "healthy": False, "problems": ["runtime.not_started"]}
-    if not running:
-        runtime = "interrupted" if state.running else "stopped"
-    elif not state.running:
-        runtime = "starting"
+    if not state.running:
+        runtime = "stopped"
+    elif not running:
+        runtime = "interrupted"
     elif now_ms < state.updated_at_ms or now_ms > state.deadline_ms:
         runtime = "unresponsive"
     else:
