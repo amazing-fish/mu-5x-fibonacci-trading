@@ -1,11 +1,17 @@
 import io
 import json
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from mu_strategy.market_data.providers.okx import fetch_okx_listing_time
 from mu_strategy.market_data.trusted_data.refresh import OKXMarketDataProvider
+from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+from mu_strategy.market_data.trusted_data.store import SegmentCorrectionError, TrustedDataStore
+from mu_strategy.models import Candle
 
 
 SYMBOL = "MU-USDT-SWAP"
@@ -56,3 +62,30 @@ class OkxListingTimeTests(unittest.TestCase):
         with patch("mu_strategy.market_data.trusted_data.refresh.fetch_okx_listing_time", return_value=LISTING) as fetch:
             self.assertEqual(LISTING, OKXMarketDataProvider().fetch_listing_time(SYMBOL))
             fetch.assert_called_once_with(SYMBOL)
+
+    def test_invalid_listing_payload_preserves_existing_publication(self):
+        now_ms = int(datetime(2026, 3, 10, tzinfo=timezone.utc).timestamp() * 1000)
+        rows = [Candle(at, 10, 11, 9, 10, 1) for at in range(LISTING, now_ms, 300_000)]
+        payloads = [b'{"code":"0","data":[]}',
+                    b'{"code":"0","data":[{"instId":"BTC-USDT-SWAP","listTime":"1772608500000"}]}',
+                    b'{"code":"500","data":[]}', b'{broken json']
+        for payload in payloads:
+            with self.subTest(payload=payload), TemporaryDirectory() as tmp:
+                store = TrustedDataStore(data_dir=Path(tmp))
+                # An unrelated valid generation is allowed to remain current;
+                # an unavailable proof must not replace it with a failed run.
+                initial = OKXMarketDataProvider(history_fetcher=lambda *a, **k: rows)
+                RefreshTrustedMarketData(store, initial).execute(
+                    RefreshTrustedMarketDataRequest(requested_intervals=("5m",), symbols=("BTC-USDT-SWAP",),
+                                                    days=180, now_ms=now_ms, run_id="a" * 32)
+                )
+                pointer = store.current_path.read_bytes()
+                provider = OKXMarketDataProvider(history_fetcher=lambda *a, **k: rows,
+                                                 listing_time_fetcher=fetch_okx_listing_time)
+                with patch("mu_strategy.market_data.providers.okx.urllib.request.urlopen", return_value=io.BytesIO(payload)):
+                    with self.assertRaises(SegmentCorrectionError):
+                        RefreshTrustedMarketData(store, provider).execute(
+                            RefreshTrustedMarketDataRequest(requested_intervals=("5m",), symbols=(SYMBOL,),
+                                                            days=1, now_ms=now_ms, run_id="b" * 32)
+                        )
+                self.assertEqual(pointer, store.current_path.read_bytes())

@@ -546,7 +546,12 @@ class RefreshTrustedMarketData:
             ):
                 return False
             if not listing_loaded:
-                listing_time_ms = self.provider.fetch_listing_time(symbol)
+                try:
+                    listing_time_ms = self.provider.fetch_listing_time(symbol)
+                except Exception as exc:
+                    # This is required publication evidence, not a bad candle
+                    # dataset that may be published as a failed generation.
+                    raise SegmentCorrectionError(f"listing metadata unavailable: {symbol}") from exc
                 listing_loaded = True
                 if listing_time_ms is not None and (
                     type(listing_time_ms) is not int or not 0 < listing_time_ms <= now_ms
@@ -665,11 +670,21 @@ class RefreshTrustedMarketData:
             or manifest_result.snapshot.imported_from_run_id is not None
         ):
             return None
+        base_health = manifest_result.snapshot.datasets.get((symbol, "5m"))
+        if (
+            base_health is None
+            or not _is_reusable_prior_health(base_health)
+            or base_health.last_timestamp_ms is None
+        ):
+            return None
+        # Reuse must assess the same shared 5m window as evaluation. Native
+        # parents omit an incomplete trailing bucket; using their own end
+        # shifts the requested start and incorrectly rejects complete caches.
         coverage = assess_requested_coverage(
             cached,
             interval=interval,
             requested_days=days,
-            window_end_time_ms=cached[-1].open_time_ms if cached else None,
+            window_end_time_ms=base_health.last_timestamp_ms,
         )
         if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None

@@ -163,7 +163,8 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
     def test_listing_boundary_supports_all_intervals_and_incremental_restart(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
 
-        now_ms = FEB_START_MS + 10 * DAY_MS
+        # A non-hour boundary leaves an incomplete trailing native hour.
+        now_ms = FEB_START_MS + 10 * DAY_MS + 15 * 60_000
         listing_ms = FEB_START_MS + 2 * DAY_MS + (7 * 60 + 15) * 60_000
         five = _window_candles(listing_ms, now_ms - STEP_MS)
 
@@ -235,7 +236,7 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
         provider = ListedProvider(_window_candles(FEB_START_MS + 2 * DAY_MS, now_ms - STEP_MS))
         with TemporaryDirectory() as tmp:
             store = TrustedDataStore(data_dir=Path(tmp))
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(SegmentCorrectionError, "listing metadata unavailable"):
                 _refresh(store, provider, RUN_A, days=1, now_ms=now_ms)
             self.assertFalse(store.current_path.exists())
             self.assertFalse(any(store.data_dir.rglob("*.csv")))

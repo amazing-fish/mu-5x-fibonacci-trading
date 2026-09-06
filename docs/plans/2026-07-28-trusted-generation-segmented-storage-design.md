@@ -187,6 +187,12 @@ or truncated starts retain strict rejection. The new generation records a listin
 uses the same partial-start representation, without changing schema, logical coverage, or readers.
 Providers supplying custom history must supply matching listing evidence explicitly; their candles
 are never automatically paired with unrelated live metadata.
+
+Incremental eligibility uses the prior generation's shared 5m window end, just as bundle evaluation
+does. An incomplete trailing native hour must not shift the logical start and force a full-history
+fetch that loses the prior partial-start reference. Without a usable prior 5m anchor, refresh asks
+for full history rather than claiming the cached parent covers the requested window.
+
 A later full-history response with complete month-open evidence can create separate canonical
 evidence while the old exact generation remains readable. A later wider
 request can move `start_row` earlier inside a complete stored month without prepending rows or
