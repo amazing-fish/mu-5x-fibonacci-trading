@@ -1,0 +1,1529 @@
+import io
+import json
+import smtplib
+import sqlite3
+import ssl
+import subprocess
+import tempfile
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from email.parser import BytesParser
+from email.policy import default
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from mu_strategy.commands.email_alerts import main
+from mu_strategy.file_locks import FileLockBusyError, locked_file
+from mu_strategy.market_data.trusted_data.contracts import HealthReason, RefreshAttemptStatus, SnapshotUsability
+from mu_strategy.models import EntryDecisionCode
+from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError
+from mu_strategy.notifications.service import EmailAlerts
+from mu_strategy.notifications.smtp import SendResult, SmtpConfig, SmtpTransport, render_message
+from mu_strategy.notifications.store import NotificationStore
+from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError
+from mu_strategy.scan_cycle import ScanCycle
+from mu_strategy.service_health import CycleHealth, HealthEvent, HealthSnapshotUnstableError, HealthStateError, HealthStore, Phase, RefreshHealth, ScanHealth, ServiceState, StepStatus
+from mu_strategy.strategies.registry import baseline_strategy_group
+from mu_strategy.signal_service import ServiceConfig, SignalService
+from tests.factories.scan_cycle import scan_result, trusted_scan_bundle
+
+
+SYMBOL = "MU-USDT-SWAP"
+CONFIG = SmtpConfig("smtp.126.com", "sender@example.test", "reader@example.test", "fake-test-authorization")
+
+
+def smtp_client():
+    return Mock(mail=Mock(return_value=(250, b"OK")), rcpt=Mock(return_value=(250, b"OK")),
+                docmd=Mock(return_value=(354, b"continue")), getreply=Mock(return_value=(250, b"accepted")))
+
+
+class Clock:
+    value = 1_000_000
+
+    def now_ms(self):
+        return self.value
+
+
+class EmailAlertsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.data_dir = Path(self.temp.name) / "live"
+        self.clock = Clock()
+        self.health = HealthStore(self.data_dir)
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.sequence = 0
+        self.state = None
+        self.running = True
+        self.snapshot = patch.object(self.health, "snapshot", side_effect=lambda: (self.state, self.running)).start()
+        self.addCleanup(patch.stopall)
+        self.transport = Mock(target_fingerprint=CONFIG.target_fingerprint,
+                              send=Mock(return_value=SendResult(DeliveryState.CONFIRMED, "smtp_accepted")))
+
+    def publish(self, kind="ready", *, signal=42, generation="trusted-run", events=None, at=None, append=True, config=None, symbol=SYMBOL, run_id="service-1"):
+        self.sequence += 1
+        at = self.clock.value if at is None else at
+        group = baseline_strategy_group(symbol)
+        clock = Mock(now_ms=Mock(return_value=at))
+        cycle = ScanCycle(clock=clock, id_factory=iter((f"cycle-{self.sequence}", f"observation-{self.sequence}")).__next__)
+        bundle = trusted_scan_bundle(symbol=symbol, allowed=kind != "blocked", reason=HealthReason.STALE_BY_CLOCK if kind == "blocked" else HealthReason.OK)
+        manifest = replace(bundle.load_context.manifest, run_id=generation)
+        bundle = replace(bundle, run_id=generation, observed_at_ms=at,
+                         load_context=replace(bundle.load_context, manifest=manifest, generation_id=generation))
+        code = EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY if kind == "ready" else EntryDecisionCode.WAITING_SECOND_PULLBACK
+        result = replace(scan_result(code, symbol=symbol), signal_time_ms=signal)
+        scanner = Mock(side_effect=RuntimeError("failure")) if kind == "failed" else Mock(return_value=result)
+        cycle.scan_symbol(symbol=symbol, source="watchlist", bundle=bundle, requested_intervals=("15m", "1h"),
+                          strategy_name=group.name, strategy_config=config or group.config, scanner=scanner, data_failure=None)
+        observed = cycle.observations()
+        if append:
+            self.alerts.observations.append_cycle(observed)
+        events = events if events is not None else (HealthEvent(1, 900_000, "started", ()),)
+        self.state = ServiceState(str(self.data_dir.resolve()), (symbol,), run_id, True, Phase.IDLE,
+                                  min(900_000, at), at, at + 330_000,
+                                  CycleHealth(self.sequence, run_id, at, at,
+                                              RefreshHealth(StepStatus.SUCCEEDED, generation, RefreshAttemptStatus.SUCCESS, SnapshotUsability.USABLE, 0),
+                                              ScanHealth(StepStatus.SUCCEEDED, observed, StepStatus.SUCCEEDED)),
+                                  0, events, events[-1].sequence)
+        self.state = ServiceState.from_dict(self.state.to_dict())
+        return observed
+
+    def records(self, kind=None):
+        records = self.alerts.store.status()["records"]
+        return records if kind is None else [record for record in records if record["kind"] == kind.value]
+
+    def entry_id(self):
+        return self.records(AlertKind.ENTRY_REVIEW)[0]["event_id"]
+
+    def test_collect_dry_run_and_send_are_separate(self):
+        self.publish()
+        result = self.alerts.collect()
+        self.assertTrue(result["caught_up"])
+        self.assertEqual("pending", self.records()[0]["state"])
+        self.transport.send.assert_not_called()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records()[0]["state"])
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+
+    def test_generation_refresh_and_restart_do_not_duplicate_same_ready_signal(self):
+        self.publish()
+        self.alerts.collect()
+        first = self.entry_id()
+        self.alerts.deliver(self.transport)
+        self.clock.value += 1000
+        self.publish(generation="new-generation")
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.alerts.collect()
+        self.assertEqual([first], [record["event_id"] for record in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+
+    def test_invalidation_and_new_ready_transition_are_traced(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value += 1000
+        self.publish("wait")
+        self.alerts.collect()
+        invalid = self.records(AlertKind.SIGNAL_INVALIDATED)[0]
+        evidence = self.alerts.store.status(event_id=invalid["event_id"])
+        self.assertEqual(original, evidence["event"]["related_event_id"])
+        self.assertEqual("decision_changed", evidence["event"]["reason"])
+        self.assertIsNone(invalid["suppressed_reason"])
+        self.clock.value += 1000
+        self.publish()
+        self.alerts.collect()
+        self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+
+    def test_unknown_data_withdraws_trust_without_claiming_strategy_reversal(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value += 1
+        self.publish("blocked")
+        self.alerts.collect()
+        invalid = self.records(AlertKind.SIGNAL_INVALIDATED)[0]
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=invalid["event_id"])["event"]["reason"])
+
+    def test_old_ready_is_preserved_but_never_sent(self):
+        self.publish(at=self.clock.value - 300_001)
+        self.alerts.collect()
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_expiry_boundary_is_exclusive(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 300_000
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_continuous_ready_survives_idle_refresh_scan_latency_without_duplicate(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.alerts.deliver(self.transport)
+        started = self.clock.value
+        for phase, updated, poll, deadline in ((Phase.IDLE, 0, 310_000, 330_000),
+                                               (Phase.REFRESH, 310_000, 360_000, 580_000),
+                                               (Phase.SCAN, 550_000, 600_000, 640_000)):
+            with self.subTest(phase=phase):
+                self.clock.value = started + poll
+                self.state = replace(self.state, phase=phase, updated_at_ms=started + updated,
+                                     deadline_ms=started + deadline)
+                self.state = ServiceState.from_dict(self.state.to_dict())
+                self.assertTrue(self.alerts.collect()["source_healthy"])
+                self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+                self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.publish(generation="next-slow-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_called_once()
+
+    def test_slow_continuous_ready_does_not_extend_unsent_email_deadline(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 310_000
+        self.state = replace(self.state, phase=Phase.REFRESH, updated_at_ms=self.clock.value,
+                             deadline_ms=self.clock.value + 270_000)
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.clock.value += 50_000
+        self.publish(generation="next-slow-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_dry_run_records_email_expiry_without_clearing_signal_identity(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 300_000
+        self.alerts.collect()
+        record = self.records(AlertKind.ENTRY_REVIEW)[0]
+        self.assertEqual(("pending", 0, "review_expired"),
+                         (record["state"], record["attempts"], record["suppressed_reason"]))
+        with self.alerts.store.connection() as db:
+            self.assertEqual(original, self.alerts.store.stream(db, SYMBOL)["active_event_id"])
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value += 1
+        self.publish(generation="next-generation")
+        self.alerts.collect()
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual("review_expired", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.transport.send.assert_not_called()
+
+    def test_expired_dry_run_entry_does_not_spend_send_limit_before_health_alert(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 300_000
+        self.publish(events=self.state.events + (HealthEvent(2, self.clock.value, "fault", ("refresh.failed",)),))
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport, limit=1))
+        self.assertEqual(AlertKind.SERVICE_FAULT, self.transport.send.call_args.args[0].kind)
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
+
+    def test_continuity_expires_at_service_deadline_instead_of_email_deadline(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value = self.state.deadline_ms
+        self.assertEqual("running", self.alerts.collect()["runtime"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.clock.value += 1
+        self.assertEqual("unresponsive", self.alerts.collect()["runtime"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=invalidations[0]["event_id"])["event"]["reason"])
+
+    def test_no_delivery_when_newer_health_cycle_has_not_been_consumed(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        self.publish("wait")
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_committed_log_tail_before_health_publication_blocks_pre_send(self):
+        self.publish()
+        self.alerts.collect()
+        old_health = self.state
+        self.clock.value += 1
+        self.publish("wait")
+        self.state = old_health
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_unreadable_log_tail_during_pre_send_is_retryable_without_network(self):
+        self.publish()
+        self.alerts.collect()
+        with patch.object(self.alerts.observations, "read_batch", side_effect=ObservationCorruptionError("retry")):
+            self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+
+    def test_writer_holding_publication_fence_defers_sender_without_network(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.observations.publication_fence():
+            self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.clock.value += 30_000
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def assert_publication_lock_error_is_reported(self, patcher):
+        self.publish()
+        output = io.StringIO()
+        environment = {"MU_SMTP_HOST": CONFIG.host, "MU_SMTP_SENDER": CONFIG.sender,
+                       "MU_SMTP_RECIPIENT": CONFIG.recipient, "MU_SMTP_AUTHORIZATION_CODE": "test-only"}
+        with patcher:
+            code = main(["run", "--once", "--send", "--data-dir", str(self.data_dir)],
+                        stdout=output, environment=environment, factory=Mock(return_value=self.alerts),
+                        transport_factory=Mock(return_value=self.transport))
+        self.assertEqual(2, code)
+        self.assertEqual({"error_code": "notification_state_or_delivery_error", "retryable": False},
+                         json.loads(output.getvalue()))
+        self.assertNotIn("private diagnostic", output.getvalue())
+        self.transport.send.assert_not_called()
+        self.assertEqual(("unknown", 1), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.clock.value += 30_000
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.transport.send.assert_not_called()
+
+    def test_publication_lock_open_permission_error_is_not_contention(self):
+        original_open = Path.open
+        def denied(path, *args, **kwargs):
+            if path == self.alerts.observations.lock_path:
+                raise PermissionError("private diagnostic must not appear")
+            return original_open(path, *args, **kwargs)
+        self.assert_publication_lock_error_is_reported(patch.object(Path, "open", new=denied))
+
+    def test_publication_lock_io_error_is_not_contention(self):
+        self.assert_publication_lock_error_is_reported(
+            patch("mu_strategy.file_locks.lock_file", side_effect=OSError("private diagnostic must not appear")))
+
+    def test_final_validation_and_transport_exclude_observation_append(self):
+        self.publish()
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        next_cycle = self.publish("wait", append=False)
+        self.state = previous
+        writer = []
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def during_send(event, **kwargs):
+                with self.assertRaises(FileLockBusyError):
+                    with self.alerts.observations.publication_fence(wait=False):
+                        self.fail("send must retain the publication fence")
+                writer.append(pool.submit(self.alerts.observations.append_cycle, next_cycle))
+                self.assertEqual(1, len(self.alerts.observations.read_cycles()))
+                return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+            self.transport.send.side_effect = during_send
+            self.assertEqual(1, self.alerts.deliver(self.transport))
+            writer[0].result(timeout=5)
+        self.assertEqual(2, len(self.alerts.observations.read_cycles()))
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_final_log_check_itself_holds_the_writer_fence(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.alerts.observations.read_batch
+        def checked_tail(**kwargs):
+            result = original(**kwargs)
+            with self.assertRaises(FileLockBusyError):
+                with self.alerts.observations.publication_fence(wait=False):
+                    self.fail("writer could commit after the tail check")
+            return result
+        with patch.object(self.alerts.observations, "read_batch", side_effect=checked_tail):
+            self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_final_validation_and_transport_exclude_health_only_publication(self):
+        self.publish()
+        self.health.write(self.state)
+        self.snapshot.side_effect = lambda: (self.health.read(), True)
+        self.alerts.collect()
+        stopped = replace(self.state, running=False)
+        writer = []
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def during_send(event, **kwargs):
+                with self.assertRaises(FileLockBusyError):
+                    with locked_file(self.health.publication_lock_path, wait=False):
+                        self.fail("health publisher could bypass send fence")
+                writer.append(pool.submit(self.health.write, stopped))
+                self.assertTrue(self.health.read().running)
+                return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+            self.transport.send.side_effect = during_send
+            self.assertEqual(1, self.alerts.deliver(self.transport))
+            writer[0].result(timeout=5)
+        self.assertFalse(self.health.read().running)
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_restart_before_first_new_cycle_does_not_withdraw_existing_signal(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value += 1
+        self.state = replace(self.state, run_id="service-2", phase=Phase.REFRESH,
+                             updated_at_ms=self.clock.value, deadline_ms=self.clock.value + 240_000)
+        self.assertFalse(self.alerts.collect()["source_healthy"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual([original], [record["event_id"] for record in self.records(AlertKind.ENTRY_REVIEW)])
+
+    def assert_restart_runtime_failure_invalidates(self, runtime, outcome):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value += 1
+        events = self.state.events + (HealthEvent(2, self.clock.value, "restarted", ()),)
+        self.state = replace(self.state, run_id="service-2", phase=Phase.REFRESH,
+                             updated_at_ms=self.clock.value, deadline_ms=self.clock.value + 10,
+                             events=events, event_sequence=2)
+        if runtime == "stopped":
+            self.state = replace(self.state, running=False, phase=Phase.IDLE,
+                                 events=events + (HealthEvent(3, self.clock.value, "stopped", ()),), event_sequence=3)
+            self.running = False
+        elif runtime == "interrupted":
+            self.running = False
+        else:
+            self.clock.value += 11
+        self.state = ServiceState.from_dict(self.state.to_dict())
+        self.assertEqual(runtime, self.alerts.collect()["runtime"])
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertIsNone(invalidations[0]["suppressed_reason"])
+
+    def test_restart_stopped_before_first_cycle_withdraws_confirmed_entry(self):
+        self.assert_restart_runtime_failure_invalidates("stopped", DeliveryState.CONFIRMED)
+
+    def test_restart_interrupted_before_first_cycle_withdraws_unknown_entry(self):
+        self.assert_restart_runtime_failure_invalidates("interrupted", DeliveryState.UNKNOWN)
+
+    def test_restart_unresponsive_before_first_cycle_withdraws_confirmed_entry(self):
+        self.assert_restart_runtime_failure_invalidates("unresponsive", DeliveryState.CONFIRMED)
+
+    def test_authoritative_failed_scan_or_persistence_withdraws_previous_entry(self):
+        for status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.SUCCEEDED):
+            with self.subTest(status=status):
+                self.clock.value += 100
+                self.publish(signal=self.clock.value)
+                self.alerts.collect()
+                self.alerts.deliver(self.transport)
+                current_id = self.entry_id()
+                self.clock.value += 1
+                uncommitted = self.publish(append=False)
+                scan = ScanHealth(status, uncommitted, StepStatus.FAILED) if status is StepStatus.SUCCEEDED else ScanHealth(status)
+                self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=scan))
+                self.assertFalse(self.alerts.collect()["caught_up"])
+                self.assertEqual("source_unavailable", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+
+    def test_previous_failed_scan_does_not_withdraw_newer_log_awaiting_health(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        previous = self.state
+        self.clock.value += 1
+        self.publish()
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.state = current
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_failed_new_run_with_small_clock_rollback_withdraws_old_confirmed_entry(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.assertFalse(self.alerts.collect()["source_healthy"])
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+
+    def test_failed_new_run_does_not_withdraw_new_log_using_previous_ordering_epoch(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        failed = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = failed
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        original = self.entry_id()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_same_run_health_catchup_binds_latest_evidence_before_failed_restart(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        previous = self.state
+        self.clock.value += 100
+        self.publish(generation="new-generation")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+
+    def test_unmatched_equal_timestamp_cycle_does_not_inherit_collection_run(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        failed = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 50
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = failed
+        self.clock.value += 10
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        with self.alerts.store.connection() as db:
+            stream = self.alerts.store.stream(db, SYMBOL)
+            self.assertEqual("service-1", stream["service_run_id"])
+            self.assertEqual("service-2", stream["collection_run_id"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.state = current
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+
+    def test_collection_run_roundtrip_and_invalid_values(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            original = self.alerts.store.stream(db, SYMBOL)
+            for run_id in (None, "service-1", "different-run"):
+                value = dict(original, collection_run_id=run_id)
+                self.alerts.store.save_stream(db, SYMBOL, value)
+                self.assertEqual(value, self.alerts.store.stream(db, SYMBOL))
+            for run_id in ("", 1, True, [], {}):
+                with self.subTest(run_id=run_id), self.assertRaises(NotificationError):
+                    with self.alerts.store.transaction(db):
+                        self.alerts.store.save_stream(db, SYMBOL, dict(original, collection_run_id=run_id))
+            with self.assertRaises(NotificationError), self.alerts.store.transaction(db):
+                value = dict(original)
+                del value["collection_run_id"]
+                self.alerts.store.save_stream(db, SYMBOL, value)
+
+    def assert_prior_run_consumption_proves_order(self, outcome):
+        self.publish()
+        self.alerts.collect()
+        if outcome is not DeliveryState.PENDING:
+            self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+            self.alerts.deliver(self.transport)
+        original = self.entry_id()
+        previous = self.state
+        self.clock.value += 100
+        self.publish(generation="new-generation")
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2")
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        self.alerts.collect()
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        invalidations = self.records(AlertKind.SIGNAL_INVALIDATED)
+        self.assertEqual(1, len(invalidations))
+        self.assertEqual("historical_event" if outcome is DeliveryState.PENDING else None, invalidations[0]["suppressed_reason"])
+
+    def test_prior_run_consumption_proves_order_without_health_catching_up(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.CONFIRMED)
+
+    def test_prior_run_unknown_entry_is_withdrawn_after_failed_restart(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.UNKNOWN)
+
+    def test_prior_run_unsent_entry_is_suppressed_after_failed_restart(self):
+        self.assert_prior_run_consumption_proves_order(DeliveryState.PENDING)
+
+    def test_unknown_cross_run_order_blocks_entry_and_reports_authoritative_fault(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 100
+        self.publish(generation="unmatched-generation")
+        self.clock.value -= 50
+        self.publish(append=False, run_id="service-2", events=self.state.events +
+                     (HealthEvent(2, self.clock.value, "fault", ("scan.failed",)),))
+        self.state = replace(self.state, last_cycle=replace(self.state.last_cycle, scan=ScanHealth(StepStatus.FAILED)))
+        self.clock.value += 60
+        view = self.alerts.collect()
+        self.assertFalse(view["source_healthy"])
+        self.assertFalse(view["caught_up"])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertEqual([original], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.transport.send.assert_called_once()
+        self.assertEqual(AlertKind.SERVICE_FAULT, self.transport.send.call_args.args[0].kind)
+        self.assertEqual(0, self.records(AlertKind.ENTRY_REVIEW)[0]["attempts"])
+
+    def test_health_snapshot_io_failure_follows_source_fault_path(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.snapshot.side_effect = PermissionError("private details")
+        output = io.StringIO()
+        self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                factory=Mock(return_value=self.alerts)))
+        self.assertEqual("notification_source_unavailable_or_cursor_gap", json.loads(output.getvalue())["error_code"])
+        self.assertNotIn("private details", output.getvalue())
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.assertEqual("source_unavailable", self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_same_ready_new_cycle_defers_then_sends_original_event_after_catching_up(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 1
+        self.publish(generation="new-generation")
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        record = self.alerts.store.status(event_id=original)["records"][0]
+        self.assertEqual(("pending", 0, None), (record["state"], record["attempts"], record["suppressed_reason"]))
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_temporarily_unreadable_log_defers_delivery_without_terminal_suppression(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.observation_unavailable()
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertIsNone(self.records()[0]["suppressed_reason"])
+        self.clock.value += 30_000
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_new_ready_log_waits_for_health_publication_without_being_withdrawn(self):
+        self.publish("failed")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        self.publish()
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        original = self.entry_id()
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.state = current
+        self.clock.value += 30_000
+        self.assertEqual(0, self.alerts.collect()["cycles_consumed"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(original, self.transport.send.call_args.args[0].event_id)
+
+    def test_new_scope_log_is_not_withdrawn_using_previous_scope_health(self):
+        self.publish("wait")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value += 1
+        self.publish(symbol="BTC-USDT-SWAP", run_id="service-2")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+        self.state = current
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_collection_clock_is_read_after_new_log_and_health(self):
+        original_read = self.alerts.observations.read_batch
+        def publish_during_read(**kwargs):
+            self.clock.value += 1
+            self.publish()
+            return original_read(**kwargs)
+        with patch.object(self.alerts.observations, "read_batch", side_effect=publish_during_read):
+            self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_backlog_larger_than_batch_advances_without_premature_scope_invalidation(self):
+        cycles = []
+        for index in range(1001):
+            self.clock.value += 1
+            cycles.append(self.publish("wait" if index < 1000 else "ready", append=False))
+        self.alerts.observations.path.write_text("".join(json.dumps(cycle.to_dict()) + "\n" for cycle in cycles), encoding="utf-8")
+        first = self.alerts.collect()
+        self.assertEqual((1000, False), (first["cycles_consumed"], first["caught_up"]))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        second = self.alerts.collect()
+        self.assertEqual((1, True), (second["cycles_consumed"], second["caught_up"]))
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+
+    def test_clock_rollback_new_run_accepts_current_cycle_and_keeps_old_log_ordering(self):
+        old = self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value -= 500_000
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        entries = self.records(AlertKind.ENTRY_REVIEW)
+        self.assertEqual(2, len(entries))
+        self.assertIsNone(entries[0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        current_id = self.entry_id()
+        self.alerts.observations.append_cycle(old)
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.assertIsNone(self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+        with self.alerts.store.connection() as db:
+            self.assertEqual(self.clock.value, self.alerts.store.stream(db, SYMBOL)["observed_at_ms"])
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(current_id, self.entry_id())
+        self.clock.value += 1
+        self.publish("wait", run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual("decision_changed", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+
+    def test_clock_rollback_log_before_health_is_reconciled_without_new_log_bytes(self):
+        self.publish("wait")
+        self.alerts.collect()
+        previous = self.state
+        self.clock.value -= 500_000
+        self.publish(run_id="service-2")
+        current = self.state
+        self.state = previous
+        self.assertFalse(self.alerts.collect()["caught_up"])
+        self.assertEqual([], self.records(AlertKind.ENTRY_REVIEW))
+        self.state = current
+        self.assertEqual(0, self.alerts.collect()["cycles_consumed"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+
+    def test_same_signal_new_service_run_without_rollback_is_not_duplicated(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.clock.value += 1
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+
+    def test_removed_symbol_pending_entry_is_suppressed_after_valid_service_restart(self):
+        self.publish()
+        self.alerts.collect()
+        original = self.entry_id()
+        self.clock.value += 1
+        self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual("source_unavailable", self.alerts.store.status(event_id=original)["records"][0]["suppressed_reason"])
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+
+    def test_removed_symbol_with_confirmed_or_unknown_entry_gets_invalidation(self):
+        for outcome in (DeliveryState.CONFIRMED, DeliveryState.UNKNOWN):
+            with self.subTest(outcome=outcome):
+                self.clock.value += 100
+                self.publish(signal=self.clock.value, run_id="service-3")
+                self.alerts.collect()
+                original = self.entry_id()
+                self.transport.send.return_value = SendResult(outcome, "smtp_accepted" if outcome is DeliveryState.CONFIRMED else "smtp_result_unknown")
+                self.alerts.deliver(self.transport)
+                self.clock.value += 1
+                self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-4")
+                self.alerts.collect()
+                related = [row for row in self.records(AlertKind.SIGNAL_INVALIDATED)
+                           if self.alerts.store.status(event_id=row["event_id"])["event"]["related_event_id"] == original]
+                self.assertEqual(1, len(related))
+                self.assertIsNone(related[0]["suppressed_reason"])
+
+    def test_send_time_symbol_check_does_not_trust_global_caught_up_flag(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        current = self.publish("wait", symbol="BTC-USDT-SWAP", run_id="service-2")
+        from mu_strategy.canonical import canonical_sha256
+        with self.alerts.store.connection() as db, self.alerts.store.transaction(db):
+            self.alerts.store.set_meta(db, "last_cycle_sha256", canonical_sha256(current.to_dict()))
+        self.alerts.deliver(self.transport)
+        self.transport.send.assert_not_called()
+
+    def test_unstable_pre_send_snapshot_defers_without_spending_smtp_attempt(self):
+        self.publish()
+        self.alerts.collect()
+        self.snapshot.side_effect = HealthSnapshotUnstableError("retry")
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertEqual(("pending", 0), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        self.transport.send.assert_not_called()
+        self.snapshot.side_effect = lambda: (self.state, self.running)
+        self.clock.value += 30_000
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records()[0]["state"])
+
+    def test_new_signal_and_config_changes_get_new_identities(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        self.publish(signal=43)
+        self.alerts.collect()
+        self.clock.value += 1
+        config = replace(baseline_strategy_group(SYMBOL).config, leverage=3)
+        self.publish(signal=43, config=config)
+        self.alerts.collect()
+        self.assertEqual(3, len(self.records(AlertKind.ENTRY_REVIEW)))
+
+    def test_new_out_of_order_record_does_not_resurrect_old_signal(self):
+        self.publish()
+        self.alerts.collect()
+        self.clock.value += 10
+        self.publish("wait")
+        self.alerts.collect()
+        self.publish(at=self.clock.value - 10)
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
+        with self.alerts.store.connection() as db:
+            self.assertEqual(1, self.alerts.store.get_meta(db, "out_of_order_observations"))
+
+    def test_old_run_duplicate_within_current_time_window_cannot_change_new_run(self):
+        self.clock.value = 550_000
+        old_wait = self.publish("wait")
+        self.alerts.collect()
+        self.clock.value = 1_000_000
+        self.publish()
+        self.alerts.collect()
+        self.clock.value = 500_000
+        self.publish(run_id="service-2")
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        current_id = self.entry_id()
+        self.clock.value = 600_000
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.alerts.observations.append_cycle(old_wait)
+        self.alerts.collect()
+        self.assertIsNone(self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+        self.publish(run_id="service-2")
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(current_id, self.entry_id())
+        self.assertEqual(2, len(self.records(AlertKind.ENTRY_REVIEW)))
+        self.clock.value += 1
+        self.publish("wait", run_id="service-2")
+        self.alerts.collect()
+        self.assertEqual("decision_changed", self.alerts.store.status(event_id=current_id)["records"][0]["suppressed_reason"])
+
+    def test_reused_cycle_identity_with_conflicting_content_is_source_corruption(self):
+        cycle = self.publish()
+        self.alerts.collect()
+        self.clock.value += 1
+        other = self.publish("wait", append=False)
+        reused = replace(other, cycle_id=cycle.cycle_id,
+                         observations=tuple(replace(item, cycle_id=cycle.cycle_id) for item in other.observations))
+        self.alerts.observations.append_cycle(reused)
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.collect()
+        self.assertIsNone(self.records(AlertKind.ENTRY_REVIEW)[0]["suppressed_reason"])
+
+    def test_identical_duplicate_is_ignored(self):
+        cycle = self.publish()
+        self.alerts.collect()
+        self.alerts.observations.append_cycle(cycle)
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.ENTRY_REVIEW)))
+
+    def test_old_duplicate_does_not_move_current_watermark_or_delay_pending_entry(self):
+        old = self.publish("wait")
+        self.alerts.collect()
+        self.clock.value += 1
+        self.publish()
+        self.alerts.collect()
+        self.alerts.observations.append_cycle(old)
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertTrue(self.alerts.collect()["caught_up"])
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+
+    def test_input_cursor_and_outbox_commit_or_rollback_together(self):
+        self.publish()
+        with patch.object(self.alerts, "_health_events", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.alerts.collect()
+        self.assertEqual([], self.records())
+        with self.alerts.store.connection() as db:
+            self.assertIsNone(self.alerts.store.get_meta(db, "observation_cursor"))
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records()))
+
+    def test_health_events_are_deduplicated_and_normal_wait_is_not_failure(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.assertEqual([], self.records())
+        events = (HealthEvent(1, 900_000, "started", ()), HealthEvent(2, self.clock.value, "fault", ("refresh.failed",)),
+                  HealthEvent(3, self.clock.value, "recovered", ()))
+        self.state = replace(self.state, events=events, event_sequence=3)
+        self.alerts.collect()
+        self.alerts.collect()
+        self.assertEqual(2, len(self.records()))
+
+    def test_health_cursor_gap_requires_explicit_reconciliation(self):
+        self.publish("wait", events=(HealthEvent(9, self.clock.value, "fault", ("refresh.failed",)),))
+        with self.assertRaises(HealthStateError):
+            self.alerts.collect()
+        self.assertEqual([], self.records())
+        self.alerts.reconcile_health()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            self.assertEqual(9, self.alerts.store.get_meta(db, "health_cursor"))
+            self.assertTrue(self.alerts.store.get_meta(db, "health_reconciliation")["missing_history_acknowledged"])
+
+    def test_stopped_runtime_and_recovery_are_not_repeated_each_poll(self):
+        self.publish("wait")
+        self.alerts.collect()
+        self.running = False
+        self.alerts.collect()
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.running = True
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
+
+    def test_durable_stop_restart_between_polls_emits_fault_and_healthy_recovery_once(self):
+        self.publish("wait")
+        self.alerts.collect()
+        events = self.state.events + (HealthEvent(2, self.clock.value, "stopped", ()),
+                                      HealthEvent(3, self.clock.value + 1, "restarted", ()))
+        self.clock.value += 2
+        self.publish("wait", run_id="service-2", events=events)
+        self.alerts.collect()
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
+
+    def test_durable_stop_does_not_duplicate_runtime_fault_or_recover_before_healthy(self):
+        self.publish("wait")
+        self.alerts.collect()
+        events = self.state.events + (HealthEvent(2, self.clock.value, "stopped", ()),)
+        self.state = replace(self.state, running=False, events=events, event_sequence=2)
+        self.running = False
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+        self.state = replace(self.state, running=True, run_id="service-2", last_cycle=None)
+        self.alerts.collect()
+        self.assertEqual([], self.records(AlertKind.SERVICE_RECOVERED))
+        self.clock.value += 1
+        self.running = True
+        self.publish("wait", run_id="service-2", events=events)
+        self.alerts.collect()
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_RECOVERED)))
+
+    def test_startup_does_not_notify_or_endorse_old_cycle(self):
+        self.publish("wait")
+        self.state = replace(self.state, run_id="service-2", last_cycle=None)
+        self.running = False
+        self.alerts.collect()
+        self.assertEqual([], self.records())
+
+    def test_source_read_failure_can_notify_independently_of_broken_source(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.source_unavailable()
+        self.alerts.source_unavailable()
+        self.alerts.deliver(self.transport)
+        self.assertEqual(1, self.transport.send.call_count)
+        self.assertEqual(AlertKind.SERVICE_FAULT, self.transport.send.call_args.args[0].kind)
+
+    def test_smtp_unknown_is_not_automatically_retried(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.UNKNOWN, "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        self.assertEqual("unknown", self.records()[0]["state"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual(1, self.transport.send.call_count)
+
+    def test_process_interruption_keeps_committed_unknown_reservation(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.alerts.deliver(self.transport)
+        self.assertEqual("unknown", self.records()[0]["state"])
+        self.transport.send.side_effect = None
+        self.alerts.deliver(self.transport)
+        self.assertEqual(1, self.transport.send.call_count)
+
+    def test_result_commit_failure_keeps_unknown_and_does_not_resend(self):
+        self.publish()
+        self.alerts.collect()
+        with patch.object(self.alerts.store, "finish", side_effect=sqlite3.OperationalError("disk full")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.alerts.deliver(self.transport)
+        self.assertEqual("unknown", self.records()[0]["state"])
+        self.alerts.deliver(self.transport)
+        self.assertEqual(1, self.transport.send.call_count)
+
+    def test_send_holds_write_fence_but_status_can_read_unknown(self):
+        self.publish()
+        self.alerts.collect()
+        def send(event, **kwargs):
+            self.assertEqual("unknown", self.alerts.store.status()["records"][0]["state"])
+            with self.alerts.store.connection() as db:
+                db.execute("PRAGMA busy_timeout=0")
+                with self.assertRaises(sqlite3.OperationalError):
+                    db.execute("BEGIN IMMEDIATE")
+            return SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+        self.transport.send.side_effect = send
+        self.alerts.deliver(self.transport)
+
+    def test_known_transient_failure_has_bounded_backoff(self):
+        self.publish("wait", events=(HealthEvent(1, self.clock.value, "fault", ("refresh.failed",)),))
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.FAILED, "smtp_connection_failed", True)
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.clock.value += 60_000
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.clock.value += 120_000
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.clock.value += 1000_000
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertEqual(3, self.records()[0]["attempts"])
+
+    def test_operator_resolution_is_audited_and_only_for_unknown(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.UNKNOWN, "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        event_id = self.entry_id()
+        self.alerts.store.resolve(event_id, outcome=DeliveryState.CONFIRMED, now_ms=self.clock.value)
+        evidence = self.alerts.store.status(event_id=event_id)
+        self.assertEqual("operator_checked", evidence["history"][-1]["result"])
+        with self.assertRaises(NotificationError):
+            self.alerts.store.resolve(event_id, outcome=DeliveryState.FAILED, now_ms=self.clock.value)
+
+    def test_destination_change_rejected_without_transmitting(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.transport.target_fingerprint = "different"
+        with self.assertRaises(NotificationError):
+            self.alerts.deliver(self.transport)
+        self.assertEqual(1, self.transport.send.call_count)
+
+    def test_event_roundtrip_and_invalid_current_contract(self):
+        self.publish()
+        self.alerts.collect()
+        payload = self.alerts.store.status(event_id=self.entry_id())["event"]
+        self.assertEqual(payload, AlertEvent.from_json(json.dumps(payload)).to_dict())
+        mutations = [dict(payload, schema_version=True), dict(payload, schema_version=2), dict(payload, event_id="a" * 64),
+                     dict(payload, unknown=1), dict(payload, observation=None), dict(payload, occurred_at_ms=-1),
+                     dict(payload, review_until_ms=payload["occurred_at_ms"]), dict(payload, problems=["bad\nheader"])]
+        missing = dict(payload)
+        missing.pop("identity")
+        mutations.append(missing)
+        for value in mutations:
+            with self.subTest(value=value), self.assertRaises(NotificationError):
+                AlertEvent.from_json(json.dumps(value))
+        with self.assertRaises(NotificationError):
+            AlertEvent.from_json('{"schema_version":1,"schema_version":1}')
+
+    def test_schema_corruption_and_wrong_directory_fail_closed(self):
+        with self.alerts.store.connection() as db:
+            db.execute("CREATE TABLE foreign_table (value TEXT)")
+        with self.assertRaises(NotificationError):
+            self.alerts.store.status()
+
+    def test_review_policy_change_is_explicitly_rejected(self):
+        with self.assertRaises(NotificationError):
+            EmailAlerts(self.data_dir, review_seconds=60).initialize()
+
+    def test_manual_retry_requires_known_failure_and_keeps_attempt_count(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.FAILED, "smtp_authentication_failed")
+        self.alerts.deliver(self.transport)
+        self.alerts.store.retry_failed(self.entry_id(), now_ms=self.clock.value)
+        self.transport.send.return_value = SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+        self.alerts.deliver(self.transport)
+        self.assertEqual(("confirmed", 2), (self.records()[0]["state"], self.records()[0]["attempts"]))
+        with self.assertRaises(NotificationError):
+            self.alerts.store.retry_failed(self.entry_id(), now_ms=self.clock.value)
+
+    def test_unknown_cannot_use_known_failure_retry_shortcut(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.UNKNOWN, "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        with self.assertRaises(NotificationError):
+            self.alerts.store.retry_failed(self.entry_id(), now_ms=self.clock.value)
+
+    def test_resolving_unknown_failed_does_not_implicitly_confirm_cause_fixed(self):
+        self.publish()
+        self.alerts.collect()
+        self.transport.send.return_value = SendResult(DeliveryState.UNKNOWN, "smtp_result_unknown")
+        self.alerts.deliver(self.transport)
+        event_id = self.entry_id()
+        self.alerts.store.resolve(event_id, outcome=DeliveryState.FAILED, now_ms=self.clock.value)
+        self.clock.value += 60_000
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+        self.assertFalse(self.records()[0]["retryable"])
+        self.alerts.store.retry_failed(event_id, now_ms=self.clock.value)
+        self.transport.send.return_value = SendResult(DeliveryState.CONFIRMED, "smtp_accepted")
+        self.assertEqual(1, self.alerts.deliver(self.transport))
+        self.assertEqual("confirmed", self.records()[0]["state"])
+
+    def test_normal_writer_marker_overlap_defers_without_false_withdrawal(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original_id = self.entry_id()
+        self.clock.value += 1
+        cycle = self.publish(append=False)
+        original_marker = self.alerts.observations._write_invalid_marker
+        def while_appending(*args, **kwargs):
+            original_marker(*args, **kwargs)
+            output = io.StringIO()
+            self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                    factory=Mock(return_value=self.alerts)))
+            self.assertEqual("observation_append_pending_retry", json.loads(output.getvalue())["error_code"])
+            self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+            self.assertIsNone(self.alerts.store.status(event_id=original_id)["records"][0]["suppressed_reason"])
+        with patch.object(self.alerts.observations, "_write_invalid_marker", side_effect=while_appending):
+            self.alerts.observations.append_cycle(cycle)
+        self.alerts.collect()
+        self.assertEqual([original_id], [row["event_id"] for row in self.records(AlertKind.ENTRY_REVIEW)])
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.assertIsNone(self.alerts.store.status()["log_unavailable_since_ms"])
+
+    def test_persistent_log_error_eventually_invalidates_and_survives_notifier_restart(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.clock.value += 30_000
+        self.assertTrue(self.alerts.observation_unavailable())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+
+    def test_log_retry_grace_restarts_after_clock_rollback(self):
+        self.publish()
+        self.alerts.collect()
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.clock.value -= 50_000
+        self.alerts = EmailAlerts(self.data_dir, clock=self.clock, health=self.health)
+        self.alerts.initialize()
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.assertEqual(self.clock.value, self.alerts.store.status()["log_unavailable_since_ms"])
+        self.clock.value += 29_999
+        self.assertFalse(self.alerts.observation_unavailable())
+        self.assertEqual([], self.records(AlertKind.SIGNAL_INVALIDATED))
+        self.clock.value += 1
+        self.assertTrue(self.alerts.observation_unavailable())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+
+    def test_cli_interrupted_send_returns_failure_and_keeps_unknown(self):
+        self.publish()
+        self.transport.send.side_effect = KeyboardInterrupt()
+        output = io.StringIO()
+        environment = {"MU_SMTP_HOST": CONFIG.host, "MU_SMTP_SENDER": CONFIG.sender,
+                       "MU_SMTP_RECIPIENT": CONFIG.recipient, "MU_SMTP_AUTHORIZATION_CODE": "test-only"}
+        self.assertEqual(130, main(["run", "--once", "--send", "--data-dir", str(self.data_dir)],
+                                  stdout=output, environment=environment, factory=Mock(return_value=self.alerts),
+                                  transport_factory=Mock(return_value=self.transport)))
+        self.assertEqual("notification_interrupted", json.loads(output.getvalue())["error_code"])
+        self.assertEqual("unknown", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        with self.alerts.observations.publication_fence(wait=False):
+            pass
+        self.transport.send.side_effect = None
+        self.assertEqual(0, self.alerts.deliver(self.transport))
+
+    def test_log_permission_error_uses_source_retry_and_persistent_fault_path(self):
+        self.publish()
+        self.alerts.collect()
+        self.alerts.deliver(self.transport)
+        original_open = Path.open
+        def log_denied(path, *args, **kwargs):
+            if path == self.alerts.observations.path:
+                raise PermissionError("private diagnostic must not appear")
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, "open", new=log_denied):
+            for delay, code in ((0, "observation_append_pending_retry"), (30_000, "observation_source_unavailable")):
+                self.clock.value += delay
+                output = io.StringIO()
+                self.assertEqual(2, main(["run", "--once", "--data-dir", str(self.data_dir)], stdout=output,
+                                        factory=Mock(return_value=self.alerts)))
+                self.assertEqual(code, json.loads(output.getvalue())["error_code"])
+                self.assertNotIn("private diagnostic", output.getvalue())
+        self.assertEqual(1, len(self.records(AlertKind.SIGNAL_INVALIDATED)))
+        self.assertEqual(1, len(self.records(AlertKind.SERVICE_FAULT)))
+
+    def test_log_seek_and_read_io_errors_are_normalized(self):
+        self.publish()
+        _, cursor = self.alerts.observations.read_batch()
+        for operation in ("seek", "readline"):
+            with self.subTest(operation=operation):
+                handle = Mock()
+                handle.__enter__ = Mock(return_value=handle)
+                handle.__exit__ = Mock(return_value=False)
+                getattr(handle, operation).side_effect = OSError("device unavailable")
+                with patch.object(Path, "open", return_value=handle):
+                    with self.assertRaises(ObservationCorruptionError):
+                        self.alerts.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2])
+
+    def test_conflicting_equal_timestamp_observation_rolls_back_cursor(self):
+        self.publish()
+        self.alerts.collect()
+        self.publish("wait")
+        with self.assertRaises(NotificationError):
+            self.alerts.collect()
+        self.assertEqual(1, len(self.records()))
+
+    def test_database_directory_identity_and_event_payload_are_validated(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            db.execute("UPDATE metadata SET value=? WHERE name='data_dir'", (json.dumps("other-directory"),))
+        with self.assertRaises(NotificationError):
+            self.alerts.store.status()
+        with self.alerts.store.connection() as db:
+            self.alerts.store.set_meta(db, "data_dir", str(self.data_dir.resolve()))
+            db.execute("UPDATE outbox SET payload='{}'")
+        with self.assertRaises(NotificationError):
+            self.alerts.store.status()
+
+    def test_duplicate_json_fields_and_missing_log_at_cursor_are_rejected(self):
+        self.publish()
+        path = self.alerts.observations.path
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.replace('"schema_version":1', '"schema_version":1,"schema_version":1', 1), encoding="utf-8")
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.collect()
+        path.write_text(original, encoding="utf-8")
+        self.alerts.collect()
+        path.unlink()
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.collect()
+
+    def test_source_history_disappearance_fails_closed(self):
+        self.publish()
+        self.alerts.collect()
+        self.state = None
+        with self.assertRaises(HealthStateError):
+            self.alerts.collect()
+
+    def test_email_template_retains_evidence_and_does_not_embed_diagnostics(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        message = render_message(event, CONFIG)
+        body = message.get_content()
+        for text in ("trusted-run", "策略代码版本: unknown", "不是交易所保护单", "实际成交需人工记录", "本提醒人工复核截止", event.event_id):
+            self.assertIn(text, body)
+        self.assertNotIn("typed scan result", body)
+        self.assertIsNone(message.get("Bcc"))
+        self.assertEqual("text/plain", message.get_content_type())
+
+    def test_smtp_checks_expiry_after_slow_login_before_data(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        client = smtp_client()
+        client.login.side_effect = lambda *args: setattr(self.clock, "value", event.review_until_ms)
+        result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(event, source_is_current=lambda: True)
+        self.assertEqual((DeliveryState.FAILED, "entry_review_expired"), (result.state, result.code))
+        client.send.assert_not_called()
+
+    def test_smtp_rechecks_runtime_after_all_setup_waits(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        for phase in ("login", "mail", "rcpt", "docmd"):
+            with self.subTest(phase=phase):
+                self.state = replace(self.state, deadline_ms=self.clock.value + 10)
+                client = smtp_client()
+                response = getattr(client, phase).return_value
+                def slow(*args):
+                    self.clock.value += 11
+                    return response
+                getattr(client, phase).side_effect = slow
+                result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(
+                    event, source_is_current=self.alerts._source_current_before_data)
+                self.assertEqual((DeliveryState.FAILED, "entry_source_unavailable", True),
+                                 (result.state, result.code, result.retryable))
+                client.send.assert_not_called()
+                client.close.assert_called_once()
+
+    def test_sender_rechecks_supervisor_liveness_after_data_354(self):
+        self.publish()
+        self.alerts.collect()
+        client = smtp_client()
+        def stopped(*args):
+            self.running = False
+            return (354, b"continue")
+        client.docmd.side_effect = stopped
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        self.assertEqual(1, self.alerts.deliver(transport))
+        client.send.assert_not_called()
+        self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.assertEqual("entry_source_unavailable", self.alerts.store.status(event_id=self.entry_id())["history"][-1]["result"])
+        with self.alerts.observations.publication_fence(wait=False):
+            pass
+
+    def test_post_354_health_read_failure_is_definite_unsent(self):
+        self.publish()
+        self.alerts.collect()
+        client = smtp_client()
+        def unreadable(*args):
+            self.snapshot.side_effect = HealthSnapshotUnstableError("private diagnostic")
+            return (354, b"continue")
+        client.docmd.side_effect = unreadable
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        self.alerts.deliver(transport)
+        client.send.assert_not_called()
+        self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.assertNotIn("private diagnostic", str(self.alerts.store.status(event_id=self.entry_id())))
+
+    def test_smtp_rechecks_email_deadline_after_354_response(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        client = smtp_client()
+        def delayed(*args):
+            self.clock.value = event.review_until_ms
+            return (354, b"continue")
+        client.docmd.side_effect = delayed
+        result = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock).send(
+            event, source_is_current=lambda: True)
+        self.assertEqual("entry_review_expired", result.code)
+        client.send.assert_not_called()
+
+    def test_entry_transport_requires_current_source_validation(self):
+        self.publish()
+        self.alerts.collect()
+        with self.alerts.store.connection() as db:
+            event = self.alerts.store.record(db, self.entry_id()).event
+        factory = Mock()
+        with self.assertRaises(NotificationError):
+            SmtpTransport(CONFIG, factory=factory, clock=self.clock).send(event)
+        factory.assert_not_called()
+
+    def test_signal_service_committed_cycle_to_fake_smtp_end_to_end(self):
+        cycle = self.publish(append=False)
+        alerts = EmailAlerts(self.data_dir, clock=self.clock)
+        alerts.initialize()
+        refresh = {"run_id": "trusted-run", "attempt_status": "success", "snapshot_usability": "usable", "usable": True}
+        scan = {"schema_version": 1, "scan": ScanHealth(StepStatus.SUCCEEDED, cycle, StepStatus.SUCCEEDED).to_dict()}
+        def run(argv, *, timeout):
+            if "scan-once" in argv:
+                alerts.observations.append_cycle(cycle)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(scan), "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(refresh), "")
+        client = smtp_client()
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        def on_cycle(view):
+            self.assertTrue(view["healthy"])
+            self.assertTrue(alerts.collect()["caught_up"])
+            self.assertEqual(1, alerts.deliver(transport))
+        SignalService(ServiceConfig(data_dir=self.data_dir), clock=self.clock,
+                      processes=Mock(run=Mock(side_effect=run))).run(cycles=1, on_cycle=on_cycle)
+        self.assertEqual(1, client.send.call_count)
+        self.assertEqual("confirmed", alerts.store.status()["records"][0]["state"])
+        alerts.collect()
+        self.assertEqual(1, len([row for row in alerts.store.status()["records"] if row["kind"] == "service_fault"]))
+
+    def test_bounded_log_cursor_detects_truncation_replacement_and_invalid_marker(self):
+        first = self.publish()
+        records, cursor = self.alerts.observations.read_batch(limit=1)
+        self.assertEqual((first,), records)
+        self.clock.value += 1
+        second = self.publish("wait")
+        records, _ = self.alerts.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2])
+        self.assertEqual((second,), records)
+        path = self.alerts.observations.path
+        original = path.read_bytes()
+        path.write_bytes(b"{}\n")
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2])
+        path.write_bytes(original)
+        self.alerts.observations.invalid_marker_path.write_text("uncommitted", encoding="utf-8")
+        with self.assertRaises(ObservationCorruptionError):
+            self.alerts.observations.read_batch()
+
+    def test_incomplete_or_malformed_observation_record_is_not_skipped(self):
+        path = self.alerts.observations.path
+        for raw in (b"{}", b"{}\n", b"\xff\n"):
+            with self.subTest(raw=raw):
+                path.write_bytes(raw)
+                with self.assertRaises(ObservationCorruptionError):
+                    self.alerts.collect()
+                self.assertEqual([], self.records())
+
+
+class SmtpAndCommandTests(unittest.TestCase):
+    def event(self):
+        return AlertEvent(AlertKind.SERVICE_FAULT, "a" * 64, 1000, None, "health_event", problems=("refresh.failed",))
+
+    def client(self):
+        return smtp_client()
+
+    def test_ssl_authentication_and_single_recipient_with_fixed_message_id(self):
+        client = self.client()
+        factory = Mock(return_value=client)
+        result = SmtpTransport(CONFIG, factory=factory).send(self.event())
+        self.assertEqual(DeliveryState.CONFIRMED, result.state)
+        self.assertEqual(("smtp.126.com", 465), factory.call_args.args)
+        self.assertTrue(factory.call_args.kwargs["context"].check_hostname)
+        self.assertEqual(ssl.CERT_REQUIRED, factory.call_args.kwargs["context"].verify_mode)
+        client.rcpt.assert_called_once_with(CONFIG.recipient)
+        message = BytesParser(policy=default).parsebytes(client.send.call_args.args[0][:-3])
+        self.assertIn(self.event().event_id, message["Message-ID"])
+        self.assertEqual("text/plain", message.get_content_type())
+        self.assertNotIn(CONFIG.authorization_code, message.as_string())
+
+    def test_transport_failure_matrix_has_no_raw_server_diagnostics(self):
+        cases = [
+            ("connect", TimeoutError("secret@example.test"), DeliveryState.FAILED, True),
+            ("login", smtplib.SMTPAuthenticationError(535, b"secret"), DeliveryState.FAILED, False),
+            ("send", smtplib.SMTPRecipientsRefused({CONFIG.recipient: (550, b"secret")}), DeliveryState.FAILED, False),
+            ("send", smtplib.SMTPDataError(451, b"secret"), DeliveryState.FAILED, True),
+            ("send", TimeoutError("secret"), DeliveryState.UNKNOWN, False),
+            ("send", smtplib.SMTPServerDisconnected("secret"), DeliveryState.UNKNOWN, False),
+        ]
+        for phase, error, expected, retryable in cases:
+            with self.subTest(phase=phase, error=type(error).__name__):
+                client = self.client()
+                factory = Mock(return_value=client)
+                if phase == "connect":
+                    factory.side_effect = error
+                else:
+                    (client.login if phase == "login" else client.send).side_effect = error
+                result = SmtpTransport(CONFIG, factory=factory).send(self.event())
+                self.assertEqual((expected, retryable), (result.state, result.retryable))
+                self.assertNotIn("secret", repr(result))
+
+    def test_close_error_after_acceptance_does_not_downgrade_delivery(self):
+        client = self.client()
+        client.close.side_effect = OSError("close")
+        self.assertEqual(DeliveryState.CONFIRMED, SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event()).state)
+
+    def test_smtp_envelope_and_final_response_rejections(self):
+        for phase, code, retryable in (("mail", 550, False), ("rcpt", 450, True),
+                                       ("docmd", 550, False), ("getreply", 451, True)):
+            with self.subTest(phase=phase):
+                client = self.client()
+                getattr(client, phase).return_value = (code, b"private diagnostic")
+                result = SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event())
+                self.assertEqual((DeliveryState.FAILED, retryable), (result.state, result.retryable))
+                if phase != "getreply":
+                    client.send.assert_not_called()
+                self.assertNotIn("private diagnostic", repr(result))
+
+    def test_smtp_data_framing_uses_crlf_and_dot_stuffing(self):
+        from email.message import EmailMessage
+        message = EmailMessage()
+        message.set_content(".first\n.\n..last\n", cte="quoted-printable")
+        client = self.client()
+        with patch("mu_strategy.notifications.smtp.render_message", return_value=message):
+            result = SmtpTransport(CONFIG, factory=Mock(return_value=client)).send(self.event())
+        self.assertEqual(DeliveryState.CONFIRMED, result.state)
+        payload = client.send.call_args.args[0]
+        self.assertTrue(payload.endswith(b"\r\n..first\r\n..\r\n...last\r\n.\r\n"))
+        self.assertNotIn(b"\n", payload.replace(b"\r\n", b""))
+        client.docmd.assert_called_once_with("DATA")
+
+    def test_missing_credentials_and_header_injection_rejected(self):
+        with self.assertRaises(NotificationError):
+            SmtpConfig.from_environment({})
+        for address in ("reader@example.test\r\nBcc: other@example.test", "Display <reader@example.test>", "one@example.test,two@example.test"):
+            with self.subTest(address=address), self.assertRaises(NotificationError):
+                SmtpConfig(CONFIG.host, CONFIG.sender, address, "fake")
+        self.assertNotIn(CONFIG.authorization_code, repr(CONFIG))
+
+    def test_status_is_read_only_and_does_not_initialize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "live"
+            output = io.StringIO()
+            self.assertEqual(0, main(["status", "--data-dir", str(data)], stdout=output))
+            self.assertFalse(json.loads(output.getvalue())["initialized"])
+            self.assertEqual([], list(Path(directory).iterdir()))
+
+    def test_default_dry_run_does_not_read_smtp_environment_or_create_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            factory = Mock()
+            environment = Mock(side_effect=AssertionError("must not access credentials"))
+            self.assertEqual(0, main(["run", "--once", "--data-dir", str(Path(directory) / "live")], stdout=io.StringIO(),
+                                    environment=environment, transport_factory=factory))
+            factory.assert_not_called()
+
+    def test_send_configuration_fails_before_any_persistent_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            code = main(["run", "--once", "--send", "--data-dir", str(Path(directory) / "live")], stdout=output, environment={})
+            self.assertEqual(2, code)
+            self.assertIn("MU_SMTP_AUTHORIZATION_CODE", output.getvalue())
+            self.assertEqual([], list(Path(directory).iterdir()))
+
+    def test_unstable_snapshot_retries_without_creating_false_stop_event(self):
+        alerts = Mock()
+        alerts.collect.side_effect = HealthSnapshotUnstableError("unstable")
+        output = io.StringIO()
+        self.assertEqual(2, main(["run", "--once"], stdout=output, factory=Mock(return_value=alerts)))
+        self.assertEqual("health_snapshot_unstable", json.loads(output.getvalue())["error_code"])
+        alerts.source_unavailable.assert_not_called()
+        alerts.deliver.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
