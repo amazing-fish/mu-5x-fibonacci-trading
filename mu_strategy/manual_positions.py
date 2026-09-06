@@ -38,6 +38,37 @@ def _number(value):
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
+def _stage(value):
+    if not isinstance(value, str) or (value and not re.fullmatch(r"[1-9]\d?", value)):
+        raise ValueError("stage 须为 1–99 的整数；不知道时留空。")
+    return int(value) if value else None
+
+
+def _note(value):
+    if not isinstance(value, str) or len(value) > 2000:
+        raise ValueError("备注最多 2000 字。")
+    return value.strip()
+
+
+def _request_identity(payload):
+    if not isinstance(payload, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in payload.items()):
+        raise ValueError("录入内容无效。")
+    return (_identifier(payload.get("request_id")), _identifier(payload.get("position_id")),
+            hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+
+
+def _saved_request(db, table, request_id, digest):
+    # The table name is supplied only by the two ledger methods below.
+    previous = db.execute(f"SELECT request_hash, position_id FROM {table} WHERE request_id=?", (request_id,)).fetchone()
+    if previous and previous[0] != digest:
+        raise ValueError("同次提交内容已变化，请重新打开录入页后记录。")
+    return previous[1] if previous else None
+
+
+def _has_state_table(db):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='position_state_revisions'").fetchone() is not None
+
+
 def _fill(payload, *, now_ms):
     action = payload.get("action")
     if not isinstance(action, str) or action not in {"buy", "sell"}:
@@ -54,20 +85,16 @@ def _fill(payload, *, now_ms):
         raise ValueError("请填写有效的北京时间成交时间。") from exc
     if not 0 < time_ms <= now_ms:
         raise ValueError("成交时间须在 1970 年之后，且不能晚于当前时间。")
-    note = payload.get("note", "")
-    if not isinstance(note, str) or len(note) > 2000:
-        raise ValueError("备注最多 2000 字。")
-    stage = payload.get("stage", "")
-    if not isinstance(stage, str) or (stage and not re.fullmatch(r"[1-9]\d?", stage)):
-        raise ValueError("stage 须为 1–99 的整数；不知道时留空。")
+    note = _note(payload.get("note", ""))
+    stage = _stage(payload.get("stage", ""))
     stop = payload.get("stop_price", "")
     stop = _number(_decimal(stop, "手记止损")) if stop else None
     voided = payload.get("voided", "")
     if not isinstance(voided, str) or voided not in {"", "yes"}:
         raise ValueError("作废标记无效。")
     return {"action": action, "quantity": quantity, "price": price, "time_ms": time_ms,
-            "stage": int(stage) if stage else None, "stop_price": stop,
-            "note": note.strip(), "voided": voided == "yes"}
+            "stage": stage, "stop_price": stop,
+            "note": note, "voided": voided == "yes"}
 
 
 def _project(position, history):
@@ -98,12 +125,23 @@ def _project(position, history):
                 raise ValueError("成交动作无效。")
             last = fill
     return {**position, "fills": fills, "history": history, "recorded_quantity": _number(quantity),
+            "fill_sequence": max((row["sequence"] for row in history), default=0),
             "average_entry_price": _number(average) if quantity else None,
             "status": "open" if quantity else "closed" if last else "empty",
             "last_fill_at_ms": last["time_ms"] if last else None,
             "recorded_stage": last["stage"] if last else None,
             "recorded_stop_price": last["stop_price"] if last else None,
             "transition_state": None, "management_status": "unknown"}
+
+
+def _current_state(position, history):
+    latest = history[-1] if history else None
+    status = ("not_open" if position["status"] != "open" else "unconfirmed" if latest is None else
+              "needs_review" if latest["fill_sequence"] != position["fill_sequence"] else "confirmed")
+    return {"status": status, "revision": latest["revision"] if latest else 0,
+            "stage": latest["stage"] if status == "confirmed" else None,
+            "stop_price": latest["stop_price"] if status == "confirmed" else None,
+            "confirmed_at_ms": latest["confirmed_at_ms"] if latest else None}
 
 
 class ManualPositionLedger:
@@ -133,7 +171,26 @@ class ManualPositionLedger:
                 "SELECT sequence, position_id, fill_id, revision, recorded_at_ms, payload FROM fill_revisions ORDER BY sequence"):
             histories[position_id].append({**json.loads(raw), "sequence": seq, "fill_id": fill_id,
                                            "revision": revision, "recorded_at_ms": recorded_at_ms})
-        return [_project(position, histories[position["position_id"]]) for position in positions]
+        states = {position["position_id"]: [] for position in positions}
+        if _has_state_table(db):
+            for position_id, revision, raw in db.execute("SELECT position_id, revision, payload FROM position_state_revisions ORDER BY revision"):
+                state = json.loads(raw)
+                if (not isinstance(state, dict) or set(state) != {"stage", "stop_price", "note", "fill_sequence", "confirmed_at_ms"}
+                        or type(state["fill_sequence"]) is not int or state["fill_sequence"] <= 0
+                        or type(state["confirmed_at_ms"]) is not int or state["confirmed_at_ms"] <= 0):
+                    raise ValueError("invalid position state record")
+                if state["stage"] is not None and (type(state["stage"]) is not int or not 1 <= state["stage"] <= 99):
+                    raise ValueError("invalid position stage")
+                if state["stop_price"] is not None:
+                    _decimal(state["stop_price"], "当前手记止损")
+                _note(state["note"])
+                states[position_id].append({**state, "revision": revision})
+        result = []
+        for position in positions:
+            projected = _project(position, histories[position["position_id"]])
+            history = states[position["position_id"]]
+            result.append({**projected, "current_state": _current_state(projected, history), "state_history": history})
+        return result
 
     def read(self):
         if not self.path.exists():
@@ -150,18 +207,12 @@ class ManualPositionLedger:
 
     def save(self, payload: dict, *, now_ms: int) -> str:
         """Commit one manual fact revision atomically; a retried request is counted once."""
-        if not isinstance(payload, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in payload.items()):
-            raise ValueError("录入内容无效。")
-        request_id = _identifier(payload.get("request_id"))
-        position_id = _identifier(payload.get("position_id"))
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        request_id, position_id, digest = _request_identity(payload)
         if self.path.exists():
             with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
-                previous = db.execute("SELECT request_hash, position_id FROM fill_revisions WHERE request_id=?", (request_id,)).fetchone()
+                previous = _saved_request(db, "fill_revisions", request_id, digest)
             if previous:
-                if previous[0] != digest:
-                    raise ValueError("同次提交内容已变化，请重新打开录入页后记录。")
-                return previous[1]
+                return previous
         command = payload.get("command")
         if not isinstance(command, str) or command not in {"create", "append", "revise"}:
             raise ValueError("录入动作无效。")
@@ -195,11 +246,9 @@ class ManualPositionLedger:
                        "request_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL, position_id TEXT NOT NULL, "
                        "fill_id TEXT NOT NULL, revision INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL, "
                        "payload TEXT NOT NULL, UNIQUE(fill_id, revision))")
-            previous = db.execute("SELECT request_hash, position_id FROM fill_revisions WHERE request_id=?", (request_id,)).fetchone()
+            previous = _saved_request(db, "fill_revisions", request_id, digest)
             if previous:
-                if previous[0] != digest:
-                    raise ValueError("同次提交内容已变化，请重新打开录入页后记录。")
-                return previous[1]
+                return previous
             positions = {row["position_id"]: row for row in self._read(db)}
             if command == "create":
                 if position_id in positions:
@@ -232,4 +281,36 @@ class ManualPositionLedger:
             db.execute("INSERT INTO fill_revisions (request_id, request_hash, position_id, fill_id, revision, recorded_at_ms, payload) "
                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (request_id, digest, position_id, fill_id, revision, now_ms, json.dumps(fill)))
+        return position_id
+
+    def save_state(self, payload: dict, *, now_ms: int) -> str:
+        """Record a manual state confirmation against the exact fill and state revisions."""
+        request_id, position_id, digest = _request_identity(payload)
+        if not self.path.exists():
+            raise ValueError("持仓记录不存在。")
+        stage = _stage(payload.get("stage", ""))
+        stop = payload.get("stop_price", "")
+        stop = _number(_decimal(stop, "当前手记止损")) if stop else None
+        note = _note(payload.get("note", ""))
+        if payload.get("confirmed") != "yes":
+            raise ValueError("请确认这些信息对应当前已记录的持仓；不知道的字段请留空。")
+        with closing(sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if _has_state_table(db):
+                previous = _saved_request(db, "position_state_revisions", request_id, digest)
+                if previous:
+                    return previous
+            position = next((item for item in self._read(db) if item["position_id"] == position_id), None)
+            if position is None or position["status"] != "open":
+                raise ValueError("仅可确认仍有已记录数量的持仓。")
+            if (payload.get("expected_fill_sequence") != str(position["fill_sequence"])
+                    or payload.get("expected_state_revision") != str(position["current_state"]["revision"])):
+                raise ValueError("成交或持仓状态已变化，请重新打开最新持仓核对后再保存。")
+            state = {"stage": stage, "stop_price": stop, "note": note,
+                     "fill_sequence": position["fill_sequence"], "confirmed_at_ms": now_ms}
+            db.execute("CREATE TABLE IF NOT EXISTS position_state_revisions (position_id TEXT NOT NULL, "
+                       "revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL, "
+                       "payload TEXT NOT NULL, PRIMARY KEY (position_id, revision))")
+            db.execute("INSERT INTO position_state_revisions VALUES (?, ?, ?, ?, ?)",
+                       (position_id, position["current_state"]["revision"] + 1, request_id, digest, json.dumps(state)))
         return position_id
