@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,3 +269,43 @@ class NotificationStore:
                 result["event"] = rows[0].event.to_dict()
                 result["history"] = [dict(row) for row in db.execute("SELECT sequence,at_ms,action,result FROM delivery_history WHERE event_id=? ORDER BY sequence", (event_id,))]
             return result
+
+    def review_snapshot(self, *, start_ms: int, end_ms: int, limit: int = 2000) -> dict:
+        """Read a date-window review without collecting, sending or advancing state.
+
+        The window selects event occurrence, while delivery results and history
+        describe this read transaction. Counts cover the complete window, even
+        when only its most recent events are retained for display.
+        """
+        integer(start_ms)
+        integer(end_ms, minimum=start_ms + 1)
+        integer(limit, minimum=1)
+        with self.connection(readonly=True) as db:
+            db.execute("BEGIN")
+            self.validate(db)
+            selected = deque(maxlen=limit)
+            counts, all_counts = Counter(), Counter()
+            total = suppressed = 0
+            for row in db.execute("SELECT event_id FROM outbox ORDER BY rowid"):
+                record = self.record(db, row[0])
+                all_counts[record.state.value] += 1
+                if not start_ms <= record.event.occurred_at_ms < end_ms:
+                    continue
+                total += 1
+                counts[record.state.value] += 1
+                suppressed += record.suppressed_reason is not None
+                selected.append({**record.summary(), "event": record.event.to_dict(), "history": []})
+            retained = {record["event_id"]: record for record in selected}
+            # Batch the displayed events' persisted history without rebuilding
+            # the sender's lifecycle or auditing cross-event completeness.
+            for item in db.execute("SELECT sequence,event_id,at_ms,action,result FROM delivery_history ORDER BY sequence"):
+                if item["event_id"] in retained:
+                    retained[item["event_id"]]["history"].append({key: item[key] for key in ("sequence", "at_ms", "action", "result")})
+            return {
+                "records": list(selected), "counts": dict(counts), "all_counts": dict(all_counts),
+                "total": total, "suppressed": suppressed, "display_limit": limit,
+                "display_truncated": total > limit,
+                "last_collection_ms": self.get_meta(db, "last_collection_ms"),
+                "out_of_order_observations": self.get_meta(db, "out_of_order_observations", 0),
+                "log_unavailable_since_ms": self.get_meta(db, "log_unavailable_since_ms"),
+            }
