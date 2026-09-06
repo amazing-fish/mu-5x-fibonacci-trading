@@ -12,6 +12,8 @@ from pathlib import Path
 
 from mu_strategy.notifications.events import AlertKind
 from mu_strategy.notifications.store import NotificationStore
+from mu_strategy.position_management import MAX_MAPPED_FILLS, baseline_configuration, project_rule_fills
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -58,7 +60,7 @@ def _request_identity(payload):
 
 
 def _saved_request(db, table, request_id, digest):
-    # The table name is supplied only by the two ledger methods below.
+    # The table name is supplied only by the ledger methods below.
     previous = db.execute(f"SELECT request_hash, position_id FROM {table} WHERE request_id=?", (request_id,)).fetchone()
     if previous and previous[0] != digest:
         raise ValueError("同次提交内容已变化，请重新打开录入页后记录。")
@@ -67,6 +69,54 @@ def _saved_request(db, table, request_id, digest):
 
 def _has_state_table(db):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='position_state_revisions'").fetchone() is not None
+
+
+def _has_management_table(db):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='position_management_revisions'").fetchone() is not None
+
+
+def _management_record(record, position):
+    """Validate the versioned manual input contract without selecting new defaults."""
+    expected = {"schema_version", "strategy_name", "strategy_rule_id", "configuration", "configuration_sha256",
+                "configuration_source", "entry_anchor", "initial_stop_price", "actual_leverage", "leverage_source",
+                "fill_stages", "fill_revisions", "fill_sequence", "state_revision", "confirmed_at_ms", "note"}
+    if not isinstance(record, dict) or set(record) != expected or type(record["schema_version"]) is not int or record["schema_version"] != 1:
+        raise ValueError("invalid management input record")
+    configuration = StrategyConfigPayloadV1.from_dict(record["configuration"])
+    if (configuration.strategy_config_sha256 != record["configuration_sha256"]
+            or configuration.to_strategy_config().symbol != position["symbol"]
+            or record["strategy_name"] != "baseline"
+            or not isinstance(record["strategy_rule_id"], str)
+            or not re.fullmatch(r"[a-z0-9]+(?:[._][a-z0-9]+)*\.v[1-9]\d*", record["strategy_rule_id"])
+            or record["configuration_source"] != "manual_baseline_selection"):
+        raise ValueError("invalid frozen management configuration")
+    for name in ("entry_anchor", "initial_stop_price", "actual_leverage"):
+        if record[name] is not None:
+            _decimal(record[name], name)
+    if record["leverage_source"] != ("manual_confirmation" if record["actual_leverage"] is not None else None):
+        raise ValueError("invalid leverage source")
+    for name, minimum in (("fill_sequence", 1), ("state_revision", 0), ("confirmed_at_ms", 1)):
+        if type(record[name]) is not int or record[name] < minimum:
+            raise ValueError("invalid management revision")
+    _note(record["note"])
+    stages, revisions = record["fill_stages"], record["fill_revisions"]
+    if not isinstance(stages, dict) or not isinstance(revisions, dict) or set(stages) != set(revisions) or not 1 <= len(stages) <= MAX_MAPPED_FILLS:
+        raise ValueError("invalid management fill mapping")
+    for identity, stage in stages.items():
+        _identifier(identity)
+        if stage is not None and (type(stage) is not int or not 1 <= stage <= 99):
+            raise ValueError("invalid mapped stage")
+        if type(revisions[identity]) is not int or revisions[identity] < 1:
+            raise ValueError("invalid mapped fill revision")
+    return record
+
+
+def _current_management(position, history):
+    latest = history[-1] if history else None
+    status = ("not_open" if position["status"] != "open" else "unconfigured" if latest is None else
+              "needs_review" if (latest["fill_sequence"] != position["fill_sequence"]
+                                 or latest["state_revision"] != position["current_state"]["revision"]) else "confirmed")
+    return {"status": status, "revision": latest["revision"] if latest else 0, "latest": latest}
 
 
 def _fill(payload, *, now_ms):
@@ -185,11 +235,22 @@ class ManualPositionLedger:
                     _decimal(state["stop_price"], "当前手记止损")
                 _note(state["note"])
                 states[position_id].append({**state, "revision": revision})
+        management = {position["position_id"]: [] for position in positions}
+        if _has_management_table(db):
+            identities = {position["position_id"]: position for position in positions}
+            for position_id, revision, raw in db.execute("SELECT position_id, revision, payload FROM position_management_revisions ORDER BY revision"):
+                record = _management_record(json.loads(raw), identities[position_id])
+                if type(revision) is not int or revision != len(management[position_id]) + 1:
+                    raise ValueError("invalid management history sequence")
+                management[position_id].append({**record, "revision": revision})
         result = []
         for position in positions:
             projected = _project(position, histories[position["position_id"]])
             history = states[position["position_id"]]
-            result.append({**projected, "current_state": _current_state(projected, history), "state_history": history})
+            projected.update(current_state=_current_state(projected, history), state_history=history)
+            management_history = management[position["position_id"]]
+            result.append({**projected, "management_inputs": _current_management(projected, management_history),
+                           "management_history": management_history})
         return result
 
     def read(self):
@@ -313,4 +374,57 @@ class ManualPositionLedger:
                        "payload TEXT NOT NULL, PRIMARY KEY (position_id, revision))")
             db.execute("INSERT INTO position_state_revisions VALUES (?, ?, ?, ?, ?)",
                        (position_id, position["current_state"]["revision"] + 1, request_id, digest, json.dumps(state)))
+        return position_id
+
+    def save_management(self, payload: dict, *, now_ms: int) -> str:
+        """Freeze explicit rule inputs against the current fill, state and input revisions."""
+        request_id, position_id, digest = _request_identity(payload)
+        if not self.path.exists():
+            raise ValueError("持仓记录不存在。")
+        if payload.get("confirmed") != "yes":
+            raise ValueError("请确认本次选择的规则配置、已知参数与成交阶段归属。")
+        parameters = {}
+        for name, label in (("entry_anchor", "加仓基准价"), ("initial_stop_price", "初始止损"), ("actual_leverage", "实际杠杆")):
+            value = payload.get(name, "")
+            parameters[name] = _number(_decimal(value, label)) if value else None
+        note = _note(payload.get("note", ""))
+        with closing(sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if _has_management_table(db):
+                previous = _saved_request(db, "position_management_revisions", request_id, digest)
+                if previous:
+                    return previous
+            position = next((item for item in self._read(db) if item["position_id"] == position_id), None)
+            if position is None or position["status"] != "open":
+                raise ValueError("仅可为仍有已记录数量的持仓确认管理输入。")
+            if any(payload.get(field) != str(value) for field, value in (
+                    ("expected_fill_sequence", position["fill_sequence"]),
+                    ("expected_state_revision", position["current_state"]["revision"]),
+                    ("expected_management_revision", position["management_inputs"]["revision"]))):
+                raise ValueError("成交、持仓状态或管理输入已变化，请重新打开最新持仓核对。")
+            previous = position["management_inputs"]["latest"]
+            template = previous or baseline_configuration(position["symbol"])
+            if payload.get("configuration_sha256") != template["configuration_sha256"]:
+                raise ValueError("本页规则配置已变化，请重新打开后核对完整参数。")
+            buys = [row for row in position["fills"] if not row["voided"] and row["action"] == "buy"]
+            if not 1 <= len(buys) <= MAX_MAPPED_FILLS:
+                raise ValueError(f"当前规则复核最多支持 {MAX_MAPPED_FILLS} 笔有效买入的阶段映射，成交台账仍可正常使用。")
+            supplied = {name.removeprefix("fill_stage_"): _stage(value) for name, value in payload.items() if name.startswith("fill_stage_")}
+            if set(supplied) != {row["fill_id"] for row in buys}:
+                raise ValueError("请逐笔核对当前全部有效买入的阶段；不知道时保留空白。")
+            record = {"schema_version": 1,
+                      **{name: template[name] for name in ("strategy_name", "strategy_rule_id", "configuration", "configuration_sha256")},
+                      "configuration_source": "manual_baseline_selection", **parameters,
+                      "leverage_source": "manual_confirmation" if parameters["actual_leverage"] is not None else None,
+                      "fill_stages": supplied, "fill_revisions": {row["fill_id"]: row["revision"] for row in buys},
+                      "fill_sequence": position["fill_sequence"], "state_revision": position["current_state"]["revision"],
+                      "confirmed_at_ms": now_ms, "note": note}
+            _management_record(record, position)
+            if all(stage is not None for stage in supplied.values()) and position["current_state"]["stage"] is not None:
+                project_rule_fills(position, record)
+            db.execute("CREATE TABLE IF NOT EXISTS position_management_revisions (position_id TEXT NOT NULL, "
+                       "revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL, "
+                       "payload TEXT NOT NULL, PRIMARY KEY (position_id, revision))")
+            db.execute("INSERT INTO position_management_revisions VALUES (?, ?, ?, ?, ?)",
+                       (position_id, position["management_inputs"]["revision"] + 1, request_id, digest, json.dumps(record)))
         return position_id
