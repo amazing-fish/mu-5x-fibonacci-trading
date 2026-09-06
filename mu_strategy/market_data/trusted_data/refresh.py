@@ -5,9 +5,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Protocol, runtime_checkable
 
-from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental
+from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental, fetch_okx_listing_time
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
@@ -26,6 +26,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     SystemClock,
     TrustedStorageLayout,
     UniverseSnapshot,
+    utc_month_segment_id,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
@@ -37,7 +38,7 @@ from mu_strategy.market_data.trusted_data.store import (
 )
 from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage
 from mu_strategy.market_data.universe import OKXSwapTicker, fetch_okx_swap_tickers, select_top_okx_usdt_swaps
-from mu_strategy.market_data.utils import dedupe_candles
+from mu_strategy.market_data.utils import dedupe_candles, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -64,6 +65,14 @@ class MarketDataProvider(Protocol):
         ...
 
 
+@runtime_checkable
+class ListingTimeProvider(Protocol):
+    """Optional exchange evidence; ordinary history providers retain strict rejection."""
+
+    def fetch_listing_time(self, symbol: str) -> int | None:
+        ...
+
+
 class OKXMarketDataProvider:
     def __init__(
         self,
@@ -72,11 +81,13 @@ class OKXMarketDataProvider:
         history_fetcher: OKXHistoryFetcher | None = None,
         incremental_fetcher: OKXIncrementalFetcher | None = None,
         history_days_fallback: int | None = None,
+        listing_time_fetcher: Callable[[str], int | None] | None = None,
     ):
         self.ticker_rows = ticker_rows
         self.history_fetcher = history_fetcher
         self.incremental_fetcher = incremental_fetcher
         self.history_days_fallback = history_days_fallback
+        self.listing_time_fetcher = listing_time_fetcher
 
     def fetch_tickers(self) -> list[dict]:
         if self.ticker_rows is not None:
@@ -94,6 +105,15 @@ class OKXMarketDataProvider:
         if self.history_fetcher is not None and self.history_days_fallback is not None:
             return self.history_fetcher(symbol, interval, days=self.history_days_fallback)
         return fetch_okx_incremental(symbol, interval, since_time_ms=since_time_ms)
+
+    def fetch_listing_time(self, symbol: str) -> int | None:
+        if self.listing_time_fetcher is not None:
+            return self.listing_time_fetcher(symbol)
+        # Injected history must bring its own boundary evidence; do not bind
+        # test/custom candles to unrelated live exchange metadata.
+        if self.history_fetcher is not None:
+            return None
+        return fetch_okx_listing_time(symbol)
 
 
 def refresh_with_okx_provider(
@@ -510,6 +530,46 @@ class RefreshTrustedMarketData:
             if base_candidate is not None and base_candidate.candles
             else None
         )
+        listing_loaded = False
+        listing_time_ms: int | None = None
+        verified_listing_starts: dict[str, int] = {}
+
+        def verified_listing_month_start(interval: str, physical: list[Candle], logical: list[Candle]) -> bool:
+            nonlocal listing_loaded, listing_time_ms
+            first = physical[0].open_time_ms
+            month = utc_month_segment_id(first)
+            if (
+                month != utc_month_segment_id(logical[0].open_time_ms)
+                or month != utc_month_segment_id(first - 1)
+                or self.store.segment_path(symbol, interval, month).exists()
+                or not isinstance(self.provider, ListingTimeProvider)
+            ):
+                return False
+            if not listing_loaded:
+                try:
+                    listing_time_ms = self.provider.fetch_listing_time(symbol)
+                except Exception as exc:
+                    # This is required publication evidence, not a bad candle
+                    # dataset that may be published as a failed generation.
+                    raise SegmentCorrectionError(f"listing metadata unavailable: {symbol}") from exc
+                listing_loaded = True
+                if listing_time_ms is not None and (
+                    type(listing_time_ms) is not int or not 0 < listing_time_ms <= now_ms
+                ):
+                    raise SegmentCorrectionError(f"invalid listing time: {symbol}")
+            if listing_time_ms is None or utc_month_segment_id(listing_time_ms) != month:
+                return False
+            step = interval_to_ms(interval)
+            # Require the first 5m bucket containing listing, or the first
+            # parent bucket fully covered by that base window. Missing even
+            # one leading base bucket is not evidence of an exchange boundary.
+            base_step = interval_to_ms("5m")
+            first_base_bucket = (listing_time_ms // base_step) * base_step
+            expected = ((first_base_bucket + step - 1) // step) * step
+            if first != expected:
+                return False
+            verified_listing_starts[interval] = listing_time_ms
+            return True
 
         def write_valid_dataset(interval: str, seed: DatasetEvaluationSeed, candles: list[Candle]) -> str:
             candidate = candidates[(symbol, interval)]
@@ -523,13 +583,16 @@ class RefreshTrustedMarketData:
                 candidate.diagnostics.fetch_mode in {"full_history", "prior_read_failed_full_history"}
                 and coverage.covered
             )
+            isolate_start = coverage.coverage_state == "partial_available_history"
+            if require_complete_start_month and verified_listing_month_start(interval, seed.candles, candles):
+                isolate_start = True
             storage_by_dataset[(symbol, interval)] = self.store.write_segmented_dataset(
                 candles,
                 symbol=symbol,
                 interval=interval,
                 physical_candles=seed.candles,
                 require_complete_start_month=require_complete_start_month,
-                isolate_partial_start_month=coverage.coverage_state == "partial_available_history",
+                isolate_partial_start_month=isolate_start,
                 reuse_partial_start_source_file=candidate.prior_partial_start_source_file,
             )
             return candles_content_sha256(candles)
@@ -548,6 +611,13 @@ class RefreshTrustedMarketData:
             raise_exceptions=(ManifestSchemaError, SegmentCorrectionError),
         )
         for interval in intervals:
+            if interval in verified_listing_starts:
+                key = (symbol, interval)
+                health = result.health_by_key[key]
+                result.health_by_key[key] = replace(
+                    health,
+                    warnings=(*health.warnings, f"verified_listing_start:listing_time_ms={verified_listing_starts[interval]}"),
+                )
             storage_by_dataset.setdefault(
                 (symbol, interval),
                 self.store.empty_segmented_storage(symbol, interval),
@@ -600,11 +670,21 @@ class RefreshTrustedMarketData:
             or manifest_result.snapshot.imported_from_run_id is not None
         ):
             return None
+        base_health = manifest_result.snapshot.datasets.get((symbol, "5m"))
+        if (
+            base_health is None
+            or not _is_reusable_prior_health(base_health)
+            or base_health.last_timestamp_ms is None
+        ):
+            return None
+        # Reuse must assess the same shared 5m window as evaluation. Native
+        # parents omit an incomplete trailing bucket; using their own end
+        # shifts the requested start and incorrectly rejects complete caches.
         coverage = assess_requested_coverage(
             cached,
             interval=interval,
             requested_days=days,
-            window_end_time_ms=cached[-1].open_time_ms if cached else None,
+            window_end_time_ms=base_health.last_timestamp_ms,
         )
         if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None

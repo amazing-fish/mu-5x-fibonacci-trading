@@ -134,6 +134,149 @@ class UtcMonthPartitionTests(unittest.TestCase):
 
 
 class SegmentedRefreshBehaviorTests(unittest.TestCase):
+    def test_complete_window_starting_in_listing_month_uses_isolated_segment(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
+
+        now_ms = FEB_START_MS + 10 * DAY_MS
+        listing_ms = FEB_START_MS + 2 * DAY_MS + (7 * 60 + 15) * 60_000
+
+        class ListedProvider(MutableHistoryProvider):
+            def fetch_listing_time(self, symbol):
+                self.asserted_symbol = symbol
+                return listing_ms
+
+        provider = ListedProvider(_window_candles(listing_ms, now_ms - STEP_MS))
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            run = _refresh(store, provider, RUN_A, days=1, now_ms=now_ms)
+
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+            health = run.datasets[(SYMBOL, "5m")]
+            self.assertEqual("complete", health.coverage_state)
+            self.assertEqual(1, health.requested_days)
+            storage = run.storage_by_dataset[(SYMBOL, "5m")]
+            self.assertIn(f".partial-{listing_ms}.csv", str(storage.segments[0].source_file))
+            self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+            self.assertEqual(SYMBOL, provider.asserted_symbol)
+            self.assertIn(f"verified_listing_start:listing_time_ms={listing_ms}", health.warnings)
+
+    def test_listing_boundary_supports_all_intervals_and_incremental_restart(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
+
+        # A non-hour boundary leaves an incomplete trailing native hour.
+        now_ms = FEB_START_MS + 10 * DAY_MS + 15 * 60_000
+        listing_ms = FEB_START_MS + 2 * DAY_MS + (7 * 60 + 15) * 60_000
+        five = _window_candles(listing_ms, now_ms - STEP_MS)
+
+        class ListedProvider(MutableBundleProvider):
+            listing_calls = 0
+
+            def fetch_listing_time(self, symbol):
+                self.listing_calls += 1
+                return listing_ms
+
+        provider = ListedProvider({"5m": five, "15m": aggregate_candles(five, interval="15m"),
+                                   "1h": aggregate_candles(five, interval="1h")})
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            first = RefreshTrustedMarketData(store, provider).execute(
+                RefreshTrustedMarketDataRequest(days=1, symbols=(SYMBOL,), now_ms=now_ms, run_id=RUN_A)
+            )
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, first.attempt_status)
+            self.assertEqual(1, provider.listing_calls)
+            paths = {interval: store.data_dir / first.storage_by_dataset[(SYMBOL, interval)].segments[0].source_file
+                     for interval in ("5m", "15m", "1h")}
+            previous_bytes = {interval: path.read_bytes() for interval, path in paths.items()}
+            self.assertIn(f".partial-{listing_ms + 45 * 60_000}.csv", str(paths["1h"]))
+            for interval in paths:
+                self.assertEqual("complete", first.datasets[(SYMBOL, interval)].coverage_state)
+                self.assertFalse(store.segment_path(SYMBOL, interval, "2026-02").exists())
+
+            five = _window_candles(listing_ms, now_ms + 3_600_000 - STEP_MS)
+            provider.rows_by_interval = {"5m": five, "15m": aggregate_candles(five, interval="15m"),
+                                         "1h": aggregate_candles(five, interval="1h")}
+            second = RefreshTrustedMarketData(TrustedDataStore(data_dir=store.data_dir), provider).execute(
+                RefreshTrustedMarketDataRequest(days=1, symbols=(SYMBOL,), now_ms=now_ms + 3_600_000, run_id=RUN_B)
+            )
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, second.attempt_status)
+            self.assertEqual(1, provider.listing_calls)
+            self.assertEqual(3, len(provider.incremental_calls))
+            for interval, path in paths.items():
+                self.assertTrue(path.read_bytes().startswith(previous_bytes[interval]))
+                self.assertEqual(path, store.data_dir / second.storage_by_dataset[(SYMBOL, interval)].segments[0].source_file)
+
+    def test_listing_time_does_not_excuse_truncated_or_wrong_month_history(self):
+        now_ms = FEB_START_MS + 10 * DAY_MS
+        listing_ms = FEB_START_MS + 2 * DAY_MS + (7 * 60 + 15) * 60_000
+
+        class ListedProvider(MutableHistoryProvider):
+            def fetch_listing_time(self, symbol):
+                return self.listing
+
+        cases = [(listing_ms, listing_ms + STEP_MS), (JAN_START_MS, listing_ms),
+                 (listing_ms + STEP_MS, listing_ms), (listing_ms + 60_000, listing_ms + STEP_MS)]
+        cases.extend((value, listing_ms) for value in (None, 0, -1, True, str(listing_ms), now_ms + 1))
+        for boundary, first_candle in cases:
+            with self.subTest(boundary=boundary, first_candle=first_candle), TemporaryDirectory() as tmp:
+                provider = ListedProvider(_window_candles(first_candle, now_ms - STEP_MS))
+                provider.listing = boundary
+                store = TrustedDataStore(data_dir=Path(tmp))
+                with self.assertRaises(SegmentCorrectionError):
+                    _refresh(store, provider, RUN_A, days=1, now_ms=now_ms)
+                self.assertFalse(store.current_path.exists())
+                self.assertFalse(any(store.data_dir.rglob("*.csv")))
+
+    def test_listing_metadata_failure_cannot_publish_a_complete_start_month(self):
+        now_ms = FEB_START_MS + 10 * DAY_MS
+
+        class ListedProvider(MutableHistoryProvider):
+            def fetch_listing_time(self, symbol):
+                raise TimeoutError("listing metadata unavailable")
+
+        provider = ListedProvider(_window_candles(FEB_START_MS + 2 * DAY_MS, now_ms - STEP_MS))
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            with self.assertRaisesRegex(SegmentCorrectionError, "listing metadata unavailable"):
+                _refresh(store, provider, RUN_A, days=1, now_ms=now_ms)
+            self.assertFalse(store.current_path.exists())
+            self.assertFalse(any(store.data_dir.rglob("*.csv")))
+
+    def test_default_180_day_window_is_capped_at_available_listing_history(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
+
+        now_ms = int(datetime(2026, 9, 6, tzinfo=timezone.utc).timestamp() * 1000)
+        listing_ms = int(datetime(2026, 3, 4, 7, 15, tzinfo=timezone.utc).timestamp() * 1000)
+
+        class ListedProvider(MutableHistoryProvider):
+            def fetch_listing_time(self, symbol):
+                return listing_ms
+
+        provider = ListedProvider(_window_candles(listing_ms, now_ms - STEP_MS))
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            request = RefreshTrustedMarketDataRequest(requested_intervals=("5m",), symbols=(SYMBOL,),
+                                                       now_ms=now_ms, run_id=RUN_A)
+            run = RefreshTrustedMarketData(store, provider).execute(request)
+            self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+            health = run.datasets[(SYMBOL, "5m")]
+            self.assertEqual(180, health.requested_days)
+            self.assertEqual("complete", health.coverage_state)
+            self.assertEqual(180 * 288 + 1, health.rows)
+            self.assertEqual([212], provider.history_days)
+            self.assertIn(f".partial-{listing_ms}.csv", str(run.storage_by_dataset[(SYMBOL, "5m")].segments[0].source_file))
+
+        # When fewer than 180 days exist, retain the existing truthful coverage
+        # state instead of inventing pre-listing rows or shortening the request.
+        short_now = listing_ms + 10 * DAY_MS
+        provider = ListedProvider(_window_candles(listing_ms, short_now - STEP_MS))
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            run = _refresh(store, provider, RUN_A, days=180, now_ms=short_now)
+            health = run.datasets[(SYMBOL, "5m")]
+            self.assertEqual(180, health.requested_days)
+            self.assertEqual("partial_available_history", health.coverage_state)
+            self.assertEqual(10 * 288, health.rows)
+
     def test_refresh_writes_only_to_configured_data_dir_not_repository_default(self):
         provider = MutableHistoryProvider(_window_candles(FEB_START_MS, FEB_START_MS + STEP_MS))
         with TemporaryDirectory() as tmp:

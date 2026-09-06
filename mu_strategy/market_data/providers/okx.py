@@ -11,6 +11,34 @@ from mu_strategy.models import Candle
 
 
 OKX_BASE_URL = "https://www.okx.com/api/v5/market/history-candles"
+OKX_INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments"
+
+
+def fetch_okx_listing_time(symbol: str) -> int:
+    """Read the exchange's start boundary, never inferring it from a short page."""
+    params = urllib.parse.urlencode({"instType": "SWAP", "instId": symbol})
+    request = urllib.request.Request(
+        f"{OKX_INSTRUMENTS_URL}?{params}",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("code") != "0":
+        raise ValueError("OKX listing metadata request failed")
+    rows = payload.get("data")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise ValueError("OKX listing metadata must identify one instrument")
+    row = rows[0]
+    value = row.get("listTime")
+    if (
+        row.get("instId") != symbol
+        or not isinstance(value, str)
+        or not value.isascii()
+        or not value.isdecimal()
+        or int(value) <= 0
+    ):
+        raise ValueError("OKX listing metadata has an invalid instrument or start time")
+    return int(value)
 
 
 def okx_interval(interval: str) -> str:
