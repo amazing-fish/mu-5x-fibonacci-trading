@@ -2,14 +2,14 @@
 
 > Deprecated as current evidence: this file is a historical parameter record only. It is not the current trusted market-data baseline, and it must not be used as proof that the current strategy still works without rerunning experiments on fresh trusted data.
 
-本文件记录当前已验证标的的 Fibonacci 回看窗口。窗口换算基于 15m K 线：
+本文件记录当时实验选择的 Fibonacci 回看窗口，不能据此推断当前有效性。窗口换算基于 15m K 线：
 
 - `1h = 4` 根 15m K
 - `2h = 8` 根 15m K
 - `3h = 12` 根 15m K
 - `9h = 36` 根 15m K
 
-## 当前记录
+## 历史记录
 
 | 标的 | 解析符号 | 数据源 | 优选窗口 | `fib_lookback` | 用途 |
 |---|---|---|---:|---:|---|
