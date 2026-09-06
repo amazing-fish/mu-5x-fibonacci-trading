@@ -9,12 +9,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from mu_strategy.market_data.trusted_data.contracts import SystemClock
 from mu_strategy.manual_positions import ManualPositionLedger
+from mu_strategy.position_management import review_position
 from mu_strategy.notifications.events import AlertKind, NotificationError
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.signal_feedback import SignalFeedbackStore
 from mu_strategy.signal_review import read_signal_review, review_window
 from mu_strategy.viz.signal_review import REVIEW_STYLE, render_signal_review
-from mu_strategy.viz.position_ledger import render_position_editor, render_position_state_editor
+from mu_strategy.viz.position_ledger import render_position_editor, render_position_management_editor, render_position_state_editor
 
 
 def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
@@ -56,7 +57,7 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             if self.headers.get("Host") not in hosts or (origin is not None and origin not in {"http://" + host for host in hosts}):
                 self.respond(403, "Local access only")
                 return
-            if urlsplit(self.path).path in {"/positions", "/position-state"}:
+            if urlsplit(self.path).path in {"/positions", "/position-state", "/position-management"}:
                 self.position_editor()
                 return
             if self.path not in {"/", "/report"}:
@@ -73,14 +74,14 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             self.respond(200, content)
 
         def do_POST(self):
-            if self.path not in {"/feedback", "/positions", "/position-state"}:
+            if self.path not in {"/feedback", "/positions", "/position-state", "/position-management"}:
                 self.respond(405, "Unsupported endpoint")
                 return
             host = self.headers.get("Host")
             if host not in {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"} or self.headers.get("Origin") != "http://" + host:
                 self.respond(403, "Same-origin local access required")
                 return
-            if self.path in {"/positions", "/position-state"}:
+            if self.path in {"/positions", "/position-state", "/position-management"}:
                 self.save_position()
                 return
             try:
@@ -110,15 +111,16 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
         def position_editor(self):
             ledger = ManualPositionLedger(data_dir)
             state_editor = urlsplit(self.path).path == "/position-state"
+            management_editor = urlsplit(self.path).path == "/position-management"
             try:
                 query = parse_qs(urlsplit(self.path).query, max_num_fields=5)
-                allowed = {"position_id"} if state_editor else {"position_id", "fill_id", "event_id", "saved"}
+                allowed = {"position_id"} if state_editor else {"position_id", "saved"} if management_editor else {"position_id", "fill_id", "event_id", "saved"}
                 if set(query) - allowed or any(len(values) != 1 for values in query.values()):
                     raise ValueError()
                 options = {key: values[0] for key, values in query.items()}
                 view = ledger.view()
                 position_id, fill_id = options.get("position_id"), options.get("fill_id")
-                if state_editor and not position_id:
+                if (state_editor or management_editor) and not position_id:
                     raise ValueError()
                 if view["available"] and (position_id or fill_id):
                     position = next((item for item in view["positions"] if item["position_id"] == position_id), None)
@@ -127,7 +129,11 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                         return
                 if options.get("event_id") and (position_id or fill_id):
                     raise ValueError()
-                if state_editor:
+                if management_editor:
+                    review = review_position(position, data_dir, now_ms=clock.now_ms()) if view["available"] else None
+                    content = render_position_management_editor(view, stylesheet=REVIEW_STYLE, position_id=position_id,
+                                                                 review=review, saved=options.get("saved") == "1")
+                elif state_editor:
                     content = render_position_state_editor(view, stylesheet=REVIEW_STYLE, position_id=position_id)
                 else:
                     source = ledger.entry_source(options["event_id"]) if options.get("event_id") else None
@@ -145,24 +151,31 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
         def save_position(self):
             ledger, payload = ManualPositionLedger(data_dir), {}
             state_editor = self.path == "/position-state"
+            management_editor = self.path == "/position-management"
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 16384 or self.headers.get_content_type() != "application/x-www-form-urlencoded":
                     raise ValueError("录入请求格式无效。")
-                fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True, max_num_fields=24)
+                fields = parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True,
+                                  max_num_fields=64 if management_editor else 24)
                 if any(len(values) != 1 for values in fields.values()):
                     raise ValueError("录入字段重复。")
                 payload = {key: values[0] for key, values in fields.items()}
-                save = ledger.save_state if state_editor else ledger.save
+                save = ledger.save_management if management_editor else ledger.save_state if state_editor else ledger.save
                 position_id = save(payload, now_ms=clock.now_ms())
             except (ValueError, UnicodeError) as exc:
                 status, error = 400, str(exc)
             except (OSError, sqlite3.Error, NotificationError):
-                status, error = 503, "持仓状态暂时无法保存，请稍后重试。" if state_editor else "成交记录暂时无法保存，请稍后重试。"
+                status, error = 503, "管理输入暂时无法保存，请稍后重试。" if management_editor else "持仓状态暂时无法保存，请稍后重试。" if state_editor else "成交记录暂时无法保存，请稍后重试。"
             else:
-                self.respond(303, "", location=f"/positions?saved={'state' if state_editor else '1'}#position-{position_id}")
+                location = (f"/position-management?position_id={position_id}&saved=1#position-review" if management_editor else
+                            f"/positions?saved={'state' if state_editor else '1'}#position-{position_id}")
+                self.respond(303, "", location=location)
                 return
-            if state_editor:
+            if management_editor:
+                content = render_position_management_editor(ledger.view(), stylesheet=REVIEW_STYLE, draft=payload,
+                                                             position_id=payload.get("position_id"), error=error)
+            elif state_editor:
                 content = render_position_state_editor(ledger.view(), stylesheet=REVIEW_STYLE, draft=payload,
                                                         position_id=payload.get("position_id"), error=error)
             else:

@@ -14,7 +14,7 @@
 python -B -m mu_strategy.commands.render_signal_review --data-dir data/live --serve
 ```
 
-打开输出的本机地址，可查看扫描、邮件和持仓，保存人工反馈、实际成交与当前状态确认。它不会自行启动行情或邮件服务。操作、备份和静态导出见[复盘手册](docs/signal-review.md)。
+打开输出的本机地址，可查看扫描、邮件和持仓，保存人工反馈、实际成交与当前状态；补齐明确的管理输入后，可按需复核 baseline 加仓、止损和退出条件。它不会自行启动行情或邮件服务。操作、支持范围和备份见[复盘手册](docs/signal-review.md)。
 
 **研究回测**：先由独立刷新流程发布可信快照，再运行只读消费者。
 

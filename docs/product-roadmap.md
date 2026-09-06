@@ -10,12 +10,12 @@
 |---|---|---|
 | 研究结果可解释、可重复 | [#83](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/83)、[#88](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/88)、[#96](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/96) | 保留已完成的固定 generation、robustness 和杠杆披露；补齐全 registry 同快照比较、剩余收益标签和解析错误契约。 |
 | 持续运行与真实邮件验收 | [#98](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/98)、[#99](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/99)、[#107](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/107) | 信号服务、邮件和上市边界代码已合并。分别核对受控 SMTP 接受/收件箱、常驻运行和故障恢复证据；代码交付不替代运维验收。 |
-| 完整持仓输入与管理提醒 | [#85](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/85)、[#90](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/90) | 以已有人工成交/状态记录为基础，补齐完整配置、锚点、初始止损、transition 和真实成交到规则输入的映射；再复用共享加仓/止损/退出规则，向邮件模块提供可信事件。 |
+| 完整持仓输入与管理提醒 | [#85](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/85)、[#90](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/90) | baseline 已接人工完整配置、锚点、初始止损、实际杠杆、逐笔买入到阶段的映射，并按需复用共享规则。剩余卖出后映射、延迟 transition、可信事件持久化/失效与邮件接入；OKX 聚合仓位的真实杠杆来源另归 #90。 |
 | 样本外与前瞻评估 | [#99](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/99) | 冻结规则、代码、配置、成本和实验窗口；持续保存全部信号、失效、送达和实际成交，分开评价策略、行情、提醒与执行偏差。 |
 
 可以并行推进研究质量与前瞻准备。入场邮件不必等待持仓模块完成；持仓类邮件必须等待完整可信状态。已有复盘页、人工处理标记和成交台账提供记录工具，尚不能替代冻结实验或前瞻结论。
 
-目前应先核实运行与邮件的剩余验收、开始按协议保留前瞻证据，同时独立推进 #85 的输入契约与共享规则接入。已有构件优先复用；不能用默认 stage、合成成交、宽松 reader 或规划止损来填补未知事实。
+目前应核实运行与邮件的剩余验收，开始按协议保留前瞻证据。#85 已从记录推进至受支持 baseline 的按需规则复核；下一步让管理判断成为可追溯、可失效、可去重的事件，再接持仓邮件，同时逐步覆盖卖出后的状态。已有构件优先复用；不能用默认 stage、合成成交、宽松 reader 或规划止损来填补未知事实。
 
 ### S1 完成门槛
 

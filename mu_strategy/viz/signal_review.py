@@ -10,7 +10,7 @@ from datetime import datetime
 
 from mu_strategy.signal_review import BEIJING
 from mu_strategy.signal_feedback import FEEDBACK_STATUSES
-from mu_strategy.viz.position_ledger import render_position_cards
+from mu_strategy.viz.position_ledger import render_capability_path, render_position_cards
 
 
 OUTCOMES = {
@@ -272,8 +272,9 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
 <div class="metrics">{summary}</div><h3>最近扫描</h3><ul class="latest">{latest_html}</ul></section>
 <section id="positions"><div class="section-heading"><h2>已记录持仓</h2>{'<a href="/positions#position-form">记录实际成交</a>' if live else '<span>导出快照 · 只读</span>'}</div>
+{render_capability_path()}
 <p class="scope">所有日期 · 人工确认记录，未核对交易所账户。剩余数量按买入减卖出计算；成本均价未计费用。</p>{position_cards}
-<p class="secondary">没有实际成交记录时保持未知。持仓规则尚未接入，transition、实际杠杆与完整配置未知；不生成持仓建议。</p></section>
+<p class="secondary">从持仓卡片打开 baseline 规则复核，按需读取当前可信行情。缺少人工输入时保持未知；卖出后的规则映射、延迟 transition 与持仓邮件仍待接入。</p></section>
 <section class="filters" aria-label="筛选报告明细"><div class="section-heading"><h2>查找记录</h2><button id="reset" type="button">重置筛选</button></div>
 <div class="filter-fields"><label>起始日期<input id="from-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['from_date'])}"></label>
 <label>结束日期<input id="to-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['to_date'])}"></label>
@@ -478,4 +479,10 @@ REVIEW_STYLE += r'''
 
 .scan-group{grid-template-columns:160px minmax(0,1fr)}.group-details{width:100%;font-size:12px}.group-details>summary{color:var(--accent);cursor:pointer;padding:5px 0}.group-details .scan-row{grid-template-columns:140px minmax(0,1fr);padding:16px 0}.group-details .row-reference{display:none}.group-details .row-main>strong{font-size:13px}.source-summary{font-size:15px;font-weight:600;color:var(--accent);cursor:pointer;padding:12px 0}.live-actions{display:flex;gap:8px;flex-wrap:wrap}.live-actions button{font-size:12px;padding:5px 9px}.live-actions button:disabled{opacity:.65;cursor:wait}.connection-lost .snapshot{border-color:var(--danger)}.connection-lost #refresh-state,.connection-lost #connection-note{color:var(--danger)}.connection-lost .status-strip{opacity:.65}@media(max-width:780px){.scan-group,.group-details .scan-row{grid-template-columns:1fr}.group-details .row-time{font-size:11px}}@media print{.live-actions{display:none}}
 
+'''
+
+REVIEW_STYLE += r'''
+.capability-path{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0;margin:18px 0 26px;border:1px solid var(--line);background:var(--surface)}.capability-path li{padding:13px 18px;border-right:1px solid var(--line);font-size:13px}.capability-path li:last-child{border-right:0}.capability-path span{display:block;font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:3px}.capability-path .current{background:var(--soft);border-bottom:3px solid var(--accent)}.capability-path .current span{color:var(--accent);font-weight:700}.management-link{padding-top:14px;border-top:1px solid var(--line);font-size:13px}.management-link a{display:inline-block;margin-left:12px}#position-review{padding:22px 26px;border:1px solid var(--line);background:var(--surface)}#position-review>.section-heading{margin-top:0}#position-review details{margin-top:14px}#position-review summary{cursor:pointer;color:var(--accent);font-size:13px}.review-messages:empty{display:none}.review-timeline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));list-style:none;padding:0;margin:24px 0;gap:18px}.review-timeline li{border-top:2px solid var(--accent);padding-top:12px}.review-timeline strong,.review-timeline span{display:block}.review-timeline strong{font-size:13px}.review-timeline span{color:var(--muted);font-size:12px;margin-top:6px}.rule-decision{padding:16px 20px;background:var(--soft);border-left:3px solid var(--accent)}.rule-decision.danger{background:var(--danger-bg);border-color:var(--danger);color:var(--danger)}.rule-decision h3{margin:0 0 8px}.rule-decision p{margin:8px 0}.rule-prices{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px;margin:24px 0}.rule-prices span,.rule-prices small{display:block;color:var(--muted);font-size:12px}.rule-prices strong{display:block;font:26px/1.5 Georgia,serif;overflow-wrap:anywhere}.input-checks{list-style:none;padding:0}.input-checks li{padding:7px 0;font-size:13px}.stage-mapping select{min-width:110px}#position-form>details pre{max-height:300px;overflow:auto;background:var(--code);padding:16px}.position-fields label{min-width:0}.position-fields input{width:100%}.confirmation{align-items:flex-start}.confirmation input{flex-shrink:0;margin-top:7px}
+@media(max-width:780px){.capability-path{grid-template-columns:1fr 1fr}.capability-path li{padding:12px;border-bottom:1px solid var(--line)}.capability-path li:nth-child(2){border-right:0}.review-timeline,.rule-prices{grid-template-columns:1fr;gap:14px}#position-review{padding:16px}.rule-prices>div{padding-bottom:12px;border-bottom:1px solid var(--line)}.rule-decision{padding:14px}.stage-mapping,.stage-mapping tbody{display:block}.stage-mapping thead{display:none}.stage-mapping tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);border-top:1px solid var(--line);margin-top:10px}.stage-mapping td{padding:8px;border:0;overflow-wrap:anywhere;min-width:0}.stage-mapping td:before{content:attr(data-label);display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.stage-mapping select{min-width:0;width:100%}.management-link a{display:block;margin:8px 0 0}}
+@media print{#position-review{break-inside:auto}.review-timeline,.rule-prices{grid-template-columns:repeat(3,minmax(0,1fr))}.capability-path{grid-template-columns:repeat(4,minmax(0,1fr))}}
 '''

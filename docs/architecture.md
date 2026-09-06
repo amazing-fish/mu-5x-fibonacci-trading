@@ -5,7 +5,7 @@ doc_kind: reference
 
 # 架构与模块建设现状
 
-核对基线：2026-09-06，main [01a2d137](https://github.com/amazing-fish/mu-5x-fibonacci-trading/commit/01a2d13725e355b69fd186fe62669acb2b87595c)，已包含 PR #113。本文说明仓库中的实现和接入；本轮未检查实际服务存活、收件箱或连续运行数据，不据此宣布部署、运维或策略效果验收完成。
+核对基线：2026-09-07，基于 main [ffc83975](https://github.com/amazing-fish/mu-5x-fibonacci-trading/commit/ffc83975b72132ad4fb2dba2631f805714670942)（含 PR #114）及本次 #85 baseline 持仓复核实现。本文说明仓库中的实现和接入；未以此验证实际服务存活、收件箱或连续运行数据，不据此宣布部署、运维或策略效果验收完成。
 
 ## 从最终工作反推模块
 
@@ -18,13 +18,13 @@ doc_kind: reference
 | 模块 / 必须回答的问题 | 已有建设与真实接入 | 仍缺什么 / 所属工作 |
 |---|---|---|
 | **可信行情**：输入是否完整、同源、可重放 | `market_data.trusted_data` 分开刷新和读取；v4 月分段、hash/时序/多周期校验、固定 generation、上市月起点验证均有实现，研究和扫描已消费。 | 数据驻留、GC 不在当前实现。#107 的冷启动代码已合并，Issue 仍开放；运维验收须另查。 |
-| **策略规则**：同样输入是否得到同样判断 | `strategy.py` 提供固定配置、指标过滤和入场规则；`strategies.registry` 统一名称/别名/默认集合；`position_rules` 的加仓与止损纯函数被回测使用，止损也被 shadow 使用。 | 人工持仓尚未组成完整 `PositionStateSnapshot`。共享规则存在不代表真实持仓管理接通，归 #85。 |
+| **策略规则**：同样输入是否得到同样判断 | `strategy.py` 提供固定配置、指标过滤和入场规则；`strategies.registry` 统一名称/别名/默认集合；`position_rules` 被回测、shadow 和人工 baseline 复核复用。 | 人工复核只支持明确映射的有效买入和 baseline；卖出后状态、延迟 transition 与管理邮件仍归 #85。 |
 | **回测与实验**：假设如何被检验 | `backtest.py` 承担 OHLC 成交和权益模拟；walk-forward、Fibonacci 扫描、候选 ladder 均有入口。普通回测/HTML/ladder 支持固定历史 generation。 | 全 registry 的同快照 robustness 比较未完成（#83）；部分 HTML/walk-forward 单笔收益标签待明确（#88）。 |
 | **研究解释与结论**：收益靠什么、是否可比较 | `research.robustness` 提供基准、top-N 集中度、stage 分布；`candidate_conclusions` 保存严格候选结论；ladder 披露实际配置杠杆和账户收益。 | 短样本、不同风险预算及样本外/前瞻证据仍归 #99；reader 异常边界 #96，候选名单解耦 #101。`mu_current` 返回 baseline 名称，不是持续策略选择系统。 |
 | **候选标的选择**：固定策略应用到谁 | `selection.basket.rank_candidates` 提供离线候选行排序；实时 universe 由可信 manifest 和 watchlist 提供。 | 只有基础排序，尚无完整候选池状态、跨标的证据与自动选优闭环；不能把 Top universe 当策略选股结果。扩展依 #73/#99 的实际研究需求。 |
 | **扫描、运行与健康**：实时判断能否稳定产生证据 | `ScanCycle` 统一 dry-run 判断；`stage0` 只持久化已完成结果；`signal_service` 调度刷新和扫描，`service_health` 区分数据、扫描、写盘、进程状态。 | #62/#97 的代码交付已完成；长期稳定性不由一次运行或进程存活证明，归 #99。服务扫描仍经 `demo_trading.run_once(dry_run=True)` 适配。 |
 | **邮件通知**：是否按有效信号提醒、结果是否可查 | `notifications` 已接入场/失效和健康/恢复事件，SQLite outbox 保存身份、游标、重试和 unknown 送达；显式 `--send` 才使用 SMTP。 | #98 的代码已合并，持仓邮件仍依赖 #85；真实受控 SMTP、常驻与持续运行证据分别验收。配置 fingerprint 不能代替代码版本。 |
-| **人工反馈与持仓事实**：用户实际做了什么 | `signal_feedback` 保存自记标记；`manual_positions` 独立保存实际成交及更正，计算剩余数量/成本，并保存阶段/止损确认；成交变化后进入待复核。实时页和静态导出已消费。 | 人工记录未经交易所核对，不能声称账户全量。完整配置、entry anchor、initial stop、transition 和实际成交映射尚未齐备，`management_status` 仍为 unknown（#85/#90）。 |
+| **人工反馈与持仓事实**：用户实际做了什么 | `manual_positions` 保存成交及更正、当前阶段/止损和独立管理输入；`position_management` 将明确的买入阶段投影为共享规则输入，固定当前可信 generation，按需检查确认后的完整区间。视图区分未知、失效、行情阻断与候选。 | 人工记录未经交易所核对，不能声称账户全量。建议不写回事实；账本级 `management_status` 不代表评估结果。卖出后映射、延迟 transition、持仓事件/邮件及 OKX 真实来源仍待完成（#85/#90）。 |
 | **执行规划与持久构件**：动作能否绑定证据与授权 | `execution` 已有类型化决策、`OrderIntentFactory`、instrument rounding、`SQLiteExecutionStore` 和审计/预留契约。 | factory/store 尚未接入现有 Demo 编排，仓库 `config/` 未包含已批准 release。真实 release 和 scan→intent→授权→reserve→adapter 归 #100。 |
 | **OKX 适配与受控 Demo**：允许哪些外部动作 | `live.okx` 支持只读账户、shadow 和显式确认的 Demo；现有 Demo 应用有买入、敞口限制、确定性 `clOrdId` 及部分失效 bot 限价单撤销。 | 不具备完整成交去重、仓位/余额对账、unknown 恢复、退出保护及风险停机闭环（#100）。Production 未实现（#7）。 |
 | **可视化与使用入口**：人能否理解和复核 | `viz` 已渲染回测、数据健康、入场/shadow 看板和每日复盘；`commands` 与兼容 CLI 提供操作入口。复盘支持实时更新、反馈及人工台账。 | 展示不是权威策略或账户状态；#88 仍有收益标签工作，#99 仍需冻结实验与前瞻评估。没有统一自动交易控制台。 |
@@ -45,10 +45,15 @@ flowchart LR
     H --> I
     G --> I
     J[人工成交与状态确认] --> I
-    J -. 补齐完整输入：85 .-> K[持仓规则评估与提醒]
+    J --> K[明确 baseline 管理输入]
+    B --> L[按需复核确认后的行情]
+    D --> L
+    K --> L
+    L --> I
+    L -. 后续：事件持久化与失效 .-> M[持仓邮件：85]
 ```
 
-现有 Demo 编排可以经显式确认触达 Demo broker；上图的人工记录尚未接入它。新的 intent/store 构件也尚未替代这个旧编排。两者必须在 #100 中显式衔接，不能因为位于同一仓库就视为已经连通。
+复核只读人工事实和固定行情，建议不变成实际成交、已执行止损或邮件。最早退出触发不会因后续恢复而消失；每根检查都使用确认的实际止损。现有 Demo 编排可以经显式确认触达 Demo broker，上图人工记录尚未接入它；新的 intent/store 也尚未替代旧编排，归 #100 衔接。
 
 ## 模块职责与接口
 
@@ -70,6 +75,7 @@ flowchart LR
 | 研究与选择 | [robustness](../mu_strategy/research/robustness.py)、[ladder](../mu_strategy/experiments/strategy_ladder.py)、[basket](../mu_strategy/selection/basket.py) | [研究选择](../tests/test_research_selection.py)、[ladder](../tests/test_strategy_ladder.py) |
 | 扫描与运行 | [scan_cycle](../mu_strategy/scan_cycle.py)、[signal_service](../mu_strategy/signal_service.py) | [依赖约束](../tests/test_architecture_dependencies.py)、[服务](../tests/test_signal_service.py) |
 | 通知与人工台账 | [notifications](../mu_strategy/notifications/service.py)、[manual_positions](../mu_strategy/manual_positions.py) | [通知测试入口](email-alerts.md)、[持仓状态](../tests/test_position_state.py) |
+| 人工持仓规则复核 | [position_management](../mu_strategy/position_management.py)、[复核页面](../mu_strategy/viz/position_ledger.py) | [输入、行情与页面回归](../tests/test_position_management.py) |
 | 执行构件与 Demo | [intents](../mu_strategy/execution/intents.py)、[store](../mu_strategy/execution/store.py)、[demo_trading](../mu_strategy/demo_trading.py) | [intent](../tests/test_order_intents.py)、[store](../tests/test_execution_store.py)、[Demo](../tests/test_okx_demo_loop.py) |
 | 可视化与复盘 | [viz](../mu_strategy/viz)、[signal_review](../mu_strategy/signal_review.py) | [复盘](../tests/test_signal_review.py)、[实时页面](../tests/test_signal_review_live.py) |
 
