@@ -331,10 +331,18 @@ _SCRIPT = r'''
   });
   filter();
   if (document.body.dataset.live !== 'true') return;
-  let paused = false, refreshing = false;
+  let paused = false, refreshing = false, editingUntil = 0;
+  for (const type of ['focusin', 'input', 'change', 'keydown', 'pointerdown']) {
+    document.addEventListener(type, event => {
+      if (event.target.matches('input, select')) editingUntil = Date.now() + 2000;
+    });
+  }
   async function refresh(manual = false) {
     if (refreshing || (!manual && (paused || document.visibilityState !== 'visible'))) return;
-    if (!manual && (document.activeElement.matches('input, select') || !window.getSelection().isCollapsed)) return;
+    if (!manual && (Date.now() < editingUntil || !window.getSelection().isCollapsed)) {
+      byId('refresh-state').textContent = Date.now() < editingUntil ? '编辑筛选 · 自动更新暂缓' : '选中文本 · 自动更新暂缓';
+      return;
+    }
     refreshing = true; byId('refresh-now').disabled = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);

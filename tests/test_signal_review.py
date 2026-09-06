@@ -1,10 +1,11 @@
 import hashlib
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -155,6 +156,31 @@ class SignalReviewTests(unittest.TestCase):
                 self.store.enqueue(db, self.event(number), now_ms=NOW)
             db.execute("UPDATE delivery_history SET action='' WHERE event_id=?", (self.event(0).event_id,))
         self.assertEqual("unavailable", self.read(display_limit=1)["sources"]["notifications"]["state"])
+
+    def test_orphan_delivery_history_rejects_source_instead_of_reporting_zero_events(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.enqueue(db, self.event(1), now_ms=NOW)
+        # Simulate an external partial deletion outside the guarded writer.
+        with closing(sqlite3.connect(self.store.path)) as db:
+            db.execute("DELETE FROM outbox")
+            db.commit()
+        source = self.read()["sources"]["notifications"]
+        self.assertEqual("unavailable", source["state"])
+        self.assertNotIn("total", source)
+        self.assertEqual(2, main(["--data-dir", str(self.data_dir), "--output", str(self.root / "review.html")],
+                                 clock=self.clock, stdout=io.StringIO()))
+
+    def test_complete_history_of_outside_window_event_remains_valid(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.enqueue(db, self.event(1, at=NOW - 4 * 86400000), now_ms=NOW)
+            self.store.claim(db, now_ms=NOW)
+            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
+        source = self.read()["sources"]["notifications"]
+        self.assertEqual("ok", source["state"])
+        self.assertEqual(0, source["total"])
+        self.assertEqual({"confirmed": 1}, source["all_counts"])
 
     def test_missing_lifecycle_rows_are_not_verified_even_outside_display_limit(self):
         self.initialize([cycle(1)])

@@ -379,7 +379,10 @@ class NotificationStore:
             retained = {record["event_id"]: record for record in selected}
             # The existing schema has no history event_id index. Scan it once,
             # validating the full window but retaining only displayed histories.
-            for item in db.execute("SELECT sequence,event_id,at_ms,action,result FROM delivery_history ORDER BY sequence"):
+            for item in db.execute("SELECT h.sequence,h.event_id,h.at_ms,h.action,h.result,o.event_id AS existing_event_id "
+                                   "FROM delivery_history AS h LEFT JOIN outbox AS o ON o.event_id=h.event_id ORDER BY h.sequence"):
+                if item["existing_event_id"] is None:
+                    raise NotificationError("delivery history references a missing event")
                 if item["event_id"] not in audits:
                     continue
                 audits[item["event_id"]][0].consume(item)
