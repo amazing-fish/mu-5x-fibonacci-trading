@@ -51,19 +51,7 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 
 ## 架构
 
-完整版见 [docs/architecture.md](docs/architecture.md)（约 1000 行，含 Stage 0-4 执行路线图和 Stage 3 契约）。分层：
-
-| 包 | 职责 |
-|---|---|
-| `market_data` | OKX/Binance provider、可信 generation 刷新与 cache-only 载入、universe |
-| `strategies` | 策略组注册表（`baseline` 为当前固定 baseline） |
-| `entry` | 入场扫描，输出 `EntryScanResult` |
-| `execution` | 非交易的入场/风险规划、`OrderIntent` v1、SQLite 审计与幂等存储 |
-| `experiments` | walk-forward 与消融 |
-| `research` | 当前结论、策略发布溯源 |
-| `viz` | 回测 / 数据健康 / 扫描看板 HTML |
-| `live` | OKX API 适配（只读、shadow、guarded demo） |
-| `demo_trading` | 5 分钟 Demo 扫描编排 |
+模块职责、实际接入与证据见 [docs/architecture.md](docs/architecture.md)；产品阶段见 [docs/product-roadmap.md](docs/product-roadmap.md)，Stage 0–4 执行门禁及 Stage 3 契约见 [docs/execution-roadmap.md](docs/execution-roadmap.md)。
 
 关键语义：
 
@@ -73,10 +61,7 @@ python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 
 
 ## 当前状态
 
-- 可信数据层已完工，schema-v4 分段存储已合并（#72 / issue #68）。
-- 30-B `OrderIntentFactory`(#59) 和 30-C 执行存储(#65) 已合并、有测试，但**无生产消费者**，处于休眠状态。原因：需要 `config/strategy-releases/` 里有可解析的 release，而发布 release 需要第二个 GitHub 身份（GitHub 禁止 PR 作者 approve 自己的 PR）。见已关闭的 #70。
-- 出场规则已提取为回测与实时共享的纯函数（#75）。`demo_trading.py` 会在返回值中提供 shadow-only `exit_observations`，但 OKX 聚合持仓缺少 fills、当前 stop 和 stage，因此真实判断保持 `unknown`，合成 stage-one 估算单独标注；仍然没有任何平仓动作。
-- 通知能力为零。
+模块实现和未接通链路集中记录在 [架构与建设现状](docs/architecture.md)，交付依赖见 [产品路线](docs/product-roadmap.md)。本文件不重复保留容易过时的通知、研究或执行进度快照。
 
 ## 存储层复杂度债（v4 分段）
 
