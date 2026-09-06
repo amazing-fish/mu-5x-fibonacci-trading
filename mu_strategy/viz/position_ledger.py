@@ -50,15 +50,17 @@ def render_position_cards(view, *, editable=False):
             action = "作废" if fill["voided"] else "买入" if fill["action"] == "buy" else "卖出"
             rows.append(f'<tr><td>{_time(fill["time_ms"])}</td><td>{action}</td><td>{_e(fill["quantity"])}</td>'
                         f'<td>{_e(fill["price"])}</td><td>{_e(fill["note"])}</td><td>{edit}</td></tr>')
-        history = ''.join(f'<tr><td>{_time(item["recorded_at_ms"])}</td><td>{item["fill_id"][:8]} · v{item["revision"]}</td>'
+        history = ''.join(f'<tr id="position-fill-version-{identity}-{item["sequence"]}"><td>{_time(item["recorded_at_ms"])}</td>'
+                          f'<td>v{item["sequence"]}</td><td>{item["fill_id"][:8]} · v{item["revision"]}</td>'
                           f'<td>{"作废" if item["voided"] else "买入" if item["action"] == "buy" else "卖出"} '
                           f'{_e(item["quantity"])} @ {_e(item["price"])}</td><td>{_time(item["time_ms"])}</td>'
                           f'<td>{_e(item["note"])}</td></tr>' for item in reversed(position["history"]))
         state_rows = ''.join(f'<tr><td>{_time(item["confirmed_at_ms"])}</td><td>v{item["revision"]}</td>'
+                             f'<td><a href="#position-fill-version-{identity}-{item["fill_sequence"]}">v{item["fill_sequence"]}</a></td>'
                              f'<td>{_e(item["stage"] or "未知")}</td><td>{_e(item["stop_price"] or "未知")}</td>'
                              f'<td>{_e(item["note"])}</td></tr>' for item in reversed(position["state_history"]))
         state_history = (f'<h4>持仓状态确认历史</h4><div class="table-wrap"><table><thead><tr><th>确认时间 / 北京时间</th><th>版本</th>'
-                         f'<th>已达到的阶段</th><th>手记止损 / USDT</th><th>说明</th></tr></thead><tbody>{state_rows}</tbody></table></div>') if state_rows else ''
+                         f'<th>对应成交记录版本</th><th>已达到的阶段</th><th>手记止损 / USDT</th><th>说明</th></tr></thead><tbody>{state_rows}</tbody></table></div>') if state_rows else ''
         source = json.dumps(position["signal_source"], ensure_ascii=False, indent=2) if position["signal_source"] else "未关联信号；配置版本未知。"
         cards.append(f'''<article class="position-card" id="position-{identity}">
           <div class="section-heading"><h3>{_e(position['symbol'])} · 多头</h3><span>{status} · {_e(position['label'] or identity[:8])}</span></div>
@@ -71,7 +73,7 @@ def render_position_cards(view, *, editable=False):
             <thead><tr><th>成交时间 / 北京时间</th><th>动作</th><th>数量</th><th>价格 / USDT</th><th>备注</th><th></th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></details>
           <details class="evidence" id="position-source-{identity}"><summary>记录来源与更正历史</summary>
             <p>来源：人工确认，未经交易所核对。关联信号配置不代表完整、可恢复的持仓配置。</p><pre>{_e(source)}</pre>
-            <div class="table-wrap"><table><thead><tr><th>录入时间 / 北京时间</th><th>成交编号 / 版本</th><th>记录值</th><th>实际成交时间</th><th>备注 / 更正原因</th></tr></thead><tbody>{history}</tbody></table></div>{state_history}</details></article>''')
+            <div class="table-wrap"><table><thead><tr><th>录入时间 / 北京时间</th><th>成交记录版本</th><th>成交编号 / 版本</th><th>记录值</th><th>实际成交时间</th><th>备注 / 更正原因</th></tr></thead><tbody>{history}</tbody></table></div>{state_history}</details></article>''')
     return ''.join(cards)
 
 

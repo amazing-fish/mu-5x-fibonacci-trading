@@ -151,11 +151,18 @@ class PositionStateTests(manual_fixtures.ManualPositionTestCase):
     def test_static_state_cards_are_read_only_and_corruption_is_visible(self):
         identity = self.save(self.payload())
         self.confirm(self.state_payload(identity, note="<script>state note</script>"))
+        self.save(self.payload(command="append", position_id=identity))
+        self.confirm(self.state_payload(identity, stop_price="97"))
         page = render_signal_review(self.fixture.read())
         self.assertIn("已人工确认", page)
         self.assertIn("&lt;script&gt;state note&lt;/script&gt;", page)
         self.assertNotIn('href="/position-state', page)
         self.assertNotIn('action="/position-state', page)
+        self.assertIn("对应成交记录版本", page)
+        for version in (1, 2):
+            anchor = f"position-fill-version-{identity}-{version}"
+            self.assertIn(f'href="#{anchor}">v{version}</a>', page)
+            self.assertIn(f'<tr id="{anchor}">', page)
         with sqlite3.connect(self.ledger.path) as db:
             db.execute("UPDATE position_state_revisions SET payload='{}'")
         self.assertFalse(self.ledger.view()["available"])
