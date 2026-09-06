@@ -54,11 +54,11 @@ def main(argv=None, *, clock=None, stdout=None) -> int:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
     stdout.write(json.dumps({
-        "output": str(args.output.resolve()), "sources_verified": report["sources_verified"],
+        "output": str(args.output.resolve()), "sources_readable": report["sources_readable"],
         "source_states": {key: source["state"] for key, source in report["sources"].items()},
         "window": window,
     }, ensure_ascii=True) + "\n")
-    return 0 if report["sources_verified"] else 2
+    return 0 if report["sources_readable"] else 2
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
             initial_bytes = path.stat().st_size
         except FileNotFoundError:
             repository.read_batch()  # Still reject a failed-write marker.
-            return _source("missing", clock.now_ms(), "尚无扫描日志，不能判断观察期内是否有信号。")
+            return _source("missing", clock.now_ms(), "尚无扫描日志。")
         while True:
             if read_cycles >= scan_limit:
                 complete = False
@@ -93,7 +93,7 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                 break
         return _source(
             "ok" if complete else "incomplete", clock.now_ms(),
-            "已校验扫描日志；统计按轮次记录时间归入北京时间日期。" if complete else
+            "已读取扫描日志。" if complete else
             "达到扫描读取上限；以下只是已读取部分，不能代表完整观察窗口。",
             records=list(rows), latest=list(latest.values()), counts=dict(counts),
             total_cycles=total_cycles, total_observations=total_observations,
@@ -103,7 +103,7 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
         )
     except (OSError, ObservationCorruptionError):
         # Never publish plausible-looking partial statistics from a corrupt log.
-        return _source("unavailable", clock.now_ms(), "扫描日志暂不可验证或已损坏。请检查日志及 .invalid 标记后重新生成；未使用部分统计。")
+        return _source("unavailable", clock.now_ms(), "扫描日志读取失败，请检查日志及 .invalid 标记。")
 
 
 def read_signal_review(data_dir: Path, window: dict, *, clock=None,
@@ -122,7 +122,7 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
                           "仅代表本次查询时的服务状态。" if state is not None else "尚无服务记录。",
                           view=current)
     except (OSError, HealthStateError):
-        service = _source("unavailable", clock.now_ms(), "健康快照暂不可验证；查询失败不等于服务已经停止。")
+        service = _source("unavailable", clock.now_ms(), "暂时无法读取服务状态。")
     observations = _read_observations(health.root / "observations.jsonl", window, clock=clock,
                                       display_limit=display_limit, scan_limit=scan_limit)
     try:
@@ -130,19 +130,19 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
         try:
             store.path.stat()
         except FileNotFoundError:
-            notifications = _source("missing", clock.now_ms(), "尚无通知库，不表示邮件已发送或没有提醒。")
+            notifications = _source("missing", clock.now_ms(), "尚无通知记录。")
         else:
             snapshot = store.review_snapshot(start_ms=window["start_ms"], end_ms=window["end_ms"], limit=display_limit)
             notifications = _source("ok", clock.now_ms(),
-                                    "事件按发生时间筛选；送达状态截至本次查询。消费时间不证明进程仍存活。",
+                                    "已读取通知记录；送达状态截至本次查询。",
                                     **snapshot)
     except (OSError, sqlite3.Error, NotificationError):
-        notifications = _source("unavailable", clock.now_ms(), "通知库暂不可验证或已损坏；请使用只读 status 查询后重新生成。")
+        notifications = _source("unavailable", clock.now_ms(), "通知记录读取失败，请检查数据目录。")
     sources = {"service": service, "observations": observations, "notifications": notifications}
     return {
         "schema_version": 1, "data_dir": str(data_dir), "window": window,
         "started_at_ms": started_at, "generated_at_ms": clock.now_ms(), "sources": sources,
-        "sources_verified": all(item["state"] == "ok" for item in sources.values()),
+        "sources_readable": all(item["state"] == "ok" for item in sources.values()),
     }
 
 

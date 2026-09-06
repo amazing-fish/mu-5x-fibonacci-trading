@@ -84,8 +84,8 @@ class ReviewLiveServerTests(unittest.TestCase):
         self.fixture.log.invalid_marker_path.write_text("interrupted", encoding="utf-8")
         status, _, page = self.request("/report")
         self.assertEqual(200, status)
-        self.assertIn('data-sources-verified="false"', page)
-        self.assertIn("扫描日志暂不可验证", page)
+        self.assertIn('data-sources-readable="false"', page)
+        self.assertIn("扫描日志读取失败", page)
 
     def test_default_window_rolls_forward_at_beijing_midnight(self):
         self.assertIn('value="2026-09-06"', self.request()[2])

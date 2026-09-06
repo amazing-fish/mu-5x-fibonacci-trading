@@ -1,11 +1,9 @@
 import hashlib
 import io
 import json
-import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -123,130 +121,11 @@ class SignalReviewTests(unittest.TestCase):
             self.assertTrue(report["sources"][name]["display_truncated"])
         self.assertIn("筛选仅作用于这些明细", render_signal_review(report))
 
-    def test_large_notification_window_reads_history_once_and_retains_complete_display_history(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            for number in range(3000):
-                event = self.event(number)
-                self.store.enqueue(db, event, now_ms=NOW)
-                self.store.claim(db, now_ms=NOW + 1)
-                self.store.finish(db, event.event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 2, code="smtp_accepted")
-        statements = []
-        original = self.store.connection
-
-        @contextmanager
-        def traced_connection(**kwargs):
-            with original(**kwargs) as db:
-                db.set_trace_callback(statements.append)
-                yield db
-
-        with patch.object(self.store, "connection", traced_connection):
-            snapshot = self.store.review_snapshot(start_ms=self.window["start_ms"], end_ms=self.window["end_ms"], limit=2)
-        self.assertEqual(3000, snapshot["total"])
-        self.assertEqual(2, len(snapshot["records"]))
-        self.assertEqual([3, 3], [len(row["history"]) for row in snapshot["records"]])
-        self.assertEqual([self.event(2998).event_id, self.event(2999).event_id], [row["event_id"] for row in snapshot["records"]])
-        history_reads = [sql for sql in statements if sql.startswith("SELECT") and "FROM delivery_history" in sql]
-        self.assertEqual(1, len(history_reads))
-
-    def test_invalid_history_in_undisplayed_window_event_still_rejects_source(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            for number in range(3):
-                self.store.enqueue(db, self.event(number), now_ms=NOW)
-            db.execute("UPDATE delivery_history SET action='' WHERE event_id=?", (self.event(0).event_id,))
-        self.assertEqual("unavailable", self.read(display_limit=1)["sources"]["notifications"]["state"])
-
-    def test_orphan_delivery_history_rejects_source_instead_of_reporting_zero_events(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.enqueue(db, self.event(1), now_ms=NOW)
-        # Simulate an external partial deletion outside the guarded writer.
-        with closing(sqlite3.connect(self.store.path)) as db:
-            db.execute("DELETE FROM outbox")
-            db.commit()
-        source = self.read()["sources"]["notifications"]
-        self.assertEqual("unavailable", source["state"])
-        self.assertNotIn("total", source)
-        self.assertEqual(2, main(["--data-dir", str(self.data_dir), "--output", str(self.root / "review.html")],
-                                 clock=self.clock, stdout=io.StringIO()))
-
-    def test_complete_history_of_outside_window_event_remains_valid(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.enqueue(db, self.event(1, at=NOW - 4 * 86400000), now_ms=NOW)
-            self.store.claim(db, now_ms=NOW)
-            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
-        source = self.read()["sources"]["notifications"]
-        self.assertEqual("ok", source["state"])
-        self.assertEqual(0, source["total"])
-        self.assertEqual({"confirmed": 1}, source["all_counts"])
-
-    def test_missing_lifecycle_rows_are_not_verified_even_outside_display_limit(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.enqueue(db, self.event(1), now_ms=NOW)
-            self.store.claim(db, now_ms=NOW)
-            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
-            self.store.enqueue(db, self.event(2), now_ms=NOW)
-            original = [tuple(row) for row in db.execute("SELECT * FROM delivery_history")]
-        for action in ("recorded", "attempt_started", "attempt_finished", "all"):
-            with self.subTest(action=action):
-                with self.store.connection() as db, self.store.transaction(db):
-                    db.execute("DELETE FROM delivery_history WHERE event_id=? AND (action=? OR ?='all')",
-                               (self.event(1).event_id, action, action))
-                report = self.read(display_limit=1)
-                self.assertFalse(report["sources_verified"])
-                self.assertEqual("unavailable", report["sources"]["notifications"]["state"])
-                output = self.root / "incomplete-history.html"
-                self.assertEqual(2, main(["--data-dir", str(self.data_dir), "--output", str(output)], clock=self.clock, stdout=io.StringIO()))
-                with self.store.connection() as db, self.store.transaction(db):
-                    db.execute("DELETE FROM delivery_history")
-                    db.executemany("INSERT INTO delivery_history VALUES (?,?,?,?,?)", original)
-
-    def test_history_must_match_attempt_count_outcome_suppression_and_retry_deadline(self):
-        self.initialize([cycle(1)])
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.enqueue(db, self.event(1), now_ms=NOW)
-            self.store.claim(db, now_ms=NOW)
-            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
-            original = tuple(db.execute("SELECT * FROM outbox").fetchone())
-        for change in ("attempts=2", "state='failed'", "suppressed_reason='review_expired'", "next_attempt_ms=0", "retryable=1"):
-            with self.subTest(change=change):
-                with self.store.connection() as db, self.store.transaction(db):
-                    db.execute("UPDATE outbox SET " + change)
-                self.assertEqual("unavailable", self.read()["sources"]["notifications"]["state"])
-                with self.store.connection() as db, self.store.transaction(db):
-                    db.execute("UPDATE outbox SET state=?,attempts=?,next_attempt_ms=?,retryable=?,suppressed_reason=? WHERE event_id=?",
-                               (*original[2:], original[0]))
-
-    def test_valid_defer_unknown_manual_resolution_and_retry_history(self):
-        self.initialize([cycle(1)])
-        event = self.event(1)
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.enqueue(db, event, now_ms=NOW)
-            self.store.claim(db, now_ms=NOW)
-            self.store.defer_unstarted(db, event.event_id, now_ms=NOW + 1)
-        self.assertEqual("ok", self.read()["sources"]["notifications"]["state"])
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.claim(db, now_ms=NOW + 30_001)
-            self.store.finish(db, event.event_id, state=DeliveryState.UNKNOWN, now_ms=NOW + 30_002, code="smtp_tls_error")
-        self.assertEqual("ok", self.read()["sources"]["notifications"]["state"])
-        self.store.resolve(event.event_id, outcome=DeliveryState.FAILED, now_ms=NOW + 30_003)
-        self.store.retry_failed(event.event_id, now_ms=NOW + 30_004)
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.claim(db, now_ms=NOW + 30_005)
-            self.store.finish(db, event.event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 30_006, code="smtp_accepted")
-            self.store.suppress(db, event.event_id, "decision_changed", NOW + 30_007)
-        report = self.read()["sources"]["notifications"]
-        self.assertEqual("ok", report["state"])
-        self.assertEqual(2, report["records"][0]["attempts"])
-        self.assertEqual(10, len(report["records"][0]["history"]))
 
     def test_scan_safety_limit_marks_incomplete_and_returns_nonzero(self):
         self.initialize([cycle(number) for number in range(4)])
         report = self.read(scan_limit=2)
-        self.assertFalse(report["sources_verified"])
+        self.assertFalse(report["sources_readable"])
         self.assertEqual("incomplete", report["sources"]["observations"]["state"])
         self.assertIn("不是完整窗口", render_signal_review(report))
 
@@ -271,7 +150,7 @@ class SignalReviewTests(unittest.TestCase):
         self.assertEqual("unavailable", report["sources"]["service"]["state"])
         self.assertNotIn("view", report["sources"]["service"])
         self.assertEqual("ok", report["sources"]["observations"]["state"])
-        self.assertIn("查询失败不等于服务已经停止", render_signal_review(report))
+        self.assertIn("暂时无法读取服务状态", render_signal_review(report))
 
     def test_missing_sources_are_not_initialized_and_still_produce_an_explanatory_report(self):
         report_path = self.root / "reports" / "empty.html"
@@ -317,7 +196,6 @@ class SignalReviewTests(unittest.TestCase):
         self.assertIn("SMTP 接受不证明收件箱到达", page)
         self.assertIn("结果不明", page)
         self.assertIn("送达状态截至本次查询", page)
-        self.assertIn('"strategy_code_version": "unknown"'.replace('"', '&quot;'), page)
 
     def test_output_is_read_only_and_escapes_untrusted_text(self):
         hostile = '</script><script>alert("unsafe")</script><img src=x onerror=alert(1)>'

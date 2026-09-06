@@ -18,7 +18,7 @@ OUTCOMES = {
     "scan_failed": ("扫描失败", "danger"),
 }
 DELIVERY = {
-    "pending": ("待发送", "neutral"), "confirmed": ("SMTP 已接受 / 已核实接受", "good"),
+    "pending": ("待发送", "neutral"), "confirmed": ("SMTP 已接受", "good"),
     "failed": ("确定失败", "danger"), "unknown": ("结果不明 · 需核查", "warning"),
 }
 KINDS = {"entry_review": "入场复核", "signal_invalidated": "原提醒失效",
@@ -54,7 +54,7 @@ def _e(value) -> str:
 
 def _time(value, *, day_only=False) -> str:
     if value is None:
-        return "unknown"
+        return "—"
     try:
         stamp = datetime.fromtimestamp(value / 1000, BEIJING)
         return stamp.strftime("%Y-%m-%d" if day_only else "%Y-%m-%d %H:%M:%S")
@@ -127,8 +127,7 @@ def _scan_row(item, *, raw=False) -> str:
     reason = _scan_reason(item)
     result = item.get("scan_result") or {}
     identifier = f'{item["cycle_id"]}/{item["observation_id"]}'
-    evidence = {"source": "observations.jsonl", "strategy_code_version": "unknown",
-                "source_service_run_id": "unknown", "source_attempt_id": "unknown", **item}
+    evidence = item
     return f'''<article class="scan-row filter-row" data-kind="{'raw-scan' if raw else 'scan'}" data-count="1" data-date="{_e(_time(item['created_at_ms'], day_only=True))}"
         data-symbol="{_e(item['symbol'])}" data-status="{_e(item['outcome'])}">
       <div class="row-time"><time>{_e(_time(item['observed_at_ms']))}</time><span>{_e(item['symbol'])}</span></div>
@@ -155,7 +154,7 @@ def _scan_group(items) -> str:
           {''.join(_scan_row(item, raw=True) for item in reversed(items))}</details></div></article>'''
 
 
-def _alert_row(record, data_dir, index, known_event_ids) -> str:
+def _alert_row(record, data_dir, known_event_ids) -> str:
     event = record["event"]
     observation = event.get("observation") or {}
     related = event.get("related_event_id")
@@ -165,16 +164,15 @@ def _alert_row(record, data_dir, index, known_event_ids) -> str:
                     '<span>关联入场不在本报告明细中；可按 event ID 查询。</span>')
         relation += f'<code class="related-id">{_e(related)}</code>'
     suppression = f'<p class="suppression">已抑制：{_e(REASONS.get(record["suppressed_reason"], record["suppressed_reason"]))}</p>' if record["suppressed_reason"] else ""
-    evidence = {**record, "strategy_code_version": "unknown", "source_service_run_id": "unknown",
-                "source_attempt_id": "unknown", "actual_trade": "尚无人工成交记录"}
+    reason = '' if event['reason'] in {'health_event', 'runtime_changed'} else f'<span>{_e(REASONS.get(event["reason"], event["reason"]))}</span>'
+    deadline = f' · 复核截止 {_e(_time(event["review_until_ms"]))}' if event['review_until_ms'] is not None else ''
     query = _copy_command(_command(data_dir, "email_alerts", "show " + record["event_id"]), f"query-{record['event_id']}")
     return f'''<article id="event-{_e(record['event_id'])}" class="alert-row filter-row" data-kind="alert"
         data-date="{_e(_time(event['occurred_at_ms'], day_only=True))}" data-symbol="{_e(observation.get('symbol', ''))}" data-status="{_e(record['state'])}">
       <div class="row-time"><time>{_e(_time(event['occurred_at_ms']))}</time><span>{_e(observation.get('symbol') or '全局服务')}</span></div>
       <div class="row-main"><strong>{_e(KINDS.get(event['kind'], event['kind']))}</strong>{_badge(record['state'], DELIVERY)}
-        <span>{_e(REASONS.get(event['reason'], event['reason']))}</span>{suppression}
-        <span class="secondary">发送尝试 {record['attempts']} 次 · 人工复核截止 {_e(_time(event['review_until_ms'])) if event['review_until_ms'] is not None else '不适用'}</span>
-        <div class="relation">{relation}</div>{_evidence(evidence, '查看事件与送达历史', identifier='event-evidence-' + record['event_id'])}
+        {reason}{suppression}<span class="secondary">发送尝试 {record['attempts']} 次{deadline}</span>
+        <div class="relation">{relation}</div>{_evidence(record, '查看详情', identifier='event-evidence-' + record['event_id'])}
         <details class="query" id="event-query-{record['event_id']}"><summary>只读查询命令</summary>{query}</details></div>
     </article>'''
 
@@ -187,7 +185,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
     generated = _time(report["generated_at_ms"])
     notices = [item["message"] for item in sources.values() if item["state"] != "ok"]
     if view and not view.get("healthy"):
-        notices.append("生成时服务未处于健康状态。请先查看健康详情；历史正常扫描不证明服务现在正常。")
+        notices.append("服务状态异常，请查看健康详情。")
     if notifications.get("all_counts", {}).get("unknown", 0):
         notices.append("通知库存在结果不明的邮件。先核查 SMTP 接受证据，不能直接重发。")
     if notifications.get("all_counts", {}).get("failed", 0):
@@ -201,14 +199,14 @@ def render_signal_review(report: dict, *, live=False) -> str:
     symbol_options = ''.join(f'<option value="{_e(symbol)}">{_e(symbol)}</option>' for symbol in symbols)
     scan_rows = ''.join(_scan_group(items) for items in reversed(group_scan_records(scan_records)))
     known_event_ids = {record["event_id"] for record in alert_records}
-    alert_rows = ''.join(_alert_row(item, report["data_dir"], index, known_event_ids) for index, item in enumerate(reversed(alert_records)))
+    alert_rows = ''.join(_alert_row(item, report["data_dir"], known_event_ids) for item in reversed(alert_records))
     totals = scans.get("counts", {})
     summary = ''.join(f'<div class="metric"><span>{_e(label)}</span><strong>{totals.get(key, 0) if "counts" in scans else "—"}</strong></div>'
                       for key, (label, _) in OUTCOMES.items())
     latest_rows = ''.join(f'<li><strong>{_e(item["symbol"])}</strong><span>{_e(_scan_reason(item))}</span><time>{_e(_time(item["observed_at_ms"]))}</time></li>'
                           for item in scans.get("latest", []))
     runtime_label = RUNTIME.get(view.get("runtime", "unavailable"), "无法核实")
-    health_label = "生成时正常" if view.get("healthy") else runtime_label
+    health_label = "正常" if view.get("healthy") else runtime_label
     data = view.get("data_at_last_scan", {})
     data_label = {"allowed": "上次扫描通过", "blocked": "上次扫描阻断", "unknown": "尚无校验记录"}.get(data.get("status"), "无法核实")
     state_counts = ' · '.join(f'{DELIVERY[key][0]} {value}' for key, value in notifications.get("all_counts", {}).items()) or '尚无提醒记录'
@@ -218,14 +216,13 @@ def render_signal_review(report: dict, *, live=False) -> str:
                  '每条代表一个标的一次扫描；重复轮询得到的 READY 不等于新的交易机会。')
     if scans.get("state") == "incomplete":
         scan_note = "读取已截断：统计与明细都不是完整窗口。缩短观察数据源或处理容量后重新生成。"
-    alert_note = (f'明细只保留最后 {notifications.get("display_limit")} 条事件；窗口统计没有使用最近 50 条摘要推算。' if notifications.get("display_truncated") else
-                  '按事件发生日期筛选，送达状态截至采集时刻。标的筛选会保留全局服务事件。')
+    alert_note = f'显示最近 {notifications.get("display_limit")} 条记录。' if notifications.get("display_truncated") else ''
     service_evidence = _evidence(service, "健康详情", identifier="health-evidence")
     source_rows = ''.join(f'<tr><th scope="row">{_e(name)}</th><td>{_e(item["state"])}</td><td>{_e(_time(item["read_at_ms"]))}</td><td>{_e(item["message"])}</td></tr>'
                           for name, item in zip(("服务健康", "扫描日志", "通知库"), (service, scans, notifications)))
     window_total = notifications.get("total", "—")
     notification_counts = ' · '.join(f'{DELIVERY[key][0]} {value}' for key, value in notifications.get("counts", {}).items()) or '无窗口内提醒 / 来源见下方'
-    latest_html = latest_rows or '<li class="empty">所选窗口内没有可验证的扫描记录。</li>'
+    latest_html = latest_rows or '<li class="empty">所选日期内暂无扫描记录。</li>'
     snapshot_html = (f'<strong id="refresh-state">自动更新 · 每 30 秒</strong><time id="report-updated">更新于 {_e(generated)} 北京时间</time>'
                      '<div class="live-actions"><button id="refresh-now" type="button">立即更新</button><button id="pause-refresh" type="button">暂停自动更新</button></div>'
                      '<span id="connection-note" role="status" aria-live="polite">已连接本地只读查看器</span>' if live else
@@ -233,40 +230,36 @@ def render_signal_review(report: dict, *, live=False) -> str:
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><link rel="icon" href="data:,"><title>MU · 每日信号复盘</title><style>{_STYLE}</style></head>
-<body data-live="{'true' if live else 'false'}" data-generated-at="{report['generated_at_ms']}" data-sources-verified="{'true' if report['sources_verified'] else 'false'}"><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
-<nav aria-label="页面导航"><a href="#overview">概览</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">来源与边界</a></nav></header>
+<body data-live="{'true' if live else 'false'}" data-generated-at="{report['generated_at_ms']}" data-sources-readable="{'true' if report['sources_readable'] else 'false'}"><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
+<nav aria-label="页面导航"><a href="#overview">概览</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">数据来源</a></nav></header>
 <main id="main"><section class="intro"><div><p class="eyebrow">SIGNAL JOURNAL / 只读复盘</p><h1>每日信号复盘</h1>
 <p class="lede">扫描状态与提醒记录</p></div><div class="snapshot">{snapshot_html}</div></section>
-<div id="review-content">{notice_html}<section id="overview" aria-label="生成时状态"><div class="status-strip">
-<div><span class="eyebrow">服务 / 生成时</span><strong>{_e(health_label)}</strong><small>{_e(runtime_label)} · 连续失败 {_e(view.get('consecutive_failures', 'unknown'))}</small></div>
+<div id="review-content">{notice_html}<section id="overview" aria-label="服务与记录状态"><div class="status-strip">
+<div><span class="eyebrow">服务状态</span><strong>{_e(health_label)}</strong><small>{_e(runtime_label)} · 连续失败 {_e(view.get('consecutive_failures', 'unknown'))}</small></div>
 <div><span class="eyebrow">行情 / 上次扫描时</span><strong>{_e(data_label)}</strong><small>校验于 {_e(_time(data.get('checked_at_ms')))}</small></div>
-<div><span class="eyebrow">通知 / 库内现状</span><strong>{_e(state_counts)}</strong><small>最近消费 {_e(_time(notifications.get('last_collection_ms')))}；不证明进程存活</small></div></div>
+<div><span class="eyebrow">邮件记录</span><strong>{_e(state_counts)}</strong><small>最近处理 {_e(_time(notifications.get('last_collection_ms')))}</small></div></div>
 {service_evidence}<div class="section-heading"><h2>观察窗口</h2><span>{_e(window['from_date'])} 至 {_e(window['to_date'])} · 北京时间自然日</span></div>
-<p class="scope">{'已完整读取现存日志' if scans.get('complete') else '尚未验证完整性'}：{_e(scans.get('total_cycles', '—'))} 个扫描轮次 · {_e(scans.get('total_observations', '—'))} 条标的观察 · 忽略 {_e(scans.get('duplicate_cycles', '—'))} 个同内容重复轮次</p>
+<p class="scope">{_e(scans.get('total_cycles', '—'))} 轮扫描 · {_e(scans.get('total_observations', '—'))} 条记录</p>
 <p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
-<div class="metrics">{summary}</div><h3>窗口内最后追加的扫描</h3><ul class="latest">{latest_html}</ul>
-<p class="secondary">历史“待复核”不代表现在仍有效或已成交。</p></section>
+<div class="metrics">{summary}</div><h3>最近扫描</h3><ul class="latest">{latest_html}</ul></section>
 <section class="filters" aria-label="筛选报告明细"><div class="section-heading"><h2>查找记录</h2><button id="reset" type="button">重置筛选</button></div>
 <div class="filter-fields"><label>起始日期<input id="from-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['from_date'])}"></label>
 <label>结束日期<input id="to-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['to_date'])}"></label>
 <label>标的<select id="symbol"><option value="">全部标的</option>{symbol_options}</select></label></div>
-<p id="filter-error" class="error" role="status" aria-live="polite"></p><p class="secondary">筛选只影响下方明细，不改变上方窗口统计和生成时状态。需要其他日期请重新生成报告。</p></section>
+<p id="filter-error" class="error" role="status" aria-live="polite"></p><p class="secondary">筛选下方记录，上方统计保持不变。</p></section>
 <section id="scans"><div class="section-heading"><h2>扫描记录 <span class="section-number">01</span></h2>
 <label class="inline-filter">扫描结果<select id="scan-status"><option value="">全部结果</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in OUTCOMES.items())}</select></label></div>
 <p class="secondary">相邻同状态的正常等待已合并，其余逐条显示。{_e(scan_note) if scans.get('display_truncated') or scans.get('state') == 'incomplete' else '展开可核对每次扫描。'}</p><p id="scan-count" class="result-count" aria-live="polite">加载了 {len(scan_records)} 条明细</p>
-<div class="record-list">{scan_rows}</div><p id="scan-empty" class="empty" {'hidden' if scan_records else ''}>没有符合筛选的可验证扫描；这不代表服务健康或没有交易机会。</p></section>
+<div class="record-list">{scan_rows}</div><p id="scan-empty" class="empty" {'hidden' if scan_records else ''}>没有符合筛选的扫描记录。</p></section>
 <section id="alerts"><div class="section-heading"><h2>邮件记录 <span class="section-number">02</span></h2>
 <label class="inline-filter">送达状态<select id="delivery-status"><option value="">全部状态</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in DELIVERY.items())}</select></label></div>
 <p class="scope">窗口内 {_e(window_total)} 个事件 · 已抑制 {_e(notifications.get('suppressed', '—'))} 个 · {_e(notification_counts)}</p>
-<p class="secondary">{_e(alert_note)} SMTP 接受不证明收件箱到达、已读或实际成交。抑制状态与送达状态分别展示。</p>
+{f'<p class="secondary">{_e(alert_note)}</p>' if alert_note else ''}
 <p id="alert-count" class="result-count" aria-live="polite">加载了 {len(alert_records)} 条明细</p><div class="record-list">{alert_rows}</div>
-<p id="alert-empty" class="empty" {'hidden' if alert_records else ''}>没有符合筛选的提醒记录；请同时查看通知来源状态。</p></section>
-<section id="sources"><details id="source-details"><summary class="source-summary">来源、口径与排查命令</summary>
-<p>三类来源分别读取，采集时点可能不同；本页不宣称跨文件的原子快照。健康源仅保留最近 100 个事件，不能由它证明完整故障历史。</p>
+<p id="alert-empty" class="empty" {'hidden' if alert_records else ''}>没有符合筛选的邮件记录。</p></section>
+<section id="sources"><details id="source-details"><summary class="source-summary">数据来源与查询命令</summary>
+<p>本页展示现有记录，不审计历史完整性。SMTP 接受不证明收件箱到达。</p>
 <div class="table-wrap"><table><thead><tr><th>来源</th><th>读取状态</th><th>采集时间 / 北京时间</th><th>说明</th></tr></thead><tbody>{source_rows}</tbody></table></div>
-<dl class="boundaries"><div><dt>策略代码版本、源运行与尝试身份</dt><dd>unknown。原日志尚未提供这些历史字段，报告生成版本不能替代。</dd></div>
-<div><dt>人工反馈与实际成交</dt><dd>尚无记录；不能从未记录推断未成交。</dd></div><div><dt>持仓管理提醒</dt><dd>尚未接入可信持仓（#85）；不判断空仓、加仓或确定退出。</dd></div>
-<div><dt>运行与策略验收</dt><dd>扫描轮数和记录天数不等于连续交易日验收，也不证明策略盈利。</dd></div></dl>
 <details class="query" id="source-queries"><summary>数据目录与只读排查命令</summary><p><code>{_e(report['data_dir'])}</code></p>
 {_copy_command(_command(report['data_dir'], 'signal_service', 'status'), 'service-query')}
 {_copy_command(_command(report['data_dir'], 'email_alerts', 'status'), 'email-query')}</details></details></section></div>
@@ -368,11 +361,11 @@ _SCRIPT = r'''
         while (detail) { detail.open = true; detail = detail.parentElement?.closest('details'); }
       }
       document.body.dataset.generatedAt = incoming.body.dataset.generatedAt;
-      document.body.dataset.sourcesVerified = incoming.body.dataset.sourcesVerified;
+      document.body.dataset.sourcesReadable = incoming.body.dataset.sourcesReadable;
       document.body.classList.remove('connection-lost');
       byId('report-updated').textContent = incoming.getElementById('report-updated').textContent;
       byId('refresh-state').textContent = paused ? '自动更新已暂停' : '自动更新 · 每 30 秒';
-      byId('connection-note').textContent = incoming.body.dataset.sourcesVerified === 'true' ? '已连接本地只读查看器' : '已更新；部分来源待核查，见下方提示';
+      byId('connection-note').textContent = incoming.body.dataset.sourcesReadable === 'true' ? '已连接本地只读查看器' : '已更新；部分来源待核查，见下方提示';
       filter();
       if (focus && byId(focus)) byId(focus).focus({preventScroll:true});
       const behavior = document.documentElement.style.scrollBehavior;
