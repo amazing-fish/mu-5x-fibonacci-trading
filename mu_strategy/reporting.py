@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from mu_strategy.market_data.utils import DAY_MS
+from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.research.robustness import (
     buy_and_hold_return_pct,
@@ -132,16 +132,16 @@ def _format_float(value: float) -> str:
 
 def candle_sample_summary(candles_by_interval: dict[str, list[Candle]]) -> list[str]:
     return [
-        f"{interval} actual sample: {_coverage_duration_label(candles)} ({len(candles)} rows)"
+        f"{interval} actual sample: {coverage_duration_label(candles)} ({len(candles)} rows)"
         for interval, candles in sorted(candles_by_interval.items())
     ]
 
 
-def _coverage_duration_label(candles: list[Candle]) -> str:
+def coverage_duration_label(candles: list[Candle]) -> str:
     if not candles:
         return "-"
     ordered = sorted(candles, key=lambda bar: bar.open_time_ms)
-    interval_ms = _infer_interval_ms(ordered)
+    interval_ms = infer_candle_interval_ms(ordered)
     duration_ms = ordered[-1].open_time_ms + interval_ms - ordered[0].open_time_ms
     total_minutes = max(0, round(duration_ms / 60_000))
     days, remainder = divmod(total_minutes, 24 * 60)
@@ -154,14 +154,3 @@ def _coverage_duration_label(candles: list[Candle]) -> str:
     if minutes or not parts:
         parts.append(f"{minutes}m")
     return " ".join(parts)
-
-
-def _infer_interval_ms(candles: list[Candle]) -> int:
-    if len(candles) < 2:
-        return 0
-    diffs = [
-        candles[index].open_time_ms - candles[index - 1].open_time_ms
-        for index in range(1, len(candles))
-        if candles[index].open_time_ms > candles[index - 1].open_time_ms
-    ]
-    return min(diffs) if diffs else 0

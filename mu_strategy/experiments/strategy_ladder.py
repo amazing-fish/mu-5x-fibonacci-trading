@@ -12,7 +12,7 @@ from mu_strategy.execution.instruments import OKXInstrumentSpec
 from mu_strategy.experiments.walk_forward import WindowBacktest, run_evaluator_walk_forward_backtests
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
-from mu_strategy.market_data.utils import DAY_MS
+from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
@@ -353,7 +353,7 @@ def evaluate_strategy_ladder(
                             execution_start_time_ms=_segment_15m[0].open_time_ms,
                             execution_end_time_ms=(
                                 _segment_15m[-1].open_time_ms
-                                + _infer_interval_ms(_segment_15m)
+                                + infer_candle_interval_ms(_segment_15m)
                             ),
                         )
 
@@ -906,17 +906,6 @@ def _format_optional_pct(value: float | None) -> str:
 
 def _decimal_metric(value: float) -> str:
     return format_candidate_metric(value)
-
-
-def _infer_interval_ms(candles: list[Candle]) -> int:
-    if len(candles) < 2:
-        return 0
-    diffs = [
-        candles[index].open_time_ms - candles[index - 1].open_time_ms
-        for index in range(1, len(candles))
-        if candles[index].open_time_ms > candles[index - 1].open_time_ms
-    ]
-    return min(diffs) if diffs else 0
 
 
 def _validate_output_paths(
