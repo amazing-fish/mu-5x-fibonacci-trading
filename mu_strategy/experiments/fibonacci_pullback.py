@@ -7,17 +7,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
-from mu_strategy.cli import build_hourly_context
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext
+from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.registry import selected_strategy_groups
 
 
-DAY_MS = 86_400_000
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 
@@ -178,7 +178,7 @@ def run_fibonacci_horizon_backtests(
     ordered_1h = sorted(candles_1h, key=lambda bar: bar.open_time_ms)
     full_context = build_hourly_context(ordered_15m, ordered_1h)
     monthly_segments = split_by_utc_month(ordered_15m)
-    interval_15m = _infer_interval_ms(ordered_15m)
+    interval_15m = infer_candle_interval_ms(ordered_15m)
 
     results: list[FibonacciHorizonBacktest] = []
     for hours in horizons_hours:
@@ -560,17 +560,6 @@ def _load_trusted_candles(
         bundle.files_by_interval["1h"],
         bundle.load_context,
     )
-
-
-def _infer_interval_ms(candles: list[Candle]) -> int:
-    if len(candles) < 2:
-        return 0
-    diffs = [
-        candles[index].open_time_ms - candles[index - 1].open_time_ms
-        for index in range(1, len(candles))
-        if candles[index].open_time_ms > candles[index - 1].open_time_ms
-    ]
-    return min(diffs) if diffs else 0
 
 
 def _best_month(months: list[MonthlyBacktest]) -> MonthlyBacktest | None:

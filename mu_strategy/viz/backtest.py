@@ -19,7 +19,7 @@ from mu_strategy.research.historical_data import (
 )
 from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
 from mu_strategy.models import BacktestResult, Candle, Trade
-from mu_strategy.reporting import _format_float
+from mu_strategy.reporting import _format_float, coverage_duration_label
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategies.registry import selected_strategy_groups
@@ -146,7 +146,7 @@ def render_html_visualization(
         strategy_name=strategy_name,
         strategy_label=strategy_label,
     )
-    duration_label = _coverage_duration_label(candles)
+    duration_label = coverage_duration_label(candles)
     risk_event_count = sum(1 for trade in result.trades if trade.exit_reason == "non_session_liquidation_risk")
     payload = json.dumps(chart_data, ensure_ascii=False)
     return f"""<!doctype html>
@@ -878,36 +878,6 @@ def _translate_reason(reason: str) -> str:
         "non_session_liquidation_risk": "非美股时段爆仓风险",
         "end_of_data": "数据结束",
     }.get(reason, reason)
-
-
-def _coverage_duration_label(candles: list[Candle]) -> str:
-    if not candles:
-        return "-"
-    ordered = sorted(candles, key=lambda bar: bar.open_time_ms)
-    interval_ms = _infer_interval_ms(ordered)
-    duration_ms = ordered[-1].open_time_ms + interval_ms - ordered[0].open_time_ms
-    total_minutes = max(0, round(duration_ms / 60_000))
-    days, remainder = divmod(total_minutes, 24 * 60)
-    hours, minutes = divmod(remainder, 60)
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes or not parts:
-        parts.append(f"{minutes}m")
-    return " ".join(parts)
-
-
-def _infer_interval_ms(candles: list[Candle]) -> int:
-    if len(candles) < 2:
-        return 0
-    diffs = [
-        candles[index].open_time_ms - candles[index - 1].open_time_ms
-        for index in range(1, len(candles))
-        if candles[index].open_time_ms > candles[index - 1].open_time_ms
-    ]
-    return min(diffs) if diffs else 0
 
 
 if __name__ == "__main__":

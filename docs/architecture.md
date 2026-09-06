@@ -30,6 +30,7 @@ Package: `mu_strategy.market_data`
 - `cache.py`: CSV cache paths, reads/writes, incremental merge, and lookback pruning.
 - `symbols.py`: OKX swap symbol normalization and aliases.
 - `universe.py`: dynamic OKX Top USDT-SWAP universe selection.
+- `utils.py`: shared candle time helpers, including `infer_candle_interval_ms`, used by reports and experiment windows.
 - `trusted_data/contracts.py`: dataclass/Enum contracts for dataset health, validation reports, refresh runs, trust decisions, trusted bundles, and universe snapshots.
 - `trusted_data/evaluate.py`: shared publication health classification plus refresh/load candle evaluation for windowing, normalization, freshness, built/native validation, and requested-days coverage.
 - `trusted_data/policy.py`: interval dependency planning, freshness policy, and trading/research/observe trust policies.
@@ -99,6 +100,8 @@ full-history response with complete month-open evidence; old compatibility evide
 Package: `mu_strategy.core`
 
 `core.market_context.build_hourly_context` owns the pure mapping from 1h regime calculations to 15m candle timestamps. A regime derived from a 1h candle close becomes visible at `open_time_ms + 1h`, never at the candle open; callers pass canonical candle timestamps and do not compensate by rewriting them. CLI, entry scanning, visualization, ordinary walk-forward, and release experiments depend on this core function; `mu_strategy.cli` re-exports it for compatibility with existing callers.
+
+Experiment implementations import this function directly from `core.market_context`. Markdown and HTML reports share `reporting.coverage_duration_label` for actual sample-length labels; candle-interval inference retains the smallest positive adjacent timestamp gap and returns zero when no such gap exists.
 
 Ordinary walk-forward and monthly Fibonacci partitions are reporting boundaries, not indicator-reset boundaries: they build one causal context from the complete supplied history and select the 15m keys belonging to each report partition. The release-candidate protocol is deliberately different: `mu.baseline.walk_forward.cold_start.v1` excludes pre-window context and starts each pinned split from fresh indicator state.
 

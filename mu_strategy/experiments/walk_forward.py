@@ -8,16 +8,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mu_strategy.backtest import run_backtest
-from mu_strategy.cli import build_hourly_context
+from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
+from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
 from mu_strategy.strategies.registry import StrategyGroup, selected_strategy_groups
 
 
-DAY_MS = 86_400_000
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
 
 WalkForwardEvaluator = Callable[[list[Candle], list[Candle], dict[int, str]], BacktestResult]
@@ -69,7 +69,7 @@ def split_into_windows(candles: list[Candle], *, window_days: int = 14, windows:
         return [[] for _ in range(windows)]
 
     ordered = sorted(candles, key=lambda bar: bar.open_time_ms)
-    interval_ms = _infer_interval_ms(ordered)
+    interval_ms = infer_candle_interval_ms(ordered)
     window_ms = window_days * DAY_MS
     end_exclusive = ordered[-1].open_time_ms + interval_ms
     start_all = end_exclusive - (window_ms * windows)
@@ -115,7 +115,7 @@ def run_evaluator_walk_forward_backtests(
     ordered_15m = sorted(candles_15m, key=lambda bar: bar.open_time_ms)
     ordered_1h = sorted(candles_1h, key=lambda bar: bar.open_time_ms)
     segments = split_into_windows(ordered_15m, window_days=window_days, windows=windows)
-    interval_ms = _infer_interval_ms(ordered_15m) if ordered_15m else 0
+    interval_ms = infer_candle_interval_ms(ordered_15m) if ordered_15m else 0
     full_context = build_hourly_context(ordered_15m, ordered_1h)
     results: list[WindowBacktest] = []
 
@@ -446,17 +446,6 @@ def main() -> None:
         args.html_report.parent.mkdir(parents=True, exist_ok=True)
         args.html_report.write_text(dashboard, encoding="utf-8")
     print(report)
-
-
-def _infer_interval_ms(candles: list[Candle]) -> int:
-    if len(candles) < 2:
-        return 0
-    diffs = [
-        candles[index].open_time_ms - candles[index - 1].open_time_ms
-        for index in range(1, len(candles))
-        if candles[index].open_time_ms > candles[index - 1].open_time_ms
-    ]
-    return min(diffs) if diffs else 0
 
 
 def _infer_window_days(window_results: list[WindowBacktest]) -> int:
