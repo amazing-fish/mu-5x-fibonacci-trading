@@ -21,12 +21,22 @@ def main(argv=None, *, clock=None, stdout=None) -> int:
     parser.add_argument("--days", type=int, default=7, help="Calendar days ending on --to-date, default 7.")
     parser.add_argument("--from-date", help="First included Beijing date, YYYY-MM-DD.")
     parser.add_argument("--to-date", help="Last included Beijing date, YYYY-MM-DD; default today.")
+    parser.add_argument("--serve", action="store_true", help="Open a loopback-only live viewer instead of writing a static report.")
+    parser.add_argument("--port", type=int, default=8769, help="Loopback port for --serve, default 8769.")
     args = parser.parse_args(argv)
     try:
         window = review_window(now_ms=clock.now_ms(), days=args.days, from_date=args.from_date, to_date=args.to_date)
-        validate_review_output(args.data_dir, args.output)
+        if args.serve:
+            if not 1 <= args.port <= 65535:
+                raise ValueError("invalid local port")
+        else:
+            validate_review_output(args.data_dir, args.output)
     except (ValueError, OverflowError, OSError):
-        parser.error("invalid report path or Beijing date window; use an .html output outside data/service state and 1–366 days")
+        parser.error("invalid report path, Beijing date window or port; use an .html output outside data/service state, 1–366 days and port 1–65535")
+    if args.serve:
+        from mu_strategy.signal_review_server import serve_signal_review
+        return serve_signal_review(args.data_dir, port=args.port, days=args.days,
+                                   from_date=args.from_date, to_date=args.to_date, clock=clock, stdout=stdout)
     report = read_signal_review(args.data_dir, window, clock=clock)
     content = render_signal_review(report)
     temporary = None

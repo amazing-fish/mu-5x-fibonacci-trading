@@ -1,7 +1,8 @@
-"""Standalone, offline Chinese review page; no execution controls or network."""
+"""Chinese review presentation shared by offline exports and the local viewer."""
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import os
 import shlex
@@ -66,8 +67,9 @@ def _badge(value, catalog) -> str:
     return f'<span class="badge {tone}">{_e(text)}</span>'
 
 
-def _evidence(value, title="查看来源证据") -> str:
-    return f'<details class="evidence"><summary>{_e(title)}</summary><pre>{_e(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))}</pre></details>'
+def _evidence(value, title="查看来源证据", *, identifier="") -> str:
+    identity = f' id="{_e(identifier)}"' if identifier else ""
+    return f'<details class="evidence"{identity}><summary>{_e(title)}</summary><pre>{_e(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))}</pre></details>'
 
 
 def _command(data_dir: str, module: str, extra="") -> str:
@@ -76,7 +78,7 @@ def _command(data_dir: str, module: str, extra="") -> str:
 
 
 def _copy_command(command, identifier) -> str:
-    return f'<div class="command"><code id="{_e(identifier)}">{_e(command)}</code><button type="button" class="copy" data-copy="{_e(identifier)}">复制命令</button></div>'
+    return f'<div class="command"><code id="{_e(identifier)}">{_e(command)}</code><button id="{_e(identifier)}-copy" type="button" class="copy" data-copy="{_e(identifier)}">复制命令</button></div>'
 
 
 def _scan_reason(item) -> str:
@@ -89,21 +91,68 @@ def _scan_reason(item) -> str:
     return reason
 
 
-def _scan_row(item) -> str:
+def _scan_identity(item) -> str:
+    return hashlib.sha256(json.dumps([item["cycle_id"], item["observation_id"]]).encode()).hexdigest()
+
+
+def group_scan_records(records: list[dict]) -> list[list[dict]]:
+    """Compact only nearby, same-day normal waits; keep every source observation."""
+    groups, last_by_symbol = [], {}
+    fields = ("symbol", "strategy_name", "strategy_config_fingerprint", "outcome", "decision_code",
+              "compatibility_reason", "compatibility_source", "trust_reason", "provenance", "trust_policy_name",
+              "trust_policy_version", "requested_intervals", "effective_intervals")
+    for index, item in enumerate(records):
+        setup = item.get("scan_result") or {}
+        signature = json.dumps([{key: item.get(key) for key in fields},
+                                {key: setup.get(key) for key in ("signal_time_ms", "trigger_price", "initial_stop")}], sort_keys=True)
+        previous = last_by_symbol.get(item["symbol"])
+        merge = False
+        if previous is not None and item["outcome"] == "normal_no_action":
+            last = previous[1][-1]
+            merge = (previous[2] == signature and
+                     _time(item["created_at_ms"], day_only=True) == _time(last["created_at_ms"], day_only=True) and
+                     0 <= item["created_at_ms"] - last["created_at_ms"] <= 600_000 and
+                     0 <= item["observed_at_ms"] - last["observed_at_ms"] <= 600_000)
+        if merge:
+            previous[0] = index
+            previous[1].append(item)
+        else:
+            group = [index, [item], signature]
+            groups.append(group)
+            last_by_symbol[item["symbol"]] = group
+    return [group[1] for group in sorted(groups, key=lambda group: group[0])]
+
+
+def _scan_row(item, *, raw=False) -> str:
     reason = _scan_reason(item)
     result = item.get("scan_result") or {}
     identifier = f'{item["cycle_id"]}/{item["observation_id"]}'
     evidence = {"source": "observations.jsonl", "strategy_code_version": "unknown",
                 "source_service_run_id": "unknown", "source_attempt_id": "unknown", **item}
-    return f'''<article class="scan-row filter-row" data-kind="scan" data-date="{_e(_time(item['created_at_ms'], day_only=True))}"
+    return f'''<article class="scan-row filter-row" data-kind="{'raw-scan' if raw else 'scan'}" data-count="1" data-date="{_e(_time(item['created_at_ms'], day_only=True))}"
         data-symbol="{_e(item['symbol'])}" data-status="{_e(item['outcome'])}">
       <div class="row-time"><time>{_e(_time(item['observed_at_ms']))}</time><span>{_e(item['symbol'])}</span></div>
       <div class="row-main">{_badge(item['outcome'], OUTCOMES)}<strong>{_e(reason)}</strong>
         <span class="secondary">策略 {_e(item['strategy_name'])} · 观察价格 {_e(result.get('last_close') if result.get('last_close') is not None else 'unknown')}</span>
-        {_evidence(evidence)}</div>
+        {_evidence(evidence, identifier='scan-evidence-' + _scan_identity(item))}</div>
       <div class="row-reference"><span>数据快照</span><code>{_e(item.get('trusted_run_id') or 'unknown')}</code>
         <span class="sr-only">{_e(identifier)}</span></div>
     </article>'''
+
+
+def _scan_group(items) -> str:
+    if len(items) == 1:
+        return _scan_row(items[0])
+    first, last = items[0], items[-1]
+    price = (last.get("scan_result") or {}).get("last_close")
+    return f'''<article class="scan-row filter-row scan-group" data-kind="scan" data-count="{len(items)}"
+        data-date="{_e(_time(last['created_at_ms'], day_only=True))}" data-symbol="{_e(last['symbol'])}" data-status="normal_no_action">
+      <div class="row-time"><time>{_e(_time(last['observed_at_ms']))}</time><span>{_e(last['symbol'])}</span></div>
+      <div class="row-main">{_badge('normal_no_action', OUTCOMES)}<strong>{_e(_scan_reason(last))}</strong>
+        <span class="secondary">{_e(_time(first['observed_at_ms']))} — {_e(_time(last['observed_at_ms']))} · 相同状态 {len(items)} 次</span>
+        <span class="secondary">最新观察价格 {_e(price if price is not None else 'unknown')}</span>
+        <details class="group-details" id="scan-group-{_scan_identity(first)}"><summary>展开 {len(items)} 次扫描记录</summary>
+          {''.join(_scan_row(item, raw=True) for item in reversed(items))}</details></div></article>'''
 
 
 def _alert_row(record, data_dir, index, known_event_ids) -> str:
@@ -118,19 +167,19 @@ def _alert_row(record, data_dir, index, known_event_ids) -> str:
     suppression = f'<p class="suppression">已抑制：{_e(REASONS.get(record["suppressed_reason"], record["suppressed_reason"]))}</p>' if record["suppressed_reason"] else ""
     evidence = {**record, "strategy_code_version": "unknown", "source_service_run_id": "unknown",
                 "source_attempt_id": "unknown", "actual_trade": "尚无人工成交记录"}
-    query = _copy_command(_command(data_dir, "email_alerts", "show " + record["event_id"]), f"query-{index}")
+    query = _copy_command(_command(data_dir, "email_alerts", "show " + record["event_id"]), f"query-{record['event_id']}")
     return f'''<article id="event-{_e(record['event_id'])}" class="alert-row filter-row" data-kind="alert"
         data-date="{_e(_time(event['occurred_at_ms'], day_only=True))}" data-symbol="{_e(observation.get('symbol', ''))}" data-status="{_e(record['state'])}">
       <div class="row-time"><time>{_e(_time(event['occurred_at_ms']))}</time><span>{_e(observation.get('symbol') or '全局服务')}</span></div>
       <div class="row-main"><strong>{_e(KINDS.get(event['kind'], event['kind']))}</strong>{_badge(record['state'], DELIVERY)}
         <span>{_e(REASONS.get(event['reason'], event['reason']))}</span>{suppression}
         <span class="secondary">发送尝试 {record['attempts']} 次 · 人工复核截止 {_e(_time(event['review_until_ms'])) if event['review_until_ms'] is not None else '不适用'}</span>
-        <div class="relation">{relation}</div>{_evidence(evidence, '查看事件与送达历史')}
-        <details class="query"><summary>只读查询命令</summary>{query}</details></div>
+        <div class="relation">{relation}</div>{_evidence(evidence, '查看事件与送达历史', identifier='event-evidence-' + record['event_id'])}
+        <details class="query" id="event-query-{record['event_id']}"><summary>只读查询命令</summary>{query}</details></div>
     </article>'''
 
 
-def render_signal_review(report: dict) -> str:
+def render_signal_review(report: dict, *, live=False) -> str:
     sources = report["sources"]
     scans, notifications, service = (sources[key] for key in ("observations", "notifications", "service"))
     window = report["window"]
@@ -150,7 +199,7 @@ def render_signal_review(report: dict) -> str:
     symbols = sorted({item["symbol"] for item in scan_records} |
                      {item["event"]["observation"]["symbol"] for item in alert_records if item["event"].get("observation")})
     symbol_options = ''.join(f'<option value="{_e(symbol)}">{_e(symbol)}</option>' for symbol in symbols)
-    scan_rows = ''.join(_scan_row(item) for item in reversed(scan_records))
+    scan_rows = ''.join(_scan_group(items) for items in reversed(group_scan_records(scan_records)))
     known_event_ids = {record["event_id"] for record in alert_records}
     alert_rows = ''.join(_alert_row(item, report["data_dir"], index, known_event_ids) for index, item in enumerate(reversed(alert_records)))
     totals = scans.get("counts", {})
@@ -171,29 +220,32 @@ def render_signal_review(report: dict) -> str:
         scan_note = "读取已截断：统计与明细都不是完整窗口。缩短观察数据源或处理容量后重新生成。"
     alert_note = (f'明细只保留最后 {notifications.get("display_limit")} 条事件；窗口统计没有使用最近 50 条摘要推算。' if notifications.get("display_truncated") else
                   '按事件发生日期筛选，送达状态截至采集时刻。标的筛选会保留全局服务事件。')
-    service_evidence = _evidence(service, "查看生成时健康状态与保留的事件")
+    service_evidence = _evidence(service, "健康详情", identifier="health-evidence")
     source_rows = ''.join(f'<tr><th scope="row">{_e(name)}</th><td>{_e(item["state"])}</td><td>{_e(_time(item["read_at_ms"]))}</td><td>{_e(item["message"])}</td></tr>'
                           for name, item in zip(("服务健康", "扫描日志", "通知库"), (service, scans, notifications)))
     window_total = notifications.get("total", "—")
     notification_counts = ' · '.join(f'{DELIVERY[key][0]} {value}' for key, value in notifications.get("counts", {}).items()) or '无窗口内提醒 / 来源见下方'
     latest_html = latest_rows or '<li class="empty">所选窗口内没有可验证的扫描记录。</li>'
+    snapshot_html = (f'<strong id="refresh-state">自动更新 · 每 30 秒</strong><time id="report-updated">更新于 {_e(generated)} 北京时间</time>'
+                     '<div class="live-actions"><button id="refresh-now" type="button">立即更新</button><button id="pause-refresh" type="button">暂停自动更新</button></div>'
+                     '<span id="connection-note" role="status" aria-live="polite">已连接本地只读查看器</span>' if live else
+                     f'<strong>导出快照 · 不自动更新</strong><time>生成于 {_e(generated)} 北京时间</time><span>日常查看请使用本地实时入口；此文件保留导出时的记录。</span>')
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><link rel="icon" href="data:,"><title>MU · 每日信号复盘</title><style>{_STYLE}</style></head>
-<body><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
+<body data-live="{'true' if live else 'false'}" data-generated-at="{report['generated_at_ms']}" data-sources-verified="{'true' if report['sources_verified'] else 'false'}"><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
 <nav aria-label="页面导航"><a href="#overview">概览</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">来源与边界</a></nav></header>
 <main id="main"><section class="intro"><div><p class="eyebrow">SIGNAL JOURNAL / 只读复盘</p><h1>每日信号复盘</h1>
-<p class="lede">看清等待的原因，沿着记录核对每一次提醒。</p></div><div class="snapshot"><strong>静态快照 · 非实时</strong>
-<time>生成于 {_e(generated)} 北京时间</time><span>重新运行命令才能更新数据；刷新页面不会查询服务。</span></div></section>
-{notice_html}<section id="overview" aria-label="生成时状态"><div class="status-strip">
+<p class="lede">扫描状态与提醒记录</p></div><div class="snapshot">{snapshot_html}</div></section>
+<div id="review-content">{notice_html}<section id="overview" aria-label="生成时状态"><div class="status-strip">
 <div><span class="eyebrow">服务 / 生成时</span><strong>{_e(health_label)}</strong><small>{_e(runtime_label)} · 连续失败 {_e(view.get('consecutive_failures', 'unknown'))}</small></div>
 <div><span class="eyebrow">行情 / 上次扫描时</span><strong>{_e(data_label)}</strong><small>校验于 {_e(_time(data.get('checked_at_ms')))}</small></div>
 <div><span class="eyebrow">通知 / 库内现状</span><strong>{_e(state_counts)}</strong><small>最近消费 {_e(_time(notifications.get('last_collection_ms')))}；不证明进程存活</small></div></div>
 {service_evidence}<div class="section-heading"><h2>观察窗口</h2><span>{_e(window['from_date'])} 至 {_e(window['to_date'])} · 北京时间自然日</span></div>
 <p class="scope">{'已完整读取现存日志' if scans.get('complete') else '尚未验证完整性'}：{_e(scans.get('total_cycles', '—'))} 个扫描轮次 · {_e(scans.get('total_observations', '—'))} 条标的观察 · 忽略 {_e(scans.get('duplicate_cycles', '—'))} 个同内容重复轮次</p>
-<p class="secondary">窗口内实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}。未运行的日期不会补成正常，也不由首尾记录推断连续运行。</p>
+<p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
 <div class="metrics">{summary}</div><h3>窗口内最后追加的扫描</h3><ul class="latest">{latest_html}</ul>
-<p class="secondary">记录反映扫描当时的判断。历史“待复核”不表示现在仍然有效，也不代表已成交。</p></section>
+<p class="secondary">历史“待复核”不代表现在仍有效或已成交。</p></section>
 <section class="filters" aria-label="筛选报告明细"><div class="section-heading"><h2>查找记录</h2><button id="reset" type="button">重置筛选</button></div>
 <div class="filter-fields"><label>起始日期<input id="from-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['from_date'])}"></label>
 <label>结束日期<input id="to-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['to_date'])}"></label>
@@ -201,7 +253,7 @@ def render_signal_review(report: dict) -> str:
 <p id="filter-error" class="error" role="status" aria-live="polite"></p><p class="secondary">筛选只影响下方明细，不改变上方窗口统计和生成时状态。需要其他日期请重新生成报告。</p></section>
 <section id="scans"><div class="section-heading"><h2>扫描记录 <span class="section-number">01</span></h2>
 <label class="inline-filter">扫描结果<select id="scan-status"><option value="">全部结果</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in OUTCOMES.items())}</select></label></div>
-<p class="secondary">{_e(scan_note)}</p><p id="scan-count" class="result-count" aria-live="polite">加载了 {len(scan_records)} 条明细</p>
+<p class="secondary">相邻同状态的正常等待已合并，其余逐条显示。{_e(scan_note) if scans.get('display_truncated') or scans.get('state') == 'incomplete' else '展开可核对每次扫描。'}</p><p id="scan-count" class="result-count" aria-live="polite">加载了 {len(scan_records)} 条明细</p>
 <div class="record-list">{scan_rows}</div><p id="scan-empty" class="empty" {'hidden' if scan_records else ''}>没有符合筛选的可验证扫描；这不代表服务健康或没有交易机会。</p></section>
 <section id="alerts"><div class="section-heading"><h2>邮件记录 <span class="section-number">02</span></h2>
 <label class="inline-filter">送达状态<select id="delivery-status"><option value="">全部状态</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in DELIVERY.items())}</select></label></div>
@@ -209,15 +261,15 @@ def render_signal_review(report: dict) -> str:
 <p class="secondary">{_e(alert_note)} SMTP 接受不证明收件箱到达、已读或实际成交。抑制状态与送达状态分别展示。</p>
 <p id="alert-count" class="result-count" aria-live="polite">加载了 {len(alert_records)} 条明细</p><div class="record-list">{alert_rows}</div>
 <p id="alert-empty" class="empty" {'hidden' if alert_records else ''}>没有符合筛选的提醒记录；请同时查看通知来源状态。</p></section>
-<section id="sources"><div class="section-heading"><h2>来源与边界 <span class="section-number">03</span></h2></div>
+<section id="sources"><details id="source-details"><summary class="source-summary">来源、口径与排查命令</summary>
 <p>三类来源分别读取，采集时点可能不同；本页不宣称跨文件的原子快照。健康源仅保留最近 100 个事件，不能由它证明完整故障历史。</p>
 <div class="table-wrap"><table><thead><tr><th>来源</th><th>读取状态</th><th>采集时间 / 北京时间</th><th>说明</th></tr></thead><tbody>{source_rows}</tbody></table></div>
 <dl class="boundaries"><div><dt>策略代码版本、源运行与尝试身份</dt><dd>unknown。原日志尚未提供这些历史字段，报告生成版本不能替代。</dd></div>
 <div><dt>人工反馈与实际成交</dt><dd>尚无记录；不能从未记录推断未成交。</dd></div><div><dt>持仓管理提醒</dt><dd>尚未接入可信持仓（#85）；不判断空仓、加仓或确定退出。</dd></div>
 <div><dt>运行与策略验收</dt><dd>扫描轮数和记录天数不等于连续交易日验收，也不证明策略盈利。</dd></div></dl>
-<details class="query"><summary>数据目录与只读排查命令</summary><p><code>{_e(report['data_dir'])}</code></p>
+<details class="query" id="source-queries"><summary>数据目录与只读排查命令</summary><p><code>{_e(report['data_dir'])}</code></p>
 {_copy_command(_command(report['data_dir'], 'signal_service', 'status'), 'service-query')}
-{_copy_command(_command(report['data_dir'], 'email_alerts', 'status'), 'email-query')}</details></section>
+{_copy_command(_command(report['data_dir'], 'email_alerts', 'status'), 'email-query')}</details></details></section></div>
 <footer>MU / SIGNAL JOURNAL<span>来源可查 · 状态分开 · 不执行交易</span></footer></main><script>{_SCRIPT}</script></body></html>'''
 
 
@@ -231,41 +283,110 @@ _STYLE = r'''
 
 
 _SCRIPT = r'''
+
 (() => {
   const byId = id => document.getElementById(id);
-  const from = byId('from-date'), to = byId('to-date'), symbol = byId('symbol');
-  const scanStatus = byId('scan-status'), deliveryStatus = byId('delivery-status');
-  const initial = [from.value, to.value];
+  const controlIds = ['from-date', 'to-date', 'symbol', 'scan-status', 'delivery-status'];
+  function resetDates() {
+    for (const id of ['from-date', 'to-date']) byId(id).value = byId(id).defaultValue;
+  }
   function filter() {
+    const from = byId('from-date'), to = byId('to-date'), symbol = byId('symbol');
     const invalid = !from.value || !to.value || from.value > to.value || from.value < from.min || to.value > to.max;
     byId('filter-error').textContent = invalid ? '日期必须位于本报告观察窗口内，且起始日期不晚于结束日期。' : '';
     for (const kind of ['scan', 'alert']) {
       const rows = Array.from(document.querySelectorAll('[data-kind="' + kind + '"]'));
-      let count = 0;
-      const status = kind === 'scan' ? scanStatus.value : deliveryStatus.value;
+      let count = 0, observations = 0;
+      const status = byId(kind === 'scan' ? 'scan-status' : 'delivery-status').value;
       for (const row of rows) {
         const match = !invalid && row.dataset.date >= from.value && row.dataset.date <= to.value
           && (!symbol.value || row.dataset.symbol === symbol.value || (kind === 'alert' && !row.dataset.symbol))
           && (!status || row.dataset.status === status);
         row.hidden = !match;
-        if (match) count++;
+        if (match) { count++; observations += Number(row.dataset.count || 1); }
       }
-      byId(kind + '-count').textContent = '当前筛选 ' + count + ' 条 / 本页已加载 ' + rows.length + ' 条明细';
+      byId(kind + '-count').textContent = kind === 'scan'
+        ? '当前筛选 ' + count + ' 组 · ' + observations + ' 次扫描'
+        : '当前筛选 ' + count + ' 条 / 本页已加载 ' + rows.length + ' 条明细';
       byId(kind + '-empty').hidden = count > 0;
     }
   }
-  for (const control of [from, to, symbol, scanStatus, deliveryStatus]) control.addEventListener('change', filter);
-  byId('reset').addEventListener('click', () => { [from.value, to.value] = initial; symbol.value = ''; scanStatus.value = ''; deliveryStatus.value = ''; filter(); });
-  for (const link of document.querySelectorAll('.relation a')) link.addEventListener('click', () => {
-    [from.value, to.value] = initial; symbol.value = ''; deliveryStatus.value = ''; filter();
-    const target = byId(link.getAttribute('href').slice(1));
-    if (target) target.querySelector('details').open = true;
-  });
-  for (const button of document.querySelectorAll('[data-copy]')) button.addEventListener('click', async () => {
-    const source = byId(button.dataset.copy);
-    try { await navigator.clipboard.writeText(source.textContent); button.textContent = '已复制'; }
-    catch { const range = document.createRange(); range.selectNodeContents(source); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); button.textContent = '已选中，请复制'; }
+  document.addEventListener('change', event => { if (controlIds.includes(event.target.id)) filter(); });
+  document.addEventListener('click', async event => {
+    if (event.target.closest('#reset')) {
+      resetDates(); for (const id of ['symbol', 'scan-status', 'delivery-status']) byId(id).value = ''; filter();
+    }
+    const relation = event.target.closest('.relation a');
+    if (relation) {
+      resetDates(); byId('symbol').value = ''; byId('delivery-status').value = ''; filter();
+      const target = byId(relation.getAttribute('href').slice(1));
+      if (target) target.querySelector('details').open = true;
+    }
+    const button = event.target.closest('[data-copy]');
+    if (button) {
+      const source = byId(button.dataset.copy);
+      try { await navigator.clipboard.writeText(source.textContent); button.textContent = '已复制'; }
+      catch { const range = document.createRange(); range.selectNodeContents(source); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); button.textContent = '已选中，请复制'; }
+    }
   });
   filter();
+  if (document.body.dataset.live !== 'true') return;
+  let paused = false, refreshing = false;
+  async function refresh(manual = false) {
+    if (refreshing || (!manual && (paused || document.visibilityState !== 'visible'))) return;
+    if (!manual && (document.activeElement.matches('input, select') || !window.getSelection().isCollapsed)) return;
+    refreshing = true; byId('refresh-now').disabled = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch('/report', {cache: 'no-store', signal: controller.signal});
+      if (!response.ok) throw new Error('unavailable');
+      const incoming = new DOMParser().parseFromString(await response.text(), 'text/html');
+      if (incoming.body.dataset.live !== 'true' || !incoming.getElementById('review-content') || !incoming.getElementById('report-updated')) throw new Error('invalid report');
+      // Read UI state at application time, so a choice made during fetch survives.
+      const values = controlIds.map(id => ({id, value: byId(id).value, defaultValue: byId(id).defaultValue}));
+      const opened = Array.from(document.querySelectorAll('details[open][id]'), node => node.id);
+      const focus = document.activeElement.id, scroll = [window.scrollX, window.scrollY];
+      byId('review-content').replaceWith(incoming.getElementById('review-content'));
+      for (const saved of values) {
+        const control = byId(saved.id);
+        if (saved.id.endsWith('-date') && saved.value === saved.defaultValue) continue;
+        if (control.tagName !== 'SELECT' || Array.from(control.options).some(option => option.value === saved.value)) control.value = saved.value;
+      }
+      for (const id of opened) { const detail = byId(id); if (detail) detail.open = true; }
+      document.body.dataset.generatedAt = incoming.body.dataset.generatedAt;
+      document.body.dataset.sourcesVerified = incoming.body.dataset.sourcesVerified;
+      document.body.classList.remove('connection-lost');
+      byId('report-updated').textContent = incoming.getElementById('report-updated').textContent;
+      byId('refresh-state').textContent = paused ? '自动更新已暂停' : '自动更新 · 每 30 秒';
+      byId('connection-note').textContent = incoming.body.dataset.sourcesVerified === 'true' ? '已连接本地只读查看器' : '已更新；部分来源待核查，见下方提示';
+      filter();
+      if (focus && byId(focus)) byId(focus).focus({preventScroll:true});
+      const behavior = document.documentElement.style.scrollBehavior;
+      document.documentElement.style.scrollBehavior = 'auto'; window.scrollTo(...scroll); document.documentElement.style.scrollBehavior = behavior;
+    } catch {
+      document.body.classList.add('connection-lost');
+      byId('refresh-state').textContent = '连接中断 · 显示上次快照';
+      byId('connection-note').textContent = '未能读取最新记录。下方保留上次快照，不代表当前服务状态；可点击立即更新重试。';
+    } finally {
+      clearTimeout(timeout); refreshing = false; byId('refresh-now').disabled = false;
+    }
+  }
+  byId('refresh-now').addEventListener('click', () => refresh(true));
+  byId('pause-refresh').addEventListener('click', () => {
+    paused = !paused;
+    byId('pause-refresh').textContent = paused ? '恢复自动更新' : '暂停自动更新';
+    byId('refresh-state').textContent = paused ? '自动更新已暂停' : '自动更新 · 每 30 秒';
+    if (!paused) refresh();
+  });
+  setInterval(() => refresh(), 30000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refresh(); });
 })();
+
+'''
+
+_STYLE += r'''
+
+.scan-group{grid-template-columns:160px minmax(0,1fr)}.group-details{width:100%;font-size:12px}.group-details>summary{color:var(--accent);cursor:pointer;padding:5px 0}.group-details .scan-row{grid-template-columns:140px minmax(0,1fr);padding:16px 0}.group-details .row-reference{display:none}.group-details .row-main>strong{font-size:13px}.source-summary{font-size:15px;font-weight:600;color:var(--accent);cursor:pointer;padding:12px 0}.live-actions{display:flex;gap:8px;flex-wrap:wrap}.live-actions button{font-size:12px;padding:5px 9px}.live-actions button:disabled{opacity:.65;cursor:wait}.connection-lost .snapshot{border-color:var(--danger)}.connection-lost #refresh-state,.connection-lost #connection-note{color:var(--danger)}.connection-lost .status-strip{opacity:.65}@media(max-width:780px){.scan-group,.group-details .scan-row{grid-template-columns:1fr}.group-details .row-time{font-size:11px}}@media print{.live-actions{display:none}}
+
 '''
