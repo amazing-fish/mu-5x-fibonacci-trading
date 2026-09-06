@@ -38,7 +38,7 @@ OKX API 与 demo 自动化独立放在应用层：`mu_strategy.live` 只负责 O
 
 ## 常用命令
 
-打开每日信号复盘的本地实时入口（只读现有服务、扫描及邮件记录；`--data-dir` 使用实际运行目录）：
+打开每日信号复盘的本地实时入口（只读服务、扫描及邮件记录，另存入场提醒的人工处理标记和备注；`--data-dir` 使用实际运行目录）：
 
 ```powershell
 python -B -m mu_strategy.commands.render_signal_review --data-dir data\live --serve

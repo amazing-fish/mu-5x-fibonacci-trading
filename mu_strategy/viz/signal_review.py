@@ -9,6 +9,7 @@ import shlex
 from datetime import datetime
 
 from mu_strategy.signal_review import BEIJING
+from mu_strategy.signal_feedback import FEEDBACK_STATUSES
 
 
 OUTCOMES = {
@@ -154,7 +155,23 @@ def _scan_group(items) -> str:
           {''.join(_scan_row(item, raw=True) for item in reversed(items))}</details></div></article>'''
 
 
-def _alert_row(record, data_dir, known_event_ids) -> str:
+def _feedback_form(event_id, saved, *, editable):
+    if saved is None:
+        return '<p class="secondary">人工反馈暂不可用</p>'
+    status = saved.get("status", "unreviewed")
+    label = FEEDBACK_STATUSES.get(status, "未处理")
+    if not editable:
+        return f'<p class="feedback-snapshot">人工处理：{_e(label)}</p><p class="feedback-note">{_e(saved.get("note", ""))}</p>'
+    options = ''.join(f'<option value="{key}" {"selected" if key == status else ""}>{_e(value)}</option>' for key, value in FEEDBACK_STATUSES.items())
+    return f'''<details class="feedback-details" id="feedback-{event_id}"><summary>人工处理 · {label}</summary>
+      <form class="feedback-form" data-event="{event_id}">
+      <label>处理状态<select name="status" id="feedback-status-{event_id}">{options}</select></label>
+      <label>备注<textarea name="note" id="feedback-note-{event_id}" rows="2" maxlength="2000" placeholder="例如：看到时已错过，或记录手动操作">{_e(saved.get('note', ''))}</textarea></label>
+      <div class="feedback-actions"><button type="submit">保存反馈</button><span class="feedback-message" role="status">{('保存于 ' + _e(_time(saved['updated_at_ms']))) if saved else ''}</span></div>
+      </form></details>'''
+
+
+def _alert_row(record, data_dir, known_event_ids, feedback, *, editable=False) -> str:
     event = record["event"]
     observation = event.get("observation") or {}
     related = event.get("related_event_id")
@@ -167,12 +184,15 @@ def _alert_row(record, data_dir, known_event_ids) -> str:
     reason = '' if event['reason'] in {'health_event', 'runtime_changed'} else f'<span>{_e(REASONS.get(event["reason"], event["reason"]))}</span>'
     deadline = f' · 复核截止 {_e(_time(event["review_until_ms"]))}' if event['review_until_ms'] is not None else ''
     query = _copy_command(_command(data_dir, "email_alerts", "show " + record["event_id"]), f"query-{record['event_id']}")
+    saved = feedback.get(record["event_id"], {}) if feedback is not None else None
+    feedback_status = (saved.get("status", "unreviewed") if saved is not None else "unavailable") if event["kind"] == "entry_review" else ""
+    feedback_html = _feedback_form(record["event_id"], saved, editable=editable) if feedback_status else ""
     return f'''<article id="event-{_e(record['event_id'])}" class="alert-row filter-row" data-kind="alert"
-        data-date="{_e(_time(event['occurred_at_ms'], day_only=True))}" data-symbol="{_e(observation.get('symbol', ''))}" data-status="{_e(record['state'])}">
+        data-date="{_e(_time(event['occurred_at_ms'], day_only=True))}" data-symbol="{_e(observation.get('symbol', ''))}" data-status="{_e(record['state'])}" data-feedback="{_e(feedback_status)}">
       <div class="row-time"><time>{_e(_time(event['occurred_at_ms']))}</time><span>{_e(observation.get('symbol') or '全局服务')}</span></div>
       <div class="row-main"><strong>{_e(KINDS.get(event['kind'], event['kind']))}</strong>{_badge(record['state'], DELIVERY)}
         {reason}{suppression}<span class="secondary">发送尝试 {record['attempts']} 次{deadline}</span>
-        <div class="relation">{relation}</div>{_evidence(record, '查看详情', identifier='event-evidence-' + record['event_id'])}
+        {feedback_html}<div class="relation">{relation}</div>{_evidence(record, '查看详情', identifier='event-evidence-' + record['event_id'])}
         <details class="query" id="event-query-{record['event_id']}"><summary>只读查询命令</summary>{query}</details></div>
     </article>'''
 
@@ -184,6 +204,9 @@ def render_signal_review(report: dict, *, live=False) -> str:
     view = service.get("view", {})
     generated = _time(report["generated_at_ms"])
     notices = [item["message"] for item in sources.values() if item["state"] != "ok"]
+    feedback = report.get("feedback", {"records": {}, "available": True})
+    if not feedback["available"]:
+        notices.append("人工反馈暂时无法读取；本次不提供编辑，请检查反馈文件后刷新。")
     if view and not view.get("healthy"):
         notices.append("服务状态异常，请查看健康详情。")
     if notifications.get("all_counts", {}).get("unknown", 0):
@@ -199,7 +222,8 @@ def render_signal_review(report: dict, *, live=False) -> str:
     symbol_options = ''.join(f'<option value="{_e(symbol)}">{_e(symbol)}</option>' for symbol in symbols)
     scan_rows = ''.join(_scan_group(items) for items in reversed(group_scan_records(scan_records)))
     known_event_ids = {record["event_id"] for record in alert_records}
-    alert_rows = ''.join(_alert_row(item, report["data_dir"], known_event_ids) for item in reversed(alert_records))
+    alert_rows = ''.join(_alert_row(item, report["data_dir"], known_event_ids, feedback["records"] if feedback["available"] else None,
+                                   editable=live and feedback["available"]) for item in reversed(alert_records))
     totals = scans.get("counts", {})
     summary = ''.join(f'<div class="metric"><span>{_e(label)}</span><strong>{totals.get(key, 0) if "counts" in scans else "—"}</strong></div>'
                       for key, (label, _) in OUTCOMES.items())
@@ -225,14 +249,14 @@ def render_signal_review(report: dict, *, live=False) -> str:
     latest_html = latest_rows or '<li class="empty">所选日期内暂无扫描记录。</li>'
     snapshot_html = (f'<strong id="refresh-state">自动更新 · 每 30 秒</strong><time id="report-updated">更新于 {_e(generated)} 北京时间</time>'
                      '<div class="live-actions"><button id="refresh-now" type="button">立即更新</button><button id="pause-refresh" type="button">暂停自动更新</button></div>'
-                     '<span id="connection-note" role="status" aria-live="polite">已连接本地只读查看器</span>' if live else
+                     '<span id="connection-note" role="status" aria-live="polite">已连接本地查看器</span>' if live else
                      f'<strong>导出快照 · 不自动更新</strong><time>生成于 {_e(generated)} 北京时间</time><span>日常查看请使用本地实时入口；此文件保留导出时的记录。</span>')
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark"><link rel="icon" href="data:,"><title>MU · 每日信号复盘</title><style>{_STYLE}</style></head>
 <body data-live="{'true' if live else 'false'}" data-generated-at="{report['generated_at_ms']}" data-sources-readable="{'true' if report['sources_readable'] else 'false'}"><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
 <nav aria-label="页面导航"><a href="#overview">概览</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">数据来源</a></nav></header>
-<main id="main"><section class="intro"><div><p class="eyebrow">SIGNAL JOURNAL / 只读复盘</p><h1>每日信号复盘</h1>
+<main id="main"><section class="intro"><div><p class="eyebrow">SIGNAL JOURNAL / 每日复盘</p><h1>每日信号复盘</h1>
 <p class="lede">扫描状态与提醒记录</p></div><div class="snapshot">{snapshot_html}</div></section>
 <div id="review-content">{notice_html}<section id="overview" aria-label="服务与记录状态"><div class="status-strip">
 <div><span class="eyebrow">服务状态</span><strong>{_e(health_label)}</strong><small>{_e(runtime_label)} · 连续失败 {_e(view.get('consecutive_failures', 'unknown'))}</small></div>
@@ -252,13 +276,16 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <p class="secondary">相邻同状态的正常等待已合并，其余逐条显示。{_e(scan_note) if scans.get('display_truncated') or scans.get('state') == 'incomplete' else '展开可核对每次扫描。'}</p><p id="scan-count" class="result-count" aria-live="polite">加载了 {len(scan_records)} 条明细</p>
 <div class="record-list">{scan_rows}</div><p id="scan-empty" class="empty" {'hidden' if scan_records else ''}>没有符合筛选的扫描记录。</p></section>
 <section id="alerts"><div class="section-heading"><h2>邮件记录 <span class="section-number">02</span></h2>
-<label class="inline-filter">送达状态<select id="delivery-status"><option value="">全部状态</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in DELIVERY.items())}</select></label></div>
+<div class="alert-filters"><label class="inline-filter">送达状态<select id="delivery-status"><option value="">全部状态</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in DELIVERY.items())}</select></label>
+<label class="inline-filter">人工处理<select id="feedback-status"><option value="">全部记录</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, label in FEEDBACK_STATUSES.items())}</select></label></div></div>
 <p class="scope">窗口内 {_e(window_total)} 个事件 · 已抑制 {_e(notifications.get('suppressed', '—'))} 个 · {_e(notification_counts)}</p>
+<p class="secondary">入场提醒可记录人工处理和备注；“已手动交易”为用户自记，不用于计算持仓。</p>
 {f'<p class="secondary">{_e(alert_note)}</p>' if alert_note else ''}
 <p id="alert-count" class="result-count" aria-live="polite">加载了 {len(alert_records)} 条明细</p><div class="record-list">{alert_rows}</div>
 <p id="alert-empty" class="empty" {'hidden' if alert_records else ''}>没有符合筛选的邮件记录。</p></section>
 <section id="sources"><details id="source-details"><summary class="source-summary">数据来源与查询命令</summary>
 <p>本页展示现有记录，不审计历史完整性。SMTP 接受不证明收件箱到达。</p>
+<p class="secondary">人工反馈单独保存在 <code>{_e(feedback.get('path', ''))}</code>。</p>
 <div class="table-wrap"><table><thead><tr><th>来源</th><th>读取状态</th><th>采集时间 / 北京时间</th><th>说明</th></tr></thead><tbody>{source_rows}</tbody></table></div>
 <details class="query" id="source-queries"><summary>数据目录与只读排查命令</summary><p><code>{_e(report['data_dir'])}</code></p>
 {_copy_command(_command(report['data_dir'], 'signal_service', 'status'), 'service-query')}
@@ -279,7 +306,7 @@ _SCRIPT = r'''
 
 (() => {
   const byId = id => document.getElementById(id);
-  const controlIds = ['from-date', 'to-date', 'symbol', 'scan-status', 'delivery-status'];
+  const controlIds = ['from-date', 'to-date', 'symbol', 'scan-status', 'delivery-status', 'feedback-status'];
   function resetDates() {
     for (const id of ['from-date', 'to-date']) byId(id).value = byId(id).defaultValue;
   }
@@ -294,7 +321,8 @@ _SCRIPT = r'''
       for (const row of rows) {
         const match = !invalid && row.dataset.date >= from.value && row.dataset.date <= to.value
           && (!symbol.value || row.dataset.symbol === symbol.value || (kind === 'alert' && !row.dataset.symbol))
-          && (!status || row.dataset.status === status);
+          && (!status || row.dataset.status === status)
+          && (kind !== 'alert' || !byId('feedback-status').value || row.dataset.feedback === byId('feedback-status').value);
         row.hidden = !match;
         if (match) { count++; observations += Number(row.dataset.count || 1); }
       }
@@ -307,11 +335,11 @@ _SCRIPT = r'''
   document.addEventListener('change', event => { if (controlIds.includes(event.target.id)) filter(); });
   document.addEventListener('click', async event => {
     if (event.target.closest('#reset')) {
-      resetDates(); for (const id of ['symbol', 'scan-status', 'delivery-status']) byId(id).value = ''; filter();
+      resetDates(); for (const id of ['symbol', 'scan-status', 'delivery-status', 'feedback-status']) byId(id).value = ''; filter();
     }
     const relation = event.target.closest('.relation a');
     if (relation) {
-      resetDates(); byId('symbol').value = ''; byId('delivery-status').value = ''; filter();
+      resetDates(); byId('symbol').value = ''; byId('delivery-status').value = ''; byId('feedback-status').value = ''; filter();
       const target = byId(relation.getAttribute('href').slice(1));
       if (target) target.querySelector('details').open = true;
     }
@@ -324,14 +352,56 @@ _SCRIPT = r'''
   });
   filter();
   if (document.body.dataset.live !== 'true') return;
-  let paused = false, refreshing = false, editingUntil = 0;
+  let paused = false, refreshing = false, editingUntil = 0, saving = false, feedbackVersion = 0;
+  const drafts = new Map();
+  const feedbackValues = form => ({status: form.elements.status.value, note: form.elements.note.value});
+  function restoreDrafts() {
+    for (const form of document.querySelectorAll('.feedback-form')) {
+      const draft = drafts.get(form.dataset.event);
+      if (!draft) continue;
+      form.elements.status.value = draft.status; form.elements.note.value = draft.note;
+      form.querySelector('.feedback-message').textContent = '尚未保存';
+    }
+  }
+  for (const type of ['input', 'change']) document.addEventListener(type, event => {
+    const form = event.target.closest('.feedback-form');
+    if (form) {
+      drafts.set(form.dataset.event, feedbackValues(form));
+      form.querySelector('.feedback-message').textContent = '尚未保存';
+    }
+  });
+  document.addEventListener('submit', async event => {
+    const form = event.target.closest('.feedback-form');
+    if (!form) return;
+    event.preventDefault();
+    if (saving) return;
+    const values = feedbackValues(form), button = form.querySelector('button'), message = form.querySelector('.feedback-message');
+    drafts.set(form.dataset.event, values);
+    saving = true; feedbackVersion++; button.disabled = true; message.textContent = '正在保存…';
+    const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch('/feedback', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({event_id:form.dataset.event, ...values}), signal:controller.signal});
+      if (!response.ok) throw new Error('save failed');
+      const saved = await response.json(), current = feedbackValues(form);
+      const label = Array.from(form.elements.status.options).find(option => option.value === saved.status).textContent;
+      form.closest('details').querySelector('summary').textContent = '人工处理 · ' + label;
+      form.closest('[data-kind="alert"]').dataset.feedback = saved.status;
+      if (current.status === values.status && current.note === values.note) {
+        drafts.delete(form.dataset.event); form.elements.note.value = saved.note; message.textContent = '已保存';
+      } else message.textContent = '已保存提交内容；新修改尚未保存';
+      filter();
+    } catch { message.textContent = '保存失败，修改仍保留；请重试'; }
+    finally { clearTimeout(timeout); saving = false; button.disabled = false; }
+  });
+  window.addEventListener('beforeunload', event => { if (drafts.size) { event.preventDefault(); event.returnValue = ''; } });
   for (const type of ['focusin', 'input', 'change', 'keydown', 'pointerdown']) {
     document.addEventListener(type, event => {
-      if (event.target.matches('input, select')) editingUntil = Date.now() + 2000;
+      if (event.target.matches('input, select, textarea')) editingUntil = Date.now() + 2000;
     });
   }
   async function refresh(manual = false) {
-    if (refreshing || (!manual && (paused || document.visibilityState !== 'visible'))) return;
+    if (refreshing || saving || (!manual && (paused || document.visibilityState !== 'visible'))) return;
     if (!manual && (Date.now() < editingUntil || !window.getSelection().isCollapsed)) {
       byId('refresh-state').textContent = Date.now() < editingUntil ? '编辑筛选 · 自动更新暂缓' : '选中文本 · 自动更新暂缓';
       return;
@@ -340,10 +410,12 @@ _SCRIPT = r'''
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
     try {
+      const version = feedbackVersion;
       const response = await fetch('/report', {cache: 'no-store', signal: controller.signal});
       if (!response.ok) throw new Error('unavailable');
       const incoming = new DOMParser().parseFromString(await response.text(), 'text/html');
       if (incoming.body.dataset.live !== 'true' || !incoming.getElementById('review-content') || !incoming.getElementById('report-updated')) throw new Error('invalid report');
+      if (saving || version !== feedbackVersion) return;
       // Read UI state at application time, so a choice made during fetch survives.
       const values = controlIds.map(id => ({id, value: byId(id).value, defaultValue: byId(id).defaultValue}));
       const opened = Array.from(document.querySelectorAll('details[open][id]'), node => node.id);
@@ -365,7 +437,8 @@ _SCRIPT = r'''
       document.body.classList.remove('connection-lost');
       byId('report-updated').textContent = incoming.getElementById('report-updated').textContent;
       byId('refresh-state').textContent = paused ? '自动更新已暂停' : '自动更新 · 每 30 秒';
-      byId('connection-note').textContent = incoming.body.dataset.sourcesReadable === 'true' ? '已连接本地只读查看器' : '已更新；部分来源待核查，见下方提示';
+      byId('connection-note').textContent = incoming.body.dataset.sourcesReadable === 'true' ? '已连接本地查看器' : '已更新；部分来源待核查，见下方提示';
+      restoreDrafts();
       filter();
       if (focus && byId(focus)) byId(focus).focus({preventScroll:true});
       const behavior = document.documentElement.style.scrollBehavior;
@@ -392,6 +465,7 @@ _SCRIPT = r'''
 '''
 
 _STYLE += r'''
+.alert-filters{display:flex;gap:16px;flex-wrap:wrap}.feedback-details{width:100%;max-width:560px;margin:12px 0;border-left:2px solid var(--line);padding-left:12px}.feedback-details>summary{cursor:pointer;color:var(--accent);font-size:13px}.feedback-form{display:grid;gap:10px;margin:12px 0;max-width:560px}.feedback-form select{max-width:200px}.feedback-form textarea{font:inherit;resize:vertical;min-height:72px;padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:var(--surface);color:var(--ink);width:100%}.feedback-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.feedback-message{font-size:12px;color:var(--muted)}.feedback-note{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.feedback-snapshot{font-size:13px;color:var(--accent);margin-bottom:0}@media print{.feedback-actions{display:none}}
 
 .scan-group{grid-template-columns:160px minmax(0,1fr)}.group-details{width:100%;font-size:12px}.group-details>summary{color:var(--accent);cursor:pointer;padding:5px 0}.group-details .scan-row{grid-template-columns:140px minmax(0,1fr);padding:16px 0}.group-details .row-reference{display:none}.group-details .row-main>strong{font-size:13px}.source-summary{font-size:15px;font-weight:600;color:var(--accent);cursor:pointer;padding:12px 0}.live-actions{display:flex;gap:8px;flex-wrap:wrap}.live-actions button{font-size:12px;padding:5px 9px}.live-actions button:disabled{opacity:.65;cursor:wait}.connection-lost .snapshot{border-color:var(--danger)}.connection-lost #refresh-state,.connection-lost #connection-note{color:var(--danger)}.connection-lost .status-strip{opacity:.65}@media(max-width:780px){.scan-group,.group-details .scan-row{grid-template-columns:1fr}.group-details .row-time{font-size:11px}}@media print{.live-actions{display:none}}
 

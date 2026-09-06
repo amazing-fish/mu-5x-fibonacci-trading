@@ -15,7 +15,7 @@ def main(argv=None, *, clock=None, stdout=None) -> int:
     import sys
     stdout = stdout or sys.stdout
     clock = clock or SystemClock()
-    parser = argparse.ArgumentParser(description="Render a read-only Chinese signal review from existing local evidence.")
+    parser = argparse.ArgumentParser(description="Review local signal evidence with optional personal feedback in the live viewer.")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
     parser.add_argument("--output", type=Path, default=Path("reports/live/signal-review.html"))
     parser.add_argument("--days", type=int, default=7, help="Calendar days ending on --to-date, default 7.")
