@@ -354,6 +354,7 @@ _SCRIPT = r'''
       // Read UI state at application time, so a choice made during fetch survives.
       const values = controlIds.map(id => ({id, value: byId(id).value, defaultValue: byId(id).defaultValue}));
       const opened = Array.from(document.querySelectorAll('details[open][id]'), node => node.id);
+      const groupAnchors = Array.from(document.querySelectorAll('.group-details[open] .evidence[id]'), node => node.id);
       const focus = document.activeElement.id, scroll = [window.scrollX, window.scrollY];
       byId('review-content').replaceWith(incoming.getElementById('review-content'));
       for (const saved of values) {
@@ -361,7 +362,11 @@ _SCRIPT = r'''
         if (saved.id.endsWith('-date') && saved.value === saved.defaultValue) continue;
         if (control.tagName !== 'SELECT' || Array.from(control.options).some(option => option.value === saved.value)) control.value = saved.value;
       }
-      for (const id of opened) { const detail = byId(id); if (detail) detail.open = true; }
+      for (const id of groupAnchors) { const group = byId(id)?.closest('.group-details'); if (group) group.open = true; }
+      for (const id of opened) {
+        let detail = byId(id);
+        while (detail) { detail.open = true; detail = detail.parentElement?.closest('details'); }
+      }
       document.body.dataset.generatedAt = incoming.body.dataset.generatedAt;
       document.body.dataset.sourcesVerified = incoming.body.dataset.sourcesVerified;
       document.body.classList.remove('connection-lost');
