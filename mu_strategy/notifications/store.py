@@ -41,6 +41,85 @@ class DeliveryRecord:
                 "retryable": self.retryable, "suppressed_reason": self.suppressed_reason}
 
 
+@dataclass
+class _ReviewHistory:
+    """Reconcile the existing history format without inventing missing evidence.
+
+    Old operator/TLS results do not uniquely identify a state, so retain only
+    their possible states and require the final outbox to match one of them.
+    """
+    states: frozenset[str] = frozenset()
+    attempts: int = 0
+    suppressed_reason: str | None = None
+    next_attempt_ms: int | None = None
+    retryable: frozenset[bool] = frozenset({False})
+    finished: bool = False
+
+    def consume(self, item) -> None:
+        integer(item["sequence"], minimum=1)
+        at_ms = integer(item["at_ms"])
+        action, result = item["action"], item["result"]
+        suppression_reasons = {"review_expired", "decision_changed", "source_unavailable", "signal_replaced", "historical_event"}
+        valid = True
+        if action == "recorded":
+            valid = not self.states and result in suppression_reasons | {"pending"}
+            self.states = frozenset({"pending"})
+            self.suppressed_reason = None if result == "pending" else result
+            self.next_attempt_ms = at_ms
+        elif not self.states:
+            valid = False
+        elif action == "attempt_started":
+            valid = (result == "unknown" and self.suppressed_reason is None and
+                     ("pending" in self.states or ("failed" in self.states and True in self.retryable)))
+            self.states, self.retryable = frozenset({"unknown"}), frozenset({False})
+            self.attempts += 1
+            self.finished = False
+        elif action == "attempt_finished":
+            outcomes = {
+                "smtp_accepted": ({"confirmed"}, {False}),
+                "smtp_result_unknown": ({"unknown"}, {False}),
+                "smtp_tls_error": ({"unknown", "failed"}, {False}),
+                "smtp_connection_failed": ({"failed"}, {True}),
+                "smtp_authentication_failed": ({"failed"}, {False}),
+                "smtp_recipient_refused": ({"failed"}, {False, True}),
+                "smtp_rejected": ({"failed"}, {False, True}),
+                "entry_review_expired": ({"failed"}, {False}),
+                "entry_source_unavailable": ({"failed"}, {True}),
+                "operator_checked": ({"confirmed", "failed"}, {False}),
+            }
+            valid = ("unknown" in self.states and self.attempts > 0 and result in outcomes and
+                     (not self.finished or result == "operator_checked"))
+            if valid:
+                states, retryable = outcomes[result]
+                self.states, self.retryable = frozenset(states), frozenset(retryable)
+                self.next_attempt_ms = at_ms + min(3600, 60 * 2 ** min(self.attempts - 1, 6)) * 1000
+                self.finished = True
+        elif action == "attempt_not_started":
+            valid = (self.states == {"unknown"} and not self.finished and self.attempts > 0 and
+                     result in {"source_snapshot_unavailable", "source_not_caught_up", "entry_not_reviewable"})
+            self.states, self.retryable = frozenset({"pending"}), frozenset({False})
+            self.attempts -= 1
+            self.next_attempt_ms = at_ms + 30_000
+        elif action == "suppressed":
+            valid = self.suppressed_reason is None and result in suppression_reasons
+            self.suppressed_reason = result
+        elif action == "operator_retry":
+            valid = ("failed" in self.states and self.suppressed_reason is None and
+                     self.attempts < 3 and result == "cause_fixed")
+            self.states, self.retryable = frozenset({"failed"}), frozenset({True})
+            self.next_attempt_ms = at_ms
+        else:
+            valid = False
+        if not valid:
+            raise NotificationError("incomplete or invalid delivery history")
+
+    def verify(self, expected: dict) -> None:
+        if (expected["state"] not in self.states or expected["attempts"] != self.attempts or
+                expected["suppressed_reason"] != self.suppressed_reason or
+                expected["next_attempt_ms"] != self.next_attempt_ms or expected["retryable"] not in self.retryable):
+            raise NotificationError("delivery history does not match outbox")
+
+
 class NotificationStore:
     def __init__(self, data_dir: Path):
         self.health = HealthStore(data_dir)
@@ -284,7 +363,7 @@ class NotificationStore:
             db.execute("BEGIN")
             self.validate(db)
             selected = deque(maxlen=limit)
-            window_ids = set()
+            audits = {}
             counts, all_counts = Counter(), Counter()
             total = suppressed = 0
             for row in db.execute("SELECT event_id FROM outbox ORDER BY rowid"):
@@ -293,7 +372,7 @@ class NotificationStore:
                 if not start_ms <= record.event.occurred_at_ms < end_ms:
                     continue
                 total += 1
-                window_ids.add(record.event.event_id)
+                audits[record.event.event_id] = (_ReviewHistory(), record.summary())
                 counts[record.state.value] += 1
                 suppressed += record.suppressed_reason is not None
                 selected.append({**record.summary(), "event": record.event.to_dict(), "history": []})
@@ -301,14 +380,13 @@ class NotificationStore:
             # The existing schema has no history event_id index. Scan it once,
             # validating the full window but retaining only displayed histories.
             for item in db.execute("SELECT sequence,event_id,at_ms,action,result FROM delivery_history ORDER BY sequence"):
-                if item["event_id"] not in window_ids:
+                if item["event_id"] not in audits:
                     continue
-                integer(item["sequence"], minimum=1)
-                integer(item["at_ms"])
-                if any(not isinstance(item[key], str) or not item[key] for key in ("action", "result")):
-                    raise NotificationError("invalid delivery history")
+                audits[item["event_id"]][0].consume(item)
                 if item["event_id"] in retained:
                     retained[item["event_id"]]["history"].append({key: item[key] for key in ("sequence", "at_ms", "action", "result")})
+            for audit, expected in audits.values():
+                audit.verify(expected)
             return {
                 "records": list(selected), "counts": dict(counts), "all_counts": dict(all_counts),
                 "total": total, "suppressed": suppressed, "display_limit": limit,

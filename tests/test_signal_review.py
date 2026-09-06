@@ -128,8 +128,8 @@ class SignalReviewTests(unittest.TestCase):
             for number in range(3000):
                 event = self.event(number)
                 self.store.enqueue(db, event, now_ms=NOW)
-                self.store.history(db, event.event_id, NOW + 1, "attempt_started", "unknown")
-                self.store.history(db, event.event_id, NOW + 2, "attempt_finished", "smtp_rejected")
+                self.store.claim(db, now_ms=NOW + 1)
+                self.store.finish(db, event.event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 2, code="smtp_accepted")
         statements = []
         original = self.store.connection
 
@@ -155,6 +155,67 @@ class SignalReviewTests(unittest.TestCase):
                 self.store.enqueue(db, self.event(number), now_ms=NOW)
             db.execute("UPDATE delivery_history SET action='' WHERE event_id=?", (self.event(0).event_id,))
         self.assertEqual("unavailable", self.read(display_limit=1)["sources"]["notifications"]["state"])
+
+    def test_missing_lifecycle_rows_are_not_verified_even_outside_display_limit(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.enqueue(db, self.event(1), now_ms=NOW)
+            self.store.claim(db, now_ms=NOW)
+            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
+            self.store.enqueue(db, self.event(2), now_ms=NOW)
+            original = [tuple(row) for row in db.execute("SELECT * FROM delivery_history")]
+        for action in ("recorded", "attempt_started", "attempt_finished", "all"):
+            with self.subTest(action=action):
+                with self.store.connection() as db, self.store.transaction(db):
+                    db.execute("DELETE FROM delivery_history WHERE event_id=? AND (action=? OR ?='all')",
+                               (self.event(1).event_id, action, action))
+                report = self.read(display_limit=1)
+                self.assertFalse(report["sources_verified"])
+                self.assertEqual("unavailable", report["sources"]["notifications"]["state"])
+                output = self.root / "incomplete-history.html"
+                self.assertEqual(2, main(["--data-dir", str(self.data_dir), "--output", str(output)], clock=self.clock, stdout=io.StringIO()))
+                with self.store.connection() as db, self.store.transaction(db):
+                    db.execute("DELETE FROM delivery_history")
+                    db.executemany("INSERT INTO delivery_history VALUES (?,?,?,?,?)", original)
+
+    def test_history_must_match_attempt_count_outcome_suppression_and_retry_deadline(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.enqueue(db, self.event(1), now_ms=NOW)
+            self.store.claim(db, now_ms=NOW)
+            self.store.finish(db, self.event(1).event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 1, code="smtp_accepted")
+            original = tuple(db.execute("SELECT * FROM outbox").fetchone())
+        for change in ("attempts=2", "state='failed'", "suppressed_reason='review_expired'", "next_attempt_ms=0", "retryable=1"):
+            with self.subTest(change=change):
+                with self.store.connection() as db, self.store.transaction(db):
+                    db.execute("UPDATE outbox SET " + change)
+                self.assertEqual("unavailable", self.read()["sources"]["notifications"]["state"])
+                with self.store.connection() as db, self.store.transaction(db):
+                    db.execute("UPDATE outbox SET state=?,attempts=?,next_attempt_ms=?,retryable=?,suppressed_reason=? WHERE event_id=?",
+                               (*original[2:], original[0]))
+
+    def test_valid_defer_unknown_manual_resolution_and_retry_history(self):
+        self.initialize([cycle(1)])
+        event = self.event(1)
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.enqueue(db, event, now_ms=NOW)
+            self.store.claim(db, now_ms=NOW)
+            self.store.defer_unstarted(db, event.event_id, now_ms=NOW + 1)
+        self.assertEqual("ok", self.read()["sources"]["notifications"]["state"])
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.claim(db, now_ms=NOW + 30_001)
+            self.store.finish(db, event.event_id, state=DeliveryState.UNKNOWN, now_ms=NOW + 30_002, code="smtp_tls_error")
+        self.assertEqual("ok", self.read()["sources"]["notifications"]["state"])
+        self.store.resolve(event.event_id, outcome=DeliveryState.FAILED, now_ms=NOW + 30_003)
+        self.store.retry_failed(event.event_id, now_ms=NOW + 30_004)
+        with self.store.connection() as db, self.store.transaction(db):
+            self.store.claim(db, now_ms=NOW + 30_005)
+            self.store.finish(db, event.event_id, state=DeliveryState.CONFIRMED, now_ms=NOW + 30_006, code="smtp_accepted")
+            self.store.suppress(db, event.event_id, "decision_changed", NOW + 30_007)
+        report = self.read()["sources"]["notifications"]
+        self.assertEqual("ok", report["state"])
+        self.assertEqual(2, report["records"][0]["attempts"])
+        self.assertEqual(10, len(report["records"][0]["history"]))
 
     def test_scan_safety_limit_marks_incomplete_and_returns_nonzero(self):
         self.initialize([cycle(number) for number in range(4)])
