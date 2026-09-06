@@ -17,6 +17,10 @@ python -B -m mu_strategy.commands.signal_service status --data-dir data\live
 
 重复 `--symbol` 配置显式 watchlist，例如 `--symbol MU-USDT-SWAP --symbol BTC-USDT-SWAP`；不读取动态榜单，别名归一化并去重。`--refresh-days` 默认 180，`--scan-days` 默认 28 且不能超过刷新天数。周期、超时和天数必须为正整数。没有交易启用参数。
 
+180 天是请求的滚动历史窗口；合约历史不足时，只保留实际已有数据，并在 manifest 中保留 `partial_available_history` 和实际覆盖天数，不填造上市前 K 线，也不把请求天数改小。如果 180 天窗口已完整，但首个存储月恰好是月中上市的月份，首次完整历史刷新会额外查询 OKX 公共合约信息的 `listTime`：只有首根 5m K 线与上市所在桶一致、15m/1h 起点与完整 5m 比较窗口一致时，才使用已有的 `.partial-<起点时间>.csv` 首月格式。首次发布的对应数据集记录 `verified_listing_start:listing_time_ms=...`，逻辑覆盖仍如实标记 `complete`。
+
+例如 MU 于 2026-03-04 上市，2026-09-06 请求 180 天时，不再因无法取得 3 月 1 日的上市前数据而失败。没有可信上市信息、返回起点晚于应有首根 K 线、时间矛盾或请求失败时仍拒绝发布；不会把接口截断当作上市边界。普通月初回看完整和增量刷新无需额外查询上市时间；重启后继续复用已验证的首月分段。已有 strict gate、数据新鲜度、连续性和 built/native 校验保持不变。
+
 ## 运行顺序与健康含义
 
 每轮先持久化活动阶段，再启动有界的独立进程：

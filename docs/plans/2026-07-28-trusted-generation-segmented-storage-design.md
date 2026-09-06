@@ -177,6 +177,16 @@ first reference uses the deterministic `YYYY-MM.partial-<physical_first_timestam
 compatibility path instead of poisoning the canonical month. If later incremental appends make the
 same logical window complete without acquiring month-open evidence, the generation continues to
 reference and grow that compatibility file; logical coverage alone never promotes it to canonical.
+
+A verified exchange listing boundary is another explicit reason to isolate the first month, even
+when the logical rolling window is complete (Issue #107). Refresh asks the provider for listing
+time only when a full-history start lacks month-open material. The first physical 5m bucket must
+contain listing, and parent starts must be the first full buckets over that base window. Metadata
+must identify the requested instrument and a valid past timestamp; unknown, missing, contradictory,
+or truncated starts retain strict rejection. The new generation records a listing-time warning and
+uses the same partial-start representation, without changing schema, logical coverage, or readers.
+Providers supplying custom history must supply matching listing evidence explicitly; their candles
+are never automatically paired with unrelated live metadata.
 A later full-history response with complete month-open evidence can create separate canonical
 evidence while the old exact generation remains readable. A later wider
 request can move `start_row` earlier inside a complete stored month without prepending rows or
