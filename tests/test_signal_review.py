@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from dataclasses import replace
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -120,6 +121,40 @@ class SignalReviewTests(unittest.TestCase):
             self.assertEqual(2, len(report["sources"][name]["records"]))
             self.assertTrue(report["sources"][name]["display_truncated"])
         self.assertIn("筛选仅作用于这些明细", render_signal_review(report))
+
+    def test_large_notification_window_reads_history_once_and_retains_complete_display_history(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            for number in range(3000):
+                event = self.event(number)
+                self.store.enqueue(db, event, now_ms=NOW)
+                self.store.history(db, event.event_id, NOW + 1, "attempt_started", "unknown")
+                self.store.history(db, event.event_id, NOW + 2, "attempt_finished", "smtp_rejected")
+        statements = []
+        original = self.store.connection
+
+        @contextmanager
+        def traced_connection(**kwargs):
+            with original(**kwargs) as db:
+                db.set_trace_callback(statements.append)
+                yield db
+
+        with patch.object(self.store, "connection", traced_connection):
+            snapshot = self.store.review_snapshot(start_ms=self.window["start_ms"], end_ms=self.window["end_ms"], limit=2)
+        self.assertEqual(3000, snapshot["total"])
+        self.assertEqual(2, len(snapshot["records"]))
+        self.assertEqual([3, 3], [len(row["history"]) for row in snapshot["records"]])
+        self.assertEqual([self.event(2998).event_id, self.event(2999).event_id], [row["event_id"] for row in snapshot["records"]])
+        history_reads = [sql for sql in statements if sql.startswith("SELECT") and "FROM delivery_history" in sql]
+        self.assertEqual(1, len(history_reads))
+
+    def test_invalid_history_in_undisplayed_window_event_still_rejects_source(self):
+        self.initialize([cycle(1)])
+        with self.store.connection() as db, self.store.transaction(db):
+            for number in range(3):
+                self.store.enqueue(db, self.event(number), now_ms=NOW)
+            db.execute("UPDATE delivery_history SET action='' WHERE event_id=?", (self.event(0).event_id,))
+        self.assertEqual("unavailable", self.read(display_limit=1)["sources"]["notifications"]["state"])
 
     def test_scan_safety_limit_marks_incomplete_and_returns_nonzero(self):
         self.initialize([cycle(number) for number in range(4)])

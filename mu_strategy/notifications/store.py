@@ -284,6 +284,7 @@ class NotificationStore:
             db.execute("BEGIN")
             self.validate(db)
             selected = deque(maxlen=limit)
+            window_ids = set()
             counts, all_counts = Counter(), Counter()
             total = suppressed = 0
             for row in db.execute("SELECT event_id FROM outbox ORDER BY rowid"):
@@ -292,19 +293,22 @@ class NotificationStore:
                 if not start_ms <= record.event.occurred_at_ms < end_ms:
                     continue
                 total += 1
+                window_ids.add(record.event.event_id)
                 counts[record.state.value] += 1
                 suppressed += record.suppressed_reason is not None
-                history = []
-                for item in db.execute(
-                    "SELECT sequence,at_ms,action,result FROM delivery_history WHERE event_id=? ORDER BY sequence",
-                    (record.event.event_id,),
-                ):
-                    integer(item["sequence"], minimum=1)
-                    integer(item["at_ms"])
-                    if any(not isinstance(item[key], str) or not item[key] for key in ("action", "result")):
-                        raise NotificationError("invalid delivery history")
-                    history.append(dict(item))
-                selected.append({**record.summary(), "event": record.event.to_dict(), "history": history})
+                selected.append({**record.summary(), "event": record.event.to_dict(), "history": []})
+            retained = {record["event_id"]: record for record in selected}
+            # The existing schema has no history event_id index. Scan it once,
+            # validating the full window but retaining only displayed histories.
+            for item in db.execute("SELECT sequence,event_id,at_ms,action,result FROM delivery_history ORDER BY sequence"):
+                if item["event_id"] not in window_ids:
+                    continue
+                integer(item["sequence"], minimum=1)
+                integer(item["at_ms"])
+                if any(not isinstance(item[key], str) or not item[key] for key in ("action", "result")):
+                    raise NotificationError("invalid delivery history")
+                if item["event_id"] in retained:
+                    retained[item["event_id"]]["history"].append({key: item[key] for key in ("sequence", "at_ms", "action", "result")})
             return {
                 "records": list(selected), "counts": dict(counts), "all_counts": dict(all_counts),
                 "total": total, "suppressed": suppressed, "display_limit": limit,
