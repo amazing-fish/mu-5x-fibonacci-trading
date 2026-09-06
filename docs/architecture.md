@@ -327,6 +327,8 @@ The implemented 30-A schema, canonical fingerprint, cycle-sized JSONL commit, st
 
 The observation-only service supervisor (`signal_service.py`) runs the sole refresh command and a cache-only watchlist scan in separate bounded processes. `service_health.py` owns the strict atomic health snapshot, event cursor and per-data-directory OS instance lock. Scanner policy remains in `ScanCycle`; the service records refresh, data gate, scan and persistence as separate evidence. An interrupted active worker phase requires explicit operator recovery before another worker can start. See [signal-service.md](signal-service.md) for health semantics and Windows operations; merging this runtime does not activate a scheduled task or email delivery.
 
+The local review application stores manual fills separately: `manual_positions.py` owns manual confirmation, source binding, append-only fill revisions and the derived quantity/cost view in `positions.sqlite3` beside personal feedback. `signal_review_server.py` handles local form transport, while `viz/position_ledger.py` renders the editor and cards shared with live/static signal review. These manually recorded positions are not broker snapshots or complete `PositionStateSnapshot` inputs; shared scan/position rules and position notifications remain unconnected. See [signal-review.md](signal-review.md) for units, corrections and unknown-state boundaries.
+
 **Failure, stop, and rollback.**
 
 - `DATA_GATE_BLOCKED`: report and stop before scanner.

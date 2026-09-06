@@ -10,6 +10,7 @@ from datetime import datetime
 
 from mu_strategy.signal_review import BEIJING
 from mu_strategy.signal_feedback import FEEDBACK_STATUSES
+from mu_strategy.viz.position_ledger import render_position_cards
 
 
 OUTCOMES = {
@@ -171,7 +172,7 @@ def _feedback_form(event_id, saved, *, editable):
       </form></details>'''
 
 
-def _alert_row(record, data_dir, known_event_ids, feedback, *, editable=False) -> str:
+def _alert_row(record, data_dir, known_event_ids, feedback, *, editable=False, live=False) -> str:
     event = record["event"]
     observation = event.get("observation") or {}
     related = event.get("related_event_id")
@@ -187,12 +188,13 @@ def _alert_row(record, data_dir, known_event_ids, feedback, *, editable=False) -
     saved = feedback.get(record["event_id"], {}) if feedback is not None else None
     feedback_status = (saved.get("status", "unreviewed") if saved is not None else "unavailable") if event["kind"] == "entry_review" else ""
     feedback_html = _feedback_form(record["event_id"], saved, editable=editable) if feedback_status else ""
+    fill_link = f'<a href="/positions?event_id={record["event_id"]}#position-form">记录实际成交</a>' if live and event["kind"] == "entry_review" else ""
     return f'''<article id="event-{_e(record['event_id'])}" class="alert-row filter-row" data-kind="alert"
         data-date="{_e(_time(event['occurred_at_ms'], day_only=True))}" data-symbol="{_e(observation.get('symbol', ''))}" data-status="{_e(record['state'])}" data-feedback="{_e(feedback_status)}">
       <div class="row-time"><time>{_e(_time(event['occurred_at_ms']))}</time><span>{_e(observation.get('symbol') or '全局服务')}</span></div>
       <div class="row-main"><strong>{_e(KINDS.get(event['kind'], event['kind']))}</strong>{_badge(record['state'], DELIVERY)}
         {reason}{suppression}<span class="secondary">发送尝试 {record['attempts']} 次{deadline}</span>
-        {feedback_html}<div class="relation">{relation}</div>{_evidence(record, '查看详情', identifier='event-evidence-' + record['event_id'])}
+        {feedback_html}{fill_link}<div class="relation">{relation}</div>{_evidence(record, '查看详情', identifier='event-evidence-' + record['event_id'])}
         <details class="query" id="event-query-{record['event_id']}"><summary>只读查询命令</summary>{query}</details></div>
     </article>'''
 
@@ -223,7 +225,9 @@ def render_signal_review(report: dict, *, live=False) -> str:
     scan_rows = ''.join(_scan_group(items) for items in reversed(group_scan_records(scan_records)))
     known_event_ids = {record["event_id"] for record in alert_records}
     alert_rows = ''.join(_alert_row(item, report["data_dir"], known_event_ids, feedback["records"] if feedback["available"] else None,
-                                   editable=live and feedback["available"]) for item in reversed(alert_records))
+                                   editable=live and feedback["available"], live=live) for item in reversed(alert_records))
+    positions = report.get("positions", {"available": True, "positions": []})
+    position_cards = render_position_cards(positions, editable=live)
     totals = scans.get("counts", {})
     summary = ''.join(f'<div class="metric"><span>{_e(label)}</span><strong>{totals.get(key, 0) if "counts" in scans else "—"}</strong></div>'
                       for key, (label, _) in OUTCOMES.items())
@@ -254,9 +258,9 @@ def render_signal_review(report: dict, *, live=False) -> str:
                      f'<strong>导出快照 · 不自动更新</strong><time>生成于 {_e(generated)} 北京时间</time><span>日常查看请使用本地实时入口；此文件保留导出时的记录。</span>')
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><link rel="icon" href="data:,"><title>MU · 每日信号复盘</title><style>{_STYLE}</style></head>
+<meta name="color-scheme" content="light dark"><link rel="icon" href="data:,"><title>MU · 每日信号复盘</title><style>{REVIEW_STYLE}</style></head>
 <body data-live="{'true' if live else 'false'}" data-generated-at="{report['generated_at_ms']}" data-sources-readable="{'true' if report['sources_readable'] else 'false'}"><a class="skip" href="#main">跳到内容</a><header class="masthead"><div class="brand">MU<span>研究与观察</span></div>
-<nav aria-label="页面导航"><a href="#overview">概览</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">数据来源</a></nav></header>
+<nav aria-label="页面导航"><a href="#overview">概览</a><a href="#positions">持仓记录</a><a href="#scans">扫描记录</a><a href="#alerts">邮件记录</a><a href="#sources">数据来源</a></nav></header>
 <main id="main"><section class="intro"><div><p class="eyebrow">SIGNAL JOURNAL / 每日复盘</p><h1>每日信号复盘</h1>
 <p class="lede">扫描状态与提醒记录</p></div><div class="snapshot">{snapshot_html}</div></section>
 <div id="review-content">{notice_html}<section id="overview" aria-label="服务与记录状态"><div class="status-strip">
@@ -267,6 +271,9 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <p class="scope">{_e(scans.get('total_cycles', '—'))} 轮扫描 · {_e(scans.get('total_observations', '—'))} 条记录</p>
 <p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
 <div class="metrics">{summary}</div><h3>最近扫描</h3><ul class="latest">{latest_html}</ul></section>
+<section id="positions"><div class="section-heading"><h2>已记录持仓</h2>{'<a href="/positions#position-form">记录实际成交</a>' if live else '<span>导出快照 · 只读</span>'}</div>
+<p class="scope">所有日期 · 人工确认记录，未核对交易所账户。剩余数量按买入减卖出计算；成本均价未计费用。</p>{position_cards}
+<p class="secondary">没有实际成交记录时保持未知。持仓规则尚未接入，transition、实际杠杆与完整配置未知；不生成持仓建议。</p></section>
 <section class="filters" aria-label="筛选报告明细"><div class="section-heading"><h2>查找记录</h2><button id="reset" type="button">重置筛选</button></div>
 <div class="filter-fields"><label>起始日期<input id="from-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['from_date'])}"></label>
 <label>结束日期<input id="to-date" type="date" min="{_e(window['from_date'])}" max="{_e(window['to_date'])}" value="{_e(window['to_date'])}"></label>
@@ -294,7 +301,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <footer>MU / SIGNAL JOURNAL<span>来源可查 · 状态分开 · 不执行交易</span></footer></main><script>{_SCRIPT}</script></body></html>'''
 
 
-_STYLE = r'''
+REVIEW_STYLE = r'''
 :root{color-scheme:light dark;--paper:#f4f3ed;--surface:#fffefa;--ink:#202b28;--muted:#58645e;--line:#d5d9cf;--accent:#175c4d;--soft:#e4eee6;--warning:#7a4800;--warn-bg:#fff0d3;--danger:#a02d25;--danger-bg:#ffebe6;--good:#246048;--good-bg:#e7f1e6;--focus:#0879a0;--code:#eaede6}
 @media(prefers-color-scheme:dark){:root{--paper:#171e1c;--surface:#202a25;--ink:#eef1e8;--muted:#b7c1b8;--line:#465149;--accent:#a3dcc6;--soft:#2b4439;--warning:#ffd38e;--warn-bg:#44361f;--danger:#ffb4a9;--danger-bg:#442d29;--good:#b5deb6;--good-bg:#294131;--focus:#80d6fa;--code:#303c33}}
 *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.7 "Microsoft YaHei UI","PingFang SC",sans-serif}button,input,select{font:inherit}button,a,input,select,summary{touch-action:manipulation}a{color:var(--accent);text-underline-offset:4px}button{color:var(--accent);background:var(--surface);border:1px solid var(--line);padding:7px 13px;border-radius:4px;cursor:pointer}button:hover{background:var(--soft)}:focus-visible{outline:3px solid var(--focus);outline-offset:3px}main{max-width:1240px;margin:auto;padding:0 36px}.masthead{max-width:1240px;margin:auto;padding:22px 36px;display:flex;justify-content:space-between;gap:24px;border-bottom:1px solid var(--line)}.brand{font:bold 26px/1.2 Georgia,serif;letter-spacing:2px}.brand span{font:12px "Microsoft YaHei UI",sans-serif;margin-left:16px;letter-spacing:1px;color:var(--muted)}nav{display:flex;flex-wrap:wrap;gap:24px;align-items:center}nav a{text-decoration:none;font-size:13px}.intro{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;padding:48px 0 32px}.eyebrow{font-size:11px;font-weight:700;letter-spacing:1.8px;color:var(--accent);margin:0 0 10px}h1{font-size:38px;line-height:1.3;letter-spacing:2px;margin:0 0 12px}h2{font-size:23px;margin:0;line-height:1.4}h3{font-size:15px;font-weight:600;margin:28px 0 10px}.lede{font-size:16px;color:var(--muted);margin:0}.snapshot{max-width:330px;display:grid;gap:5px;font-size:12px;color:var(--muted);border-left:3px solid var(--accent);padding-left:16px}.snapshot strong{color:var(--ink);font-size:14px}.status-strip{display:grid;grid-template-columns:1fr 1fr 1.4fr;border:1px solid var(--line);background:var(--surface)}.status-strip>div{display:grid;align-content:start;gap:8px;padding:22px;border-left:1px solid var(--line)}.status-strip>div:first-child{border-left:0}.status-strip strong{font-size:18px;line-height:1.5}.status-strip small{color:var(--muted);font-size:12px}.status-strip .eyebrow{margin:0}section{margin-bottom:36px}.section-heading{display:flex;justify-content:space-between;gap:20px;align-items:center;margin:28px 0 12px}.section-heading>span{font-size:13px;color:var(--muted)}.section-number{font:italic 18px Georgia,serif;color:var(--muted);margin-left:12px}.scope{font-size:13px;color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);border-top:2px solid var(--accent);border-bottom:1px solid var(--line)}.metric{padding:18px 24px;display:flex;align-items:center;justify-content:space-between;border-left:1px solid var(--line)}.metric:first-child{border-left:0}.metric span{font-size:13px;color:var(--muted)}.metric strong{font:34px/1.2 Georgia,serif;font-variant-numeric:tabular-nums}.latest{list-style:none;padding:0;margin:0}.latest li{display:grid;grid-template-columns:180px 1fr auto;gap:16px;border-bottom:1px solid var(--line);padding:12px 0}.latest time{font-size:12px;color:var(--muted)}.secondary{color:var(--muted);font-size:12px}.filters{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:0 0 18px}.filter-fields{display:flex;gap:16px;flex-wrap:wrap}label{display:grid;gap:5px;font-size:12px;color:var(--muted)}input,select{min-height:40px;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px 10px;max-width:100%}.filter-fields label{min-width:180px}.inline-filter{display:flex;align-items:center;gap:10px}.record-list{border-top:1px solid var(--line)}.scan-row,.alert-row{display:grid;gap:22px;padding:20px 0;border-bottom:1px solid var(--line);grid-template-columns:160px minmax(0,1fr) 190px}.alert-row{grid-template-columns:160px minmax(0,1fr)}.row-time{font-size:12px;display:flex;flex-direction:column;gap:5px;color:var(--muted)}.row-time span{font-weight:600;color:var(--ink)}.row-main{display:flex;align-items:flex-start;flex-direction:column;gap:8px;min-width:0}.row-main>strong{font-size:15px}.badge{display:inline-block;font-size:11px;line-height:1.7;font-weight:700;padding:3px 9px;border-radius:3px;background:var(--code);color:var(--muted)}.accent{background:var(--soft);color:var(--accent)}.warning{background:var(--warn-bg);color:var(--warning)}.danger{background:var(--danger-bg);color:var(--danger)}.good{background:var(--good-bg);color:var(--good)}.row-reference{display:grid;gap:5px;align-content:start;color:var(--muted);font-size:11px}code,pre{font-family:Consolas,"SFMono-Regular",monospace;font-size:12px;overflow-wrap:anywhere;white-space:pre-wrap}.row-reference code{font-size:11px}.evidence,.query{width:100%;font-size:12px}.evidence>summary,.query>summary{color:var(--accent);cursor:pointer;padding:5px 0}.evidence pre{max-height:380px;overflow:auto;background:var(--code);padding:16px;border:1px solid var(--line);border-radius:4px;line-height:1.6;margin:8px 0}.result-count{font-size:12px;font-weight:700;color:var(--muted)}.empty{padding:24px;color:var(--muted);border:1px dashed var(--line);font-size:13px}.notice{padding:16px 20px;background:var(--warn-bg);color:var(--warning);border-left:3px solid var(--warning);margin-bottom:24px}.notice ul{margin:6px 0;padding-left:22px;font-size:13px}.error{color:var(--danger);min-height:1em;font-size:12px;margin-bottom:0}.suppression{margin:0;color:var(--warning);font-size:12px}.relation{font-size:12px;max-width:100%}.related-id{display:block;margin-top:4px}.command{display:flex;gap:12px;align-items:center;padding:12px;background:var(--code);margin:8px 0;border-radius:4px;max-width:100%}.command code{flex:1;min-width:0}.copy{flex-shrink:0;font-size:11px}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px;text-align:left}td,th{border-bottom:1px solid var(--line);padding:12px;vertical-align:top}th{white-space:nowrap}footer{display:flex;justify-content:space-between;gap:18px;font-size:11px;letter-spacing:1px;padding:28px 0;border-top:1px solid var(--line);color:var(--muted)}[hidden]{display:none!important}.sr-only,.skip{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}.skip:focus{position:fixed;top:8px;left:8px;width:auto;height:auto;clip-path:none;background:var(--surface);padding:10px;z-index:5}
@@ -465,7 +472,8 @@ _SCRIPT = r'''
 
 '''
 
-_STYLE += r'''
+REVIEW_STYLE += r'''
+.position-card{padding:18px 22px;margin:12px 0;border:1px solid var(--line);background:var(--surface)}.position-card .section-heading{margin-top:0}.position-card h3{margin:0}.position-card summary{cursor:pointer;color:var(--accent);font-size:13px;padding:5px 0}.position-numbers{display:flex;align-items:baseline;gap:28px;flex-wrap:wrap}.position-numbers>strong{font:30px Georgia,serif}.position-numbers small{font:13px "Microsoft YaHei UI",sans-serif}.position-numbers>span{font-size:13px;color:var(--muted)}.position-numbers b{color:var(--ink)}.position-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:16px 0}#position-form{padding:20px 24px;border:1px solid var(--line);background:var(--surface)}#position-form textarea{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);padding:10px;resize:vertical;width:100%;margin-bottom:12px}.confirmation{display:flex;align-items:center;gap:8px;margin:14px 0}.confirmation input{min-height:0}.save-result{color:var(--good);background:var(--good-bg);padding:12px}.position-card td{overflow-wrap:anywhere}.position-card td:last-child{min-width:90px}@media(max-width:780px){.position-fields{grid-template-columns:1fr}.position-card,#position-form{padding:16px}.position-card .section-heading{gap:6px}}@media print{#position-form{display:none}}
 .alert-filters{display:flex;gap:16px;flex-wrap:wrap}.feedback-details{width:100%;max-width:560px;margin:12px 0;border-left:2px solid var(--line);padding-left:12px}.feedback-details>summary{cursor:pointer;color:var(--accent);font-size:13px}.feedback-form{display:grid;gap:10px;margin:12px 0;max-width:560px}.feedback-form select{max-width:200px}.feedback-form textarea{font:inherit;resize:vertical;min-height:72px;padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:var(--surface);color:var(--ink);width:100%}.feedback-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.feedback-message{font-size:12px;color:var(--muted)}.feedback-note{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.feedback-snapshot{font-size:13px;color:var(--accent);margin-bottom:0}@media print{.feedback-actions{display:none}}
 
 .scan-group{grid-template-columns:160px minmax(0,1fr)}.group-details{width:100%;font-size:12px}.group-details>summary{color:var(--accent);cursor:pointer;padding:5px 0}.group-details .scan-row{grid-template-columns:140px minmax(0,1fr);padding:16px 0}.group-details .row-reference{display:none}.group-details .row-main>strong{font-size:13px}.source-summary{font-size:15px;font-weight:600;color:var(--accent);cursor:pointer;padding:12px 0}.live-actions{display:flex;gap:8px;flex-wrap:wrap}.live-actions button{font-size:12px;padding:5px 9px}.live-actions button:disabled{opacity:.65;cursor:wait}.connection-lost .snapshot{border-color:var(--danger)}.connection-lost #refresh-state,.connection-lost #connection-note{color:var(--danger)}.connection-lost .status-strip{opacity:.65}@media(max-width:780px){.scan-group,.group-details .scan-row{grid-template-columns:1fr}.group-details .row-time{font-size:11px}}@media print{.live-actions{display:none}}

@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from mu_strategy.market_data.trusted_data.contracts import SystemClock
+from mu_strategy.manual_positions import ManualPositionLedger
 from mu_strategy.notifications.events import NotificationError
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError
@@ -150,6 +151,7 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
         "started_at_ms": started_at, "generated_at_ms": clock.now_ms(), "sources": sources,
         "sources_readable": all(item["state"] == "ok" for item in sources.values()),
         "feedback": {**feedback, "path": str(feedback_store.path)},
+        "positions": ManualPositionLedger(data_dir).view(),
     }
 
 
