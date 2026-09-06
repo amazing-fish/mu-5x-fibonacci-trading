@@ -21,6 +21,7 @@ data/live/generations/**
 data/*.csv
 data/observations/
 data/*-signal-service/
+data/*-signal-review/
 data/strategy-release-candidates/
 reports/live/
 reports/*.html

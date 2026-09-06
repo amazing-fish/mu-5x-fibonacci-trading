@@ -12,6 +12,7 @@ from mu_strategy.notifications.events import NotificationError
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError
 from mu_strategy.service_health import HealthStateError, HealthStore, health_view
+from mu_strategy.signal_feedback import SignalFeedbackStore
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -139,10 +140,16 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
     except (OSError, sqlite3.Error, NotificationError):
         notifications = _source("unavailable", clock.now_ms(), "通知记录读取失败，请检查数据目录。")
     sources = {"service": service, "observations": observations, "notifications": notifications}
+    feedback_store = SignalFeedbackStore(data_dir)
+    try:
+        feedback = {"records": feedback_store.read(), "available": True}
+    except (OSError, sqlite3.Error):
+        feedback = {"records": {}, "available": False}
     return {
         "schema_version": 1, "data_dir": str(data_dir), "window": window,
         "started_at_ms": started_at, "generated_at_ms": clock.now_ms(), "sources": sources,
         "sources_readable": all(item["state"] == "ok" for item in sources.values()),
+        "feedback": {**feedback, "path": str(feedback_store.path)},
     }
 
 
