@@ -65,6 +65,18 @@ python -B -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit 
 
 早于 1h 收盘可见性修复（[#50](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/50)）的普通报告不能直接与修复后结果比较。先固定数据、代码、配置、成本和窗口，再比较结果；不将旧报告的收益数字复制为“当前表现”。
 
+## 回测末根事件契约
+
+最后一根 K 线属于已观测行情。已有持仓先沿用非时段杠杆风险、已有止损的优先级与成交函数；跳空越过卖出止损时按开盘价成交。已退出就结束该仓位，不再加仓或期末平仓。未退出时按原规则加仓、收紧止损、记录收盘标记权益；收紧后的止损不回查本根旧低点。最后仍有仓位才按末根收盘价执行一次 `end_of_data`，费用沿用现有成交及平仓函数。
+
+`second_pullback` 挂单从信号后的下一根起可成交，`signal_index + second_pullback_wait_bars` 为包含的到期根；到期范围不随输入长度截短。末根落在有效期内时仍须满足真实限价成交与日历/时段条件，过期订单不得成交。末根收盘新产生的信号没有后续执行根，不创建可执行订单或虚构成交；少于 4 根仍沿用空结果契约。
+
+入场根保留原入口差异：二次回踩成交后检查初始风险并推进一根；`direct_next_open` / `break_high` 在执行根检查一次初始风险，存活仓位在该根继续原有加仓/止损更新。末根也沿用这些行为，不额外重复风险检查、成交或扣费。
+
+追加未来 K 线不能改写共同历史区间内已应发生的风险退出时间、价格与原因。`end_of_data` 是人为终止事件，必须从此前缀不变量排除；不同结束日期的最终权益不要求相等。
+
+早于 [#117](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/117) 修复的报告可能遗漏末根止损、有效挂单或持仓管理；不能直接与修复后报告比较为同一引擎版本。完整事件循环也会在存活末根新增平仓前标记权益点；这是原标记/结算顺序的延伸，不能把两条同时间戳权益记录当作重复扣费。需在相同 generation、完整配置（含日历）、成本、窗口和依赖下重跑。具体反例、固定快照影响及未处理问题见[末根验证记录](backtest-terminal-validation.md)。
+
 ## 研究与执行之间
 
 严格候选、SCM 审批快照和 exact-ID release resolver 已实现，但当前仓库未保存已批准策略 release。第一阶段研究无需靠发布 release 才能开展；第二阶段执行前置由 [#100](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/100) 承接，详见[产品路线](product-roadmap.md)。不得用 mock release、自动挑最高收益或宽松 resolver 接通执行。
