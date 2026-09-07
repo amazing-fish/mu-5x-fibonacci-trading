@@ -1,0 +1,146 @@
+name: PR118 isolated backtest audit
+
+on:
+  push:
+    branches:
+      - audit/pr118-replay-20260908
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out the exact merged implementation
+        uses: actions/checkout@v4
+        with:
+          ref: 21545f860bc5ad06f8b6fd119f0180896899228f
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Package the unmodified public source and tracked data
+        run: |
+          mkdir -p audit-output
+          python - <<'PY'
+          import hashlib, json, platform, subprocess, sys, zipfile
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          paths = subprocess.check_output(['git','ls-files','-z']).decode().split('\0')
+          target = Path('audit-output/source.zip')
+          with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as z:
+              for name in paths:
+                  if name and Path(name).is_file():
+                      z.write(name, name)
+          meta = {'commit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+                  'python': sys.version, 'platform': platform.platform(),
+                  'timezone': str(ZoneInfo('America/New_York')),
+                  'source_zip_sha256': hashlib.sha256(target.read_bytes()).hexdigest()}
+          Path('audit-output/environment.json').write_text(json.dumps(meta, indent=2))
+          print(json.dumps(meta))
+          PY
+      - name: Export source for independent local replay
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr118-source-21545f86
+          path: |
+            audit-output/source.zip
+            audit-output/environment.json
+          retention-days: 7
+      - name: Attempt public market refresh in an isolated directory
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys, time
+          from pathlib import Path
+          out = Path('audit-output')
+          data = Path(os.environ['RUNNER_TEMP']) / 'pr118-market'
+          cmd = [sys.executable, '-B', '-m', 'mu_strategy.commands.refresh_market_data',
+                 '--symbol', 'MU-USDT-SWAP', '--days', '180', '--data-dir', str(data),
+                 '--html-output', str(out.resolve()/'data-health.html')]
+          start = time.time()
+          with (out/'refresh.log').open('w') as log:
+              try:
+                  result = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=300)
+                  record = {'returncode': result.returncode, 'timed_out': False}
+              except subprocess.TimeoutExpired:
+                  record = {'returncode': None, 'timed_out': True}
+          record.update({'command':cmd, 'data_dir':str(data), 'elapsed_seconds':time.time()-start})
+          (out/'refresh.json').write_text(json.dumps(record, indent=2))
+          print(json.dumps(record))
+          PY
+      - name: Select a strictly validated generation and run backtests
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, sys, zipfile
+          from pathlib import Path
+          from mu_strategy.research.historical_data import HistoricalGenerationError, HistoricalTrustedGenerationReader, load_historical_window
+          from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
+          out = Path('audit-output').resolve()
+          fresh = Path(os.environ['RUNNER_TEMP'])/'pr118-market'
+          reasons = []
+          chosen = None
+          for mode, root in [('fresh_public_refresh', fresh), ('tracked_historical_fallback', Path('data/live').resolve())]:
+              candidates = []
+              for p in (root/'generations').glob('*/manifest.json'):
+                  try:
+                      payload = json.loads(p.read_text())
+                      candidates.append((payload.get('completed_at_ms',0), p.parent.name))
+                  except (ValueError,OSError) as exc:
+                      reasons.append({'mode':mode,'manifest':p.parent.name,'error':str(exc)})
+              for _, gid in sorted(candidates, reverse=True):
+                  try:
+                      generation = HistoricalTrustedGenerationReader(data_dir=root).read(run_id=gid, symbol='MU-USDT-SWAP')
+                      end = min(bars[-1].open_time_ms + interval_to_ms(interval) for interval,bars in generation.candles_by_interval.items())
+                      end -= end % 3600000
+                      first = max(generation.candles_by_interval[k][0].open_time_ms for k in ('15m','1h'))
+                      days = min(180, (end-first)//DAY_MS)
+                      if days < 14:
+                          raise HistoricalGenerationError('less than 14 full days available')
+                      window = load_historical_window(data_dir=root, generation_id=gid, symbol='MU-USDT-SWAP', days=days)
+                      chosen = {'mode':mode,'generation_id':gid,'data_dir':str(root), 'days':days,
+                                'start_ms':window.start_ms,'end_ms':window.end_ms,'published_at_ms':generation.completed_at_ms,
+                                'dataset':generation.reference.to_dict(), 'rejected_candidates':reasons}
+                      break
+                  except (HistoricalGenerationError, ValueError, OSError) as exc:
+                      reasons.append({'mode':mode,'generation_id':gid,'error':str(exc)})
+              if chosen:
+                  break
+              reasons.append({'mode':mode,'status':'no usable generation'})
+          if chosen is None:
+              (out/'selection.json').write_text(json.dumps({'status':'blocked','reasons':reasons}, indent=2))
+              raise SystemExit('No strictly usable generation; no backtest was run')
+          (out/'selection.json').write_text(json.dumps(chosen, indent=2))
+          print('AUDIT_SELECTION='+json.dumps(chosen))
+          with zipfile.ZipFile(out/'market.zip','w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(Path(chosen['data_dir']).rglob('*')):
+                  if p.is_file():
+                      z.write(p,p.relative_to(chosen['data_dir']).as_posix())
+          for days,fee in [(chosen['days'],'market'),(chosen['days'],'limit'),(14,'market')]:
+              name=f'baseline-{days}d-{fee}'
+              cmd=[sys.executable,'-B','-m','mu_strategy.cli','--generation-id',chosen['generation_id'],
+                   '--data-dir',chosen['data_dir'],'--days',str(days),'--strategy','baseline',
+                   '--fee-profile',fee,'--report',str(out/(name+'.md'))]
+              with (out/(name+'.log')).open('w') as log:
+                  subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=90)
+          cmd=[sys.executable,'-B','-m','mu_strategy.visualize','--generation-id',chosen['generation_id'],
+               '--data-dir',chosen['data_dir'],'--days',str(chosen['days']),'--strategy','baseline',
+               '--output',str(out/'baseline.html')]
+          with (out/'visualize.log').open('w') as log:
+              subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=90)
+          PY
+      - name: Run the full merged test suite
+        run: |
+          python -B -m unittest discover -s tests > audit-output/unittest.log 2>&1
+          tail -n 8 audit-output/unittest.log
+      - name: Export complete evidence even if refresh or tests failed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr118-replay-evidence-21545f86
+          path: audit-output/
+          retention-days: 7
