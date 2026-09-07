@@ -42,7 +42,7 @@ from mu_strategy.research.strategy_releases import (
     ReleaseDecision,
     ScmReviewSnapshotV1,
     SelectionReasonCode,
-    StrategyConfigPayloadV1,
+    StrategyConfigPayloadV2,
     StrategyReleaseApprovalV1,
     StrategyReleaseCandidateV1,
     StrategyReleaseResolutionError,
@@ -606,7 +606,7 @@ def _observation(
 
 
 def _release(*, evaluated_code_commit_sha="a" * 40, review_record_id="1"):
-    config = StrategyConfigPayloadV1.from_config(baseline_strategy_group("MU-USDT-SWAP").config)
+    config = StrategyConfigPayloadV2.from_config(baseline_strategy_group("MU-USDT-SWAP").config)
     candidate = StrategyReleaseCandidateV1.create(
         strategy_rule_id=STRATEGY_RELEASE_V1_RULE_ID,
         strategy_name="baseline",

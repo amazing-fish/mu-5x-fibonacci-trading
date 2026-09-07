@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "default_calendar": "weekday_windows_v1",
+  "symbols": {
+    "MU-USDT-SWAP": "us_equities_2025_2028_v1",
+    "SPCX-USDT-SWAP": "us_equities_2025_2028_v1",
+    "META-USDT-SWAP": "us_equities_2025_2028_v1"
+  }
+}

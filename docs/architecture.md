@@ -5,7 +5,7 @@ doc_kind: reference
 
 # 架构与模块建设现状
 
-核对基线：2026-09-07，基于 main [ffc83975](https://github.com/amazing-fish/mu-5x-fibonacci-trading/commit/ffc83975b72132ad4fb2dba2631f805714670942)（含 PR #114）及本次 #85 baseline 持仓复核实现。本文说明仓库中的实现和接入；未以此验证实际服务存活、收件箱或连续运行数据，不据此宣布部署、运维或策略效果验收完成。
+核对基线：2026-09-07，基于 main [f63fa14c](https://github.com/amazing-fish/mu-5x-fibonacci-trading/commit/f63fa14cbd95af9f3cf65534ba60a2662631adcb)（含 PR #115）及本次日历与复盘改进。本文说明仓库中的实现和接入；未以此验证实际服务存活、收件箱或连续运行数据，不据此宣布部署、运维或策略效果验收完成。
 
 ## 从最终工作反推模块
 
@@ -18,7 +18,7 @@ doc_kind: reference
 | 模块 / 必须回答的问题 | 已有建设与真实接入 | 仍缺什么 / 所属工作 |
 |---|---|---|
 | **可信行情**：输入是否完整、同源、可重放 | `market_data.trusted_data` 分开刷新和读取；v4 月分段、hash/时序/多周期校验、固定 generation、上市月起点验证均有实现，研究和扫描已消费。 | 数据驻留、GC 不在当前实现。#107 的冷启动代码已合并，Issue 仍开放；运维验收须另查。 |
-| **策略规则**：同样输入是否得到同样判断 | `strategy.py` 提供固定配置、指标过滤和入场规则；`strategies.registry` 统一名称/别名/默认集合；`position_rules` 被回测、shadow 和人工 baseline 复核复用。 | 人工复核只支持明确映射的有效买入和 baseline；卖出后状态、延迟 transition 与管理邮件仍归 #85。 |
+| **策略规则**：同样输入是否得到同样判断 | `strategy.py` 提供固定配置、指标过滤和入场规则；`strategies.registry` 统一名称/别名/默认集合，并读取独立标的日历配置；`core.trading_calendar` 为扫描、回测、加仓与风险检查提供共同的时段交集；`position_rules` 被回测、shadow 和人工 baseline 复核复用。 | 人工复核只支持明确映射的有效买入和 baseline；卖出后状态、延迟 transition 与管理邮件仍归 #85。 |
 | **回测与实验**：假设如何被检验 | `backtest.py` 承担 OHLC 成交和权益模拟；walk-forward、Fibonacci 扫描、候选 ladder 均有入口。普通回测/HTML/ladder 支持固定历史 generation。 | 全 registry 的同快照 robustness 比较未完成（#83）；部分 HTML/walk-forward 单笔收益标签待明确（#88）。 |
 | **研究解释与结论**：收益靠什么、是否可比较 | `research.robustness` 提供基准、top-N 集中度、stage 分布；`candidate_conclusions` 保存严格候选结论；ladder 披露实际配置杠杆和账户收益。 | 短样本、不同风险预算及样本外/前瞻证据仍归 #99；reader 异常边界 #96，候选名单解耦 #101。`mu_current` 返回 baseline 名称，不是持续策略选择系统。 |
 | **候选标的选择**：固定策略应用到谁 | `selection.basket.rank_candidates` 提供离线候选行排序；实时 universe 由可信 manifest 和 watchlist 提供。 | 只有基础排序，尚无完整候选池状态、跨标的证据与自动选优闭环；不能把 Top universe 当策略选股结果。扩展依 #73/#99 的实际研究需求。 |
@@ -27,7 +27,7 @@ doc_kind: reference
 | **人工反馈与持仓事实**：用户实际做了什么 | `manual_positions` 保存成交及更正、当前阶段/止损和独立管理输入；`position_management` 将明确的买入阶段投影为共享规则输入，固定当前可信 generation，按需检查确认后的完整区间。视图区分未知、失效、行情阻断与候选。 | 人工记录未经交易所核对，不能声称账户全量。建议不写回事实；账本级 `management_status` 不代表评估结果。卖出后映射、延迟 transition、持仓事件/邮件及 OKX 真实来源仍待完成（#85/#90）。 |
 | **执行规划与持久构件**：动作能否绑定证据与授权 | `execution` 已有类型化决策、`OrderIntentFactory`、instrument rounding、`SQLiteExecutionStore` 和审计/预留契约。 | factory/store 尚未接入现有 Demo 编排，仓库 `config/` 未包含已批准 release。真实 release 和 scan→intent→授权→reserve→adapter 归 #100。 |
 | **OKX 适配与受控 Demo**：允许哪些外部动作 | `live.okx` 支持只读账户、shadow 和显式确认的 Demo；现有 Demo 应用有买入、敞口限制、确定性 `clOrdId` 及部分失效 bot 限价单撤销。 | 不具备完整成交去重、仓位/余额对账、unknown 恢复、退出保护及风险停机闭环（#100）。Production 未实现（#7）。 |
-| **可视化与使用入口**：人能否理解和复核 | `viz` 已渲染回测、数据健康、入场/shadow 看板和每日复盘；`commands` 与兼容 CLI 提供操作入口。复盘支持实时更新、反馈及人工台账。 | 展示不是权威策略或账户状态；#88 仍有收益标签工作，#99 仍需冻结实验与前瞻评估。没有统一自动交易控制台。 |
+| **可视化与使用入口**：人能否理解和复核 | `viz` 已渲染回测、数据健康、入场/shadow 看板和每日复盘；`commands` 与兼容 CLI 提供操作入口。复盘支持实时更新、反馈及人工台账，分开当前日历限制与已核实的最近扫描，提供按需原始记录。新观察 v2 保存评估 K 线及日历依据；v1 严格保留原字段与 hash。 | 展示不是权威策略或账户状态；#88 仍有收益标签工作，#99 仍需冻结实验与前瞻评估。没有统一自动交易控制台。 |
 
 ## 已接通的证据流
 

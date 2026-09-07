@@ -280,6 +280,7 @@ def write_generation_manifest_and_caches(
     run_id: str = "run-1",
     universe_symbols: tuple[str, ...] | None = None,
     stock_token_symbols: tuple[str, ...] | None = None,
+    start_ms: int = 0,
 ) -> dict:
     from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
     from mu_strategy.market_data.utils import DAY_MS
@@ -289,7 +290,7 @@ def write_generation_manifest_and_caches(
     if not generation_dir.exists():
         store.prepare_generation(run_id)
     five = [
-        Candle(index * 300_000, 100.0 + index, 101.0 + index, 99.0 + index, 100.0 + index, 1000.0)
+        Candle(start_ms + index * 300_000, 100.0 + index, 101.0 + index, 99.0 + index, 100.0 + index, 1000.0)
         for index in range(days * DAY_MS // 300_000)
     ]
     rows_by_interval = {"5m": five, "15m": aggregate_candles(five, interval="15m"), "1h": aggregate_candles(five, interval="1h")}
@@ -318,7 +319,7 @@ def write_generation_manifest_and_caches(
             "rows": len(rows),
             "first_timestamp_ms": rows[0].open_time_ms,
             "last_timestamp_ms": rows[-1].open_time_ms,
-            "updated_at_ms": 86_400_000,
+            "updated_at_ms": start_ms + 86_400_000,
             "source_file": store.generation_source_file(symbol, interval).as_posix(),
             "content_sha256": candles_content_sha256(rows) if integrity == "valid" else None,
             "validation": {"ok": integrity == "valid", "reason": "ok" if integrity == "valid" else reason},
@@ -338,8 +339,8 @@ def write_generation_manifest_and_caches(
             "stale": SnapshotUsability.STALE.value,
             "invalid": SnapshotUsability.INVALID.value,
         }.get(status, status),
-        "started_at_ms": 0,
-        "completed_at_ms": 0,
+        "started_at_ms": start_ms,
+        "completed_at_ms": start_ms,
         "requested_intervals": ["15m", "1h"],
         "effective_intervals": ["5m", "15m", "1h"],
         "universes": {

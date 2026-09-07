@@ -9,6 +9,8 @@ created: 2026-07-12
 
 The Stage 0 observation log is durable evidence of what the strict trusted-data gate and typed scanner observed. It is not an `OrderIntent`, confirmation, broker request, mutation reservation, idempotency ledger, or authorization to call a broker.
 
+New cycles/observations use schema v2. The scanner records the evaluated 15m candle open/close, reference calendar ID/hash, session and strategy windows in `scan_result`; these fields participate in its result fingerprint. `signal_time_ms` still identifies the signal candle. V1 records retain their exact original wire shape/hash and have no inferred candle/calendar context. Versions may coexist as separate cycles in one log; mismatched cycle/observation versions or unknown/missing fields fail. Calendar/time gates precede indicators after trusted-data validation; unavailable calendars fail scanning, while known closed sessions produce a typed input-stage wait. See [calendar semantics](trading-calendar.md).
+
 The dry-run demo command enables this sidecar by default:
 
 ```powershell

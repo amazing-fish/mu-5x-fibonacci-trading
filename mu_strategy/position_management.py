@@ -12,7 +12,7 @@ from mu_strategy.live_exit import evaluate_exit
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2, parse_strategy_config_payload
 from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot, decide_pyramid_add
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -25,7 +25,7 @@ MAX_MAPPED_FILLS = 32
 def baseline_configuration(symbol):
     """The selectable template, not a reconstruction of the entry signal."""
     group = baseline_strategy_group(symbol)
-    payload = StrategyConfigPayloadV1.from_config(group.config)
+    payload = StrategyConfigPayloadV2.from_config(group.config)
     return {"strategy_name": group.name, "strategy_rule_id": group.rule.strategy_rule_id,
             "configuration": payload.to_dict(), "configuration_sha256": payload.strategy_config_sha256}
 
@@ -79,7 +79,7 @@ def management_checks(position):
         {"key": "mapping", "label": "全部有效买入已明确映射到连续策略阶段", "ok": False},
     ]
     if inputs is not None:
-        config = StrategyConfigPayloadV1.from_dict(inputs["configuration"]).to_strategy_config()
+        config = parse_strategy_config_payload(inputs["configuration"]).to_strategy_config()
         group = baseline_strategy_group(position["symbol"])
         checks[4]["ok"] = (
             inputs["strategy_name"] == "baseline" and inputs["strategy_rule_id"] == group.rule.strategy_rule_id
@@ -163,11 +163,11 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         if candles[first_index].open_time_ms != first_open or first_index < 35 or sum(
                 candle.open_time_ms + 3_600_000 <= first_open for candle in hourly) < 35:
             raise ValueError("review range or indicator history is incomplete")
-        config_payload = StrategyConfigPayloadV1.from_dict(inputs["configuration"])
+        config_payload = parse_strategy_config_payload(inputs["configuration"])
         # Keep the selected complete baseline immutable. Only this risk input
         # uses the separately confirmed actual leverage, with separate identity.
         config = replace(config_payload.to_strategy_config(), leverage=float(inputs["actual_leverage"]))
-        effective_payload = StrategyConfigPayloadV1.from_config(config)
+        effective_payload = type(config_payload).from_config(config)
         provenance["effective_configuration_sha256"] = effective_payload.strategy_config_sha256
         projected = project_rule_fills(position, inputs)
         snapshot = PositionStateSnapshot(
@@ -183,14 +183,19 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         rsi_values, hist = rsi(closes), macd(closes)[2]
         earliest_exit = None
         latest = None
+        calendar_error = None
         for index in range(first_index, len(candles)):
             latest = evaluate_exit(snapshot, candles[index], index=index, candles=candles,
                                    regime=hourly_context[candles[index].open_time_ms], config=config)
+            calendar_error = calendar_error or latest.calendar_error
             if latest.exit_triggered and earliest_exit is None:
                 earliest_exit = asdict(latest)
         last = candles[-1]
         addition = None
         if earliest_exit is None:
+            if calendar_error:
+                return {**result, "status": "data_blocked", "calendar_error": calendar_error,
+                        "messages": ["已检查确认止损；参考日历不可用，无法完成退出与加仓条件复核。"]}
             addition = asdict(decide_pyramid_add(
                 snapshot, last, rsi_value=rsi_values[-1], macd_hist=hist[-1], previous_macd_hist=hist[-2],
                 regime=hourly_context[last.open_time_ms], config=config,
@@ -205,11 +210,13 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
             "latest_close": last.close, "regime": hourly_context[last.open_time_ms], "addition": addition,
             "projected_fills": projected, "actual_leverage": inputs["actual_leverage"],
             "transition_state": "not_used_by_baseline",
+            "calendar_error": calendar_error,
         }
         provenance["review_identity"] = canonical_sha256({
             "position_id": position["position_id"], "provenance": {key: value for key, value in provenance.items() if key != "evaluated_at_ms"},
             "first_open_ms": first_open, "last_open_ms": last.open_time_ms,
         })
-        return {**result, "status": "evaluated", "messages": [], "evaluation": evaluation}
+        messages = ["参考日历不可用；已确认触及退出条件，日历相关风险条件仍未知，加仓未评估。"] if calendar_error else []
+        return {**result, "status": "partial" if calendar_error else "evaluated", "messages": messages, "evaluation": evaluation}
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return {**result, "status": "data_blocked", "messages": ["行情或规则输入不足以完整复核本次确认后的区间，请检查来源与覆盖范围。"]}

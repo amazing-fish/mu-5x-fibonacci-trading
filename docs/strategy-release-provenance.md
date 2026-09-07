@@ -12,7 +12,7 @@ R0 separates a named research strategy from an execution-eligible strategy relea
 ## Identities
 
 - `strategy_rule_id` is the registry-owned semantic rule identity. The MU baseline is `mu.baseline.second_pullback.long_limit.v1`.
-- `strategy_config_sha256` binds every field in the frozen v1 `StrategyConfig` payload. Canonical serialization rejects missing, extra, non-canonical, and non-finite values.
+- `strategy_config_sha256` binds every field in its explicitly versioned frozen `StrategyConfig` payload. New v2 payloads include the reference calendar ID and content hash; v1 retains its exact historical fields/hash and weekday-window semantics. Both codecs reject missing, extra, non-canonical, and non-finite values; unknown versions fail. See [calendar versioning](trading-calendar.md#来源版本与历史).
 - `candidate_fingerprint` binds the rule, full config, exact evaluated Git SHA, pinned trusted generation and interval hashes, experiment windows, assumptions, and result summaries.
 - `strategy_release_id` is `sr1_` plus the SHA-256 of the unchanged candidate and a verified approval snapshot. The snapshot includes its closed `approval_mode`, so changing only the mode changes both `snapshot_sha256` and `strategy_release_id`.
 

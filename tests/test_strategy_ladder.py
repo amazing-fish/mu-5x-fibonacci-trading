@@ -114,7 +114,7 @@ class StrategyLadderSignalTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 10 * DAY_MS
+            now_ms = 1_780_300_800_000 + 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="BTC-USDT-SWAP",
@@ -1082,7 +1082,7 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 10 * DAY_MS
+            now_ms = 1_780_300_800_000 + 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="MU-USDT-SWAP",
@@ -1109,7 +1109,7 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 10 * DAY_MS
+            now_ms = 1_780_300_800_000 + 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="MU-USDT-SWAP",
@@ -1196,7 +1196,7 @@ class StrategyLadderTrustedDataTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
-            now_ms = 10 * DAY_MS
+            now_ms = 1_780_300_800_000 + 10 * DAY_MS
             write_generation_publication(
                 data_dir,
                 symbol="MU-USDT-SWAP",
@@ -1333,14 +1333,15 @@ def _hourly_candle(hour: int, price: float) -> Candle:
 
 
 def _walk_forward_candles(*, days: int) -> tuple[list[Candle], list[Candle]]:
+    start = 1_780_300_800_000  # 2026-06-01, within the pinned calendar.
     quarter_count = days * 24 * 4
     hourly_count = days * 24
     candles_15m = [
-        Candle(index * QUARTER_HOUR_MS, 100 + index / 10, 101 + index / 10, 99 + index / 10, 100.5 + index / 10, 1_000)
+        Candle(start + index * QUARTER_HOUR_MS, 100 + index / 10, 101 + index / 10, 99 + index / 10, 100.5 + index / 10, 1_000)
         for index in range(quarter_count)
     ]
     candles_1h = [
-        Candle(index * HOUR_MS, 100 + index / 2, 101 + index / 2, 99 + index / 2, 100.5 + index / 2, 4_000)
+        Candle(start + index * HOUR_MS, 100 + index / 2, 101 + index / 2, 99 + index / 2, 100.5 + index / 2, 4_000)
         for index in range(hourly_count)
     ]
     return candles_15m, candles_1h

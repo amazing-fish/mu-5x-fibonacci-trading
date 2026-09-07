@@ -19,7 +19,7 @@ from mu_strategy.research.strategy_releases import (
     FillModel,
     PartialFillModel,
     SelectionReasonCode,
-    StrategyConfigPayloadV1,
+    StrategyConfigPayloadV2,
     StrategyReleaseCandidateV1,
 )
 from mu_strategy.research.strategy_artifact_publication import (
@@ -80,7 +80,7 @@ def build_strategy_release_candidate(
     )
 
     group = baseline_strategy_group(request.symbol)
-    config_payload = StrategyConfigPayloadV1.from_config(group.config)
+    config_payload = StrategyConfigPayloadV2.from_config(group.config)
     assumptions = BacktestAssumptionsV1(
         starting_equity="10000",
         fee_profile=group.config.fee_profile,

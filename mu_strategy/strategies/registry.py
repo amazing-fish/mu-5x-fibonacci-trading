@@ -90,7 +90,9 @@ def validate_strategy_rule_descriptors(descriptors: tuple[StrategyRuleDescriptor
 
 def _config(**kwargs) -> "StrategyConfig":
     from mu_strategy.strategy import StrategyConfig
+    from mu_strategy.strategies.instruments import instrument_calendar
 
+    kwargs.setdefault("trading_calendar_id", instrument_calendar(kwargs.get("symbol", "MUUSDT")))
     return StrategyConfig(**kwargs)
 
 

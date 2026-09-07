@@ -31,7 +31,7 @@ class WalkForwardTests(unittest.TestCase):
     def test_main_is_cache_only_and_defaults_to_trusted_live_store(self):
         from mu_strategy.experiments import walk_forward
 
-        now_ms = 20 * DAY_MS
+        now_ms = 1_780_300_800_000 + 20 * DAY_MS  # 2026-06-01 UTC + 20 days
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from mu_strategy.core.trading_calendar import LEGACY_CALENDAR, calendar_sha256, evaluate_trading_window
 
 from mu_strategy.models import (
     Candle,
@@ -83,8 +83,15 @@ class StrategyConfig:
     trading_windows_et: tuple[tuple[str, str], ...] = field(
         default_factory=lambda: (("09:45", "11:30"), ("14:30", "15:45"))
     )
+    trading_calendar_id: str = LEGACY_CALENDAR
+    trading_calendar_sha256: str | None = None
 
     def __post_init__(self) -> None:
+        digest = calendar_sha256(self.trading_calendar_id)
+        if self.trading_calendar_sha256 is None:
+            object.__setattr__(self, "trading_calendar_sha256", digest)
+        elif self.trading_calendar_sha256 != digest:
+            raise ValueError("trading calendar digest does not match its version")
         profile = normalize_fee_profile(self.fee_profile)
         object.__setattr__(self, "fee_profile", profile)
         if self.fee_rate is None:
@@ -345,20 +352,7 @@ def recent_higher_low(candles: list[Candle], index: int, lookback: int = 8) -> f
 
 
 def is_preferred_us_cash_window(open_time_ms: int, config: StrategyConfig) -> bool:
-    try:
-        eastern = ZoneInfo("America/New_York")
-    except Exception:
-        eastern = timezone.utc
-    dt = datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc).astimezone(eastern)
-    if dt.weekday() >= 5:
-        return False
-    minutes = dt.hour * 60 + dt.minute
-    for start, end in config.trading_windows_et:
-        start_minutes = _parse_hhmm(start)
-        end_minutes = _parse_hhmm(end)
-        if start_minutes <= minutes <= end_minutes:
-            return True
-    return False
+    return evaluate_trading_window(open_time_ms, config).allowed
 
 
 def _parse_hhmm(value: str) -> int:
