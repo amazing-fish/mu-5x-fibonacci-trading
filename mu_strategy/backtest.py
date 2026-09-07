@@ -72,9 +72,8 @@ def run_backtest(
     pending_entry: PendingEntry | None = None
 
     index = 1
-    while index < len(candles_15m) - 1:
+    while index < len(candles_15m):
         candle = candles_15m[index]
-        next_candle = candles_15m[index + 1]
 
         if position is None:
             if config.entry_execution == "second_pullback" and pending_entry is not None:
@@ -124,6 +123,10 @@ def run_backtest(
                     index += 1
                     continue
 
+            # Pending orders consume the current bar, including the final one.
+            # A new close-confirmed signal needs a real later execution bar.
+            if index + 1 >= len(candles_15m):
+                break
             if not is_preferred_us_cash_window(candle.open_time_ms, config):
                 index += 1
                 continue
@@ -149,11 +152,12 @@ def run_backtest(
             if config.entry_execution == "second_pullback":
                 pending_entry = PendingEntry(
                     fib_level=fib_level,
-                    expires_index=min(len(candles_15m) - 2, index + config.second_pullback_wait_bars),
+                    expires_index=index + config.second_pullback_wait_bars,
                 )
                 index += 1
                 continue
 
+            next_candle = candles_15m[index + 1]
             execution = should_execute_entry(candles_15m, index, next_candle, fib_level, regime, config)
             if not execution.allowed or execution.entry_price is None:
                 index += 1
@@ -195,7 +199,10 @@ def run_backtest(
             index += 1
             continue
 
-        if _has_non_session_liquidation_risk(candle, position, config):
+        # Next-bar execution above has already checked this fill bar's initial
+        # risk. Its surviving position still receives normal add/stop updates.
+        entry_bar_risk_checked = position.fills[0].time_ms == candle.open_time_ms
+        if not entry_bar_risk_checked and _has_non_session_liquidation_risk(candle, position, config):
             exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
             equity, trade = _close_position(
                 position,
@@ -211,7 +218,7 @@ def run_backtest(
             index += 1
             continue
 
-        if candle.low <= position.stop_price:
+        if not entry_bar_risk_checked and candle.low <= position.stop_price:
             exit_price = _sell_stop_fill_price(candle, position.stop_price)
             equity, trade = _close_position(
                 position,
