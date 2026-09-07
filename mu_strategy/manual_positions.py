@@ -13,7 +13,7 @@ from pathlib import Path
 from mu_strategy.notifications.events import AlertKind
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.position_management import MAX_MAPPED_FILLS, baseline_configuration, project_rule_fills
-from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2, parse_strategy_config_payload
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -82,7 +82,7 @@ def _management_record(record, position):
                 "fill_stages", "fill_revisions", "fill_sequence", "state_revision", "confirmed_at_ms", "note"}
     if not isinstance(record, dict) or set(record) != expected or type(record["schema_version"]) is not int or record["schema_version"] != 1:
         raise ValueError("invalid management input record")
-    configuration = StrategyConfigPayloadV1.from_dict(record["configuration"])
+    configuration = parse_strategy_config_payload(record["configuration"])
     if (configuration.strategy_config_sha256 != record["configuration_sha256"]
             or configuration.to_strategy_config().symbol != position["symbol"]
             or record["strategy_name"] != "baseline"

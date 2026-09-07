@@ -35,7 +35,7 @@ from mu_strategy.research.strategy_releases import (
     ExperimentWindowRole,
     FillModel,
     PartialFillModel,
-    StrategyConfigPayloadV1,
+    StrategyConfigPayloadV2,
     StrategyReleaseCandidateV1,
     TrustedExperimentDatasetV1,
 )
@@ -307,7 +307,7 @@ class CandidateGenerationTests(unittest.TestCase):
             self.assertEqual(group.rule.strategy_rule_id, candidate.strategy_rule_id)
             self.assertEqual(group.name, candidate.strategy_name)
             self.assertEqual(
-                StrategyConfigPayloadV1.from_config(group.config).to_dict(),
+                StrategyConfigPayloadV2.from_config(group.config).to_dict(),
                 candidate.strategy_config.to_dict(),
             )
             self.assertEqual(
@@ -593,7 +593,7 @@ def _synthetic_generation_and_windows(
     *,
     hours_per_window: int = 1,
 ) -> tuple[HistoricalTrustedGeneration, tuple[ExperimentWindow, ...]]:
-    start = 1_700_000_000_000
+    start = 1_780_300_800_000  # 2026-06-01, inside the pinned reference calendar.
     interval_ms = 900_000
     total_hours = 3 * hours_per_window
     candles_15m = tuple(

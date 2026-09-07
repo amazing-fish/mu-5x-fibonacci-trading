@@ -215,7 +215,7 @@ class PositionManagementTests(PositionManagementFixture):
         self.assertNotEqual(low_risk["provenance"]["effective_configuration_sha256"], high_risk["provenance"]["effective_configuration_sha256"])
 
     def test_latest_shared_add_candidate_does_not_write_a_fill(self):
-        at = int(datetime(2026, 9, 7, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        at = int(datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
         identity = self.ready(at=at)
         loader = self.loader(end=at + 4 * BAR_MS, trend=True)
         before = self.position(identity)

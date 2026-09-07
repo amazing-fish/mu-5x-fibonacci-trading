@@ -17,7 +17,7 @@ from mu_strategy.research.historical_data import (
     replay_html,
     validate_replay_outputs,
 )
-from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2
 from mu_strategy.models import BacktestResult, Candle, Trade
 from mu_strategy.reporting import _format_float, coverage_duration_label
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig, fee_profile_label, with_fee_profile
@@ -65,7 +65,7 @@ def main() -> None:
             )
             provenance = window.provenance({
                 "strategy": args.strategy,
-                "strategy_config": StrategyConfigPayloadV1.from_config(config).to_dict(),
+                "strategy_config": StrategyConfigPayloadV2.from_config(config).to_dict(),
                 "days": args.days,
                 "chart_interval": args.chart_interval,
                 "starting_equity": 10000,

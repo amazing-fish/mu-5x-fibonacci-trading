@@ -1243,7 +1243,7 @@ class EmailAlertsTests(unittest.TestCase):
         self.publish()
         path = self.alerts.observations.path
         original = path.read_text(encoding="utf-8")
-        path.write_text(original.replace('"schema_version":1', '"schema_version":1,"schema_version":1', 1), encoding="utf-8")
+        path.write_text(original.replace('"schema_version":2', '"schema_version":2,"schema_version":2', 1), encoding="utf-8")
         with self.assertRaises(ObservationCorruptionError):
             self.alerts.collect()
         path.write_text(original, encoding="utf-8")

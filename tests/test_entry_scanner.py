@@ -376,7 +376,7 @@ class EntryScannerTests(unittest.TestCase):
     def test_scan_entry_skips_when_last_regime_is_red(self):
         from mu_strategy.entry.scanner import scan_entry
 
-        candles = [_candle(i * 900_000, 100 + i * 0.1) for i in range(40)]
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
         config = baseline_strategy_group("BTC-USDT-SWAP").config
 
         with patch("mu_strategy.entry.scanner.build_hourly_context") as build_context:

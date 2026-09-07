@@ -13,13 +13,15 @@ from typing import Any, Mapping, Protocol
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
+from mu_strategy.core.trading_calendar import calendar_sha256
 from mu_strategy.file_locks import locked_file
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
 
 
-OBSERVATION_SCHEMA_VERSION = 1
+OBSERVATION_SCHEMA_VERSION = 2
+_EVALUATION_FIELDS = {"evaluated_candle_open_ms", "evaluated_candle_close_ms", "calendar_id", "calendar_sha256", "calendar_session", "trading_windows_et"}
 DEFAULT_STAGE0_OBSERVATION_LOG = Path("data/observations/stage0.jsonl")
 STAGE0_TRUST_POLICY_NAME = "trading_strict"
 STAGE0_TRUST_POLICY_VERSION = 1
@@ -125,6 +127,12 @@ class Stage0ScanResult:
     trigger_price: float | None
     initial_stop: float | None
     signal_time_ms: int | None
+    evaluated_candle_open_ms: int | None = None
+    evaluated_candle_close_ms: int | None = None
+    calendar_id: str | None = None
+    calendar_sha256: str | None = None
+    calendar_session: str | None = None
+    trading_windows_et: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.symbol, str) or not self.symbol:
@@ -160,6 +168,26 @@ class Stage0ScanResult:
             if self.signal_time_ms < 0:
                 raise ValueError("scan_result signal_time_ms must be non-negative")
 
+        context = [getattr(self, name) for name in _EVALUATION_FIELDS]
+        if any(value is not None for value in context):
+            if any(value is None for value in context):
+                raise ValueError("scan evaluation context must be complete")
+            if (type(self.evaluated_candle_open_ms) is not int or self.evaluated_candle_open_ms < 0
+                    or type(self.evaluated_candle_close_ms) is not int
+                    or self.evaluated_candle_close_ms != self.evaluated_candle_open_ms + 900_000):
+                raise ValueError("scan evaluation must identify one 15m candle")
+            if self.calendar_sha256 != calendar_sha256(self.calendar_id):
+                raise ValueError("scan calendar digest mismatch")
+            if self.calendar_session not in {"open", "early_close", "holiday", "weekend"}:
+                raise ValueError("unsupported scan calendar session")
+            windows = self.trading_windows_et
+            if (not isinstance(windows, (list, tuple)) or not windows
+                    or any(not isinstance(w, (list, tuple)) or len(w) != 2
+                           or any(not isinstance(t, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", t) for t in w)
+                           or w[0] > w[1] for w in windows)):
+                raise ValueError("invalid evaluated trading windows")
+            object.__setattr__(self, "trading_windows_et", tuple(tuple(w) for w in windows))
+
     @classmethod
     def from_entry_result(cls, result: EntryScanResult) -> "Stage0ScanResult":
         return cls(
@@ -174,28 +202,26 @@ class Stage0ScanResult:
             trigger_price=result.trigger_price,
             initial_stop=result.initial_stop,
             signal_time_ms=result.signal_time_ms,
+            **{name: getattr(result, name) for name in _EVALUATION_FIELDS},
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "symbol": self.symbol,
-            "last_close": self.last_close,
-            "regime_1h": self.regime_1h,
-            "rsi14": self.rsi14,
-            "macd_hist": self.macd_hist,
-            "macd_hist_prev": self.macd_hist_prev,
-            "fib_level": self.fib_level,
-            "fib_distance_pct": self.fib_distance_pct,
-            "trigger_price": self.trigger_price,
-            "initial_stop": self.initial_stop,
-            "signal_time_ms": self.signal_time_ms,
-        }
+    def to_dict(self, *, schema_version=OBSERVATION_SCHEMA_VERSION) -> dict[str, Any]:
+        payload = asdict(self)
+        if schema_version == 1:
+            for name in _EVALUATION_FIELDS:
+                payload.pop(name)
+        elif self.trading_windows_et is not None:
+            payload["trading_windows_et"] = [list(w) for w in self.trading_windows_et]
+        return payload
 
     @classmethod
-    def from_dict(cls, payload: Any) -> "Stage0ScanResult":
+    def from_dict(cls, payload: Any, *, schema_version=OBSERVATION_SCHEMA_VERSION) -> "Stage0ScanResult":
         if not isinstance(payload, dict):
             raise ObservationSchemaError("scan_result must be an object")
-        _require_exact_fields(payload, set(cls.__dataclass_fields__), "scan_result")
+        expected = set(cls.__dataclass_fields__)
+        if schema_version == 1:
+            expected -= _EVALUATION_FIELDS
+        _require_exact_fields(payload, expected, "scan_result")
         try:
             return cls(**payload)
         except (TypeError, ValueError) as exc:
@@ -235,7 +261,7 @@ class Stage0Observation:
     schema_version: int = OBSERVATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != OBSERVATION_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
             raise ObservationSchemaError(f"unsupported observation schema_version: {self.schema_version}")
         if not self.observation_id or not self.cycle_id or not self.symbol:
             raise ValueError("observation_id, cycle_id, and symbol are required")
@@ -245,6 +271,9 @@ class Stage0Observation:
             raise ValueError("result_fingerprint must be lowercase SHA-256")
         immutable_hashes = MappingProxyType(dict(self.content_sha256_by_interval))
         object.__setattr__(self, "content_sha256_by_interval", immutable_hashes)
+        if self.schema_version == 1 and self.scan_result is not None and any(
+                getattr(self.scan_result, name) is not None for name in _EVALUATION_FIELDS):
+            raise ObservationSchemaError("V1 cannot contain V2 evaluation context")
         _validate_observation_semantics(self)
 
     def to_dict(self) -> dict[str, Any]:
@@ -276,7 +305,7 @@ class Stage0Observation:
             "failure_code": self.failure_code.value if self.failure_code else None,
             "error_type": self.error_type,
             "error_message": self.error_message,
-            "scan_result": self.scan_result.to_dict() if self.scan_result else None,
+            "scan_result": self.scan_result.to_dict(schema_version=self.schema_version) if self.scan_result else None,
             "result_fingerprint": self.result_fingerprint,
         }
 
@@ -286,7 +315,7 @@ class Stage0Observation:
             raise ObservationSchemaError("observation must be an object")
         expected = {field for field in cls.__dataclass_fields__}
         _require_exact_fields(payload, expected, "observation")
-        if payload.get("schema_version") != OBSERVATION_SCHEMA_VERSION:
+        if type(payload.get("schema_version")) is not int or payload.get("schema_version") not in (1, 2):
             raise ObservationSchemaError(f"unsupported observation schema_version: {payload.get('schema_version')}")
         try:
             observation = cls(
@@ -317,7 +346,7 @@ class Stage0Observation:
                 failure_code=_optional_enum(payload.get("failure_code"), ObservationFailureCode),
                 error_type=_optional_text(payload.get("error_type")),
                 error_message=_optional_text(payload.get("error_message")),
-                scan_result=Stage0ScanResult.from_dict(payload["scan_result"])
+                scan_result=Stage0ScanResult.from_dict(payload["scan_result"], schema_version=payload["schema_version"])
                 if payload.get("scan_result") is not None
                 else None,
                 result_fingerprint=_required_text(payload, "result_fingerprint"),
@@ -340,12 +369,14 @@ class Stage0ObservationCycle:
     schema_version: int = OBSERVATION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != OBSERVATION_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version not in (1, 2):
             raise ObservationSchemaError(f"unsupported cycle schema_version: {self.schema_version}")
         if not self.cycle_id:
             raise ValueError("cycle_id is required")
         ids: set[str] = set()
         for observation in self.observations:
+            if observation.schema_version != self.schema_version:
+                raise ValueError("observation schema_version must match cycle")
             if observation.cycle_id != self.cycle_id:
                 raise ValueError("observation cycle_id must match cycle")
             if observation.observation_id in ids:
@@ -368,7 +399,7 @@ class Stage0ObservationCycle:
         if not isinstance(payload, dict):
             raise ObservationSchemaError("cycle must be an object")
         _require_exact_fields(payload, {"schema_version", "cycle_id", "created_at_ms", "observations"}, "cycle")
-        if payload.get("schema_version") != OBSERVATION_SCHEMA_VERSION:
+        if type(payload.get("schema_version")) is not int or payload.get("schema_version") not in (1, 2):
             raise ObservationSchemaError(f"unsupported cycle schema_version: {payload.get('schema_version')}")
         observations = payload.get("observations")
         if not isinstance(observations, list):
@@ -654,7 +685,7 @@ def _result_fingerprint(observation: Stage0Observation) -> str:
         "decision_stage": observation.decision_stage.value if observation.decision_stage else None,
         "outcome": observation.outcome.value,
         "failure_code": observation.failure_code.value if observation.failure_code else None,
-        "scan_result": observation.scan_result.to_dict() if observation.scan_result else None,
+        "scan_result": observation.scan_result.to_dict(schema_version=observation.schema_version) if observation.scan_result else None,
         "provenance": observation.provenance,
     }
     return canonical_sha256(payload)

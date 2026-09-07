@@ -7,9 +7,10 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, unique
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, ClassVar
 
 from mu_strategy.canonical import canonical_sha256
+from mu_strategy.core.trading_calendar import LEGACY_CALENDAR
 from mu_strategy.research.strategy_artifact_publication import (
     StrategyArtifactPublicationError,
     read_strategy_artifact_text,
@@ -17,7 +18,7 @@ from mu_strategy.research.strategy_artifact_publication import (
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, StrategyConfig
 
 
-STRATEGY_CONFIG_SCHEMA_VERSION = 1
+STRATEGY_CONFIG_SCHEMA_VERSION = 2
 STRATEGY_CONFIG_V1_FIELD_NAMES = (
     "symbol",
     "entry_execution",
@@ -96,16 +97,18 @@ class StrategyReleaseResolutionError(ValueError):
 @dataclass(frozen=True)
 class StrategyConfigPayloadV1:
     values: Mapping[str, Any]
-    schema_version: int = STRATEGY_CONFIG_SCHEMA_VERSION
+    schema_version: int = 1
+    VERSION: ClassVar[int] = 1
+    FIELD_NAMES: ClassVar[tuple[str, ...]] = STRATEGY_CONFIG_V1_FIELD_NAMES
 
     def __post_init__(self) -> None:
         if (
             isinstance(self.schema_version, bool)
             or not isinstance(self.schema_version, int)
-            or self.schema_version != STRATEGY_CONFIG_SCHEMA_VERSION
+            or self.schema_version != self.VERSION
         ):
             raise StrategyReleaseSchemaError(f"unsupported strategy config schema_version: {self.schema_version}")
-        normalized = _validate_config_values(dict(self.values))
+        normalized = _validate_config_values(dict(self.values), self.FIELD_NAMES)
         object.__setattr__(self, "values", MappingProxyType(normalized))
 
     @property
@@ -115,11 +118,13 @@ class StrategyConfigPayloadV1:
     @classmethod
     def from_config(cls, config: StrategyConfig) -> "StrategyConfigPayloadV1":
         actual_fields = tuple(field.name for field in dataclass_fields(StrategyConfig))
-        if actual_fields != STRATEGY_CONFIG_V1_FIELD_NAMES:
-            raise StrategyReleaseSchemaError("StrategyConfig fields changed without a v1 schema decision")
+        if actual_fields != STRATEGY_CONFIG_V2_FIELD_NAMES:
+            raise StrategyReleaseSchemaError("StrategyConfig fields changed without a schema decision")
+        if cls.VERSION == 1 and config.trading_calendar_id != LEGACY_CALENDAR:
+            raise StrategyReleaseSchemaError("V1 cannot encode a reference calendar; use V2")
         encoded = {
             field_name: _encode_config_value(field_name, getattr(config, field_name))
-            for field_name in STRATEGY_CONFIG_V1_FIELD_NAMES
+            for field_name in cls.FIELD_NAMES
         }
         return cls(encoded)
 
@@ -151,16 +156,44 @@ class StrategyConfigPayloadV1:
         return StrategyConfig(**decoded)
 
 
-def _validate_config_values(values: dict[str, Any]) -> dict[str, Any]:
+
+STRATEGY_CONFIG_V2_FIELD_NAMES = STRATEGY_CONFIG_V1_FIELD_NAMES + ("trading_calendar_id", "trading_calendar_sha256")
+
+
+@dataclass(frozen=True)
+class StrategyConfigPayloadV2(StrategyConfigPayloadV1):
+    schema_version: int = 2
+    VERSION: ClassVar[int] = 2
+    FIELD_NAMES: ClassVar[tuple[str, ...]] = STRATEGY_CONFIG_V2_FIELD_NAMES
+
+    def __post_init__(self):
+        super().__post_init__()
+        try:
+            self.to_strategy_config()  # Reject unsupported IDs or a mismatched frozen digest.
+        except ValueError as exc:
+            raise StrategyReleaseSchemaError(str(exc)) from exc
+
+
+def parse_strategy_config_payload(payload):
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int:
+        raise StrategyReleaseSchemaError("invalid strategy config schema_version")
+    codecs = {1: StrategyConfigPayloadV1, 2: StrategyConfigPayloadV2}
+    codec = codecs.get(payload["schema_version"])
+    if codec is None:
+        raise StrategyReleaseSchemaError("unsupported strategy config schema_version")
+    return codec.from_dict(payload)
+
+
+def _validate_config_values(values: dict[str, Any], field_names) -> dict[str, Any]:
     actual = set(values)
-    expected = set(STRATEGY_CONFIG_V1_FIELD_NAMES)
+    expected = set(field_names)
     if unknown := actual - expected:
         raise StrategyReleaseSchemaError(f"strategy config has unknown fields: {sorted(unknown)}")
     if missing := expected - actual:
         raise StrategyReleaseSchemaError(f"strategy config has missing fields: {sorted(missing)}")
     return {
         field_name: _validate_config_value(field_name, values[field_name])
-        for field_name in STRATEGY_CONFIG_V1_FIELD_NAMES
+        for field_name in field_names
     }
 
 
@@ -757,7 +790,7 @@ class StrategyReleaseCandidateV1:
         }
         _require_exact_mapping(payload, expected, "candidate")
         try:
-            config = StrategyConfigPayloadV1.from_dict(payload["strategy_config"])
+            config = parse_strategy_config_payload(payload["strategy_config"])
             if payload["strategy_config_sha256"] != config.strategy_config_sha256:
                 raise StrategyReleaseSchemaError("candidate strategy config fingerprint does not match payload")
             return cls(

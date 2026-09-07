@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 from datetime import datetime
+from urllib.parse import urlencode
 
 from mu_strategy.signal_review import BEIJING
 from mu_strategy.signal_feedback import FEEDBACK_STATUSES
@@ -26,6 +27,7 @@ DELIVERY = {
 KINDS = {"entry_review": "入场复核", "signal_invalidated": "原提醒失效",
          "service_fault": "服务故障", "service_recovered": "服务恢复"}
 REASONS = {
+    "reference_market_closed": "参考市场休市，等待下一策略窗口",
     "current_bar_outside_trading_window": "交易时段外，正常等待",
     "waiting_second_pullback": "等待第二次回踩", "regime_blocked": "1h 市场结构暂未允许入场",
     "second_pullback_limit_ready": "回踩条件满足，曾进入人工复核",
@@ -72,6 +74,60 @@ def _badge(value, catalog) -> str:
 def _evidence(value, title="查看来源证据", *, identifier="") -> str:
     identity = f' id="{_e(identifier)}"' if identifier else ""
     return f'<details class="evidence"{identity}><summary>{_e(title)}</summary><pre>{_e(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))}</pre></details>'
+
+
+
+def _scan_evidence(item, *, live):
+    if not live:
+        return _evidence(item, "查看原始记录", identifier="scan-evidence-" + _scan_identity(item))
+    query = urlencode({"cycle_id": item["cycle_id"], "observation_id": item["observation_id"]})
+    return f'<a class="evidence-link" href="/scan-evidence?{_e(query)}" target="_blank" rel="noopener">查看原始记录 ↗</a>'
+
+
+def render_scan_evidence(item):
+    return ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>扫描原始记录</title><style>' + REVIEW_STYLE + '</style></head><body><main>'
+            '<p><a href="/">返回每日复盘</a></p><h1>扫描原始记录</h1>'
+            '<p>按精确 ID 从当前日志读取并校验；保留记录当时的判断。</p>'
+            '<pre>' + _e(json.dumps(item, ensure_ascii=False, indent=2, allow_nan=False)) + '</pre></main></body></html>')
+
+
+def _candle_label(result):
+    opened, closed = result.get("evaluated_candle_open_ms"), result.get("evaluated_candle_close_ms")
+    if opened is None or closed is None:
+        return "旧记录未保存评估 K 线时间"
+    return f"15m K 线 {_time(opened)} — {_time(closed)}"
+
+
+def _indicators(item):
+    result = item.get("scan_result") or {}
+    values = (("1h 结构", "regime_1h"), ("RSI", "rsi14"), ("MACD", "macd_hist"),
+              ("前根 MACD", "macd_hist_prev"), ("回踩位", "fib_level"))
+    entries = "".join(f'<div><dt>{label}</dt><dd>{_e(round(result[key], 6) if isinstance(result.get(key), (int, float)) else result.get(key) or "—")}</dd></div>'
+                      for label, key in values)
+    calendar = result.get("calendar_id")
+    context = f'参考日历 {_e(calendar)} · {_e(result.get("calendar_session"))}' if calendar else "旧记录未保存日历依据"
+    return f'<details class="indicator-details" id="indicators-{_scan_identity(item)}"><summary>指标与时间依据</summary><p>{_e(_candle_label(result))}</p><dl class="indicator-grid">{entries}</dl><p class="secondary">{context}</p></details>'
+
+
+def _current_card(item):
+    schedule, latest = item.get("schedule"), item.get("latest")
+    calendar = ""
+    if schedule:
+        state = {"holiday": "休市日", "weekend": "周末休市", "early_close": "提前收盘日", "open": "开放日"}[schedule["session"]]
+        window_text = " · ".join(f'{_time(start)[:16]}–{_time(end - 60_000)[:16]}' for start, end in schedule["today_windows"]) or "今日无策略窗口"
+        next_window = schedule.get("next_window")
+        upcoming = (f'{_time(next_window[0])} — {_time(next_window[1] - 60_000)[11:16]}' if next_window else "覆盖范围内没有可核实的下一窗口")
+        market = schedule.get("market_session")
+        market_text = f'参考市场时段：{_time(market[0])[:16]} — {_time(market[1])[:16]}' if market else "参考市场今日休市"
+        calendar = f'<div class="session-strip"><span>现在的参考日历 · {state}</span><strong>{_e(window_text)}</strong><small>{_e(market_text)} · 北京时间</small><small>美东日期 {_e(schedule["eastern_date"])}</small><span>下一窗口：{_e(upcoming)}</span></div><p class="secondary">配置：{_e(schedule["calendar_id"])} · 日历与策略窗口取交集</p>'
+    last = '<p class="secondary">暂无可核实扫描记录。</p>'
+    if latest:
+        last = (f'<div class="last-scan"><span class="eyebrow">最近一次扫描 · 保留当时判断</span><strong>{_e(_scan_reason(latest))}</strong>'
+                f'<span>记录于 {_e(_time(latest["observed_at_ms"]))}</span><span>{_e(_candle_label(latest.get("scan_result") or {}))}</span></div>')
+    tone = "neutral" if item["status"] == "waiting" else "accent" if item["status"] == "current" else "warning"
+    label = "当前参考" if item["status"] == "current" else "等待" if item["status"] == "waiting" else "待核实"
+    return f'<article class="current-card" data-current-symbol="{_e(item["symbol"])}"><div class="section-heading"><h3>{_e(item["symbol"])}</h3><span class="badge {tone}">{label}</span></div><p class="current-message">{_e(item["message"])}</p>{calendar}{last}</article>'
 
 
 def _command(data_dir: str, module: str, extra="") -> str:
@@ -125,35 +181,36 @@ def group_scan_records(records: list[dict]) -> list[list[dict]]:
     return [group[1] for group in sorted(groups, key=lambda group: group[0])]
 
 
-def _scan_row(item, *, raw=False) -> str:
+def _scan_row(item, *, raw=False, live=False) -> str:
     reason = _scan_reason(item)
     result = item.get("scan_result") or {}
     identifier = f'{item["cycle_id"]}/{item["observation_id"]}'
-    evidence = item
     return f'''<article class="scan-row filter-row" data-kind="{'raw-scan' if raw else 'scan'}" data-count="1" data-date="{_e(_time(item['created_at_ms'], day_only=True))}"
         data-symbol="{_e(item['symbol'])}" data-status="{_e(item['outcome'])}">
       <div class="row-time"><time>{_e(_time(item['observed_at_ms']))}</time><span>{_e(item['symbol'])}</span></div>
       <div class="row-main">{_badge(item['outcome'], OUTCOMES)}<strong>{_e(reason)}</strong>
         <span class="secondary">策略 {_e(item['strategy_name'])} · 观察价格 {_e(result.get('last_close') if result.get('last_close') is not None else 'unknown')}</span>
-        {_evidence(evidence, identifier='scan-evidence-' + _scan_identity(item))}</div>
-      <div class="row-reference"><span>数据快照</span><code>{_e(item.get('trusted_run_id') or 'unknown')}</code>
-        <span class="sr-only">{_e(identifier)}</span></div>
+        {'' if raw else _indicators(item)}{_scan_evidence(item, live=live)}</div>
+      <span class="sr-only">{_e(identifier)}</span>
     </article>'''
 
 
-def _scan_group(items) -> str:
+def _scan_group(items, *, live=False) -> str:
     if len(items) == 1:
-        return _scan_row(items[0])
+        return _scan_row(items[0], live=live)
     first, last = items[0], items[-1]
     price = (last.get("scan_result") or {}).get("last_close")
+    bars = {(row.get("scan_result") or {}).get("evaluated_candle_open_ms") for row in items}
+    bar_note = f"涉及 {len(bars)} 根评估 K 线" if None not in bars else "旧记录缺少 K 线标识，无法确定独立 K 线数"
     return f'''<article class="scan-row filter-row scan-group" data-kind="scan" data-count="{len(items)}"
         data-date="{_e(_time(last['created_at_ms'], day_only=True))}" data-symbol="{_e(last['symbol'])}" data-status="normal_no_action">
       <div class="row-time"><time>{_e(_time(last['observed_at_ms']))}</time><span>{_e(last['symbol'])}</span></div>
       <div class="row-main">{_badge('normal_no_action', OUTCOMES)}<strong>{_e(_scan_reason(last))}</strong>
-        <span class="secondary">{_e(_time(first['observed_at_ms']))} — {_e(_time(last['observed_at_ms']))} · 相同状态 {len(items)} 次</span>
+        <span class="secondary">{_e(_time(first['observed_at_ms']))} — {_e(_time(last['observed_at_ms']))} · 相同状态 {len(items)} 次 · {_e(bar_note)}</span>
         <span class="secondary">最新观察价格 {_e(price if price is not None else 'unknown')}</span>
+        {_indicators(last)}
         <details class="group-details" id="scan-group-{_scan_identity(first)}"><summary>展开 {len(items)} 次扫描记录</summary>
-          {''.join(_scan_row(item, raw=True) for item in reversed(items))}</details></div></article>'''
+          {''.join(_scan_row(item, raw=True, live=live) for item in reversed(items))}</details></div></article>'''
 
 
 def _feedback_form(event_id, saved, *, editable):
@@ -222,7 +279,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
     symbols = sorted({item["symbol"] for item in scan_records} |
                      {item["event"]["observation"]["symbol"] for item in alert_records if item["event"].get("observation")})
     symbol_options = ''.join(f'<option value="{_e(symbol)}">{_e(symbol)}</option>' for symbol in symbols)
-    scan_rows = ''.join(_scan_group(items) for items in reversed(group_scan_records(scan_records)))
+    scan_rows = ''.join(_scan_group(items, live=live) for items in reversed(group_scan_records(scan_records)))
     known_event_ids = {record["event_id"] for record in alert_records}
     alert_rows = ''.join(_alert_row(item, report["data_dir"], known_event_ids, feedback["records"] if feedback["available"] else None,
                                    editable=live and feedback["available"], live=live) for item in reversed(alert_records))
@@ -251,6 +308,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
                           for name, item in zip(("服务健康", "扫描日志", "通知库"), (service, scans, notifications)))
     window_total = notifications.get("total", "—")
     notification_counts = ' · '.join(f'{DELIVERY[key][0]} {value}' for key, value in notifications.get("counts", {}).items()) or '无窗口内提醒 / 来源见下方'
+    current_html = "".join(_current_card(item) for item in report.get("current_conclusions", [])) or '<p class="empty">暂无可核实的当前结论。</p>'
     latest_html = latest_rows or '<li class="empty">所选日期内暂无扫描记录。</li>'
     snapshot_html = (f'<strong id="refresh-state">自动更新 · 每 30 秒</strong><time id="report-updated">更新于 {_e(generated)} 北京时间</time>'
                      '<div class="live-actions"><button id="refresh-now" type="button">立即更新</button><button id="pause-refresh" type="button">暂停自动更新</button></div>'
@@ -267,10 +325,12 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <div><span class="eyebrow">服务状态</span><strong>{_e(health_label)}</strong><small>{_e(runtime_label)} · 连续失败 {_e(view.get('consecutive_failures', 'unknown'))}</small></div>
 <div><span class="eyebrow">行情 / 上次扫描时</span><strong>{_e(data_label)}</strong><small>校验于 {_e(_time(data.get('checked_at_ms')))}</small></div>
 <div><span class="eyebrow">邮件记录</span><strong>{_e(state_counts)}</strong><small>最近处理 {_e(_time(notifications.get('last_collection_ms')))}</small></div></div>
-{service_evidence}<div class="section-heading"><h2>观察窗口</h2><span>{_e(window['from_date'])} 至 {_e(window['to_date'])} · 北京时间自然日</span></div>
+{service_evidence}<div class="section-heading"><h2>当前结论</h2><span>截至 {_e(generated)} · 不受下方历史筛选影响</span></div>
+<p class="secondary">参考美股休市限制策略入场；OKX 永续仍可能交易，持仓风险检查继续。</p><div class="current-grid">{current_html}</div>
+<details class="window-summary" id="window-summary"><summary>观察窗口统计与最近历史记录</summary><div class="section-heading"><h2>观察窗口</h2><span>{_e(window['from_date'])} 至 {_e(window['to_date'])} · 北京时间自然日</span></div>
 <p class="scope">{_e(scans.get('total_cycles', '—'))} 轮扫描 · {_e(scans.get('total_observations', '—'))} 条记录</p>
 <p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
-<div class="metrics">{summary}</div><h3>最近扫描</h3><ul class="latest">{latest_html}</ul></section>
+<div class="metrics">{summary}</div><h3>所选窗口内最后记录</h3><ul class="latest">{latest_html}</ul></details></section>
 <section id="positions"><div class="section-heading"><h2>已记录持仓</h2>{'<a href="/positions#position-form">记录实际成交</a>' if live else '<span>导出快照 · 只读</span>'}</div>
 {render_capability_path()}
 <p class="scope">所有日期 · 人工确认记录，未核对交易所账户。剩余数量按买入减卖出计算；成本均价未计费用。</p>{position_cards}
@@ -485,4 +545,8 @@ REVIEW_STYLE += r'''
 .capability-path{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0;margin:18px 0 26px;border:1px solid var(--line);background:var(--surface)}.capability-path li{padding:13px 18px;border-right:1px solid var(--line);font-size:13px}.capability-path li:last-child{border-right:0}.capability-path span{display:block;font-size:10px;letter-spacing:1px;color:var(--muted);margin-bottom:3px}.capability-path .current{background:var(--soft);border-bottom:3px solid var(--accent)}.capability-path .current span{color:var(--accent);font-weight:700}.management-link{padding-top:14px;border-top:1px solid var(--line);font-size:13px}.management-link a{display:inline-block;margin-left:12px}#position-review{padding:22px 26px;border:1px solid var(--line);background:var(--surface)}#position-review>.section-heading{margin-top:0}#position-review details{margin-top:14px}#position-review summary{cursor:pointer;color:var(--accent);font-size:13px}.review-messages:empty{display:none}.review-timeline{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));list-style:none;padding:0;margin:24px 0;gap:18px}.review-timeline li{border-top:2px solid var(--accent);padding-top:12px}.review-timeline strong,.review-timeline span{display:block}.review-timeline strong{font-size:13px}.review-timeline span{color:var(--muted);font-size:12px;margin-top:6px}.rule-decision{padding:16px 20px;background:var(--soft);border-left:3px solid var(--accent)}.rule-decision.danger{background:var(--danger-bg);border-color:var(--danger);color:var(--danger)}.rule-decision h3{margin:0 0 8px}.rule-decision p{margin:8px 0}.rule-prices{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px;margin:24px 0}.rule-prices span,.rule-prices small{display:block;color:var(--muted);font-size:12px}.rule-prices strong{display:block;font:26px/1.5 Georgia,serif;overflow-wrap:anywhere}.input-checks{list-style:none;padding:0}.input-checks li{padding:7px 0;font-size:13px}.stage-mapping select{min-width:110px}#position-form>details pre{max-height:300px;overflow:auto;background:var(--code);padding:16px}.position-fields label{min-width:0}.position-fields input{width:100%}.confirmation{align-items:flex-start}.confirmation input{flex-shrink:0;margin-top:7px}
 @media(max-width:780px){.capability-path{grid-template-columns:1fr 1fr}.capability-path li{padding:12px;border-bottom:1px solid var(--line)}.capability-path li:nth-child(2){border-right:0}.review-timeline,.rule-prices{grid-template-columns:1fr;gap:14px}#position-review{padding:16px}.rule-prices>div{padding-bottom:12px;border-bottom:1px solid var(--line)}.rule-decision{padding:14px}.stage-mapping,.stage-mapping tbody{display:block}.stage-mapping thead{display:none}.stage-mapping tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);border-top:1px solid var(--line);margin-top:10px}.stage-mapping td{padding:8px;border:0;overflow-wrap:anywhere;min-width:0}.stage-mapping td:before{content:attr(data-label);display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.stage-mapping select{min-width:0;width:100%}.management-link a{display:block;margin:8px 0 0}}
 @media print{#position-review{break-inside:auto}.review-timeline,.rule-prices{grid-template-columns:repeat(3,minmax(0,1fr))}.capability-path{grid-template-columns:repeat(4,minmax(0,1fr))}}
+'''
+
+REVIEW_STYLE += r'''
+.current-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,330px),1fr));gap:16px;margin:20px 0 28px}.current-card{padding:20px;border:1px solid var(--line);background:var(--surface);min-width:0}.current-card .section-heading{margin:0;flex-direction:row;align-items:center;flex-wrap:wrap}.current-card h3{margin:0;font-size:17px}.current-message{font-size:18px;font-weight:650;line-height:1.6;margin:16px 0}.session-strip{display:grid;gap:7px;padding:14px 16px;border-left:3px solid var(--accent);background:var(--soft);font-size:13px}.session-strip small{color:var(--muted)}.last-scan{display:grid;gap:6px;padding-top:14px;border-top:1px solid var(--line);font-size:12px}.last-scan strong{font-size:14px}.window-summary>summary{cursor:pointer;color:var(--accent);font-weight:650;padding:12px 0}.indicator-details{font-size:12px;max-width:100%}.indicator-details>summary{cursor:pointer;color:var(--accent);padding:5px 0}.indicator-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(95px,1fr));gap:10px;margin:8px 0}.indicator-grid div{padding:10px;background:var(--code)}.indicator-grid dt{color:var(--muted)}.indicator-grid dd{margin:4px 0 0;font-weight:650}.evidence-link{font-size:12px;margin-top:5px;align-self:flex-start}.scan-row{grid-template-columns:180px minmax(0,1fr)}.current-card code{overflow-wrap:anywhere}@media(max-width:780px){.scan-row{grid-template-columns:1fr}.current-card{padding:16px}.current-message{font-size:16px}.session-strip{padding:12px}.current-card .section-heading{gap:8px}}
 '''

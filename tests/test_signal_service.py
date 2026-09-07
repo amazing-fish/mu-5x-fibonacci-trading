@@ -404,13 +404,13 @@ class ServiceTests(unittest.TestCase):
 
     def test_fresh_real_cache_worker_pins_one_context_and_preserves_current_pointer(self):
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-        write_generation_manifest_and_caches(self.config.data_dir, symbol=SYMBOL, days=2)
+        write_generation_manifest_and_caches(self.config.data_dir, symbol="BTC-USDT-SWAP", days=2)
         pointer = (self.config.data_dir / "current.json").read_bytes()
         original = LoadTrustedBundle.open_context
         with patch("mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms", return_value=172800000), patch.object(
             LoadTrustedBundle, "open_context", autospec=True, side_effect=original
         ) as opened, patch("socket.create_connection", side_effect=AssertionError("no network")) as network:
-            scan = scan_once(replace(self.config, scan_days=2))
+            scan = scan_once(replace(self.config, symbols=("BTC-USDT-SWAP",), scan_days=2))
         self.assertIs(StepStatus.SUCCEEDED, scan.status)
         self.assertTrue(scan.cycle.observations[0].trust_allowed)
         self.assertNotIn(scan.cycle.observations[0].outcome, {ObservationOutcome.DATA_GATE_BLOCKED, ObservationOutcome.SCAN_FAILED})

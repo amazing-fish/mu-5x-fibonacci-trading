@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from mu_strategy.core.trading_calendar import evaluate_trading_window
 
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.execution.plan import initial_stop_price
@@ -34,6 +36,13 @@ class EntryScanResult:
     signal_time_ms: int | None = None
     decision_code: EntryDecisionCode = EntryDecisionCode.UNKNOWN
 
+    evaluated_candle_open_ms: int | None = None
+    evaluated_candle_close_ms: int | None = None
+    calendar_id: str | None = None
+    calendar_sha256: str | None = None
+    calendar_session: str | None = None
+    trading_windows_et: tuple[tuple[str, str], ...] | None = None
+
     def __post_init__(self) -> None:
         if self.decision_code is not EntryDecisionCode.UNKNOWN:
             object.__setattr__(self, "action", scanner_action_for(self.disposition))
@@ -47,7 +56,26 @@ class EntryScanResult:
         return entry_decision_metadata(self.decision_code).stage
 
 
-def scan_entry(
+def scan_entry(symbol, candles_15m, candles_1h, *, config, lookback_bars=16, max_fib_distance_pct=0.01):
+    if not candles_15m:
+        return _scan_entry(symbol, candles_15m, candles_1h, config=config)
+    candle = candles_15m[-1]
+    calendar = evaluate_trading_window(candle.open_time_ms, config)
+    if not calendar.allowed:
+        result = EntryScanResult(
+            symbol, "wait", ("reference market is closed" if calendar.reason == "reference_market_closed" else "current bar is outside configured trading window"), candle.close, "unknown", None, None, None,
+            decision_code=EntryDecisionCode(calendar.reason),
+        )
+    else:
+        result = _scan_entry(symbol, candles_15m, candles_1h, config=config,
+                             lookback_bars=lookback_bars, max_fib_distance_pct=max_fib_distance_pct)
+    return replace(result, evaluated_candle_open_ms=candle.open_time_ms,
+                   evaluated_candle_close_ms=candle.open_time_ms + 900_000,
+                   calendar_id=calendar.calendar_id, calendar_sha256=calendar.calendar_sha256,
+                   calendar_session=calendar.session, trading_windows_et=config.trading_windows_et)
+
+
+def _scan_entry(
     symbol: str,
     candles_15m: list[Candle],
     candles_1h: list[Candle],
@@ -91,18 +119,6 @@ def scan_entry(
             lookback_bars=_effective_lookback_bars(config, lookback_bars),
         )
         if pending_signal is not None:
-            if not is_preferred_us_cash_window(last_candle.open_time_ms, config):
-                return EntryScanResult(
-                    symbol=symbol,
-                    action="wait",
-                    reason="current bar is outside configured trading window",
-                    last_close=last_candle.close,
-                    regime_1h=last_regime,
-                    rsi14=last_rsi,
-                    macd_hist=last_hist,
-                    macd_hist_prev=previous_hist,
-                    decision_code=EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW,
-                )
             return _result_for_recent_signal(
                 symbol=symbol,
                 last_candle=last_candle,
@@ -126,19 +142,6 @@ def scan_entry(
     )
     if blocked is not None:
         return blocked
-
-    if not is_preferred_us_cash_window(last_candle.open_time_ms, config):
-        return EntryScanResult(
-            symbol=symbol,
-            action="wait",
-            reason="current bar is outside configured trading window",
-            last_close=last_candle.close,
-            regime_1h=last_regime,
-            rsi14=last_rsi,
-            macd_hist=last_hist,
-            macd_hist_prev=previous_hist,
-            decision_code=EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW,
-        )
 
     signal = _latest_recent_signal(
         candles_15m,

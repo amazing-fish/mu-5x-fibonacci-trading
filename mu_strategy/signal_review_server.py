@@ -13,8 +13,9 @@ from mu_strategy.position_management import review_position
 from mu_strategy.notifications.events import AlertKind, NotificationError
 from mu_strategy.notifications.store import NotificationStore
 from mu_strategy.signal_feedback import SignalFeedbackStore
-from mu_strategy.signal_review import read_signal_review, review_window
-from mu_strategy.viz.signal_review import REVIEW_STYLE, render_signal_review
+from mu_strategy.signal_review import read_signal_review, review_window, read_scan_evidence
+from mu_strategy.observations import ObservationCorruptionError
+from mu_strategy.viz.signal_review import REVIEW_STYLE, render_signal_review, render_scan_evidence
 from mu_strategy.viz.position_ledger import render_position_editor, render_position_management_editor, render_position_state_editor
 
 
@@ -56,6 +57,19 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             origin = self.headers.get("Origin")
             if self.headers.get("Host") not in hosts or (origin is not None and origin not in {"http://" + host for host in hosts}):
                 self.respond(403, "Local access only")
+                return
+            if urlsplit(self.path).path == "/scan-evidence":
+                try:
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True, max_num_fields=2)
+                    if set(query) != {"cycle_id", "observation_id"} or any(len(value) != 1 for value in query.values()):
+                        raise ValueError("invalid query")
+                    record = read_scan_evidence(data_dir, query["cycle_id"][0], query["observation_id"][0], clock=clock)
+                except (ValueError, UnicodeError):
+                    self.respond(400, "原始记录查询参数无效。")
+                except (OSError, ObservationCorruptionError):
+                    self.respond(503, "原始记录来源暂不可用，无法核实。")
+                else:
+                    self.respond(200, render_scan_evidence(record)) if record else self.respond(404, "原始记录不存在。")
                 return
             if urlsplit(self.path).path in {"/positions", "/position-state", "/position-management"}:
                 self.position_editor()

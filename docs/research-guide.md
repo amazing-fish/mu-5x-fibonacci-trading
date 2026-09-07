@@ -68,3 +68,5 @@ python -B -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit 
 ## 研究与执行之间
 
 严格候选、SCM 审批快照和 exact-ID release resolver 已实现，但当前仓库未保存已批准策略 release。第一阶段研究无需靠发布 release 才能开展；第二阶段执行前置由 [#100](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/100) 承接，详见[产品路线](product-roadmap.md)。不得用 mock release、自动挑最高收益或宽松 resolver 接通执行。
+
+新建 registry 配置采用[标的交易日历](trading-calendar.md)，美股参考日历目前覆盖 2025–2028。新增日历会改变休市/提前收盘期间的入场、加仓和非时段风险判定，须按新配置身份重新评估；旧 V1 实验与持仓配置保留旧语义，不混合比较为同一 baseline。

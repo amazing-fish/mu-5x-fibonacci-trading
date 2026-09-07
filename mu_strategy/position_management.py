@@ -12,7 +12,7 @@ from mu_strategy.live_exit import evaluate_exit
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2, parse_strategy_config_payload
 from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot, decide_pyramid_add
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -25,7 +25,7 @@ MAX_MAPPED_FILLS = 32
 def baseline_configuration(symbol):
     """The selectable template, not a reconstruction of the entry signal."""
     group = baseline_strategy_group(symbol)
-    payload = StrategyConfigPayloadV1.from_config(group.config)
+    payload = StrategyConfigPayloadV2.from_config(group.config)
     return {"strategy_name": group.name, "strategy_rule_id": group.rule.strategy_rule_id,
             "configuration": payload.to_dict(), "configuration_sha256": payload.strategy_config_sha256}
 
@@ -79,7 +79,7 @@ def management_checks(position):
         {"key": "mapping", "label": "全部有效买入已明确映射到连续策略阶段", "ok": False},
     ]
     if inputs is not None:
-        config = StrategyConfigPayloadV1.from_dict(inputs["configuration"]).to_strategy_config()
+        config = parse_strategy_config_payload(inputs["configuration"]).to_strategy_config()
         group = baseline_strategy_group(position["symbol"])
         checks[4]["ok"] = (
             inputs["strategy_name"] == "baseline" and inputs["strategy_rule_id"] == group.rule.strategy_rule_id
@@ -163,11 +163,11 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         if candles[first_index].open_time_ms != first_open or first_index < 35 or sum(
                 candle.open_time_ms + 3_600_000 <= first_open for candle in hourly) < 35:
             raise ValueError("review range or indicator history is incomplete")
-        config_payload = StrategyConfigPayloadV1.from_dict(inputs["configuration"])
+        config_payload = parse_strategy_config_payload(inputs["configuration"])
         # Keep the selected complete baseline immutable. Only this risk input
         # uses the separately confirmed actual leverage, with separate identity.
         config = replace(config_payload.to_strategy_config(), leverage=float(inputs["actual_leverage"]))
-        effective_payload = StrategyConfigPayloadV1.from_config(config)
+        effective_payload = type(config_payload).from_config(config)
         provenance["effective_configuration_sha256"] = effective_payload.strategy_config_sha256
         projected = project_rule_fills(position, inputs)
         snapshot = PositionStateSnapshot(

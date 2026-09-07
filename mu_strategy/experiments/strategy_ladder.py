@@ -35,7 +35,7 @@ from mu_strategy.research.candidate_conclusions import (
 )
 from mu_strategy.research.robustness import trade_concentration
 from mu_strategy.research.historical_data import load_historical_window, replay_html, replay_markdown
-from mu_strategy.research.strategy_releases import StrategyConfigPayloadV1
+from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2
 from mu_strategy.strategy import StrategyConfig
 from mu_strategy.strategies.registry import baseline_strategy_group
 
@@ -634,7 +634,7 @@ def run_strategy_ladder(
     if generation_id is not None:
         provenance = window.provenance({
             "protocol": PROTOCOL_VERSION,
-            "baseline_config": StrategyConfigPayloadV1.from_config(baseline_config).to_dict(),
+            "baseline_config": StrategyConfigPayloadV2.from_config(baseline_config).to_dict(),
             "candidates": [asdict(item.definition) for item in evaluations],
             "local_candidate_leverage": LOCAL_CANDIDATE_LEVERAGE,
             "window_days": window_days, "windows": windows,

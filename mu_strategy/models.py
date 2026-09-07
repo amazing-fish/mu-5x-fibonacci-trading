@@ -30,6 +30,7 @@ class EntryDecisionCode(str, Enum):
     MARKET_DATA_UNAVAILABLE = "market_data_unavailable"
     NO_CANDLES = "no_candles"
     CURRENT_BAR_OUTSIDE_TRADING_WINDOW = "current_bar_outside_trading_window"
+    REFERENCE_MARKET_CLOSED = "reference_market_closed"
     REGIME_BLOCKED = "regime_blocked"
     RSI_BELOW_FLOOR = "rsi_below_floor"
     MACD_WEAKENING = "macd_weakening"
@@ -71,6 +72,10 @@ ENTRY_DECISION_CATALOG: Mapping[EntryDecisionCode, EntryDecisionMetadata] = Mapp
             EntryDecisionStage.INPUT,
         ),
         EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW: EntryDecisionMetadata(
+            EntryDisposition.WAIT,
+            EntryDecisionStage.INPUT,
+        ),
+        EntryDecisionCode.REFERENCE_MARKET_CLOSED: EntryDecisionMetadata(
             EntryDisposition.WAIT,
             EntryDecisionStage.INPUT,
         ),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 from collections import Counter, deque
 from datetime import date, datetime, time, timedelta, timezone
@@ -11,7 +12,9 @@ from mu_strategy.market_data.trusted_data.contracts import SystemClock
 from mu_strategy.manual_positions import ManualPositionLedger
 from mu_strategy.notifications.events import NotificationError
 from mu_strategy.notifications.store import NotificationStore
-from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError
+from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError, canonical_payload_sha256
+from mu_strategy.core.trading_calendar import trading_window_schedule
+from mu_strategy.strategies.registry import baseline_strategy_group, selected_strategy_groups
 from mu_strategy.service_health import HealthStateError, HealthStore, health_view
 from mu_strategy.signal_feedback import SignalFeedbackStore
 
@@ -40,11 +43,11 @@ def _source(state: str, at_ms: int, message: str, **extra) -> dict:
     return {"state": state, "read_at_ms": at_ms, "message": message, **extra}
 
 
-def _read_observations(path: Path, window: dict, *, clock, display_limit: int, scan_limit: int) -> dict:
+def _read_observations(path: Path, window: dict, *, clock, display_limit: int, scan_limit: int, evidence_key=None) -> dict:
     repository = JsonlObservationRepository(path)
     counts = Counter()
     rows = deque(maxlen=display_limit)
-    latest = {}
+    latest, latest_all, evidence = {}, {}, None
     seen = {}
     total_cycles = total_observations = duplicates = read_cycles = 0
     cursor = (0, 0, None)
@@ -76,6 +79,11 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                     duplicates += 1
                     continue
                 seen[cycle.cycle_id] = fingerprint
+                for observation in cycle.observations:
+                    payload = observation.to_dict()
+                    latest_all[observation.symbol] = payload
+                    if evidence_key == (cycle.cycle_id, observation.observation_id):
+                        evidence = payload
                 if not window["start_ms"] <= cycle.created_at_ms < window["end_ms"]:
                     continue
                 total_cycles += 1
@@ -97,7 +105,7 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
             "ok" if complete else "incomplete", clock.now_ms(),
             "已读取扫描日志。" if complete else
             "达到扫描读取上限；以下只是已读取部分，不能代表完整观察窗口。",
-            records=list(rows), latest=list(latest.values()), counts=dict(counts),
+            records=list(rows), latest=list(latest.values()), latest_all=list(latest_all.values()), evidence=evidence, counts=dict(counts),
             total_cycles=total_cycles, total_observations=total_observations,
             duplicate_cycles=duplicates, scanned_cycles=read_cycles, read_through_byte=cursor[0],
             complete=complete, first_at_ms=first_at, last_at_ms=last_at,
@@ -122,7 +130,7 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
         current = health_view(state, running=running, now_ms=at)
         service = _source("ok" if state is not None else "missing", at,
                           "仅代表本次查询时的服务状态。" if state is not None else "尚无服务记录。",
-                          view=current)
+                          view=current, symbols=list(state.symbols) if state else [])
     except (OSError, HealthStateError):
         service = _source("unavailable", clock.now_ms(), "暂时无法读取服务状态。")
     observations = _read_observations(health.root / "observations.jsonl", window, clock=clock,
@@ -152,7 +160,71 @@ def read_signal_review(data_dir: Path, window: dict, *, clock=None,
         "sources_readable": all(item["state"] == "ok" for item in sources.values()),
         "feedback": {**feedback, "path": str(feedback_store.path)},
         "positions": ManualPositionLedger(data_dir).view(),
+        "current_conclusions": current_conclusions(service, observations, now_ms=clock.now_ms()),
     }
+
+
+
+def current_conclusions(service, observations, *, now_ms):
+    """Current calendar projection and last verified scan are distinct evidence."""
+    latest = {row["symbol"]: row for row in observations.get("latest_all", [])}
+    view = service.get("view", {})
+    last_cycle = view.get("last_cycle") or {}
+    cycle = (last_cycle.get("scan") or {}).get("cycle") or {}
+    health_rows = {row["symbol"]: row for row in cycle.get("observations", [])}
+    results = []
+    for symbol in sorted(set(service.get("symbols", [])) | set(latest)):
+        row = latest.get(symbol)
+        item = {"symbol": symbol, "as_of_ms": now_ms, "latest": row, "schedule": None,
+                "status": "unavailable", "message": "当前策略结论无法核实"}
+        try:
+            config = (selected_strategy_groups(symbol, [row["strategy_name"]])[0].config if row
+                      else baseline_strategy_group(symbol).config)
+            item["schedule"] = trading_window_schedule(now_ms, config)
+        except (ValueError, OSError, TypeError):
+            item["message"] = "日历或标的配置不可用，停止判断入场"
+            results.append(item)
+            continue
+        result = (row.get("scan_result") or {}) if row else {}
+        if service.get("state") != "ok" or observations.get("state") != "ok":
+            item["message"] = "来源读取不完整，当前策略结论无法核实"
+        elif not row or health_rows.get(symbol) != row:
+            item["message"] = "扫描日志与最新服务周期未对齐，仅保留最后已知记录"
+        elif row["outcome"] in {"scan_failed", "data_gate_blocked"}:
+            item["message"] = "最近一轮扫描失败，暂无可采信结论" if row["outcome"] == "scan_failed" else "最近一轮数据校验未通过，停止判断入场"
+        elif (not view.get("healthy") or view.get("runtime") != "running"
+              or last_cycle.get("service_run_id") != view.get("run_id")):
+            item["message"] = "服务未处于可核实的正常运行状态，仅保留最后已知记录"
+        elif not 0 <= now_ms - row["observed_at_ms"] <= 600_000:
+            item["message"] = "最近扫描已超过 10 分钟或时间异常，等待新一轮确认"
+        elif result.get("evaluated_candle_close_ms") is None:
+            item["message"] = "旧记录缺少评估 K 线及日历依据，不能当作当前入场结论"
+        elif not 0 <= now_ms - result["evaluated_candle_close_ms"] <= 1_800_000:
+            item["message"] = "评估 K 线已超过 30 分钟或尚未收盘，等待新一轮确认"
+        elif row["strategy_config_fingerprint"] != canonical_payload_sha256(config):
+            item["message"] = "最近扫描与当前策略配置不同，等待新配置扫描"
+        elif not item["schedule"]["allowed"]:
+            item.update(status="waiting", message="参考市场休市，等待下一策略窗口" if item["schedule"]["reason"] == "reference_market_closed"
+                        else "当前在策略时段外，等待下一窗口")
+        elif row["decision_code"] in {"reference_market_closed", "current_bar_outside_trading_window"}:
+            item.update(status="waiting", message="当前已进入策略窗口，等待窗口内已收盘 K 线的扫描")
+        else:
+            item.update(status="current", message="最近一轮可用于人工复核" if row["outcome"] == "ready_for_review" else "最近一轮仍在等待策略条件")
+        results.append(item)
+    return results
+
+
+def read_scan_evidence(data_dir, cycle_id, observation_id, *, clock=None):
+    if any(not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+           for value in (cycle_id, observation_id)):
+        raise ValueError("invalid observation identity")
+    clock = clock or SystemClock()
+    result = _read_observations(HealthStore(Path(data_dir)).root / "observations.jsonl",
+                                {"start_ms": 0, "end_ms": 2**63}, clock=clock, display_limit=1,
+                                scan_limit=SCAN_LIMIT, evidence_key=(cycle_id, observation_id))
+    if result["state"] != "ok":
+        raise ObservationCorruptionError("evidence source is unavailable or incomplete")
+    return result["evidence"]
 
 
 def validate_review_output(data_dir: Path, output: Path) -> None:

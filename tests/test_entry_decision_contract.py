@@ -29,6 +29,7 @@ class EntryDecisionContractTests(unittest.TestCase):
 
     def test_catalog_encodes_the_required_decision_semantics(self):
         expected = {
+            EntryDecisionCode.REFERENCE_MARKET_CLOSED: (EntryDisposition.WAIT, EntryDecisionStage.INPUT),
             EntryDecisionCode.MARKET_DATA_UNAVAILABLE: (EntryDisposition.BLOCK, EntryDecisionStage.INPUT),
             EntryDecisionCode.NO_CANDLES: (EntryDisposition.WAIT, EntryDecisionStage.INPUT),
             EntryDecisionCode.CURRENT_BAR_OUTSIDE_TRADING_WINDOW: (

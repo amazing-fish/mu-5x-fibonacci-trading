@@ -44,7 +44,7 @@ from mu_strategy.research.strategy_releases import (
     STRATEGY_RELEASE_V1_RULE_ID,
     STRATEGY_RELEASE_V1_STRATEGY_NAME,
     STRATEGY_RELEASE_V1_SYMBOL,
-    StrategyConfigPayloadV1,
+    StrategyConfigPayloadV2,
     StrategyReleaseApprovalV1,
     StrategyReleaseCandidateV1,
     StrategyReleaseV1,
@@ -102,9 +102,9 @@ class StrategyConfigPayloadTests(unittest.TestCase):
     def test_payload_owns_every_strategy_config_field_and_round_trips(self):
         config = baseline_strategy_group("MU-USDT-SWAP").config
 
-        payload = StrategyConfigPayloadV1.from_config(config)
+        payload = StrategyConfigPayloadV2.from_config(config)
         wire = payload.to_dict()
-        restored = StrategyConfigPayloadV1.from_dict(wire)
+        restored = StrategyConfigPayloadV2.from_dict(wire)
 
         self.assertEqual({field.name for field in fields(StrategyConfig)}, set(wire["fields"]))
         self.assertEqual(payload, restored)
@@ -114,30 +114,30 @@ class StrategyConfigPayloadTests(unittest.TestCase):
         self.assertEqual(["0.2", "0.2", "0.2", "0.4"], wire["fields"]["margin_steps"])
 
     def test_payload_rejects_unknown_missing_noncanonical_and_nonfinite_fields(self):
-        wire = StrategyConfigPayloadV1.from_config(StrategyConfig()).to_dict()
+        wire = StrategyConfigPayloadV2.from_config(StrategyConfig()).to_dict()
 
         unknown = {**wire, "fields": {**wire["fields"], "future_field": "value"}}
         with self.assertRaisesRegex(StrategyReleaseSchemaError, "unknown"):
-            StrategyConfigPayloadV1.from_dict(unknown)
+            StrategyConfigPayloadV2.from_dict(unknown)
 
         missing_fields = dict(wire["fields"])
         missing_fields.pop("leverage")
         with self.assertRaisesRegex(StrategyReleaseSchemaError, "missing"):
-            StrategyConfigPayloadV1.from_dict({**wire, "fields": missing_fields})
+            StrategyConfigPayloadV2.from_dict({**wire, "fields": missing_fields})
 
         noncanonical = {**wire, "fields": {**wire["fields"], "leverage": "5.00"}}
         with self.assertRaisesRegex(StrategyReleaseSchemaError, "canonical decimal"):
-            StrategyConfigPayloadV1.from_dict(noncanonical)
+            StrategyConfigPayloadV2.from_dict(noncanonical)
 
         for invalid in (True, math.nan, math.inf):
             with self.subTest(value=invalid):
                 malformed = {**wire, "fields": {**wire["fields"], "leverage": invalid}}
                 with self.assertRaises(StrategyReleaseSchemaError):
-                    StrategyConfigPayloadV1.from_dict(malformed)
+                    StrategyConfigPayloadV2.from_dict(malformed)
 
     def test_payload_hash_changes_with_any_executable_config_change(self):
-        first = StrategyConfigPayloadV1.from_config(StrategyConfig())
-        second = StrategyConfigPayloadV1.from_config(replace(StrategyConfig(), fib_lookback=33))
+        first = StrategyConfigPayloadV2.from_config(StrategyConfig())
+        second = StrategyConfigPayloadV2.from_config(replace(StrategyConfig(), fib_lookback=33))
 
         self.assertNotEqual(first.strategy_config_sha256, second.strategy_config_sha256)
 
@@ -216,7 +216,7 @@ class StrategyReleaseContractTests(unittest.TestCase):
 
     def test_candidate_identity_changes_for_each_control_dimension(self):
         base = _candidate()
-        fee_config = StrategyConfigPayloadV1.from_config(
+        fee_config = StrategyConfigPayloadV2.from_config(
             replace(
                 baseline_strategy_group("MU-USDT-SWAP").config,
                 fee_profile="limit",
@@ -226,7 +226,7 @@ class StrategyReleaseContractTests(unittest.TestCase):
         changed = (
             _candidate(evaluated_code_commit_sha="b" * 40),
             _candidate(
-                config=StrategyConfigPayloadV1.from_config(
+                config=StrategyConfigPayloadV2.from_config(
                     replace(baseline_strategy_group("MU-USDT-SWAP").config, fib_lookback=33)
                 )
             ),
@@ -245,7 +245,7 @@ class StrategyReleaseContractTests(unittest.TestCase):
                 self.assertNotEqual(base.candidate_fingerprint, candidate.candidate_fingerprint)
 
     def test_candidate_rejects_a_config_symbol_that_differs_from_the_dataset(self):
-        mismatched = StrategyConfigPayloadV1.from_config(
+        mismatched = StrategyConfigPayloadV2.from_config(
             baseline_strategy_group("BTC-USDT-SWAP").config
         )
         with self.assertRaisesRegex(ValueError, "config symbol"):
@@ -1251,14 +1251,14 @@ def _results(*, ending_equity: str = "10000") -> tuple[ExperimentWindowResultV1,
 def _candidate(
     *,
     evaluated_code_commit_sha: str = "a" * 40,
-    config: StrategyConfigPayloadV1 | None = None,
+    config: StrategyConfigPayloadV2 | None = None,
     dataset: TrustedExperimentDatasetV1 | None = None,
     windows: tuple[ExperimentWindow, ...] | None = None,
     assumptions: BacktestAssumptionsV1 | None = None,
     results: tuple[ExperimentWindowResultV1, ...] | None = None,
     selection_reason: SelectionReasonCode = SelectionReasonCode.BASELINE_CONTINUITY,
 ) -> StrategyReleaseCandidateV1:
-    config = config or StrategyConfigPayloadV1.from_config(baseline_strategy_group("MU-USDT-SWAP").config)
+    config = config or StrategyConfigPayloadV2.from_config(baseline_strategy_group("MU-USDT-SWAP").config)
     return StrategyReleaseCandidateV1.create(
         strategy_rule_id="mu.baseline.second_pullback.long_limit.v1",
         strategy_name="baseline",
