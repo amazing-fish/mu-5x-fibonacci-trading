@@ -183,14 +183,19 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         rsi_values, hist = rsi(closes), macd(closes)[2]
         earliest_exit = None
         latest = None
+        calendar_error = None
         for index in range(first_index, len(candles)):
             latest = evaluate_exit(snapshot, candles[index], index=index, candles=candles,
                                    regime=hourly_context[candles[index].open_time_ms], config=config)
+            calendar_error = calendar_error or latest.calendar_error
             if latest.exit_triggered and earliest_exit is None:
                 earliest_exit = asdict(latest)
         last = candles[-1]
         addition = None
         if earliest_exit is None:
+            if calendar_error:
+                return {**result, "status": "data_blocked", "calendar_error": calendar_error,
+                        "messages": ["已检查确认止损；参考日历不可用，无法完成退出与加仓条件复核。"]}
             addition = asdict(decide_pyramid_add(
                 snapshot, last, rsi_value=rsi_values[-1], macd_hist=hist[-1], previous_macd_hist=hist[-2],
                 regime=hourly_context[last.open_time_ms], config=config,
@@ -205,11 +210,13 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
             "latest_close": last.close, "regime": hourly_context[last.open_time_ms], "addition": addition,
             "projected_fills": projected, "actual_leverage": inputs["actual_leverage"],
             "transition_state": "not_used_by_baseline",
+            "calendar_error": calendar_error,
         }
         provenance["review_identity"] = canonical_sha256({
             "position_id": position["position_id"], "provenance": {key: value for key, value in provenance.items() if key != "evaluated_at_ms"},
             "first_open_ms": first_open, "last_open_ms": last.open_time_ms,
         })
-        return {**result, "status": "evaluated", "messages": [], "evaluation": evaluation}
+        messages = ["参考日历不可用；已确认触及退出条件，日历相关风险条件仍未知，加仓未评估。"] if calendar_error else []
+        return {**result, "status": "partial" if calendar_error else "evaluated", "messages": messages, "evaluation": evaluation}
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return {**result, "status": "data_blocked", "messages": ["行情或规则输入不足以完整复核本次确认后的区间，请检查来源与覆盖范围。"]}

@@ -2,6 +2,8 @@
 
 日历限制策略允许的评估日期，`StrategyConfig.trading_windows_et` 限制美东策略时间；两者取交集。它是策略参考市场的配置，不能据此断言 OKX 永续本身休市。行情刷新不受该日历过滤，止损与已有持仓风险检查也不会因正常休市而停止。
 
+日历超出覆盖范围或时区不可用时，入场、加仓及依赖这些判断的完整回测继续失败。已有持仓的只读退出检查仍评估确认止损和收紧值：已触及止损就保留明确结果，同时记录 `calendar_error`；未触及止损时 `exit_triggered` 为未知（`null`），不能据此声称所有退出条件均未触发。人工持仓复核只有已确认退出证据时显示部分结果，并保留日历未知提示；否则保持阻断，不产生加仓建议。日历错误不会被解释为已知休市或切换到另一个日历。
+
 ## 配置与接入
 
 在 [config/instrument_calendars.json](../config/instrument_calendars.json) 按 canonical OKX 标的指定日历。当前 MU、META、SPCX 显式采用 `us_equities_2025_2028_v1`；其他标的采用文件明确声明的 `default_calendar: weekday_windows_v1`，沿用原策略工作日限制。新增标的应先确定适用日历；不要按 `USDT` 后缀推定全天交易。

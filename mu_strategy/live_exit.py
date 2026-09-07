@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from mu_strategy.core.trading_calendar import CalendarUnavailable
 from mu_strategy.models import Candle
 from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
@@ -33,18 +34,23 @@ class ExitObservation:
     candle. Only a position that survives that test receives the tightened
     stop for the next candle. ``stop_after_candle_if_open`` is therefore a
     conditional next value, not the trigger used for this candle.
+
+    If the reference calendar is unavailable, a breached carried stop still
+    gives a confirmed exit. Otherwise ``exit_triggered`` is unknown (None),
+    with ``calendar_error`` explaining the unevaluated session condition.
     """
 
     candle_open_time_ms: int
     latest_close: float
     stop_before_candle: float
     stop_after_candle_if_open: float
-    exit_triggered: bool
+    exit_triggered: bool | None
     exit_reason: str | None
     trigger_basis: str
     latest_close_at_or_below_tightened_stop: bool
     transition_fill_count: int
     transition_start: float
+    calendar_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,9 +101,16 @@ def evaluate_exit(
 ) -> ExitObservation:
     """Evaluate a known position without mutating state or placing orders."""
 
-    non_session_liquidation_risk = _has_non_session_liquidation_risk(candle, position, config)
+    calendar_error = None
+    try:
+        non_session_liquidation_risk = _has_non_session_liquidation_risk(candle, position, config)
+    except CalendarUnavailable as exc:
+        # A missing reference session cannot invalidate a known carried stop,
+        # nor justify claiming that every exit condition is clear.
+        non_session_liquidation_risk = None
+        calendar_error = str(exc)
     stop_triggered = candle.low <= position.stop_price
-    exit_triggered = non_session_liquidation_risk or stop_triggered
+    exit_triggered = True if non_session_liquidation_risk or stop_triggered else non_session_liquidation_risk
     if non_session_liquidation_risk:
         exit_reason = "non_session_liquidation_risk"
         trigger_basis = "candle_low_at_or_below_non_session_liquidation_risk_price"
@@ -106,7 +119,7 @@ def evaluate_exit(
         trigger_basis = "candle_low_at_or_below_stop_before_candle"
     else:
         exit_reason = None
-        trigger_basis = "none"
+        trigger_basis = "calendar_unavailable" if calendar_error else "none"
     outcome = tighten_stop(
         position,
         candle,
@@ -126,6 +139,7 @@ def evaluate_exit(
         latest_close_at_or_below_tightened_stop=candle.close <= outcome.stop_price,
         transition_fill_count=outcome.transition_fill_count,
         transition_start=outcome.transition_start,
+        calendar_error=calendar_error,
     )
 
 

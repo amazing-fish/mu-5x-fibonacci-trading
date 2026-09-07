@@ -214,6 +214,21 @@ class PositionManagementTests(PositionManagementFixture):
         self.assertEqual(low_risk["provenance"]["configuration_sha256"], high_risk["provenance"]["configuration_sha256"])
         self.assertNotEqual(low_risk["provenance"]["effective_configuration_sha256"], high_risk["provenance"]["effective_configuration_sha256"])
 
+    def test_out_of_coverage_stop_is_partial_review_and_never_permits_add(self):
+        at = int(datetime(2029, 1, 2, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        identity = self.ready(at=at)
+        before = self.ledger.path.read_bytes()
+        result = self.review(identity, self.loader(end=at + 4 * BAR_MS, lows={at: 94}), at=at + 4 * BAR_MS)
+        self.assertEqual('partial', result['status'])
+        self.assertEqual('exit_review', result['evaluation']['outcome'])
+        self.assertEqual('stop', result['evaluation']['earliest_exit']['exit_reason'])
+        self.assertIsNone(result['evaluation']['addition'])
+        self.assertIn('日历', result['messages'][0])
+        unknown = self.review(identity, self.loader(end=at + 4 * BAR_MS), at=at + 4 * BAR_MS)
+        self.assertEqual('data_blocked', unknown['status'])
+        self.assertIsNone(unknown['evaluation'])
+        self.assertEqual(before, self.ledger.path.read_bytes())
+
     def test_latest_shared_add_candidate_does_not_write_a_fill(self):
         at = int(datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
         identity = self.ready(at=at)

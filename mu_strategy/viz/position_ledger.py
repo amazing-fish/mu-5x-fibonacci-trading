@@ -197,7 +197,8 @@ def _rule_review(review):
     labels = {"unknown": ("还需补齐管理输入", "warning"), "needs_review": ("记录已变化，请重新核对", "warning"),
               "unsupported": ("超出当前规则支持范围", "warning"), "not_open": ("当前无可复核持仓", "neutral"),
               "data_blocked": ("行情或输入阻断，未产生可采信判断", "danger"),
-              "waiting": ("等待确认后的完整 K 线", "neutral"), "evaluated": ("已完成本次规则复核", "good")}
+              "waiting": ("等待确认后的完整 K 线", "neutral"), "evaluated": ("已完成本次规则复核", "good"),
+              "partial": ("已确认退出条件，部分日历条件未知", "warning")}
     label, tone = labels[review["status"]]
     messages = "".join(f'<li>{_e(message)}</li>' for message in review["messages"])
     checks = "".join(f'<li><span class="badge {"good" if item["ok"] else "warning"}">{"已满足" if item["ok"] else "待核对"}</span> {_e(item["label"])}</li>' for item in review["checks"])
@@ -217,8 +218,9 @@ def _rule_review(review):
         exit_ = evaluation["earliest_exit"]
         if exit_:
             reason = "非交易时段杠杆风险模型条件" if exit_["exit_reason"] == "non_session_liquidation_risk" else "已确认止损条件"
+            first = "最早已确认在" if review["status"] == "partial" else "最早在"
             decision = (f'<div class="rule-decision danger"><h3>曾触及退出条件，先核对实际处理</h3>'
-                        f'<p>最早在 {_time(exit_["candle_open_time_ms"])} 开始的 15m K 线，最低价触及{reason}。'
+                        f'<p>{first} {_time(exit_["candle_open_time_ms"])} 开始的 15m K 线，最低价触及{reason}。'
                         f'后续价格恢复不会撤销这条记录；本次不再给出加仓候选。</p><p>这不表示已平仓，台账数量与止损均未自动改变。</p></div>')
         else:
             addition = evaluation["addition"]

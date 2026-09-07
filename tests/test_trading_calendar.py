@@ -110,6 +110,48 @@ class TradingCalendarTests(unittest.TestCase):
         candle = replace(candle, low=75)
         self.assertEqual('non_session_liquidation_risk', evaluate_exit(position, candle, index=0, candles=[candle], regime='green', config=self.config).exit_reason)
 
+    def test_unavailable_calendar_preserves_stop_but_never_asserts_no_exit(self):
+        from mu_strategy.models import Candle
+        from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot, decide_pyramid_add
+        from mu_strategy.live_exit import evaluate_exit, observe_okx_position
+
+        for symbol in ('MU-USDT-SWAP', 'META-USDT-SWAP', 'SPCX-USDT-SWAP'):
+            config = baseline_strategy_group(symbol).config
+            for year in (1970, 2024, 2029):
+                with self.subTest(symbol=symbol, year=year):
+                    at = _utc_ms(year, 1, 2, 15, 0)
+                    position = PositionStateSnapshot((PositionFillSnapshot(at, 100, 1),), 95, 100, 95)
+                    candle = Candle(at, 100, 101, 94, 100, 1000)
+                    result = evaluate_exit(position, candle, index=0, candles=[candle], regime='green', config=config)
+                    self.assertTrue(result.exit_triggered)
+                    self.assertEqual('stop', result.exit_reason)
+                    self.assertIn('2025 through 2028', result.calendar_error)
+                    self.assertEqual(95, result.stop_after_candle_if_open)
+                    safe = replace(candle, low=99)
+                    unknown = evaluate_exit(position, safe, index=0, candles=[safe], regime='green', config=config)
+                    self.assertIsNone(unknown.exit_triggered)
+                    self.assertEqual('calendar_unavailable', unknown.trigger_basis)
+                    shadow = observe_okx_position({'instId': symbol, 'pos': '1', 'avgPx': '100'}, candles=[candle], regime='green', config=config)
+                    self.assertEqual('unknown', shadow.decision_status)
+                    self.assertTrue(shadow.assumption_evaluation.exit_triggered)
+                    with self.assertRaises(CalendarUnavailable):
+                        scan_entry(symbol, [candle], [candle], config=config)
+                    with self.assertRaises(CalendarUnavailable):
+                        decide_pyramid_add(position, candle, rsi_value=60, macd_hist=.2, previous_macd_hist=.1, regime='green', config=config)
+
+    def test_missing_timezone_preserves_stop_without_guessing_session(self):
+        from mu_strategy.models import Candle
+        from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot
+        from mu_strategy.live_exit import evaluate_exit
+        at = _utc_ms(2026, 9, 8, 14, 0)
+        position = PositionStateSnapshot((PositionFillSnapshot(at, 100, 1),), 95, 100, 95)
+        candle = Candle(at, 100, 101, 75, 100, 1000)
+        with patch('mu_strategy.core.trading_calendar.ZoneInfo', side_effect=RuntimeError('tz missing')):
+            result = evaluate_exit(position, candle, index=0, candles=[candle], regime='green', config=self.config)
+        self.assertTrue(result.exit_triggered)
+        self.assertEqual('stop', result.exit_reason)
+        self.assertIn('timezone', result.calendar_error)
+
     def test_instrument_file_is_strict_and_does_not_change_refresh_classification(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'instruments.json'
