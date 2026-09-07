@@ -1109,7 +1109,14 @@ class OKXDemoLoopTests(unittest.TestCase):
 
 
 def _bundle(symbol: str) -> CandleBundle:
-    return replace(trusted_scan_bundle(symbol=symbol), run_id=None, observed_at_ms=None, files_by_interval={})
+    bundle = trusted_scan_bundle(symbol=symbol)
+    # Keep synthetic observations within the configured reference calendar.
+    start_ms = 1_780_300_800_000  # 2026-06-01 UTC
+    candles = {
+        interval: [replace(candle, open_time_ms=start_ms + candle.open_time_ms) for candle in rows]
+        for interval, rows in bundle.candles_by_interval.items()
+    }
+    return replace(bundle, candles_by_interval=candles, run_id=None, observed_at_ms=None, files_by_interval={})
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:

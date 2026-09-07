@@ -40,7 +40,7 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
     def test_main_is_cache_only_and_defaults_to_trusted_live_store(self):
         from mu_strategy.experiments import fibonacci_pullback
 
-        now_ms = 20 * DAY_MS
+        now_ms = 1_780_300_800_000 + 20 * DAY_MS  # 2026-06-01 UTC + 20 days
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "data" / "live"
@@ -92,7 +92,7 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
     def test_multi_asset_main_is_cache_only_and_preserves_report_structure(self):
         from mu_strategy.experiments import fibonacci_pullback
 
-        now_ms = 20 * DAY_MS
+        now_ms = 1_780_300_800_000 + 20 * DAY_MS
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data_dir = root / "trusted"
@@ -136,7 +136,8 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
     def test_multi_asset_main_pins_one_generation_when_current_pointer_changes(self):
         from mu_strategy.experiments import fibonacci_pullback
 
-        now_ms = DAY_MS
+        start_ms = 1_780_300_800_000  # 2026-06-01 UTC, inside the reference calendar
+        now_ms = start_ms + DAY_MS
         symbols = ("MU-USDT-SWAP", "BTC-USDT-SWAP")
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -147,6 +148,7 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
                 symbol=symbols[0],
                 days=1,
                 run_id="old-run",
+                start_ms=start_ms,
                 universe_symbols=(symbols[0],),
             )
             for run_id, symbol in (
@@ -159,6 +161,7 @@ class FibonacciPullbackExperimentTests(unittest.TestCase):
                     symbol=symbol,
                     days=1,
                     run_id=run_id,
+                    start_ms=start_ms,
                     universe_symbols=symbols,
                 )
             store = TrustedDataStore(data_dir=data_dir)
