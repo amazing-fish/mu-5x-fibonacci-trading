@@ -45,6 +45,9 @@ def render_markdown_report(
         f"- ending equity: {result.ending_equity:.2f}",
         f"- total return: {result.total_return_pct:.2%}",
         f"- max drawdown: {result.max_drawdown_pct:.2%}",
+        "- equity / drawdown basis: net of incurred fees; executed-event and 15m-close samples "
+        "labelled by bar open, ordered within each bar, with final settlement last. "
+        "Not precise intrabar extrema; no reserve for future exit fees.",
         f"- trades: {result.trade_count}",
         f"- win rate: {result.win_rate:.2%}",
         f"- profit factor: {_format_float(result.profit_factor)}",

@@ -75,11 +75,19 @@ def run_backtest(
     rsi_values = rsi(closes, 14)
     _, _, hist_values = macd(closes)
 
+    # Settled equity is also the existing sizing budget. Open-position fees
+    # affect measurements only; debiting this budget would change later fills
+    # and charge the same entry fees again at settlement. It is not free margin.
     equity = starting_equity
     equity_curve: list[tuple[int, float]] = [(candles_15m[0].open_time_ms, equity)]
     trades: list[Trade] = []
     position: OpenPosition | None = None
     pending_entry: PendingEntry | None = None
+
+    def record_close(candle: Candle) -> None:
+        # All timestamps label the 15m bar, not an exact intrabar instant.
+        # Preserve list order: executed events, observed close, final settlement.
+        equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
 
     index = 1
     while index < len(candles_15m):
@@ -91,16 +99,19 @@ def run_backtest(
                     pending_entry = None
                 elif candle.low <= pending_entry.fib_level * (1 + config.fib_tolerance_pct):
                     if not is_preferred_us_cash_window(candle.open_time_ms, config):
+                        record_close(candle)
                         index += 1
                         continue
                     entry_price = _buy_limit_fill_price(candle, pending_entry.fib_level)
                     if entry_price is None:
+                        record_close(candle)
                         index += 1
                         continue
                     fill = _make_fill(candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
                     stop_price = entry_price * (1 - config.initial_stop_pct)
                     position = OpenPosition([fill], stop_price, entry_price, stop_price)
                     pending_entry = None
+                    equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, entry_price)))
                     if _has_non_session_liquidation_risk(candle, position, config):
                         exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
                         equity, trade = _close_position(
@@ -127,21 +138,26 @@ def run_backtest(
                         trades.append(trade)
                         position = None
                         equity_curve.append((candle.open_time_ms, equity))
+                    record_close(candle)
                     index += 1
                     continue
                 else:
+                    record_close(candle)
                     index += 1
                     continue
 
             # Pending orders consume the current bar, including the final one.
             # A new close-confirmed signal needs a real later execution bar.
             if index + 1 >= len(candles_15m):
+                record_close(candle)
                 break
             if not is_preferred_us_cash_window(candle.open_time_ms, config):
+                record_close(candle)
                 index += 1
                 continue
             fib_level = nearest_fib_retest_level(candles_15m, index, config)
             if fib_level is None:
+                record_close(candle)
                 index += 1
                 continue
 
@@ -156,6 +172,7 @@ def run_backtest(
                 config,
             )
             if not signal.allowed or signal.stop_price is None:
+                record_close(candle)
                 index += 1
                 continue
 
@@ -164,22 +181,29 @@ def run_backtest(
                     fib_level=fib_level,
                     expires_index=index + config.second_pullback_wait_bars,
                 )
+                record_close(candle)
                 index += 1
                 continue
 
             next_candle = candles_15m[index + 1]
             execution = should_execute_entry(candles_15m, index, next_candle, fib_level, regime, config)
             if not execution.allowed or execution.entry_price is None:
+                record_close(candle)
                 index += 1
                 continue
             if not is_preferred_us_cash_window(next_candle.open_time_ms, config):
+                record_close(candle)
                 index += 1
                 continue
 
+            # This branch creates a future fill early in control flow. Sample
+            # the signal close before that fill (or its exit) changes state.
+            record_close(candle)
             entry_price = execution.entry_price
             fill = _make_fill(next_candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
             stop_price = entry_price * (1 - config.initial_stop_pct)
             position = OpenPosition([fill], stop_price, entry_price, stop_price)
+            equity_curve.append((next_candle.open_time_ms, _marked_equity(equity, position, entry_price)))
             if _has_non_session_liquidation_risk(next_candle, position, config):
                 exit_price = _sell_stop_fill_price(next_candle, _liquidation_risk_price(position, config))
                 equity, trade = _close_position(
@@ -225,6 +249,7 @@ def run_backtest(
             trades.append(trade)
             position = None
             equity_curve.append((candle.open_time_ms, equity))
+            record_close(candle)
             index += 1
             continue
 
@@ -241,13 +266,17 @@ def run_backtest(
             trades.append(trade)
             position = None
             equity_curve.append((candle.open_time_ms, equity))
+            record_close(candle)
             index += 1
             continue
 
+        fill_count = len(position.fills)
         _execute_pyramid_add(position, candle, index, candles_15m, hourly_context, hist_values, rsi_values, equity, config)
+        if len(position.fills) > fill_count:
+            equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, position.fills[-1].price)))
         _tighten_stop(position, candle, index, candles_15m, hourly_context.get(candle.open_time_ms, "yellow"), config)
         _plan_pyramid_add(position, candle, index, hourly_context, hist_values, rsi_values, config)
-        equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
+        record_close(candle)
         index += 1
 
     if position is not None:
@@ -427,10 +456,15 @@ def _position_snapshot(position: OpenPosition) -> PositionStateSnapshot:
 
 
 def _marked_equity(equity: float, position: OpenPosition | None, mark_price: float) -> float:
+    """Net equity: settled budget + unrealized PnL - incurred entry fees.
+
+    No margin deduction or reserve for a hypothetical future exit fee. Closed
+    trades already contributed their net PnL to equity via _close_position.
+    """
     if position is None:
         return equity
     unrealized = sum((mark_price - fill.price) * fill.units for fill in position.fills)
-    return equity + unrealized
+    return equity + unrealized - position.fees
 
 
 def _close_position(

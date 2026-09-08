@@ -50,6 +50,7 @@ python -B -m mu_strategy.experiments.strategy_ladder --generation-id $generation
 | 指标 / 场景 | 含义与限制 |
 |---|---|
 | 账户收益 | 窗口权益变化；不能与单笔保证金收益混用 |
+| 净权益与最大回撤 | 实际成交后及每根 15m 收盘计入已发生费用；时间戳为 K 线标签，同根按记录顺序，末根结算最后发生。不是精确盘中极值；[定义、采样和配对证据](net-equity-measurement.md) |
 | `Trade.return_pct` | 已投入保证金口径的单笔收益；HTML/walk-forward 的部分标签仍待 #88 修正 |
 | 1x buy-and-hold / 杠杆 price-only diagnostic | 价格对照，不含费用、funding、清算及路径依赖，不能当作可实现杠杆收益 |
 | top-5 集中度、剔除净利、stage 分布 | 用于解释结果依赖的少数交易和加仓阶段；见 [robustness](../mu_strategy/research/robustness.py) |
