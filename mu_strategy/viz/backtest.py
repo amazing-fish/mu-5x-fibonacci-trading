@@ -356,7 +356,8 @@ def render_html_visualization(
     <div id="volume-chart" class="chart"></div>
   </section>
   <section>
-    <h2>权益曲线</h2>
+    <h2>净权益曲线</h2>
+    <p class="note">已扣实际发生的手续费，不预扣未来平仓费。采样保留成交后、退出后、15m 收盘与期末结算；横轴为 K 线开盘标签，同根按记录顺序排列，不代表精确盘中时刻。最大回撤按这些净权益点计算，未建模盘中极值。</p>
     <div id="equity-chart" class="chart"></div>
   </section>
   <section>

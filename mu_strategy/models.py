@@ -295,6 +295,9 @@ class BacktestResult:
     starting_equity: float
     ending_equity: float
     trades: list[Trade]
+    # run_backtest emits net-equity samples labelled by 15m bar open. List order
+    # retains executed events, observed close, then optional final settlement;
+    # duplicate labels are meaningful, not precise intrabar timestamps.
     equity_curve: list[tuple[int, float]] = field(default_factory=list)
 
     @property
