@@ -225,7 +225,8 @@ def _rule_review(review):
         else:
             addition = evaluation["addition"]
             title = "该 K 线满足下一阶段加仓条件" if addition["should_add"] else "存在止损收紧候选" if evaluation["outcome"] == "stop_review" else "本次未触发新增管理动作"
-            detail = (f'候选阶段 {addition["stage"]} · 规则参考价 {_e(addition["fill_price"])} USDT · 阶段资金比例 {addition["margin_fraction"]:.0%}。'
+            detail = (f'候选阶段 {addition["stage"]} · 规则参考价 {_e(addition["reference_price"])} USDT · 阶段资金比例 {addition["margin_fraction"]:.0%}。'
+                      f'该收盘候选最早可用于 {_time(addition["available_at_ms"])} 北京时间开始的下一根；仍须核对时段、资格和实际触价。'
                       '这是该 K 线下的规则候选，不是已成交价格、委托数量或现在可成交的承诺。'
                       if addition["should_add"] else '当前 K 线没有加仓候选；已有实际阶段保持不变。')
             decision = f'<div class="rule-decision"><h3>{title}</h3><p>{detail}</p></div>'

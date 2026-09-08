@@ -237,6 +237,10 @@ class PositionManagementTests(PositionManagementFixture):
         result = self.review(identity, loader, at=at + 4 * BAR_MS)
         self.assertEqual("add_candidate", result["evaluation"]["outcome"])
         self.assertEqual(2, result["evaluation"]["addition"]["stage"])
+        self.assertEqual(result["evaluation"]["checked_through_ms"],
+                         result["evaluation"]["addition"]["available_at_ms"])
+        self.assertIn("reference_price", result["evaluation"]["addition"])
+        self.assertNotIn("fill_price", result["evaluation"]["addition"])
         self.assertEqual(before, self.position(identity))
 
     def test_waits_for_first_whole_candle_and_never_backcasts_new_stop(self):

@@ -51,17 +51,21 @@ class PositionStateSnapshot:
 
 @dataclass(frozen=True)
 class PyramidAddDecision:
+    """Close-confirmed candidate, never an executed fill or an executable quote."""
+
     should_add: bool
     stage: int | None = None
-    fill_price: float | None = None
+    reference_price: float | None = None
     margin_fraction: float | None = None
+    trigger_price: float | None = None
+    available_at_ms: int | None = None
 
     def __post_init__(self) -> None:
-        details = (self.stage, self.fill_price, self.margin_fraction)
+        details = (self.stage, self.reference_price, self.margin_fraction, self.trigger_price, self.available_at_ms)
         if self.should_add and any(value is None for value in details):
-            raise ValueError("add decision requires stage, fill_price, and margin_fraction")
+            raise ValueError("add candidate requires stage, reference, margin, trigger, and availability")
         if not self.should_add and any(value is not None for value in details):
-            raise ValueError("no-add decision cannot contain fill details")
+            raise ValueError("no-add decision cannot contain candidate details")
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,11 @@ def decide_pyramid_add(
     regime: str,
     config: StrategyConfig,
 ) -> PyramidAddDecision:
+    """Evaluate a closed candle; callers own later planning and execution.
+
+    The reference price describes the signal candle's threshold/gap observation.
+    Only a later execution candle can establish an actual simulated fill price.
+    """
     next_stage = position.max_stage + 1
     if next_stage > len(config.margin_steps):
         return PyramidAddDecision(False)
@@ -89,8 +98,7 @@ def decide_pyramid_add(
 
     threshold = config.add_thresholds[next_stage - 2]
     trigger_price = position.entry_anchor * (1 + threshold)
-    fill_price = _buy_stop_fill_price(candle, trigger_price)
-    if fill_price is None:
+    if candle.high < trigger_price:
         return PyramidAddDecision(False)
     if rsi_value < config.rsi_add_floor or macd_hist < previous_macd_hist:
         return PyramidAddDecision(False)
@@ -100,17 +108,11 @@ def decide_pyramid_add(
     return PyramidAddDecision(
         should_add=True,
         stage=next_stage,
-        fill_price=fill_price,
+        reference_price=max(candle.open, trigger_price),
         margin_fraction=config.margin_steps[next_stage - 1],
+        trigger_price=trigger_price,
+        available_at_ms=candle.open_time_ms + 900_000,
     )
-
-
-def _buy_stop_fill_price(candle: Candle, trigger_price: float) -> float | None:
-    if candle.high < trigger_price:
-        return None
-    if candle.open > trigger_price:
-        return candle.open
-    return trigger_price
 
 
 def tighten_stop(

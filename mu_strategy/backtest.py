@@ -14,6 +14,7 @@ from mu_strategy.strategy import (
 from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
     PositionStateSnapshot,
+    PyramidAddDecision,
     decide_pyramid_add,
     tighten_stop,
 )
@@ -28,6 +29,7 @@ class OpenPosition:
     max_stage: int = 1
     stop_transition_fill_count: int = 0
     stop_transition_start: float = 0.0
+    pending_add: PendingPyramidAdd | None = None
 
     @property
     def units(self) -> float:
@@ -48,6 +50,14 @@ class OpenPosition:
 class PendingEntry:
     fib_level: float
     expires_index: int
+
+
+@dataclass(frozen=True)
+class PendingPyramidAdd:
+    """A close-confirmed candidate valid only on the adjacent execution bar."""
+
+    candidate: PyramidAddDecision
+    signal_index: int
 
 
 def run_backtest(
@@ -234,8 +244,9 @@ def run_backtest(
             index += 1
             continue
 
-        _maybe_add(position, candle, index, candles_15m, hourly_context, hist_values, rsi_values, equity, config)
+        _execute_pyramid_add(position, candle, index, candles_15m, hourly_context, hist_values, rsi_values, equity, config)
         _tighten_stop(position, candle, index, candles_15m, hourly_context.get(candle.open_time_ms, "yellow"), config)
+        _plan_pyramid_add(position, candle, index, hourly_context, hist_values, rsi_values, config)
         equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
         index += 1
 
@@ -299,7 +310,7 @@ def _liquidation_risk_price(position: OpenPosition, config: StrategyConfig) -> f
     return position.entry_price * max(0.0, 1 - (1 / config.leverage))
 
 
-def _maybe_add(
+def _execute_pyramid_add(
     position: OpenPosition,
     candle: Candle,
     index: int,
@@ -310,28 +321,69 @@ def _maybe_add(
     equity: float,
     config: StrategyConfig,
 ) -> None:
+    # Consume once, including misses/invalidations. Closing the owning position
+    # discards its plan too. Never use this execution bar's close indicators.
+    plan = position.pending_add
+    position.pending_add = None
+    if plan is None:
+        return
+    candidate = plan.candidate
+    if (index != plan.signal_index + 1
+            or candle.open_time_ms != candidate.available_at_ms
+            or position.max_stage + 1 != candidate.stage):
+        return
+    if not is_preferred_us_cash_window(candle.open_time_ms, config):
+        return
     regime = hourly_context.get(candle.open_time_ms, "yellow")
     decision = decide_pyramid_add(
         _position_snapshot(position),
-        candle,
-        rsi_value=rsi_values[index],
-        macd_hist=hist_values[index],
-        previous_macd_hist=hist_values[index - 1],
+        candles[plan.signal_index],
+        rsi_value=rsi_values[plan.signal_index],
+        macd_hist=hist_values[plan.signal_index],
+        previous_macd_hist=hist_values[plan.signal_index - 1],
         regime=regime,
         config=config,
     )
     if not decision.should_add:
         return
 
+    fill_price = _buy_stop_fill_price(candle, candidate.trigger_price)
+    if fill_price is None:
+        return
+
     fill = _make_fill(
         candle.open_time_ms,
-        decision.fill_price,
-        decision.margin_fraction,
+        fill_price,
+        candidate.margin_fraction,
         equity,
         config,
     )
     position.fills.append(fill)
-    position.max_stage = decision.stage
+    position.max_stage = candidate.stage
+
+
+def _plan_pyramid_add(
+    position: OpenPosition,
+    candle: Candle,
+    index: int,
+    hourly_context: dict[int, str],
+    hist_values: list[float],
+    rsi_values: list[float],
+    config: StrategyConfig,
+) -> None:
+    candidate = decide_pyramid_add(
+        _position_snapshot(position), candle,
+        rsi_value=rsi_values[index], macd_hist=hist_values[index],
+        previous_macd_hist=hist_values[index - 1],
+        regime=hourly_context.get(candle.open_time_ms, "yellow"), config=config,
+    )
+    position.pending_add = PendingPyramidAdd(candidate, index) if candidate.should_add else None
+
+
+def _buy_stop_fill_price(candle: Candle, trigger_price: float) -> float | None:
+    if candle.high < trigger_price:
+        return None
+    return max(candle.open, trigger_price)
 
 
 def _tighten_stop(
