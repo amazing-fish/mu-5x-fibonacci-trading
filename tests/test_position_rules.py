@@ -56,7 +56,7 @@ def position_snapshot(
 
 
 class BacktestTradeSnapshotTests(unittest.TestCase):
-    def test_fixed_synthetic_series_preserves_every_trade_and_fill_field(self):
+    def test_fixed_synthetic_series_has_causal_fills_and_unchanged_sizing(self):
         config = StrategyConfig(
             fee_rate=0,
             trading_windows_et=(("00:00", "23:59"),),
@@ -91,7 +91,7 @@ class BacktestTradeSnapshotTests(unittest.TestCase):
                             "fee": 0.0,
                         },
                         {
-                            "time_ms": 2_700_000,
+                            "time_ms": 3_600_000,
                             "price": 105.26400000000001,
                             "margin_fraction": 0.2,
                             "notional": 10_000.0,
@@ -99,7 +99,7 @@ class BacktestTradeSnapshotTests(unittest.TestCase):
                             "fee": 0.0,
                         },
                         {
-                            "time_ms": 3_600_000,
+                            "time_ms": 4_500_000,
                             "price": 107.328,
                             "margin_fraction": 0.2,
                             "notional": 10_000.0,
@@ -547,14 +547,17 @@ class PyramidAddRuleTests(unittest.TestCase):
         values.update(overrides)
         return decide_pyramid_add(state, self.current, **values)
 
-    def test_add_decision_returns_stage_gap_fill_and_margin_without_mutation(self):
+    def test_add_decision_returns_reference_and_availability_without_mutation(self):
         state = position_snapshot((100,), max_stage=1)
 
         decision = self.decide(state)
 
         self.assertTrue(decision.should_add)
         self.assertEqual(2, decision.stage)
-        self.assertEqual(self.current.open, decision.fill_price)
+        self.assertEqual(self.current.open, decision.reference_price)
+        self.assertEqual(102, decision.trigger_price)
+        self.assertEqual(self.current.open_time_ms + 900_000, decision.available_at_ms)
+        self.assertNotIn("fill_price", asdict(decision))
         self.assertEqual(self.config.margin_steps[1], decision.margin_fraction)
         self.assertEqual(1, state.max_stage)
         self.assertEqual(1, len(state.fills))

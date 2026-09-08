@@ -187,8 +187,10 @@ class TerminalBacktestTests(unittest.TestCase):
                     self.assertEqual([], result.equity_curve)
 
     def test_terminal_add_and_tightening_do_not_recheck_the_old_low(self):
-        terminal = bar(3, 100, 103, 99, 102)
-        bars = [bar(0), bar(1), bar(2), terminal]
+        # A real preceding close now creates the plan; the terminal risk and
+        # no-retroactive-stop assertions from #118 remain unchanged.
+        terminal = bar(4, 100, 103, 99, 102)
+        bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102), terminal]
         result = self.replay(bars)
         self.assertEqual(1, result.trade_count)
         trade = result.trades[0]
@@ -197,7 +199,7 @@ class TerminalBacktestTests(unittest.TestCase):
         self.assertEqual([START + 2 * STEP, terminal.open_time_ms], [f.time_ms for f in trade.fills])
         self.assertEqual(2, trade.max_stage)
         # The raised stop applies on the following bar, not retroactively to low=99.
-        extended = self.replay(bars + [bar(4, 102, 103, 99, 101)])
+        extended = self.replay(bars + [bar(5, 102, 103, 99, 101)])
         self.assertEqual(1, extended.trade_count)
         self.assertEqual(trade.fills, extended.trades[0].fills)
         self.assertEqual("stop", extended.trades[0].exit_reason)

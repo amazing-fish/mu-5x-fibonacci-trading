@@ -9,7 +9,8 @@ from mu_strategy.backtest import (
     OpenPosition,
     _close_position,
     _make_fill,
-    _maybe_add,
+    _execute_pyramid_add,
+    _plan_pyramid_add,
     _return_on_margin,
     _tighten_stop,
     run_backtest,
@@ -148,16 +149,19 @@ class BacktestTests(unittest.TestCase):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),))
         first = _make_fill(0, 100, 0.2, 10_000, config)
         position = OpenPosition([first], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=1)
-        gap_above_threshold = candle(1, 105, 106, 104, 105)
+        signal = candle(1, 101, 103, 100, 102)
+        gap_above_threshold = candle(2, 105, 106, 104, 105)
+        context = {bar.open_time_ms: "green" for bar in (signal, gap_above_threshold)}
+        _plan_pyramid_add(position, signal, 1, context, [0.1, 0.2, 0.3], [55] * 3, config)
 
-        _maybe_add(
+        _execute_pyramid_add(
             position,
             gap_above_threshold,
-            1,
-            [candle(0, 100, 101, 99, 100), gap_above_threshold],
-            {gap_above_threshold.open_time_ms: "green"},
-            [0.1, 0.2],
-            [55, 55],
+            2,
+            [candle(0, 100, 101, 99, 100), signal, gap_above_threshold],
+            context,
+            [0.1, 0.2, 0.3],
+            [55] * 3,
             10_000,
             config,
         )
@@ -242,7 +246,8 @@ class BacktestTests(unittest.TestCase):
 
         self.assertEqual(1, result.trade_count)
         self.assertEqual(2, result.trades[0].max_stage)
-        self.assertEqual(candles_15m[4].open_time_ms, result.trades[0].exit_time_ms)
+        self.assertEqual(candles_15m[4].open_time_ms, result.trades[0].fills[-1].time_ms)
+        self.assertEqual(candles_15m[5].open_time_ms, result.trades[0].exit_time_ms)
         self.assertEqual(100, result.trades[0].exit_price)
 
     def test_half_protect_green_wide_stop_does_not_jump_to_first_entry_cost(self):
@@ -491,21 +496,26 @@ class BacktestTests(unittest.TestCase):
         first = _make_fill(0, 100, 0.2, 10_000, config)
         position = OpenPosition([first], stop_price=98, entry_anchor=100, initial_stop_price=98, max_stage=1)
         outside_session = utc_candle(2026, 6, 11, 20, 0, 102, 103, 101, 102.5)
+        signal = utc_candle(2026, 6, 11, 19, 45, 101, 103, 100, 102)
+        context = {bar.open_time_ms: "green" for bar in (signal, outside_session)}
+        _plan_pyramid_add(position, signal, 1, context, [0.1, 0.2, 0.3], [55] * 3, config)
+        self.assertIsNotNone(position.pending_add)
 
-        _maybe_add(
+        _execute_pyramid_add(
             position,
             outside_session,
-            1,
-            [outside_session],
-            {outside_session.open_time_ms: "green"},
-            [0.1, 0.2],
-            [55, 55],
+            2,
+            [candle(0, 100, 101, 99, 100), signal, outside_session],
+            context,
+            [0.1, 0.2, 0.3],
+            [55] * 3,
             10_000,
             config,
         )
 
         self.assertEqual(1, position.max_stage)
         self.assertEqual(1, len(position.fills))
+        self.assertIsNone(position.pending_add)
 
 
 def utc_candle(year, month, day, hour, minute, open_, high, low, close):
