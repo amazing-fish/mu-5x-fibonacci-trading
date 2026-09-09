@@ -89,6 +89,20 @@ def run_backtest(
         # Preserve list order: executed events, observed close, final settlement.
         equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
 
+    def _exit_on_risk(candle: Candle, *, stop_reason: str) -> bool:
+        # Called only with an open position. Own risk settlement and its event
+        # sample here; callers retain their distinct close/continue boundaries.
+        nonlocal equity, position
+        decision = _risk_exit(candle, position, config, stop_reason=stop_reason)
+        if decision is None:
+            return False
+        exit_price, reason = decision
+        equity, trade = _close_position(position, candle, exit_price, equity, reason, config)
+        trades.append(trade)
+        position = None
+        equity_curve.append((candle.open_time_ms, equity))
+        return True
+
     index = 1
     while index < len(candles_15m):
         candle = candles_15m[index]
@@ -112,32 +126,7 @@ def run_backtest(
                     position = OpenPosition([fill], stop_price, entry_price, stop_price)
                     pending_entry = None
                     equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, entry_price)))
-                    if _has_non_session_liquidation_risk(candle, position, config):
-                        exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
-                        equity, trade = _close_position(
-                            position,
-                            candle,
-                            exit_price if exit_price is not None else _liquidation_risk_price(position, config),
-                            equity,
-                            "non_session_liquidation_risk",
-                            config,
-                        )
-                        trades.append(trade)
-                        position = None
-                        equity_curve.append((candle.open_time_ms, equity))
-                    elif candle.low <= position.stop_price:
-                        exit_price = _sell_stop_fill_price(candle, position.stop_price)
-                        equity, trade = _close_position(
-                            position,
-                            candle,
-                            exit_price if exit_price is not None else position.stop_price,
-                            equity,
-                            "initial_stop",
-                            config,
-                        )
-                        trades.append(trade)
-                        position = None
-                        equity_curve.append((candle.open_time_ms, equity))
+                    _exit_on_risk(candle, stop_reason="initial_stop")
                     record_close(candle)
                     index += 1
                     continue
@@ -204,68 +193,14 @@ def run_backtest(
             stop_price = entry_price * (1 - config.initial_stop_pct)
             position = OpenPosition([fill], stop_price, entry_price, stop_price)
             equity_curve.append((next_candle.open_time_ms, _marked_equity(equity, position, entry_price)))
-            if _has_non_session_liquidation_risk(next_candle, position, config):
-                exit_price = _sell_stop_fill_price(next_candle, _liquidation_risk_price(position, config))
-                equity, trade = _close_position(
-                    position,
-                    next_candle,
-                    exit_price if exit_price is not None else _liquidation_risk_price(position, config),
-                    equity,
-                    "non_session_liquidation_risk",
-                    config,
-                )
-                trades.append(trade)
-                position = None
-                equity_curve.append((next_candle.open_time_ms, equity))
-            elif next_candle.low <= position.stop_price:
-                exit_price = _sell_stop_fill_price(next_candle, position.stop_price)
-                equity, trade = _close_position(
-                    position,
-                    next_candle,
-                    exit_price if exit_price is not None else position.stop_price,
-                    equity,
-                    "initial_stop",
-                    config,
-                )
-                trades.append(trade)
-                position = None
-                equity_curve.append((next_candle.open_time_ms, equity))
+            _exit_on_risk(next_candle, stop_reason="initial_stop")
             index += 1
             continue
 
         # Next-bar execution above has already checked this fill bar's initial
         # risk. Its surviving position still receives normal add/stop updates.
         entry_bar_risk_checked = position.fills[0].time_ms == candle.open_time_ms
-        if not entry_bar_risk_checked and _has_non_session_liquidation_risk(candle, position, config):
-            exit_price = _sell_stop_fill_price(candle, _liquidation_risk_price(position, config))
-            equity, trade = _close_position(
-                position,
-                candle,
-                exit_price if exit_price is not None else _liquidation_risk_price(position, config),
-                equity,
-                "non_session_liquidation_risk",
-                config,
-            )
-            trades.append(trade)
-            position = None
-            equity_curve.append((candle.open_time_ms, equity))
-            record_close(candle)
-            index += 1
-            continue
-
-        if not entry_bar_risk_checked and candle.low <= position.stop_price:
-            exit_price = _sell_stop_fill_price(candle, position.stop_price)
-            equity, trade = _close_position(
-                position,
-                candle,
-                exit_price if exit_price is not None else position.stop_price,
-                equity,
-                "stop",
-                config,
-            )
-            trades.append(trade)
-            position = None
-            equity_curve.append((candle.open_time_ms, equity))
+        if not entry_bar_risk_checked and _exit_on_risk(candle, stop_reason="stop"):
             record_close(candle)
             index += 1
             continue
@@ -325,6 +260,26 @@ def _sell_stop_fill_price(candle: Candle, stop_price: float) -> float | None:
     if candle.open < stop_price:
         return candle.open
     return stop_price
+
+
+def _risk_exit(
+    candle: Candle,
+    position: OpenPosition,
+    config: StrategyConfig,
+    *,
+    stop_reason: str,
+) -> tuple[float, str] | None:
+    """Resolve existing risk priority and gap pricing; caller names stop context."""
+    if _has_non_session_liquidation_risk(candle, position, config):
+        threshold = _liquidation_risk_price(position, config)
+        reason = "non_session_liquidation_risk"
+    elif candle.low <= position.stop_price:
+        threshold = position.stop_price
+        reason = stop_reason
+    else:
+        return None
+    exit_price = _sell_stop_fill_price(candle, threshold)
+    return (exit_price if exit_price is not None else threshold), reason
 
 
 def _has_non_session_liquidation_risk(candle: Candle, position: OpenPosition, config: StrategyConfig) -> bool:

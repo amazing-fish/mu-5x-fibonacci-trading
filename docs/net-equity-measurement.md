@@ -1,5 +1,7 @@
 # 净权益、费用确认与配对验收
 
+> 历史证据：本页记录 #121 / #122 的费用测量修复及旧三路配对。复现本页三路命令需使用[当时的脚本](https://github.com/amazing-fish/mu-5x-fibonacci-trading/blob/1fc366cacbe4c0d635e2cc756289afce40517ca3/tests/replay_net_equity.py)与下述旧基线；当前脚本已改为 [#122 后的双进程完整行为比较](backtest-risk-exit-refactor.md)，不能对当前净权益再执行 fee-only 扣费。本页原测量结果保持不变。
+
 本次修复只改变净权益测量和采样。固定快照下，全部 57 个 Trade、106 个买入 Fill 的所有字段及期末权益 **精确不变**；净权益每个采样点均能用实际成交和已发生手续费对账。Refs [#121](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/121)、#83 / #99，不关闭父 Issue。
 
 ## 三个不同概念
