@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from mu_strategy.commands.signal_service import main
-from mu_strategy.demo_trading import run_once
+from mu_strategy.readonly_scan import scan_watchlist
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode
 from mu_strategy.observations import JsonlObservationRepository, ObservationOutcome
@@ -352,10 +352,10 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("error_code", json.loads(output.getvalue()))
 
     def test_actual_scan_path_is_cache_only_and_retains_persistence_failure_evidence(self):
-        def runner(config, **kwargs):
-            self.assertTrue(config.dry_run)
-            self.assertIsNone(kwargs["broker"])
-            return run_once(config, **kwargs, candle_loader=lambda *args, **kw: trusted_scan_bundle(symbol=SYMBOL),
+        def runner(**kwargs):
+            self.assertEqual({"data_dir", "symbols", "days"}, set(kwargs))
+            self.assertEqual((SYMBOL,), kwargs["symbols"])
+            return scan_watchlist(**kwargs, candle_loader=lambda *args, **kw: trusted_scan_bundle(symbol=SYMBOL),
                             scanner=lambda *args, **kw: scan_result(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, symbol=SYMBOL))
         for broken in (False, True):
             with self.subTest(broken=broken):
@@ -376,6 +376,15 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(3, child.call_args.kwargs["timeout"])
         self.assertNotIn("shell", child.call_args.kwargs)
         self.assertEqual(Path(__file__).resolve().parents[1], child.call_args.kwargs["cwd"])
+
+    def test_scan_runner_failure_or_missing_result_does_not_attempt_persistence(self):
+        for runner, error in ((Mock(side_effect=RuntimeError("failed")), "scan_failed"),
+                              (Mock(return_value=None), "scan_result_missing")):
+            with self.subTest(error=error):
+                repository = Mock()
+                result = scan_once(self.config, repository=repository, runner=runner)
+                self.assertEqual(ScanHealth(StepStatus.FAILED, error_code=error), result)
+                repository.append_cycle.assert_not_called()
 
     def test_real_cache_worker_reports_missing_invalid_and_stale_data_without_network(self):
         config = replace(self.config, symbols=(SYMBOL, "BTC-USDT-SWAP"), scan_days=1)

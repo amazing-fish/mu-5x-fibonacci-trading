@@ -1,5 +1,7 @@
 import ast
 import importlib.util
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -23,7 +25,7 @@ LOW_LEVEL_DEPENDENCY_RULES = (
 class ArchitectureDependencyTests(unittest.TestCase):
     def test_scan_cycle_and_observation_writer_do_not_import_broker_or_application_adapters(self):
         violations = []
-        for relative_path in ("scan_cycle.py", "stage0.py"):
+        for relative_path in ("scan_cycle.py", "stage0.py", "readonly_scan.py", "market_data/trusted_data/load.py"):
             for line, statement in _forbidden_import_statements(
                 (PACKAGE_ROOT / relative_path).read_text(encoding="utf-8"),
                 package="mu_strategy",
@@ -32,10 +34,47 @@ class ArchitectureDependencyTests(unittest.TestCase):
                     "mu_strategy.market_data.trusted_data.refresh",
                     "mu_strategy.execution.intents",
                     "mu_strategy.execution.store",
+                    "mu_strategy.notifications",
+                    "smtplib",
                 ),
             ):
                 violations.append(f"{relative_path}:{line}: {statement}")
         self.assertEqual([], violations)
+
+    def test_service_scan_cannot_reach_demo_broker_smtp_or_refresh_writer_indirectly(self):
+        # A fresh interpreter catches transitive imports through a new wrapper.
+        # Scope this guard to the service's real scan path, not the whole package.
+        code = '''
+import importlib.abc
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+class NoApplicationAdapters(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        forbidden = ("mu_strategy.demo_trading", "mu_strategy.live", "mu_strategy.notifications",
+                     "mu_strategy.market_data.service", "mu_strategy.market_data.trusted_data.refresh", "smtplib")
+        if any(fullname == name or fullname.startswith(name + ".") for name in forbidden):
+            raise AssertionError("read-only scan imported " + fullname)
+
+sys.meta_path.insert(0, NoApplicationAdapters())
+from mu_strategy.signal_service import ServiceConfig, scan_once
+from mu_strategy.service_health import StepStatus
+with TemporaryDirectory() as directory, patch("socket.create_connection", side_effect=AssertionError("network")) as network:
+    scan = scan_once(ServiceConfig(data_dir=Path(directory), symbols=("BTC", "ETH")))
+    assert scan.status is StepStatus.SUCCEEDED, scan
+    assert scan.persistence is StepStatus.SUCCEEDED, scan
+    assert len(scan.cycle.observations) == 2, scan
+    network.assert_not_called()
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", code], cwd=REPO_ROOT,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual([], _forbidden_import_statements(
+            (PACKAGE_ROOT / "signal_service.py").read_text(encoding="utf-8"), package="mu_strategy",
+            forbidden_imports=("mu_strategy.demo_trading", "mu_strategy.live", "mu_strategy.notifications", "smtplib"),
+        ))
 
     def test_domain_packages_do_not_import_application_layers(self):
         violations: list[str] = []

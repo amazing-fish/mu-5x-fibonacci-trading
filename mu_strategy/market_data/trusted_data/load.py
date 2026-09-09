@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
+from mu_strategy.market_data.trusted_data.compat import CandleBundle, candle_bundle_from_trusted_bundle
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
     Clock,
@@ -15,12 +16,13 @@ from mu_strategy.market_data.trusted_data.contracts import (
     ManifestSchemaError,
     SystemClock,
     TrustDecision,
+    TrustedConsumerRefreshError,
     TrustedBundle,
     TrustedLoadContext,
     ValidationReport,
 )
 from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, VALIDATION_FAILURE_REASONS, evaluate_candle_bundle
-from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy
+from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy, research_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 from mu_strategy.models import Candle
 
@@ -365,3 +367,41 @@ def _merge_warnings(*groups: tuple[str, ...]) -> tuple[str, ...]:
             if warning not in values:
                 values.append(warning)
     return tuple(values)
+
+
+TRUSTED_CONSUMER_REFRESH_ERROR = (
+    "trusted bundle loading is cache-only; run "
+    "python -m mu_strategy.commands.refresh_market_data "
+    "before loading trusted data"
+)
+
+
+def load_trusted_candle_bundle(
+    symbol: str,
+    *,
+    intervals: tuple[str, ...] = ("15m", "1h"),
+    days: int = 28,
+    data_dir: Path = Path("data/live"),
+    refresh: bool = False,
+    policy: TrustPolicy | None = None,
+    freshness_policy: FreshnessPolicy | None = None,
+    max_staleness_bars: int = 3,
+    clock: Clock | None = None,
+    context: TrustedLoadContext | None = None,
+) -> CandleBundle:
+    if refresh:
+        raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
+    resolved = resolve_okx_swap_symbol(symbol)
+    store = TrustedDataStore(data_dir=Path(data_dir))
+    requested_intervals = tuple(dict.fromkeys(intervals))
+    resolved_freshness_policy = freshness_policy or FreshnessPolicy(max_staleness_bars=max_staleness_bars)
+    bundle = LoadTrustedBundle(store, clock=clock, freshness_policy=resolved_freshness_policy).execute(
+        LoadTrustedBundleQuery(
+            resolved.inst_id,
+            intervals=requested_intervals,
+            days=days,
+        ),
+        policy or research_strict_policy(),
+        context=context,
+    )
+    return candle_bundle_from_trusted_bundle(resolved, bundle)

@@ -22,7 +22,7 @@ doc_kind: reference
 | **回测与实验**：假设如何被检验 | `backtest.py` 承担 OHLC 成交和权益模拟；walk-forward、Fibonacci 扫描、候选 ladder 均有入口。普通回测/HTML/ladder 支持固定历史 generation。 | 全 registry 的同快照 robustness 比较未完成（#83）；部分 HTML/walk-forward 单笔收益标签待明确（#88）。 |
 | **研究解释与结论**：收益靠什么、是否可比较 | `research.robustness` 提供基准、top-N 集中度、stage 分布；`candidate_conclusions` 保存严格候选结论；ladder 披露实际配置杠杆和账户收益。 | 短样本、不同风险预算及样本外/前瞻证据仍归 #99；reader 异常边界 #96，候选名单解耦 #101。`mu_current` 返回 baseline 名称，不是持续策略选择系统。 |
 | **候选标的选择**：固定策略应用到谁 | `selection.basket.rank_candidates` 提供离线候选行排序；实时 universe 由可信 manifest 和 watchlist 提供。 | 只有基础排序，尚无完整候选池状态、跨标的证据与自动选优闭环；不能把 Top universe 当策略选股结果。扩展依 #73/#99 的实际研究需求。 |
-| **扫描、运行与健康**：实时判断能否稳定产生证据 | `ScanCycle` 统一 dry-run 判断；`stage0` 只持久化已完成结果；`signal_service` 调度刷新和扫描，`service_health` 区分数据、扫描、写盘、进程状态。 | #62/#97 的代码交付已完成；长期稳定性不由一次运行或进程存活证明，归 #99。服务扫描仍经 `demo_trading.run_once(dry_run=True)` 适配。 |
+| **扫描、运行与健康**：实时判断能否稳定产生证据 | `readonly_scan.ScanBatch` 为服务与 Demo dry-run 共用固定 context、加载门禁和 `ScanCycle` 编排；`stage0` 只持久化已完成结果；`signal_service` 直接接收 cycle，调度刷新和扫描，`service_health` 区分数据、扫描、写盘、进程状态。 | #62/#97 的代码交付已完成；长期稳定性不由一次运行或进程存活证明，归 #99。Demo 展示/计划、shadow 与 confirmed 执行仍由 Demo 应用负责。 |
 | **邮件通知**：是否按有效信号提醒、结果是否可查 | `notifications` 已接入场/失效和健康/恢复事件，SQLite outbox 保存身份、游标、重试和 unknown 送达；显式 `--send` 才使用 SMTP。 | #98 的代码已合并，持仓邮件仍依赖 #85；真实受控 SMTP、常驻与持续运行证据分别验收。配置 fingerprint 不能代替代码版本。 |
 | **人工反馈与持仓事实**：用户实际做了什么 | `manual_positions` 保存成交及更正、当前阶段/止损和独立管理输入；`position_management` 将明确的买入阶段投影为共享规则输入，固定当前可信 generation，按需检查确认后的完整区间。视图区分未知、失效、行情阻断与候选。 | 人工记录未经交易所核对，不能声称账户全量。建议不写回事实；账本级 `management_status` 不代表评估结果。卖出后映射、延迟 transition、持仓事件/邮件及 OKX 真实来源仍待完成（#85/#90）。 |
 | **执行规划与持久构件**：动作能否绑定证据与授权 | `execution` 已有类型化决策、`OrderIntentFactory`、instrument rounding、`SQLiteExecutionStore` 和审计/预留契约。 | factory/store 尚未接入现有 Demo 编排，仓库 `config/` 未包含已批准 release。真实 release 和 scan→intent→授权→reserve→adapter 归 #100。 |
@@ -58,11 +58,12 @@ flowchart LR
 ## 模块职责与接口
 
 - **事实由来源模块负责**：行情由可信发布层持有，扫描由 `ScanCycle` 产出，运行状态由 `HealthStore` 产出，送达由通知 outbox 记录，人工成交由台账记录。视图读取这些结果。
+- **只读扫描与应用分开**：`readonly_scan` 接收显式标的或 Demo 已选出的 ticker，固定可信 context 并逐标的生成完整扫描结果；`market_data.trusted_data.load` 持有 cache-only reader，旧 `market_data.service.refresh_trusted_candle_bundle` 仅保留同一函数的导出名。服务保留自己的调度、持久化与健康发布；Demo 保留 universe 选择、展示/计划与外部动作边界。confirmed Demo 使用同一加载门禁，但不经过 dry-run 的 canonical scanner 结果校验。
 - **策略语义集中复用**：`models` 的类型化决策区分 READY/WAIT/BLOCK；`core.market_context` 统一 1h 收盘后对 15m 的可见性；`decide_pyramid_add` / `tighten_stop` 是共同规则入口。回测负责模拟成交和权益，不把该模拟当真实回执。
 - **研究结论与执行资格分开**：registry 名称、配置指纹、历史 candidate 和已审批 release 各有不同身份；release 解析保持 exact-ID，不能用 latest、mock 或宽松 fallback 补上执行前置。
 - **持久化只共用合适的底层能力**：`fs_durability`、`file_locks` 提供系统原语；行情 pointer、策略 artifact、观测日志、邮件 outbox 和执行存储各自保留提交/恢复协议，不能合成一个通用“成功”状态。
 
-`tests/test_architecture_dependencies.py` 已限制 core/entry/execution/strategies 反向导入应用层，也约束 scan-cycle/观测 writer 的依赖。它不是“全仓无环”的证明：例如策略构造仍与 registry 相互引用，execution 的 release 输入仍由 research 模块提供。当前按实际契约组织模块，不为目录对称移动代码或增加接口。
+`tests/test_architecture_dependencies.py` 已限制 core/entry/execution/strategies 反向导入应用层，也约束只读扫描、reader、scan-cycle/观测 writer 的依赖，并在新进程阻止服务扫描经间接导入回到 Demo、broker、SMTP 或刷新 writer。它不是“全仓无环”的证明：例如策略构造仍与 registry 相互引用，execution 的 release 输入仍由 research 模块提供。当前按实际契约组织模块，不为目录对称移动代码或增加接口。
 
 ## 源码与验证入口
 
@@ -73,7 +74,7 @@ flowchart LR
 | 数据与上市边界 | [refresh](../mu_strategy/market_data/trusted_data/refresh.py)、[load](../mu_strategy/market_data/trusted_data/load.py) | [分段存储](../tests/test_trusted_segmented_storage.py)、[上市时间](../tests/test_okx_listing_time.py) |
 | 策略与回测 | [registry](../mu_strategy/strategies/registry.py)、[position_rules](../mu_strategy/strategies/position_rules.py)、[backtest](../mu_strategy/backtest.py) | [规则](../tests/test_position_rules.py)、[registry](../tests/test_strategy_registry.py) |
 | 研究与选择 | [robustness](../mu_strategy/research/robustness.py)、[ladder](../mu_strategy/experiments/strategy_ladder.py)、[basket](../mu_strategy/selection/basket.py) | [研究选择](../tests/test_research_selection.py)、[ladder](../tests/test_strategy_ladder.py) |
-| 扫描与运行 | [scan_cycle](../mu_strategy/scan_cycle.py)、[signal_service](../mu_strategy/signal_service.py) | [依赖约束](../tests/test_architecture_dependencies.py)、[服务](../tests/test_signal_service.py) |
+| 扫描与运行 | [readonly_scan](../mu_strategy/readonly_scan.py)、[scan_cycle](../mu_strategy/scan_cycle.py)、[signal_service](../mu_strategy/signal_service.py) | [完整输出表征](../tests/test_readonly_scan_equivalence.py)、[严格 reader](../tests/test_readonly_scan_reader.py)、[依赖约束](../tests/test_architecture_dependencies.py)、[服务](../tests/test_signal_service.py) |
 | 通知与人工台账 | [notifications](../mu_strategy/notifications/service.py)、[manual_positions](../mu_strategy/manual_positions.py) | [通知测试入口](email-alerts.md)、[持仓状态](../tests/test_position_state.py) |
 | 人工持仓规则复核 | [position_management](../mu_strategy/position_management.py)、[复核页面](../mu_strategy/viz/position_ledger.py) | [输入、行情与页面回归](../tests/test_position_management.py) |
 | 执行构件与 Demo | [intents](../mu_strategy/execution/intents.py)、[store](../mu_strategy/execution/store.py)、[demo_trading](../mu_strategy/demo_trading.py) | [intent](../tests/test_order_intents.py)、[store](../tests/test_execution_store.py)、[Demo](../tests/test_okx_demo_loop.py) |
