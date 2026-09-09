@@ -1,16 +1,15 @@
-"""Pinned real-data acceptance for #121 (standard library; no network or data writes).
+"""Post-#122 behavior equivalence (standard library; no network or data writes).
 
-Run `python -B tests/replay_net_equity.py pair --help`. Each source is imported
-in a fresh process. Export wraps real fill/mark/settlement functions only to
-observe accounting; fee-only is the explicitly labelled old-sampling diagnostic.
-Full Trade/Fill and curve evidence is written to the requested ignored directory.
+Each source runs the unmodified real entry point in a fresh process. Audit uses
+only input candles and returned Trade/Fill/curve records, never engine frames or
+observers. `pair` compares the entire result exactly, including duplicate labels.
+The #121 three-way fee-only diagnostic remains historical evidence at commit
+1fc366c; do not apply it to data whose net equity already includes entry fees.
 """
 
 import argparse
-from collections import Counter
 from dataclasses import asdict
 import hashlib
-import inspect
 import json
 import math
 from pathlib import Path
@@ -38,19 +37,90 @@ def close(a, b):
     return math.isclose(a, b, abs_tol=ABS_TOL, rel_tol=REL_TOL)
 
 
-def same(a, b, path="root"):
+def same(a, b, path="root", *, exact=False):
     if isinstance(a, float):
-        assert close(a, b), (path, a, b)
+        assert (a == b if exact else close(a, b)), (path, a, b)
     elif isinstance(a, dict):
         assert a.keys() == b.keys(), path
         for key in a:
-            same(a[key], b[key], f"{path}.{key}")
+            same(a[key], b[key], f"{path}.{key}", exact=exact)
     elif isinstance(a, list):
         assert len(a) == len(b), path
         for i, (left, right) in enumerate(zip(a, b)):
-            same(left, right, f"{path}[{i}]")
+            same(left, right, f"{path}[{i}]", exact=exact)
     else:
         assert a == b, (path, a, b)
+
+
+def audit_result(bars, result, fee_rate):
+    """Reconcile the documented post-#122 sampling contract from public output.
+
+    This ledger does not decide whether/when to enter, add or exit. Actual fills
+    and exits come exclusively from returned trades. Within each candle label:
+    fills, risk exit, observed close, then any terminal settlement. Equal labels
+    and equal values are deliberately retained as separate observations.
+    """
+    if len(bars) < 4:
+        assert not result.trades and not result.equity_curve
+        assert result.starting_equity == result.ending_equity
+        return []
+    events = {}
+    for trade in result.trades:
+        for fill in trade.fills:
+            events.setdefault(fill.time_ms, []).append(("fill", fill))
+        kind = "settlement" if trade.exit_reason == "end_of_data" else "exit"
+        events.setdefault(trade.exit_time_ms, []).append((kind, trade))
+    gross_realized = 0.0
+    fees = 0.0
+    open_fills = []
+    samples = []
+
+    def sample(label, kind, price):
+        unrealized = sum((price - f.price) * f.units for f in open_fills)
+        samples.append(dict(time_ms=label, kind=kind, gross_realized=gross_realized,
+                            unrealized=unrealized, incurred_fees=fees,
+                            open_entry_fees=sum(f.fee for f in open_fills),
+                            accounting_net=result.starting_equity + gross_realized + unrealized - fees))
+
+    def settle(trade):
+        nonlocal gross_realized, fees
+        assert open_fills == trade.fills, "exit must settle exactly the executed fills"
+        gross = sum((trade.exit_price - f.price) * f.units for f in open_fills)
+        exit_fee = trade.exit_price * sum(f.units for f in open_fills) * fee_rate
+        same(trade.fees, sum(f.fee for f in open_fills) + exit_fee, "trade fees")
+        same(trade.pnl, gross - trade.fees, "net trade PnL")
+        gross_realized += gross
+        fees += exit_fee
+        open_fills.clear()
+
+    sample(bars[0].open_time_ms, "initial", bars[0].close)
+    for candle in bars[1:]:
+        terminal = []
+        for kind, event in events.pop(candle.open_time_ms, []):
+            if kind == "settlement":
+                assert candle == bars[-1], "end_of_data must be on the last candle"
+                terminal.append(event)
+            elif kind == "fill":
+                same(event.fee, event.notional * fee_rate, "fill fee")
+                open_fills.append(event)
+                fees += event.fee
+                sample(candle.open_time_ms, kind, event.price)
+            else:
+                settle(event)
+                sample(candle.open_time_ms, kind, event.exit_price)
+        sample(candle.open_time_ms, "close", candle.close)
+        for trade in terminal:
+            settle(trade)
+            sample(candle.open_time_ms, "settlement", trade.exit_price)
+    assert not events and not open_fills, "unaccounted event or unsettled position"
+    assert len(samples) == len(result.equity_curve), (len(samples), len(result.equity_curve))
+    for index, (s, (label, value)) in enumerate(zip(samples, result.equity_curve)):
+        assert s["time_ms"] == label, (index, s, label)
+        same(s["accounting_net"], value, f"sample[{index}]")
+        s["value"] = value
+    same(fees, sum(t.fees for t in result.trades), "fee conservation")
+    same(result.starting_equity + gross_realized - fees, result.ending_equity, "ending ledger")
+    return samples
 
 
 def export(args):
@@ -71,58 +141,8 @@ def export(args):
     context = build_hourly_context(bars, list(window.candles_by_interval["1h"]))
     config = selected_strategy_groups("MU-USDT-SWAP", ["baseline"])[0].config
     assert (config.leverage, config.fee_rate, config.margin_steps) == (5, .0005, (.2, .2, .2, .4))
-    gross_realized = 0.0
-    fees = 0.0
-    latest_event = bars[0].open_time_ms
-    samples = []
-
-    def sample(label, kind, value, unrealized=0.0, open_fees=0.0):
-        assert latest_event <= label, ("future event leaked into mark", latest_event, label)
-        samples.append(dict(time_ms=label, kind=kind, value=value,
-                            gross_realized=gross_realized, unrealized=unrealized,
-                            incurred_fees=fees, open_entry_fees=open_fees,
-                            accounting_net=10000 + gross_realized + unrealized - fees))
-
-    sample(bars[0].open_time_ms, "initial", 10000.0)
-    original_fill = engine._make_fill
-    original_mark = engine._marked_equity
-    original_exit = engine._close_position
-
-    def fill(*values):
-        nonlocal fees, latest_event
-        result = original_fill(*values)
-        fees += result.fee
-        latest_event = result.time_ms
-        return result
-
-    def mark(equity, position, price):
-        result = original_mark(equity, position, price)
-        if args.mode == "fee-only" and position is not None:
-            result -= position.fees
-        caller = inspect.currentframe().f_back
-        kind = "close" if args.mode != "after" or caller.f_code.co_name == "record_close" else "fill"
-        label = caller.f_locals["candle"].open_time_ms if kind == "close" else position.fills[-1].time_ms
-        unrealized = sum((price - f.price) * f.units for f in position.fills) if position else 0.0
-        sample(label, kind, result, unrealized, position.fees if position else 0.0)
-        return result
-
-    def settle(position, candle, price, equity, reason, cfg):
-        nonlocal gross_realized, fees, latest_event
-        result = original_exit(position, candle, price, equity, reason, cfg)
-        gross_realized += sum((price - f.price) * f.units for f in position.fills)
-        fees += price * sum(f.units for f in position.fills) * cfg.fee_rate
-        latest_event = candle.open_time_ms
-        sample(candle.open_time_ms, "settlement" if reason == "end_of_data" else "exit", result[0])
-        return result
-
-    engine._make_fill, engine._marked_equity, engine._close_position = fill, mark, settle
     result = engine.run_backtest(bars, context, config=config)
-    assert [(s["time_ms"], s["value"]) for s in samples] == result.equity_curve
-    assert sorted(t for t, _ in result.equity_curve) == [t for t, _ in result.equity_curve]
-    if args.mode == "after":
-        assert [s["time_ms"] for s in samples if s["kind"] in ("initial", "close")] == [b.open_time_ms for b in bars]
-        for s in samples:
-            assert close(s["value"], s["accounting_net"]), s
+    samples = audit_result(bars, result, config.fee_rate)
     data_after = file_hashes(args.data_dir)
     assert data_before == data_after, "data changed during read-only replay"
     config_payload = dict(strategy="baseline", strategy_config=StrategyConfigPayloadV2.from_config(config).to_dict(),
@@ -146,53 +166,37 @@ def export(args):
 def pair(args):
     args.output_dir.mkdir(parents=True, exist_ok=True)
     runs = {}
-    for mode, source in (("before", args.before_source), ("fee-only", args.before_source), ("after", args.after_source)):
+    for mode, source in (("before", args.before_source), ("after", args.after_source)):
         output = args.output_dir / f"{mode}.json"
         subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "export", "--source", str(source.resolve()),
                         "--data-dir", str(args.data_dir.resolve()), "--mode", mode, "--output", str(output.resolve())], check=True)
         runs[mode] = json.loads(output.read_text(encoding="utf-8"))
-    before, fee_only, after = (runs[m] for m in ("before", "fee-only", "after"))
-    for other in (fee_only, after):
-        same(before["result"]["trades"], other["result"]["trades"], "all Trade/Fill fields")
-        same(before["result"]["ending_equity"], other["result"]["ending_equity"], "ending equity")
-        assert before["data_files"] == other["data_files"]
-        assert before["environment"] == other["environment"]
-        for key, value in before["provenance"].items():
-            if key != "code_sha256":
-                assert value == other["provenance"][key], key
-    assert (before["summary"]["trades"], before["summary"]["buy_fills"]) == (57, 106)
-    same(before["summary"]["ending_equity"], 29399.55932527934)
-    same(before["summary"]["fees"], 2507.3578334614494)
-    same(before["summary"]["max_drawdown_pct"], -24.185950262931833)
-
-    def keyed(samples):
-        counts = Counter()
-        result = {}
-        for s in samples:
-            key = (s["time_ms"], s["kind"])
-            counts[key] += 1
-            result[(*key, counts[key])] = s
-        return result
-
-    old, diagnostic, new = (keyed(runs[m]["samples"]) for m in ("before", "fee-only", "after"))
-    assert old.keys() == diagnostic.keys()
-    assert old.keys() <= new.keys(), "old meaningful sample omitted"
-    for key, s in diagnostic.items():
-        same(s["value"], new[key]["value"], f"retained sample {key}")
-    changed = [dict(before=s, after=new[k]) for k, s in old.items() if not close(s["value"], new[k]["value"])]
-    added = [s for k, s in new.items() if k not in old]
+    before, after = runs["before"], runs["after"]
+    same(before["result"], after["result"], "complete BacktestResult", exact=True)
+    same(before["summary"], after["summary"], "derived summary", exact=True)
+    assert before["data_files"] == after["data_files"]
+    assert before["environment"] == after["environment"]
+    for key in before["provenance"].keys() | after["provenance"].keys():
+        if key != "code_sha256":
+            assert before["provenance"][key] == after["provenance"][key], key
+    assert before["hashes"] == after["hashes"] == dict(
+        trades="5ff2b75c6fcec5b8c30335380dcddc1e773c282fc9a7c083fa2bd6bac78336f9",
+        curve="1e853d61937a960f4f4f86ea23ba76e32d3d92b0c7a1d0995ea2694e2e561bbe")
+    summary = before["summary"]
+    assert (summary["trades"], summary["buy_fills"], summary["curve_points"]) == (57, 106, 17347)
+    assert summary["ending_equity"] == 29399.55932527934
+    assert summary["fees"] == 2507.3578334614494
+    assert summary["max_drawdown_pct"] == -24.188368164054207
     comparison = dict(
-        tolerances=dict(abs_tol=ABS_TOL, rel_tol=REL_TOL, discrete="exact"),
+        comparison="exact complete result and summary; no tolerance used for equivalence",
+        accounting_tolerances=dict(abs_tol=ABS_TOL, rel_tol=REL_TOL),
+        source_heads={mode: run["source_head"] for mode, run in runs.items()},
+        code_sha256={mode: run["provenance"]["code_sha256"] for mode, run in runs.items()},
         summaries={mode: run["summary"] for mode, run in runs.items()},
         hashes={mode: run["hashes"] for mode, run in runs.items()},
-        exact_trade_equality=before["result"]["trades"] == after["result"]["trades"],
-        exact_ending_equity_equality=before["result"]["ending_equity"] == after["result"]["ending_equity"],
-        retained_samples=len(old), fee_changed_samples=len(changed),
-        added_samples=len(added), added_by_kind=dict(Counter(s["kind"] for s in added)),
-        first_fee_difference=changed[0] if changed else None,
-        first_added_sample=added[0] if added else None,
-        max_previously_unrecognized_entry_fees=max(s["open_entry_fees"] for s in before["samples"]),
-        max_accounting_residual=max(abs(s["value"] - s["accounting_net"]) for s in after["samples"]),
+        exact_result_equality=True,
+        max_accounting_residual={mode: max(abs(s["value"] - s["accounting_net"]) for s in run["samples"])
+                                 for mode, run in runs.items()},
         terminal_samples=after["samples"][-3:])
     (args.output_dir / "comparison.json").write_text(json.dumps(comparison, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(comparison, indent=2, ensure_ascii=False))
@@ -204,7 +208,7 @@ if __name__ == "__main__":
     worker = sub.add_parser("export")
     worker.add_argument("--source", type=Path, required=True)
     worker.add_argument("--data-dir", type=Path, required=True)
-    worker.add_argument("--mode", choices=("before", "fee-only", "after"), required=True)
+    worker.add_argument("--mode", choices=("before", "after"), required=True)
     worker.add_argument("--output", type=Path, required=True)
     paired = sub.add_parser("pair")
     paired.add_argument("--before-source", type=Path, required=True)
