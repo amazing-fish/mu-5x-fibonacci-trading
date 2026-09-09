@@ -1,0 +1,5653 @@
+{
+  "wait": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "wait",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "wait",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "waiting_second_pullback",
+          "disposition": "wait",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "wait",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "normal_no_action",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "5af401b3480c33b8ed75222c52efdb261ef2a42cd2d54e00ed82c237d39a82a5"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "waiting_second_pullback",
+          "disposition": "wait",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "wait",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "normal_no_action",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "17369b4cfb1c506e8ea6aa21dc9a3e107f3a64727cceb107185372d4a89daab6"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "waiting_second_pullback",
+            "disposition": "wait",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "wait",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "normal_no_action",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "5af401b3480c33b8ed75222c52efdb261ef2a42cd2d54e00ed82c237d39a82a5"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "waiting_second_pullback",
+            "disposition": "wait",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "wait",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "normal_no_action",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "17369b4cfb1c506e8ea6aa21dc9a3e107f3a64727cceb107185372d4a89daab6"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "ready": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        }
+      ],
+      "orders": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "ODEA30ECCB02DCAE861FAF",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "OD00116235B447489B2159",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        }
+      ],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "strategy_block": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "regime_blocked",
+          "disposition": "block",
+          "decision_stage": "signal",
+          "compatibility_action": "skip",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "normal_no_action",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "71e1c0d92ed1bc1cd2c5f71963d7bad2a43f6fcd529f10e69f9e2d4c4c8becc2"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "regime_blocked",
+          "disposition": "block",
+          "decision_stage": "signal",
+          "compatibility_action": "skip",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "normal_no_action",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "e6d5952e10954a2e375c84a11e1d495006b5ccee41c1d9784caa67451cc232e9"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "regime_blocked",
+            "disposition": "block",
+            "decision_stage": "signal",
+            "compatibility_action": "skip",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "normal_no_action",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "71e1c0d92ed1bc1cd2c5f71963d7bad2a43f6fcd529f10e69f9e2d4c4c8becc2"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "regime_blocked",
+            "disposition": "block",
+            "decision_stage": "signal",
+            "compatibility_action": "skip",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "normal_no_action",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "e6d5952e10954a2e375c84a11e1d495006b5ccee41c1d9784caa67451cc232e9"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "data_missing": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_missing",
+          "last_close": null,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "market_data_missing",
+            "interval": "15m",
+            "latest_open_time_ms": null,
+            "source_file": "15m.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_missing",
+          "last_close": null,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "market_data_missing",
+            "interval": "15m",
+            "latest_open_time_ms": null,
+            "source_file": "15m.csv"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "market_data_missing",
+          "interval": "15m",
+          "latest_open_time_ms": null,
+          "source_file": "15m.csv"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "market_data_missing",
+          "interval": "15m",
+          "latest_open_time_ms": null,
+          "source_file": "15m.csv"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_missing",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_missing",
+          "scan_result": null,
+          "result_fingerprint": "59a39df0fae4c1c1fe2147778b4549d9d96bcd97bb1e2aedc849ae7528b909e5"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_missing",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_missing",
+          "scan_result": null,
+          "result_fingerprint": "7fe54d7c072eb6a28b28c48cbef640d5a28628fceda62b657dc1fc07858ccf68"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_missing",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_missing",
+            "scan_result": null,
+            "result_fingerprint": "59a39df0fae4c1c1fe2147778b4549d9d96bcd97bb1e2aedc849ae7528b909e5"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_missing",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_missing",
+            "scan_result": null,
+            "result_fingerprint": "7fe54d7c072eb6a28b28c48cbef640d5a28628fceda62b657dc1fc07858ccf68"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "data_corrupt": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "market_data_invalid",
+            "interval": null,
+            "status_reason": "cache_content_mismatch",
+            "error_type": null,
+            "message": null,
+            "latest_open_time_ms": null,
+            "source_file": "",
+            "run_id": "trusted-run",
+            "attempt_status": "success",
+            "snapshot_usability": "usable"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "market_data_invalid",
+            "interval": null,
+            "status_reason": "cache_content_mismatch",
+            "error_type": null,
+            "message": null,
+            "latest_open_time_ms": null,
+            "source_file": "",
+            "run_id": "trusted-run",
+            "attempt_status": "success",
+            "snapshot_usability": "usable"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "market_data_invalid",
+          "interval": null,
+          "status_reason": "cache_content_mismatch",
+          "error_type": null,
+          "message": null,
+          "latest_open_time_ms": null,
+          "source_file": "",
+          "run_id": "trusted-run",
+          "attempt_status": "success",
+          "snapshot_usability": "usable"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "market_data_invalid",
+          "interval": null,
+          "status_reason": "cache_content_mismatch",
+          "error_type": null,
+          "message": null,
+          "latest_open_time_ms": null,
+          "source_file": "",
+          "run_id": "trusted-run",
+          "attempt_status": "success",
+          "snapshot_usability": "usable"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_content_mismatch",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_invalid",
+          "scan_result": null,
+          "result_fingerprint": "0522128bb22332f7014c99fbeaca18a29c044bd603596413ab8155c9d4fad380"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_content_mismatch",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_invalid",
+          "scan_result": null,
+          "result_fingerprint": "8a6d01ee8620f963ca39fa5116652812445afca57d390d492a61f55fc077bb17"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_content_mismatch",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_invalid",
+            "scan_result": null,
+            "result_fingerprint": "0522128bb22332f7014c99fbeaca18a29c044bd603596413ab8155c9d4fad380"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_content_mismatch",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_invalid",
+            "scan_result": null,
+            "result_fingerprint": "8a6d01ee8620f963ca39fa5116652812445afca57d390d492a61f55fc077bb17"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "stale": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "market_data_invalid",
+            "interval": null,
+            "status_reason": "stale_by_clock",
+            "error_type": null,
+            "message": null,
+            "latest_open_time_ms": null,
+            "source_file": "",
+            "run_id": "trusted-run",
+            "attempt_status": "success",
+            "snapshot_usability": "usable"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "market_data_invalid",
+            "interval": null,
+            "status_reason": "stale_by_clock",
+            "error_type": null,
+            "message": null,
+            "latest_open_time_ms": null,
+            "source_file": "",
+            "run_id": "trusted-run",
+            "attempt_status": "success",
+            "snapshot_usability": "usable"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "market_data_invalid",
+          "interval": null,
+          "status_reason": "stale_by_clock",
+          "error_type": null,
+          "message": null,
+          "latest_open_time_ms": null,
+          "source_file": "",
+          "run_id": "trusted-run",
+          "attempt_status": "success",
+          "snapshot_usability": "usable"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "market_data_invalid",
+          "interval": null,
+          "status_reason": "stale_by_clock",
+          "error_type": null,
+          "message": null,
+          "latest_open_time_ms": null,
+          "source_file": "",
+          "run_id": "trusted-run",
+          "attempt_status": "success",
+          "snapshot_usability": "usable"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "stale_by_clock",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_invalid",
+          "scan_result": null,
+          "result_fingerprint": "a59339471213bddda28144f6b09eabdd324025520b2097ec2f5178837ac96617"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "stale_by_clock",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_blocked",
+          "error_type": null,
+          "error_message": "market_data_invalid",
+          "scan_result": null,
+          "result_fingerprint": "bc8f385a40848fea61069dcdf864423be315b08aaab60e86aa12ec66a5b06ef5"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "stale_by_clock",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_invalid",
+            "scan_result": null,
+            "result_fingerprint": "a59339471213bddda28144f6b09eabdd324025520b2097ec2f5178837ac96617"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "stale_by_clock",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_blocked",
+            "error_type": null,
+            "error_message": "market_data_invalid",
+            "scan_result": null,
+            "result_fingerprint": "bc8f385a40848fea61069dcdf864423be315b08aaab60e86aa12ec66a5b06ef5"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "load_error": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_load_failed",
+          "last_close": null,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "data_files": {},
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "market_data_load_failed",
+            "error_type": "OSError",
+            "message": "cache unavailable"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "market_data_load_failed",
+          "last_close": null,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "data_files": {},
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "market_data_load_failed",
+            "error_type": "OSError",
+            "message": "cache unavailable"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "market_data_load_failed",
+          "error_type": "OSError",
+          "message": "cache unavailable"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "market_data_load_failed",
+          "error_type": "OSError",
+          "message": "cache unavailable"
+        }
+      ]
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 1000,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_read_failed",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "trusted_load_failure",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_load_failed",
+          "error_type": "OSError",
+          "error_message": "cache unavailable",
+          "scan_result": null,
+          "result_fingerprint": "004b3505262e4a2a8a24c5dbbfb79f2658d131aaabd52f8b8e242b4df7d3ff41"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 1000,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "cache_read_failed",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "trusted_load_failure",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_data_load_failed",
+          "error_type": "OSError",
+          "error_message": "cache unavailable",
+          "scan_result": null,
+          "result_fingerprint": "32b1d40658299ce584ca1fc18331c6ab72f0f3ddf6559247acba57fd4d96378d"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 1000,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_read_failed",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "trusted_load_failure",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_load_failed",
+            "error_type": "OSError",
+            "error_message": "cache unavailable",
+            "scan_result": null,
+            "result_fingerprint": "004b3505262e4a2a8a24c5dbbfb79f2658d131aaabd52f8b8e242b4df7d3ff41"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 1000,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "cache_read_failed",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "trusted_load_failure",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_data_load_failed",
+            "error_type": "OSError",
+            "error_message": "cache unavailable",
+            "scan_result": null,
+            "result_fingerprint": "32b1d40658299ce584ca1fc18331c6ab72f0f3ddf6559247acba57fd4d96378d"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "scanner_error": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_failed",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "scanner_failed",
+            "error_type": "RuntimeError",
+            "message": "api_key=[REDACTED] scanner failed"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_failed",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "scanner_failed",
+            "error_type": "RuntimeError",
+            "message": "api_key=[REDACTED] scanner failed"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "scanner_failed",
+          "error_type": "RuntimeError",
+          "message": "api_key=[REDACTED] scanner failed"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "scanner_failed",
+          "error_type": "RuntimeError",
+          "message": "api_key=[REDACTED] scanner failed"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_exception",
+          "error_type": "RuntimeError",
+          "error_message": "api_key=[REDACTED] scanner failed",
+          "scan_result": null,
+          "result_fingerprint": "96cf5bd9baa367c1f42e8b6e7193b25994d79f99e92cd40ddf24cca4c4959c15"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_exception",
+          "error_type": "RuntimeError",
+          "error_message": "api_key=[REDACTED] scanner failed",
+          "scan_result": null,
+          "result_fingerprint": "b3e698f5e24eed99e7e8a4612b131e52a27bc376c6cdb755e160df923ce770e7"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_exception",
+            "error_type": "RuntimeError",
+            "error_message": "api_key=[REDACTED] scanner failed",
+            "scan_result": null,
+            "result_fingerprint": "96cf5bd9baa367c1f42e8b6e7193b25994d79f99e92cd40ddf24cca4c4959c15"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_exception",
+            "error_type": "RuntimeError",
+            "error_message": "api_key=[REDACTED] scanner failed",
+            "scan_result": null,
+            "result_fingerprint": "b3e698f5e24eed99e7e8a4612b131e52a27bc376c6cdb755e160df923ce770e7"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "unknown": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner returned EntryDecisionCode.UNKNOWN"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner returned EntryDecisionCode.UNKNOWN"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner returned EntryDecisionCode.UNKNOWN"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner returned EntryDecisionCode.UNKNOWN"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner returned EntryDecisionCode.UNKNOWN",
+          "scan_result": null,
+          "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner returned EntryDecisionCode.UNKNOWN",
+          "scan_result": null,
+          "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner returned EntryDecisionCode.UNKNOWN",
+            "scan_result": null,
+            "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner returned EntryDecisionCode.UNKNOWN",
+            "scan_result": null,
+            "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "invalid": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner returned dict instead of EntryScanResult"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner returned dict instead of EntryScanResult"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner returned dict instead of EntryScanResult"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner returned dict instead of EntryScanResult"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner returned dict instead of EntryScanResult",
+          "scan_result": null,
+          "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner returned dict instead of EntryScanResult",
+          "scan_result": null,
+          "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner returned dict instead of EntryScanResult",
+            "scan_result": null,
+            "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner returned dict instead of EntryScanResult",
+            "scan_result": null,
+            "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "missing_hash": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "trusted_provenance_incomplete",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "message": "trusted content SHA-256 is missing for 5m"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "trusted_provenance_incomplete",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "message": "trusted content SHA-256 is missing for 5m"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "message": "trusted content SHA-256 is missing for 5m"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "message": "trusted content SHA-256 is missing for 5m"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "malformed_manifest",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "error_message": "trusted content SHA-256 is missing for 5m",
+          "scan_result": null,
+          "result_fingerprint": "6a0fc00e60a062197bec7aad97c382ae0b7a2d4d019414714669dbe9d66a932b"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "malformed_manifest",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "error_message": "trusted content SHA-256 is missing for 5m",
+          "scan_result": null,
+          "result_fingerprint": "e61ab1c25b192b73b89789a0d78f949604c78012dc83434b74800e2a9479c583"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "malformed_manifest",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "error_message": "trusted content SHA-256 is missing for 5m",
+            "scan_result": null,
+            "result_fingerprint": "6a0fc00e60a062197bec7aad97c382ae0b7a2d4d019414714669dbe9d66a932b"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "malformed_manifest",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "error_message": "trusted content SHA-256 is missing for 5m",
+            "scan_result": null,
+            "result_fingerprint": "e61ab1c25b192b73b89789a0d78f949604c78012dc83434b74800e2a9479c583"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "wrong_generation": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "trusted_provenance_incomplete",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "different-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "message": "trusted run_id and generation identity must match"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "trusted_provenance_incomplete",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "different-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "message": "trusted run_id and generation identity must match"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "message": "trusted run_id and generation identity must match"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "message": "trusted run_id and generation identity must match"
+        }
+      ],
+      "run_id": "different-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "malformed_manifest",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "error_message": "trusted run_id and generation identity must match",
+          "scan_result": null,
+          "result_fingerprint": "6a0fc00e60a062197bec7aad97c382ae0b7a2d4d019414714669dbe9d66a932b"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": null,
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {},
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": false,
+          "trust_reason": "malformed_manifest",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "market_data_unavailable",
+          "disposition": "block",
+          "decision_stage": "input",
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "data_gate_blocked",
+          "failure_code": "trusted_provenance_incomplete",
+          "error_type": "ValueError",
+          "error_message": "trusted run_id and generation identity must match",
+          "scan_result": null,
+          "result_fingerprint": "e61ab1c25b192b73b89789a0d78f949604c78012dc83434b74800e2a9479c583"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "malformed_manifest",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "error_message": "trusted run_id and generation identity must match",
+            "scan_result": null,
+            "result_fingerprint": "6a0fc00e60a062197bec7aad97c382ae0b7a2d4d019414714669dbe9d66a932b"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": null,
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {},
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": false,
+            "trust_reason": "malformed_manifest",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "market_data_unavailable",
+            "disposition": "block",
+            "decision_stage": "input",
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "data_gate_blocked",
+            "failure_code": "trusted_provenance_incomplete",
+            "error_type": "ValueError",
+            "error_message": "trusted run_id and generation identity must match",
+            "scan_result": null,
+            "result_fingerprint": "e61ab1c25b192b73b89789a0d78f949604c78012dc83434b74800e2a9479c583"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "v2": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "BTC-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "skip",
+          "reason": "scanner_result_invalid",
+          "last_close": 100.0,
+          "regime_1h": "yellow",
+          "rsi14": null,
+          "macd_hist": null,
+          "macd_hist_prev": null,
+          "fib_level": null,
+          "fib_distance_pct": null,
+          "trigger_price": null,
+          "initial_stop": null,
+          "signal_time_ms": null,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          },
+          "data_error": {
+            "symbol": "ETH-USDT-SWAP",
+            "reason": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar"
+          }
+        }
+      ],
+      "orders": [],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "none",
+        "reason": "dry_run_has_no_position_source",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar"
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "reason": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar"
+        }
+      ],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar",
+          "scan_result": null,
+          "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": null,
+          "disposition": null,
+          "decision_stage": null,
+          "compatibility_action": null,
+          "compatibility_reason": null,
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "scan_failed",
+          "failure_code": "scanner_result_invalid",
+          "error_type": "InvalidScannerResult",
+          "error_message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar",
+          "scan_result": null,
+          "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar",
+            "scan_result": null,
+            "result_fingerprint": "78c4754a86d9c86a39554e572f22aaefb6923a5ebe8947f84277931ae8b878ce"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": null,
+            "disposition": null,
+            "decision_stage": null,
+            "compatibility_action": null,
+            "compatibility_reason": null,
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "scan_failed",
+            "failure_code": "scanner_result_invalid",
+            "error_type": "InvalidScannerResult",
+            "error_message": "scanner result failed canonical validation: unsupported reference calendar: fixture-calendar",
+            "scan_result": null,
+            "result_fingerprint": "c689b6c2ae2c22923643c28c4f1001b042c90dab6e2e4f83fc2430780e5c8ec6"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "write_error": {
+    "demo_payload": null,
+    "demo_exception": [
+      "ObservationCycleInvalidError",
+      "observation persistence failed; cycle is not promotion evidence",
+      "OSError",
+      "disk full"
+    ],
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+          }
+        ]
+      },
+      "persistence": "failed",
+      "error_code": "observation_write_failed"
+    },
+    "demo_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "shadow": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        }
+      ],
+      "orders": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "ODEA30ECCB02DCAE861FAF",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "OD00116235B447489B2159",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        }
+      ],
+      "expired_orders": [],
+      "exit_observations": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "decision_status": "unknown",
+          "state_quality": "degraded",
+          "position_size": 1.0,
+          "average_entry_price": 100.0,
+          "known_fields": [
+            "instId",
+            "pos",
+            "avgPx"
+          ],
+          "unknown_fields": [
+            "fills",
+            "stop_price",
+            "initial_stop_price",
+            "entry_anchor",
+            "max_stage",
+            "stop_transition_fill_count",
+            "stop_transition_start"
+          ],
+          "assumptions": [
+            "fills=single_synthetic_fill_at_avgPx",
+            "synthetic_fill_time=latest_closed_candle",
+            "entry_anchor=avgPx",
+            "stop_price=avgPx*(1-initial_stop_pct)",
+            "initial_stop_price=assumed_stop_price",
+            "max_stage=1",
+            "stop_transition_state=defaults",
+            "leverage=5.0"
+          ],
+          "unavailable_reason": null,
+          "assumption_evaluation": {
+            "candle_open_time_ms": 39,
+            "latest_close": 100.0,
+            "stop_before_candle": 98.0,
+            "stop_after_candle_if_open": 98.0,
+            "exit_triggered": false,
+            "exit_reason": null,
+            "trigger_basis": "none",
+            "latest_close_at_or_below_tightened_stop": false,
+            "transition_fill_count": 0,
+            "transition_start": 0.0,
+            "calendar_error": null
+          }
+        }
+      ],
+      "exit_observation_status": {
+        "status": "available",
+        "source": "injected",
+        "reason": null,
+        "position_count": 1,
+        "observation_count": 1
+      },
+      "universe_error": null,
+      "data_errors": [],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "positions"
+      ],
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  },
+  "shadow_error": {
+    "demo_payload": {
+      "mode": "dry_run",
+      "dry_run": true,
+      "universe": [
+        {
+          "inst_id": "BTC-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        },
+        {
+          "inst_id": "ETH-USDT-SWAP",
+          "last": 0.0,
+          "volume_ccy_24h": 0.0,
+          "source": "watchlist"
+        }
+      ],
+      "open_exposure": 0,
+      "account_context": {},
+      "scans": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "action": "enter",
+          "reason": "typed scan result",
+          "last_close": 100.0,
+          "regime_1h": "green",
+          "rsi14": 55.0,
+          "macd_hist": 0.2,
+          "macd_hist_prev": 0.1,
+          "fib_level": 99.0,
+          "fib_distance_pct": 0.01,
+          "trigger_price": 99.0,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "source": "watchlist",
+          "run_id": "trusted-run",
+          "observed_at_ms": 900,
+          "second_pullback_wait_bars": 8,
+          "data_files": {
+            "15m": "15m.csv",
+            "1h": "1h.csv"
+          }
+        }
+      ],
+      "orders": [
+        {
+          "symbol": "BTC-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "ODEA30ECCB02DCAE861FAF",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        },
+        {
+          "symbol": "ETH-USDT-SWAP",
+          "status": "planned",
+          "reason": "typed scan result",
+          "client_order_id": "OD00116235B447489B2159",
+          "notional_usdt": 10.0,
+          "trigger_price": 99.0,
+          "limit_price": "99",
+          "size": null,
+          "initial_stop": 97.0,
+          "signal_time_ms": 42,
+          "leverage": 5
+        }
+      ],
+      "expired_orders": [],
+      "exit_observations": [],
+      "exit_observation_status": {
+        "status": "unavailable",
+        "source": "injected",
+        "reason": "position_source_failed",
+        "error_type": "OSError",
+        "message": "position source unavailable",
+        "position_count": 0,
+        "observation_count": 0
+      },
+      "universe_error": null,
+      "data_errors": [],
+      "run_id": "trusted-run"
+    },
+    "demo_exception": null,
+    "demo_cycle": {
+      "schema_version": 2,
+      "cycle_id": "cycle",
+      "created_at_ms": 1000,
+      "observations": [
+        {
+          "schema_version": 2,
+          "observation_id": "observation-1",
+          "cycle_id": "cycle",
+          "symbol": "BTC-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "BTC-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+        },
+        {
+          "schema_version": 2,
+          "observation_id": "observation-2",
+          "cycle_id": "cycle",
+          "symbol": "ETH-USDT-SWAP",
+          "created_at_ms": 1000,
+          "observed_at_ms": 900,
+          "trusted_run_id": "trusted-run",
+          "requested_intervals": [
+            "15m",
+            "1h"
+          ],
+          "effective_intervals": [
+            "5m",
+            "15m",
+            "1h"
+          ],
+          "content_sha256_by_interval": {
+            "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "trust_policy_name": "trading_strict",
+          "trust_policy_version": 1,
+          "trust_allowed": true,
+          "trust_reason": "ok",
+          "strategy_name": "baseline",
+          "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+          "decision_code": "second_pullback_limit_ready",
+          "disposition": "ready",
+          "decision_stage": "pending_entry",
+          "compatibility_action": "enter",
+          "compatibility_reason": "typed scan result",
+          "compatibility_source": "watchlist",
+          "provenance": "canonical_trusted_generation",
+          "outcome": "ready_for_review",
+          "failure_code": null,
+          "error_type": null,
+          "error_message": null,
+          "scan_result": {
+            "symbol": "ETH-USDT-SWAP",
+            "last_close": 100.0,
+            "regime_1h": "green",
+            "rsi14": 55.0,
+            "macd_hist": 0.2,
+            "macd_hist_prev": 0.1,
+            "fib_level": 99.0,
+            "fib_distance_pct": 0.01,
+            "trigger_price": 99.0,
+            "initial_stop": 97.0,
+            "signal_time_ms": 42,
+            "evaluated_candle_open_ms": null,
+            "evaluated_candle_close_ms": null,
+            "calendar_id": null,
+            "calendar_sha256": null,
+            "calendar_session": null,
+            "trading_windows_et": null
+          },
+          "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+        }
+      ]
+    },
+    "scan_health": {
+      "status": "succeeded",
+      "cycle": {
+        "schema_version": 2,
+        "cycle_id": "cycle",
+        "created_at_ms": 1000,
+        "observations": [
+          {
+            "schema_version": 2,
+            "observation_id": "observation-1",
+            "cycle_id": "cycle",
+            "symbol": "BTC-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "74c6273cef568705e5fab91ab7eaeedc867eecae0a16366486a15e7910a649a8",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "BTC-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "469e9a06ce5b6279f949d1e0f0df754341990b0f66a3b18344056717b1155e17"
+          },
+          {
+            "schema_version": 2,
+            "observation_id": "observation-2",
+            "cycle_id": "cycle",
+            "symbol": "ETH-USDT-SWAP",
+            "created_at_ms": 1000,
+            "observed_at_ms": 900,
+            "trusted_run_id": "trusted-run",
+            "requested_intervals": [
+              "15m",
+              "1h"
+            ],
+            "effective_intervals": [
+              "5m",
+              "15m",
+              "1h"
+            ],
+            "content_sha256_by_interval": {
+              "5m": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "15m": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "1h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            },
+            "trust_policy_name": "trading_strict",
+            "trust_policy_version": 1,
+            "trust_allowed": true,
+            "trust_reason": "ok",
+            "strategy_name": "baseline",
+            "strategy_config_fingerprint": "cabbfbb15a98b8e5fe73b89b71a2480706766af288e41e0c04a1e713e8e02c67",
+            "decision_code": "second_pullback_limit_ready",
+            "disposition": "ready",
+            "decision_stage": "pending_entry",
+            "compatibility_action": "enter",
+            "compatibility_reason": "typed scan result",
+            "compatibility_source": "watchlist",
+            "provenance": "canonical_trusted_generation",
+            "outcome": "ready_for_review",
+            "failure_code": null,
+            "error_type": null,
+            "error_message": null,
+            "scan_result": {
+              "symbol": "ETH-USDT-SWAP",
+              "last_close": 100.0,
+              "regime_1h": "green",
+              "rsi14": 55.0,
+              "macd_hist": 0.2,
+              "macd_hist_prev": 0.1,
+              "fib_level": 99.0,
+              "fib_distance_pct": 0.01,
+              "trigger_price": 99.0,
+              "initial_stop": 97.0,
+              "signal_time_ms": 42,
+              "evaluated_candle_open_ms": null,
+              "evaluated_candle_close_ms": null,
+              "calendar_id": null,
+              "calendar_sha256": null,
+              "calendar_session": null,
+              "trading_windows_et": null
+            },
+            "result_fingerprint": "5008807c9c1e9d67f4b2baf7577c6a5034b11534d226d3c2007b01d42460553c"
+          }
+        ]
+      },
+      "persistence": "succeeded",
+      "error_code": null
+    },
+    "demo_events": [
+      [
+        "positions"
+      ],
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ],
+    "service_events": [
+      [
+        "load",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "BTC-USDT-SWAP"
+      ],
+      [
+        "load",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "scan",
+        "ETH-USDT-SWAP"
+      ],
+      [
+        "persist",
+        "cycle"
+      ]
+    ]
+  }
+}

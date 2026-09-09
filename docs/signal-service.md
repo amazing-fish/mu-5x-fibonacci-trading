@@ -24,8 +24,10 @@ python -B -m mu_strategy.commands.signal_service status --data-dir data\live
 每轮先持久化活动阶段，再启动有界的独立进程：
 
 1. `mu_strategy.commands.refresh_market_data` 是唯一行情 writer，默认超时 240 秒。
-2. writer 退出后启动 `signal_service scan-once`，默认超时 60 秒。worker 为整个 watchlist 固定一个 trusted context，使用现有 `trading_strict` reader 和权威 `ScanCycle`；manifest 不可读时仍为每个请求标的记录类型化数据失败。
+2. writer 退出后启动 `signal_service scan-once`，默认超时 60 秒。worker 调用 `readonly_scan.scan_watchlist`，由 `ScanBatch` 为整个 watchlist 固定一个 trusted context，使用现有 `trading_strict` reader 和权威 `ScanCycle`；manifest 不可读时仍为每个请求标的记录类型化数据失败。服务直接接收完整 cycle，再调用 Stage 0 持久化并分类写盘结果。
 3. 将完成的刷新、扫描、持久化结果和健康事件一起原子发布到 `health.json`。
+
+只读编排不依赖 Demo、broker、SMTP 或刷新 writer。Demo dry-run 也消费 `ScanBatch.scan` 的结果，展示、订单计划和可选持仓 shadow 留在 Demo 层；其原有 universe 失败行为与 confirmed Demo 的 scanner 兼容边界保持独立。服务仍只扫描显式 watchlist，不构造 Demo 配置或订单计划；扫描完成后写盘失败仍保留原 cycle，不重新扫描。
 
 失败会在下一个周期重试，不立即重试。周期按 monotonic clock 计算，慢周期跳过错过的时点，不积压或重叠运行。刷新失败仍允许只读检查上一 generation；可能得到允许扫描的缓存，但整体健康仍保留刷新失败。成功刷新与允许扫描的 generation 不一致会报告 `data.publication_changed`，提示检查其他 writer。
 

@@ -11,32 +11,19 @@ from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live_exit import observe_okx_position
 from mu_strategy.live.okx import OKXInstrumentSpec
-from mu_strategy.market_data.service import CandleBundle, TRUSTED_CONSUMER_REFRESH_ERROR, refresh_trusted_candle_bundle
-from mu_strategy.market_data.trusted_data.compat import ensure_trusted_candle_bundle, trust_error_payload
-from mu_strategy.market_data.trusted_data.contracts import (
-    Clock,
-    FreshnessState,
-    HealthReason,
-    SystemClock,
-    TrustedConsumerRefreshError,
-    TrustedLoadContext,
-    UniverseSnapshot,
-)
-from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, trading_strict_policy
+from mu_strategy.market_data.trusted_data.compat import CandleBundle
+from mu_strategy.market_data.trusted_data.contracts import Clock, TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import EntryDecisionCode
-from mu_strategy.observations import JsonlObservationRepository, ObservationFailureCode, ObservationRepository
-from mu_strategy.scan_cycle import ScanCycle, ScanDataFailure
+from mu_strategy.observations import JsonlObservationRepository, ObservationRepository
+from mu_strategy.scan_cycle import ScanCycle
+from mu_strategy.readonly_scan import CandleLoader, Scanner, ScanBatch, ScannedSymbol, merge_watchlist_tickers
 from mu_strategy.stage0 import persist_observation_cycle
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
 UniverseProvider = Callable[..., list[OKXSwapTicker]]
-CandleLoader = Callable[..., CandleBundle]
-Scanner = Callable[..., EntryScanResult]
 PositionSource = Callable[[], dict[str, Any]]
 BOT_CLIENT_ORDER_ID_PATTERN = re.compile(r"^OD[A-F0-9]{20}$")
 PENDING_ORDER_STATES = {"", "live", "partially_filled"}
@@ -83,12 +70,10 @@ def run_once(
         if config.dry_run
         else None
     )
-    default_trusted_loader = candle_loader is None
-    if default_trusted_loader and config.refresh:
-        raise TrustedConsumerRefreshError(TRUSTED_CONSUMER_REFRESH_ERROR)
-    candle_loader = candle_loader or refresh_trusted_candle_bundle
+    batch = ScanBatch(data_dir=config.data_dir, days=config.days, candle_loader=candle_loader,
+                      refresh=config.refresh, max_candle_staleness_bars=config.max_candle_staleness_bars)
     tickers: list[OKXSwapTicker] = []
-    universe_error: dict[str, Any] | None = None
+    universe_error = _universe_load_error(batch.context_error) if batch.context_error is not None else None
     open_exposure = 0
     open_position_inst_ids: set[str] = set()
     open_order_inst_ids: set[str] = set()
@@ -96,19 +81,12 @@ def run_once(
     existing_client_order_ids: set[str] = set()
     account_context: dict[str, Any] = {}
     account_error: dict[str, str] | None = None
-    trusted_context: TrustedLoadContext | None = None
     exit_position_rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
     exit_observation_status: dict[str, Any] = {
         "status": "unavailable",
         "source": "none",
         "reason": "dry_run_has_no_position_source",
     }
-
-    if default_trusted_loader and not config.refresh:
-        try:
-            trusted_context = LoadTrustedBundle(TrustedDataStore(data_dir=config.data_dir)).open_context()
-        except Exception as exc:
-            universe_error = _universe_load_error(exc)
 
     if config.dry_run:
         if position_source is not None:
@@ -138,8 +116,8 @@ def run_once(
                     }
         if universe_error is None:
             try:
-                tickers = _merge_watchlist_tickers(
-                    _load_universe(config, universe_provider, context=trusted_context),
+                tickers = merge_watchlist_tickers(
+                    _load_universe(config, universe_provider, context=batch.context),
                     config.watchlist_symbols,
                 )
             except Exception as exc:
@@ -173,8 +151,8 @@ def run_once(
             open_position_inst_ids = _open_position_inst_ids(positions)
             if universe_error is None:
                 try:
-                    tickers = _merge_watchlist_tickers(
-                        _load_universe(config, universe_provider, context=trusted_context),
+                    tickers = merge_watchlist_tickers(
+                        _load_universe(config, universe_provider, context=batch.context),
                         config.watchlist_symbols,
                     )
                 except Exception as exc:
@@ -192,45 +170,16 @@ def run_once(
     loaded_bundles: dict[str, CandleBundle | None] = {}
     loaded_data_errors: dict[str, dict[str, Any] | None] = {}
 
-    for ticker in _tickers_to_scan(tickers, open_order_rows_by_inst_id):
-        bundle, data_failure = _load_cycle_bundle(
-            ticker.inst_id,
-            config=config,
-            candle_loader=candle_loader,
-            default_trusted_loader=default_trusted_loader,
-            trusted_context=trusted_context,
-        )
-        data_error = data_failure.payload if data_failure is not None else None
+    evaluated = (batch.scan(tickers, cycle=scan_cycle, scanner=scanner) if config.dry_run else
+                 _scan_confirmed_demo(batch, _tickers_to_scan(tickers, open_order_rows_by_inst_id), scanner))
+    for item in evaluated:
+        ticker, bundle, strategy_config = item.ticker, item.bundle, item.strategy_config
+        result, data_error = item.result, item.data_error
         loaded_bundles[ticker.inst_id] = bundle
-        loaded_data_errors[ticker.inst_id] = data_error
-        result = None
-        requested_intervals = ("15m", "1h")
+        # Shadow reads retain loader health independently of scanner outcomes.
+        loaded_data_errors[ticker.inst_id] = item.load_failure.payload if item.load_failure is not None else None
         if bundle is not None:
             cycle_run_id = cycle_run_id or bundle.run_id
-
-        strategy_group = baseline_strategy_group(ticker.inst_id)
-        strategy_config = strategy_group.config
-        if scan_cycle is not None:
-            outcome = scan_cycle.scan_symbol(
-                symbol=ticker.inst_id,
-                source=ticker.source,
-                bundle=bundle,
-                requested_intervals=requested_intervals,
-                strategy_name=strategy_group.name,
-                strategy_config=strategy_config,
-                scanner=scanner,
-                data_failure=data_failure,
-            )
-            result = outcome.scan_result
-            data_error = outcome.data_error
-        elif bundle is not None and data_error is None:
-            # Confirmed Demo retains its existing compatibility boundary.
-            result = scanner(
-                ticker.inst_id,
-                bundle.candles_by_interval.get("15m", []),
-                bundle.candles_by_interval.get("1h", []),
-                config=strategy_config,
-            )
 
         if data_error is not None:
             data_errors.append(data_error)
@@ -291,13 +240,7 @@ def run_once(
             bundle = loaded_bundles[symbol]
             data_error = loaded_data_errors[symbol]
         else:
-            bundle, data_failure = _load_cycle_bundle(
-                symbol,
-                config=config,
-                candle_loader=candle_loader,
-                default_trusted_loader=default_trusted_loader,
-                trusted_context=trusted_context,
-            )
+            bundle, data_failure = batch.load(symbol)
             data_error = data_failure.payload if data_failure is not None else None
             loaded_bundles[symbol] = bundle
             loaded_data_errors[symbol] = data_error
@@ -426,6 +369,19 @@ def run_once(
     return payload
 
 
+def _scan_confirmed_demo(batch: ScanBatch, tickers: list[OKXSwapTicker], scanner: Scanner):
+    # Keep the legacy-bundle / UNKNOWN / exception boundary of confirmed Demo.
+    for ticker in tickers:
+        bundle, failure = batch.load(ticker.inst_id)
+        data_error = failure.payload if failure is not None else None
+        strategy_config = baseline_strategy_group(ticker.inst_id).config
+        result = None
+        if bundle is not None and data_error is None:
+            result = scanner(ticker.inst_id, bundle.candles_by_interval.get("15m", []),
+                             bundle.candles_by_interval.get("1h", []), config=strategy_config)
+        yield ScannedSymbol(ticker, bundle, failure, strategy_config, result, data_error)
+
+
 def generate_client_order_id(symbol: str, signal_time_ms: int | None, trigger_price: float) -> str:
     source = f"{symbol}:{signal_time_ms or 0}:{trigger_price:.8f}"
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:20].upper()
@@ -544,21 +500,6 @@ def _instrument_spec(response: dict[str, Any]) -> OKXInstrumentSpec | None:
     return OKXInstrumentSpec.from_row(data[0])
 
 
-def _merge_watchlist_tickers(
-    tickers: list[OKXSwapTicker],
-    watchlist_symbols: tuple[str, ...],
-) -> list[OKXSwapTicker]:
-    merged = list(tickers)
-    seen = {ticker.inst_id for ticker in merged}
-    for symbol in watchlist_symbols:
-        inst_id = resolve_okx_swap_symbol(symbol).inst_id
-        if inst_id in seen:
-            continue
-        merged.append(OKXSwapTicker(inst_id=inst_id, last=0.0, volume_ccy_24h=0.0, source="watchlist"))
-        seen.add(inst_id)
-    return merged
-
-
 def _scan_payload(
     result: EntryScanResult,
     bundle: CandleBundle,
@@ -648,146 +589,12 @@ def _data_error_scan_payload(
     return payload
 
 
-def _load_cycle_bundle(
-    symbol: str,
-    *,
-    config: DemoTradingConfig,
-    candle_loader: CandleLoader,
-    default_trusted_loader: bool,
-    trusted_context: TrustedLoadContext | None,
-) -> tuple[CandleBundle | None, ScanDataFailure | None]:
-    requested_intervals = ("15m", "1h")
-    try:
-        loader_kwargs = {
-            "intervals": requested_intervals,
-            "days": config.days,
-            "data_dir": config.data_dir,
-            "refresh": config.refresh,
-        }
-        if default_trusted_loader:
-            loader_kwargs["policy"] = trading_strict_policy()
-            loader_kwargs["max_staleness_bars"] = config.max_candle_staleness_bars
-            if trusted_context is not None:
-                loader_kwargs["context"] = trusted_context
-        bundle = candle_loader(symbol, **loader_kwargs)
-        if not _is_plain_legacy_bundle(bundle):
-            bundle = ensure_trusted_candle_bundle(bundle, requested_intervals=requested_intervals)
-    except Exception as exc:
-        return None, ScanDataFailure(
-            ObservationFailureCode.TRUSTED_DATA_LOAD_FAILED,
-            HealthReason.CACHE_READ_FAILED,
-            _market_data_load_error(symbol, exc),
-        )
-
-    return bundle, _market_data_freshness_error(
-        symbol=symbol,
-        bundle=bundle,
-        requested_intervals=requested_intervals,
-        max_staleness_bars=config.max_candle_staleness_bars,
-    )
-
-
-def _market_data_load_error(symbol: str, exc: Exception) -> dict[str, Any]:
-    return {
-        "symbol": symbol,
-        "reason": "market_data_load_failed",
-        "error_type": type(exc).__name__,
-        "message": str(exc),
-    }
-
-
 def _universe_load_error(exc: Exception) -> dict[str, Any]:
     return {
         "reason": "universe_load_failed",
         "error_type": type(exc).__name__,
         "message": str(exc),
     }
-
-
-def _market_data_freshness_error(
-    *,
-    symbol: str,
-    bundle: CandleBundle,
-    requested_intervals: tuple[str, ...],
-    max_staleness_bars: int,
-) -> ScanDataFailure | None:
-    if _is_plain_legacy_bundle(bundle):
-        legacy_error = _plain_legacy_market_data_staleness_error(
-            symbol=symbol,
-            bundle=bundle,
-            requested_intervals=requested_intervals,
-            max_staleness_bars=max_staleness_bars,
-        )
-        if legacy_error is not None:
-            return legacy_error
-    else:
-        trust_error = trust_error_payload(symbol, bundle, requested_intervals=requested_intervals)
-        if trust_error is not None:
-            return ScanDataFailure(
-                ObservationFailureCode.TRUSTED_DATA_BLOCKED,
-                bundle.trust_decision.reason,
-                trust_error,
-            )
-    for interval in requested_intervals:
-        candles = bundle.candles_by_interval.get(interval) or []
-        if not candles:
-            return ScanDataFailure(
-                ObservationFailureCode.TRUSTED_DATA_BLOCKED,
-                HealthReason.CACHE_MISSING,
-                {
-                    "symbol": symbol,
-                    "reason": "market_data_missing",
-                    "interval": interval,
-                    "latest_open_time_ms": None,
-                    "source_file": str(bundle.files_by_interval.get(interval, "")),
-                },
-            )
-    return None
-
-
-def _is_plain_legacy_bundle(bundle: Any) -> bool:
-    statuses = getattr(bundle, "statuses_by_interval", None)
-    return (
-        getattr(bundle, "trust_decision", None) is None
-        and not statuses
-        and isinstance(getattr(bundle, "candles_by_interval", None), dict)
-    )
-
-
-def _plain_legacy_market_data_staleness_error(
-    *,
-    symbol: str,
-    bundle: Any,
-    requested_intervals: tuple[str, ...],
-    max_staleness_bars: int,
-) -> ScanDataFailure | None:
-    policy = FreshnessPolicy(max_staleness_bars=max_staleness_bars)
-    now_ms = SystemClock().now_ms()
-    for interval in requested_intervals:
-        candles = bundle.candles_by_interval.get(interval) or []
-        if not candles:
-            continue
-        latest = max(candles, key=lambda candle: candle.open_time_ms)
-        freshness = policy.assess(
-            now_ms=now_ms,
-            interval=interval,
-            last_confirmed_open_time_ms=latest.open_time_ms,
-        )
-        if freshness.state == FreshnessState.FRESH:
-            continue
-        return ScanDataFailure(
-            ObservationFailureCode.TRUSTED_DATA_BLOCKED,
-            freshness.reason,
-            {
-                "symbol": symbol,
-                "reason": "market_data_stale",
-                "interval": interval,
-                "status_reason": freshness.reason.value,
-                "latest_open_time_ms": latest.open_time_ms,
-                "source_file": str(getattr(bundle, "files_by_interval", {}).get(interval, "")),
-            },
-        )
-    return None
 
 
 def _latest_close(candles: list) -> float | None:
@@ -960,4 +767,3 @@ def _float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-

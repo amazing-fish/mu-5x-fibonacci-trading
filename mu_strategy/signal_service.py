@@ -9,14 +9,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
-from mu_strategy.demo_trading import DemoTradingConfig, run_once
-from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import Clock, RefreshAttemptStatus, SnapshotUsability, SystemClock
-from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle
-from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
-from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.observations import JsonlObservationRepository, ObservationCycleInvalidError, Stage0ObservationCycle
+from mu_strategy.observations import JsonlObservationRepository, ObservationCycleInvalidError
+from mu_strategy.readonly_scan import scan_watchlist
+from mu_strategy.stage0 import persist_observation_cycle
 from mu_strategy.service_health import (
     EVENT_LIMIT, MAX_STATE_BYTES, CycleHealth, HealthEvent, HealthStateError, HealthStore,
     Phase, RefreshHealth, ScanHealth, ServiceState, StepStatus, decode_health_json, health_view,
@@ -230,58 +227,20 @@ def recover_interrupted(store: HealthStore, *, clock: Clock | None = None) -> Se
         return state
 
 
-class _ObservedRepository:
-    def __init__(self, repository):
-        self.repository = repository
-        self.cycle: Stage0ObservationCycle | None = None
-        self.persistence = StepStatus.NOT_RUN
-
-    def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
-        self.cycle = cycle
-        try:
-            self.repository.append_cycle(cycle)
-        except Exception:
-            self.persistence = StepStatus.FAILED
-            raise
-        self.persistence = StepStatus.SUCCEEDED
-
-
-def _watchlist_scan(config: DemoTradingConfig, **kwargs) -> dict:
-    # Pin one context for the entire explicit watchlist. A broken manifest must
-    # become a typed data failure for every requested symbol, not an empty universe.
-    context = None
-    load_error = None
-    try:
-        context = LoadTrustedBundle(TrustedDataStore(data_dir=config.data_dir)).open_context()
-    except Exception as exc:
-        load_error = exc
-
-    def load(symbol, **query):
-        if load_error is not None:
-            raise load_error
-        return refresh_trusted_candle_bundle(
-            symbol, **query, context=context, policy=trading_strict_policy(),
-            max_staleness_bars=config.max_candle_staleness_bars,
-        )
-
-    return run_once(config, **kwargs, candle_loader=load)
-
-
-def scan_once(config: ServiceConfig, *, repository=None, runner=_watchlist_scan) -> ScanHealth:
+def scan_once(config: ServiceConfig, *, repository=None, runner=scan_watchlist) -> ScanHealth:
     store = HealthStore(config.data_dir)
-    observed = _ObservedRepository(repository if repository is not None else JsonlObservationRepository(store.root / "observations.jsonl"))
+    repository = repository if repository is not None else JsonlObservationRepository(store.root / "observations.jsonl")
     try:
-        runner(DemoTradingConfig(data_dir=config.data_dir, universe_limit=0, days=config.scan_days, dry_run=True,
-                                 watchlist_symbols=config.symbols), broker=None, observation_repository=observed)
-    except ObservationCycleInvalidError:
-        if observed.cycle is not None and observed.persistence is StepStatus.FAILED:
-            return ScanHealth(StepStatus.SUCCEEDED, observed.cycle, StepStatus.FAILED, "observation_write_failed")
-        return ScanHealth(StepStatus.FAILED, error_code="scan_failed")
+        cycle = runner(data_dir=config.data_dir, days=config.scan_days, symbols=config.symbols)
     except Exception:
         return ScanHealth(StepStatus.FAILED, error_code="scan_failed")
-    if observed.cycle is None:
+    if cycle is None:
         return ScanHealth(StepStatus.FAILED, error_code="scan_result_missing")
-    return ScanHealth(StepStatus.SUCCEEDED, observed.cycle, observed.persistence)
+    try:
+        persist_observation_cycle(repository, cycle)
+    except ObservationCycleInvalidError:
+        return ScanHealth(StepStatus.SUCCEEDED, cycle, StepStatus.FAILED, "observation_write_failed")
+    return ScanHealth(StepStatus.SUCCEEDED, cycle, StepStatus.SUCCEEDED)
 
 
 def _result_json(value: str) -> dict:
