@@ -186,6 +186,12 @@ def current_conclusions(service, observations, *, now_ms):
             results.append(item)
             continue
         result = (row.get("scan_result") or {}) if row else {}
+        missing = [label for key, label in (
+            ("evaluated_candle_open_ms", "评估 K 线开始时间"),
+            ("evaluated_candle_close_ms", "评估 K 线结束时间"),
+            ("calendar_id", "参考日历 ID"), ("calendar_sha256", "日历内容指纹"),
+            ("calendar_session", "评估时日历状态"), ("trading_windows_et", "评估时策略窗口"),
+        ) if result.get(key) is None]
         if service.get("state") != "ok" or observations.get("state") != "ok":
             item["message"] = "来源读取不完整，当前策略结论无法核实"
         elif not row or health_rows.get(symbol) != row:
@@ -195,10 +201,10 @@ def current_conclusions(service, observations, *, now_ms):
         elif (not view.get("healthy") or view.get("runtime") != "running"
               or last_cycle.get("service_run_id") != view.get("run_id")):
             item["message"] = "服务未处于可核实的正常运行状态，仅保留最后已知记录"
+        elif missing:
+            item["message"] = "最近记录缺少评估依据，当前结论待核实。缺少：" + "、".join(missing) + "。"
         elif not 0 <= now_ms - row["observed_at_ms"] <= 600_000:
             item["message"] = "最近扫描已超过 10 分钟或时间异常，等待新一轮确认"
-        elif result.get("evaluated_candle_close_ms") is None:
-            item["message"] = "旧记录缺少评估 K 线及日历依据，不能当作当前入场结论"
         elif not 0 <= now_ms - result["evaluated_candle_close_ms"] <= 1_800_000:
             item["message"] = "评估 K 线已超过 30 分钟或尚未收盘，等待新一轮确认"
         elif row["strategy_config_fingerprint"] != canonical_payload_sha256(config):
