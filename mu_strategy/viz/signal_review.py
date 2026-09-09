@@ -94,9 +94,7 @@ def render_scan_evidence(item):
 
 def _candle_label(result):
     opened, closed = result.get("evaluated_candle_open_ms"), result.get("evaluated_candle_close_ms")
-    if opened is None or closed is None:
-        return "旧记录未保存评估 K 线时间"
-    return f"15m K 线 {_time(opened)} — {_time(closed)}"
+    return f"评估 K 线 / 15m：{_time(opened) if opened is not None else '开始时间缺失'} — {_time(closed) if closed is not None else '结束时间缺失'}"
 
 
 def _indicators(item):
@@ -106,28 +104,54 @@ def _indicators(item):
     entries = "".join(f'<div><dt>{label}</dt><dd>{_e(round(result[key], 6) if isinstance(result.get(key), (int, float)) else result.get(key) or "—")}</dd></div>'
                       for label, key in values)
     calendar = result.get("calendar_id")
-    context = f'参考日历 {_e(calendar)} · {_e(result.get("calendar_session"))}' if calendar else "旧记录未保存日历依据"
+    context = f'参考日历 {_e(calendar)} · {_e(result.get("calendar_session"))}' if calendar else "记录未保存日历依据"
     return f'<details class="indicator-details" id="indicators-{_scan_identity(item)}"><summary>指标与时间依据</summary><p>{_e(_candle_label(result))}</p><dl class="indicator-grid">{entries}</dl><p class="secondary">{context}</p></details>'
 
 
-def _current_card(item):
+def _current_card(item, *, live=False, alerts=()):
     schedule, latest = item.get("schedule"), item.get("latest")
-    calendar = ""
+    calendar = '<p class="notice">当前日历与策略窗口无法核实。</p>'
     if schedule:
         state = {"holiday": "休市日", "weekend": "周末休市", "early_close": "提前收盘日", "open": "开放日"}[schedule["session"]]
-        window_text = " · ".join(f'{_time(start)[:16]}–{_time(end - 60_000)[:16]}' for start, end in schedule["today_windows"]) or "今日无策略窗口"
+        def window_label(window):
+            return f'{_time(window[0])[:16]} — {_time(window[1] - 60_000)[:16]}'
+
+        window_text = " · ".join(window_label(window) for window in schedule["today_windows"]) or "该参考日无策略窗口"
+        current_windows = [window for window in schedule["today_windows"] if window[0] <= schedule["evaluated_at_ms"] < window[1]]
+        headline = ("当前处于策略窗口内" if schedule["allowed"] else
+                    "当前参考日休市，策略入场窗口关闭" if schedule["reason"] == "reference_market_closed" else "当前处于策略窗口外")
+        active = f'<strong>当前窗口：{_e(" · ".join(map(window_label, current_windows)))}</strong>' if schedule["allowed"] else ''
         next_window = schedule.get("next_window")
-        upcoming = (f'{_time(next_window[0])} — {_time(next_window[1] - 60_000)[11:16]}' if next_window else "覆盖范围内没有可核实的下一窗口")
+        upcoming = window_label(next_window) if next_window else "覆盖范围内没有可核实的下一窗口"
         market = schedule.get("market_session")
-        market_text = f'参考市场时段：{_time(market[0])[:16]} — {_time(market[1])[:16]}' if market else "参考市场今日休市"
-        calendar = f'<div class="session-strip"><span>现在的参考日历 · {state}</span><strong>{_e(window_text)}</strong><small>{_e(market_text)} · 北京时间</small><small>美东日期 {_e(schedule["eastern_date"])}</small><span>下一窗口：{_e(upcoming)}</span></div><p class="secondary">配置：{_e(schedule["calendar_id"])} · 日历与策略窗口取交集</p>'
+        market_text = f'参考市场时段：{_time(market[0])[:16]} — {_time(market[1])[:16]}' if market else "该参考日休市"
+        calendar = (f'<div class="session-strip"><span class="eyebrow">当前日历与策略窗口</span><strong>{headline}</strong>{active}'
+                    f'<small>下一窗口：{_e(upcoming)} · 北京时间</small></div>'
+                    f'<details class="indicator-details" id="calendar-{_e(item["symbol"])}"><summary>日历规则与来源</summary>'
+                    f'<p>参考日历：{state} · 美东日期 {_e(schedule["eastern_date"])}</p><p>该参考日的策略窗口：{_e(window_text)}</p>'
+                    f'<p>{_e(market_text)} · 以上时刻均为北京时间</p>'
+                    '<p>规则：开放日不等于全天允许入场，策略窗口与参考日历取交集。参考市场休市不代表 OKX 合约停市。</p>'
+                    f'<p>配置：{_e(schedule["calendar_id"])}</p><pre>{_e(json.dumps(schedule, ensure_ascii=False, indent=2))}</pre></details>')
     last = '<p class="secondary">暂无可核实扫描记录。</p>'
     if latest:
-        last = (f'<div class="last-scan"><span class="eyebrow">最近一次扫描 · 保留当时判断</span><strong>{_e(_scan_reason(latest))}</strong>'
-                f'<span>记录于 {_e(_time(latest["observed_at_ms"]))}</span><span>{_e(_candle_label(latest.get("scan_result") or {}))}</span></div>')
+        last = (f'<div class="last-scan"><span class="eyebrow">最近一次扫描 · 仅为记录当时的结论</span><strong>{_e(_scan_reason(latest))}</strong>'
+                f'<span>扫描记录时间（观察时点）：{_e(_time(latest["observed_at_ms"]))}</span><span>{_e(_candle_label(latest.get("scan_result") or {}))}</span></div>')
     tone = "neutral" if item["status"] == "waiting" else "accent" if item["status"] == "current" else "warning"
     label = "当前参考" if item["status"] == "current" else "等待" if item["status"] == "waiting" else "待核实"
-    return f'<article class="current-card" data-current-symbol="{_e(item["symbol"])}"><div class="section-heading"><h3>{_e(item["symbol"])}</h3><span class="badge {tone}">{label}</span></div><p class="current-message">{_e(item["message"])}</p>{calendar}{last}</article>'
+    entry_link = ""
+    action = '<p class="secondary">导出快照 · 只读；记录成交请打开本地实时页面。</p>'
+    if live:
+        # Only an exact source observation establishes an association. Same symbol
+        # or nearby timestamps never justify attaching a manual fill to an event.
+        matches = [record["event_id"] for record in alerts if latest and record["event"]["kind"] == "entry_review"
+                   and record["event"].get("observation") == latest]
+        query = {"event_id": matches[0]} if len(matches) == 1 else {"symbol": item["symbol"]}
+        entry_link = f'<a class="primary-action" href="/positions?{_e(urlencode(query))}#position-form">记录实际成交</a>'
+        action = '<p class="secondary">已在交易所成交后录入；无需等待信号有效。记录成交不会确认本条信号，也不会下单。</p>'
+    return (f'<article class="current-card" data-current-symbol="{_e(item["symbol"])}"><div class="section-heading"><h3>{_e(item["symbol"])}</h3>{entry_link}</div>'
+            f'{calendar}<div class="conclusion-heading"><span class="eyebrow">最近扫描可采信状态</span><span class="badge {tone}">{label}</span></div>'
+            f'<p class="current-message">{_e(item["message"])}</p>{last}'
+            f'<p class="secondary">当前查询时间：{_e(_time(item["as_of_ms"]))} · 北京时间</p>{action}</article>')
 
 
 def _command(data_dir: str, module: str, extra="") -> str:
@@ -308,7 +332,8 @@ def render_signal_review(report: dict, *, live=False) -> str:
                           for name, item in zip(("服务健康", "扫描日志", "通知库"), (service, scans, notifications)))
     window_total = notifications.get("total", "—")
     notification_counts = ' · '.join(f'{DELIVERY[key][0]} {value}' for key, value in notifications.get("counts", {}).items()) or '无窗口内提醒 / 来源见下方'
-    current_html = "".join(_current_card(item) for item in report.get("current_conclusions", [])) or '<p class="empty">暂无可核实的当前结论。</p>'
+    current_html = "".join(_current_card(item, live=live, alerts=alert_records if notifications["state"] == "ok" else ())
+                           for item in report.get("current_conclusions", [])) or '<p class="empty">暂无可核实的当前结论。</p>'
     latest_html = latest_rows or '<li class="empty">所选日期内暂无扫描记录。</li>'
     snapshot_html = (f'<strong id="refresh-state">自动更新 · 每 30 秒</strong><time id="report-updated">更新于 {_e(generated)} 北京时间</time>'
                      '<div class="live-actions"><button id="refresh-now" type="button">立即更新</button><button id="pause-refresh" type="button">暂停自动更新</button></div>'
@@ -326,7 +351,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <div><span class="eyebrow">行情 / 上次扫描时</span><strong>{_e(data_label)}</strong><small>校验于 {_e(_time(data.get('checked_at_ms')))}</small></div>
 <div><span class="eyebrow">邮件记录</span><strong>{_e(state_counts)}</strong><small>最近处理 {_e(_time(notifications.get('last_collection_ms')))}</small></div></div>
 {service_evidence}<div class="section-heading"><h2>当前结论</h2><span>截至 {_e(generated)} · 不受下方历史筛选影响</span></div>
-<p class="secondary">参考美股休市限制策略入场；OKX 永续仍可能交易，持仓风险检查继续。</p><div class="current-grid">{current_html}</div>
+<p class="secondary">服务正常仅说明运行状态；是否可参考信号，请看各标的的窗口与扫描依据。</p><div class="current-grid">{current_html}</div>
 <details class="window-summary" id="window-summary"><summary>观察窗口统计与最近历史记录</summary><div class="section-heading"><h2>观察窗口</h2><span>{_e(window['from_date'])} 至 {_e(window['to_date'])} · 北京时间自然日</span></div>
 <p class="scope">{_e(scans.get('total_cycles', '—'))} 轮扫描 · {_e(scans.get('total_observations', '—'))} 条记录</p>
 <p class="secondary">实际记录：{_e(_time(scans.get('first_at_ms')))} 至 {_e(_time(scans.get('last_at_ms')))}</p>
@@ -348,7 +373,7 @@ def render_signal_review(report: dict, *, live=False) -> str:
 <div class="alert-filters"><label class="inline-filter">送达状态<select id="delivery-status"><option value="">全部状态</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, (label, _) in DELIVERY.items())}</select></label>
 <label class="inline-filter">人工处理<select id="feedback-status"><option value="">全部记录</option>{''.join(f'<option value="{key}">{_e(label)}</option>' for key, label in FEEDBACK_STATUSES.items())}</select></label></div></div>
 <p class="scope">窗口内 {_e(window_total)} 个事件 · 已抑制 {_e(notifications.get('suppressed', '—'))} 个 · {_e(notification_counts)}</p>
-<p class="secondary">入场提醒可记录人工处理和备注；“已手动交易”为用户自记，不用于计算持仓。</p>
+<p class="secondary">“已手动交易”只是提醒处理标记，不是成交台账，也不会创建持仓。已发生的买入请点击“记录实际成交”。</p>
 {f'<p class="secondary">{_e(alert_note)}</p>' if alert_note else ''}
 <p id="alert-count" class="result-count" aria-live="polite">加载了 {len(alert_records)} 条明细</p><div class="record-list">{alert_rows}</div>
 <p id="alert-empty" class="empty" {'hidden' if alert_records else ''}>没有符合筛选的邮件记录。</p></section>
@@ -534,6 +559,7 @@ _SCRIPT = r'''
 '''
 
 REVIEW_STYLE += r'''
+.primary-action{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border-radius:4px;background:var(--accent);color:var(--surface);font-weight:650;text-decoration:none;min-height:44px;overflow-wrap:anywhere}.primary-action:hover{filter:brightness(.9)}.conclusion-heading{display:flex;align-items:center;gap:12px;margin-top:18px}.current-position-state .primary-action{margin:12px 0}.next-actions{display:flex;flex-wrap:wrap;align-items:center;gap:20px}.position-choices{padding:0;list-style:none}.position-choices li{margin:14px 0}.position-choices span{display:block;color:var(--muted);font-size:13px}.save-result h2{margin-top:0}.current-card .indicator-details pre{white-space:pre-wrap;overflow-wrap:anywhere}.current-card>.section-heading{margin-bottom:16px}@media(max-width:780px){.current-card .section-heading .primary-action{width:100%}.next-actions{gap:12px}.save-result{padding:16px}}
 .position-card{padding:18px 22px;margin:12px 0;border:1px solid var(--line);background:var(--surface)}.position-card .section-heading{margin-top:0}.position-card h3{margin:0}.position-card summary{cursor:pointer;color:var(--accent);font-size:13px;padding:5px 0}.position-numbers{display:flex;align-items:baseline;gap:28px;flex-wrap:wrap}.position-numbers>strong{font:30px Georgia,serif}.position-numbers small{font:13px "Microsoft YaHei UI",sans-serif}.position-numbers>span{font-size:13px;color:var(--muted)}.position-numbers b{color:var(--ink)}.position-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:16px 0}#position-form{padding:20px 24px;border:1px solid var(--line);background:var(--surface)}#position-form textarea{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);padding:10px;resize:vertical;width:100%;margin-bottom:12px}.confirmation{display:flex;align-items:center;gap:8px;margin:14px 0}.confirmation input{min-height:0}.save-result{color:var(--good);background:var(--good-bg);padding:12px}.position-card td{overflow-wrap:anywhere}.position-card td:last-child{min-width:90px}@media(max-width:780px){.position-fields{grid-template-columns:1fr}.position-card,#position-form{padding:16px}.position-card .section-heading{gap:6px}}@media print{#position-form{display:none}}
 .alert-filters{display:flex;gap:16px;flex-wrap:wrap}.feedback-details{width:100%;max-width:560px;margin:12px 0;border-left:2px solid var(--line);padding-left:12px}.feedback-details>summary{cursor:pointer;color:var(--accent);font-size:13px}.feedback-form{display:grid;gap:10px;margin:12px 0;max-width:560px}.feedback-form select{max-width:200px}.feedback-form textarea{font:inherit;resize:vertical;min-height:72px;padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:var(--surface);color:var(--ink);width:100%}.feedback-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.feedback-message{font-size:12px;color:var(--muted)}.feedback-note{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.feedback-snapshot{font-size:13px;color:var(--accent);margin-bottom:0}@media print{.feedback-actions{display:none}}
 

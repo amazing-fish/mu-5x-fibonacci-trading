@@ -154,7 +154,7 @@ class PositionStateTests(manual_fixtures.ManualPositionTestCase):
         self.save(self.payload(command="append", position_id=identity))
         self.confirm(self.state_payload(identity, stop_price="97"))
         page = render_signal_review(self.fixture.read())
-        self.assertIn("已人工确认", page)
+        self.assertIn("已确认当前状态（人工核实）", page)
         self.assertIn("&lt;script&gt;state note&lt;/script&gt;", page)
         self.assertNotIn('href="/position-state', page)
         self.assertNotIn('action="/position-state', page)

@@ -75,7 +75,7 @@ class CurrentConclusionTests(unittest.TestCase):
         old = legacy_cycle()['observations'][0]
         result = current_conclusions(*sources(old), now_ms=old['observed_at_ms'])[0]
         self.assertEqual('unavailable', result['status'])
-        self.assertIn('旧记录', result['message'])
+        self.assertIn('最近记录缺少评估依据，当前结论待核实', result['message'])
         self.assertEqual(old, result['latest'])
 
     def report(self):

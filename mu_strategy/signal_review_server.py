@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -127,8 +128,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             state_editor = urlsplit(self.path).path == "/position-state"
             management_editor = urlsplit(self.path).path == "/position-management"
             try:
-                query = parse_qs(urlsplit(self.path).query, max_num_fields=5)
-                allowed = {"position_id"} if state_editor else {"position_id", "saved"} if management_editor else {"position_id", "fill_id", "event_id", "saved"}
+                query = parse_qs(urlsplit(self.path).query, max_num_fields=6)
+                allowed = {"position_id"} if state_editor else {"position_id", "saved"} if management_editor else {"position_id", "fill_id", "event_id", "saved", "symbol", "new"}
                 if set(query) - allowed or any(len(values) != 1 for values in query.values()):
                     raise ValueError()
                 options = {key: values[0] for key, values in query.items()}
@@ -143,6 +144,12 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                         return
                 if options.get("event_id") and (position_id or fill_id):
                     raise ValueError()
+                symbol = options.get("symbol")
+                if symbol and (not re.fullmatch(r"[A-Z0-9]{1,20}-USDT-SWAP", symbol)
+                               or position_id or fill_id or options.get("event_id")):
+                    raise ValueError()
+                if options.get("new") and (options["new"] != "1" or position_id or fill_id):
+                    raise ValueError()
                 if management_editor:
                     review = review_position(position, data_dir, now_ms=clock.now_ms()) if view["available"] else None
                     content = render_position_management_editor(view, stylesheet=REVIEW_STYLE, position_id=position_id,
@@ -153,7 +160,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                     source = ledger.entry_source(options["event_id"]) if options.get("event_id") else None
                     saved = "state" if options.get("saved") == "state" else options.get("saved") == "1"
                     content = render_position_editor(view, stylesheet=REVIEW_STYLE, position_id=position_id,
-                                                      fill_id=fill_id, source=source, saved=saved)
+                                                      fill_id=fill_id, source=source, saved=saved,
+                                                      symbol=symbol, new=options.get("new") == "1")
             except (ValueError, UnicodeError):
                 self.respond(400, "录入入口无效，请从复盘页重新打开。")
                 return
@@ -183,7 +191,7 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                 status, error = 503, "管理输入暂时无法保存，请稍后重试。" if management_editor else "持仓状态暂时无法保存，请稍后重试。" if state_editor else "成交记录暂时无法保存，请稍后重试。"
             else:
                 location = (f"/position-management?position_id={position_id}&saved=1#position-review" if management_editor else
-                            f"/positions?saved={'state' if state_editor else '1'}#position-{position_id}")
+                            f"/positions?position_id={position_id}&saved={'state' if state_editor else '1'}#save-result")
                 self.respond(303, "", location=location)
                 return
             if management_editor:

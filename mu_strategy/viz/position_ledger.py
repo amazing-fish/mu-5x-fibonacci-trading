@@ -5,6 +5,7 @@ import html
 import json
 from datetime import datetime
 from decimal import Decimal
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from mu_strategy.manual_positions import BEIJING, UNITS
@@ -23,13 +24,13 @@ def _time(value, *, input_value=False):
 
 def _state_summary(position, *, editable):
     state = position["current_state"]
-    labels = {"unconfirmed": ("当前状态尚未确认", "warning"), "confirmed": ("已人工确认", "good"),
+    labels = {"unconfirmed": ("当前状态尚未确认", "warning"), "confirmed": ("已确认当前状态（人工核实）", "good"),
               "needs_review": ("成交记录已变化，待重新核对", "warning"), "not_open": ("当前无可确认的持仓状态", "neutral")}
     label, style = labels[state["status"]]
     values = (f'<p>已达到的策略阶段 {_e(state["stage"] or "未知")} · 当前手记止损 / USDT {_e(state["stop_price"] or "未知")}</p>'
               if state["status"] != "not_open" else '')
     at = f'<span class="secondary">上次确认 {_time(state["confirmed_at_ms"])} 北京时间</span>' if state["confirmed_at_ms"] else ''
-    link = f'<a href="/position-state?position_id={position["position_id"]}#position-form">更新持仓状态</a>' if editable and position["status"] == "open" else ''
+    link = f'<a class="primary-action" href="/position-state?position_id={position["position_id"]}#position-form">更新持仓状态</a>' if editable and position["status"] == "open" else ''
     return f'<div class="current-position-state"><span class="badge {style}">{label}</span>{values}{at} {link}</div>'
 
 
@@ -43,9 +44,9 @@ def _management_summary(position, *, editable):
 
 
 def render_capability_path():
-    return '''<ol class="capability-path" aria-label="持仓管理能力进展">
-      <li><span>已有</span>实际成交台账</li><li><span>已有</span>当前状态确认</li>
-      <li class="current"><span>已接通</span>baseline 规则复核</li><li><span>后续</span>持仓事件与邮件</li></ol>'''
+    return '''<ol class="capability-path" aria-label="人工记录与后续步骤">
+      <li><span>人工事实 · 未经交易所对账</span>记录实际成交</li><li><span>另行核实阶段、止损等</span>确认当前状态</li>
+      <li><span>需额外管理输入 · 按需查询</span>规则复核</li><li><span>尚未接通 · 不自动开始</span>持仓邮件</li></ol>'''
 
 
 def render_position_cards(view, *, editable=False):
@@ -98,13 +99,14 @@ def render_position_cards(view, *, editable=False):
     return ''.join(cards)
 
 
-def render_position_editor(view, *, stylesheet, position_id=None, fill_id=None, source=None, draft=None, error=None, saved=False):
+def render_position_editor(view, *, stylesheet, position_id=None, fill_id=None, source=None, draft=None, error=None, saved=False,
+                           symbol=None, new=False):
     positions = {item["position_id"]: item for item in view["positions"]}
     position = positions.get(position_id)
     fill = next((item for item in position["fills"] if item["fill_id"] == fill_id), None) if position else None
     values = {"request_id": uuid4().hex, "position_id": position_id or uuid4().hex,
               "command": "revise" if fill else "append" if position else "create", "action": "buy",
-              "symbol": source["symbol"] if source else "", "event_id": source["event_id"] if source else "",
+              "symbol": source["symbol"] if source else symbol or "", "event_id": source["event_id"] if source else "",
               "unit": "", "label": "", "quantity": "", "price": "", "executed_at": "",
               "note": "", "stage": "", "stop_price": "", "confirmed": "", "voided": ""}
     if fill:
@@ -133,13 +135,13 @@ def render_position_editor(view, *, stylesheet, position_id=None, fill_id=None, 
     action_field = ('<input type="hidden" name="action" value="buy"><p class="secondary">新建多头持仓 · 记录实际买入</p>' if creating else
                     select_field("action", "实际动作", {"buy": "买入 / 增加记录", "sell": "卖出 / 减少记录"}))
     source_note = (f'关联信号：{_e(source["symbol"])} · {_e(source["strategy_name"])}。只带入标的与来源，实际成交请自行填写。' if source else
-                   "未关联入场信号；配置版本保持未知。") if creating else f'此笔属于 {_e(position["symbol"])} · 数量单位：{_e(UNITS[position["unit"]])}' if position else "请核对目标持仓。"
+                   '保留关联事件信息，保存时重新校验来源。' if values.get("event_id") else
+                   "未关联入场信号；信号来源未知，配置版本保持未知。") if creating else f'此笔属于 {_e(position["symbol"])} · 数量单位：{_e(UNITS[position["unit"]])}' if position else "请核对目标持仓。"
     void_field = f'<label class="confirmation"><input type="checkbox" name="voided" value="yes" {"checked" if values.get("voided") == "yes" else ""}>作废这笔成交记录（保留历史）</label>' if revising else ""
     title = "更正成交" if revising else "补录成交" if position else "记录实际成交"
-    message = "已保存当前持仓状态。" if saved == "state" else "已保存实际成交记录。"
-    notice = f'<p class="notice" role="alert">{_e(error)} 输入仍保留，可修改后重新提交。</p>' if error else f'<p class="save-result" role="status">{message}</p>' if saved else ''
+    notice = f'<p class="notice" role="alert">{_e(error)} 输入仍保留，可修改后重新提交。</p>' if error else ''
     form = f'''<section id="position-form"><div class="section-heading"><h2>{title}</h2><a href="/positions">另建持仓</a></div>
-      <p class="secondary">{source_note}</p>{notice}
+      <p class="secondary">{source_note}</p><p>仅保存已发生的实际成交，不是确认下单；信号待核实、已过期或没有提醒时也可独立录入，录入不证明信号有效。</p>{notice}
       <form method="post" action="/positions">{identity_fields}<div class="position-fields">{create_fields}{action_field}
         {input_field('quantity', '实际数量', required=True, extra='inputmode="decimal" maxlength="31"')}
         {input_field('price', '实际成交价格 / USDT', required=True, extra='inputmode="decimal" maxlength="31"')}
@@ -150,6 +152,28 @@ def render_position_editor(view, *, stylesheet, position_id=None, fill_id=None, 
       </div></details><label>{'更正 / 作废原因（必填）' if revising else '成交备注 / 可选'}<textarea name="note" rows="2" maxlength="2000" {'required' if revising else ''}>{_e(values.get('note', ''))}</textarea></label>
       {void_field}<label class="confirmation"><input type="checkbox" name="confirmed" value="yes" required {"checked" if values.get('confirmed') == 'yes' else ''}>我确认填写的是已发生的实际成交，数量单位正确。</label>
       <button type="submit">{'保存更正' if revising else '保存实际成交'}</button></form></section>''' if view["available"] or draft is not None else ''
+    # A repeated visit from a symbol or alert must first offer existing positions.
+    # The user explicitly chooses an independent position; no event is guessed.
+    existing = [item for item in view["positions"] if item["status"] == "open"
+                and (not values["symbol"] or item["symbol"] == values["symbol"])]
+    if creating and draft is None and existing and not new:
+        links = ''.join(f'<li><a class="primary-action" href="/positions?position_id={item["position_id"]}#position-form">'
+                        f'补录成交 · {_e(item["symbol"])} · {_e(item["label"] or item["position_id"][:8])}</a>'
+                        f'<span> 已记录 {_e(item["recorded_quantity"])} {_e(UNITS[item["unit"]])}</span></li>' for item in existing)
+        query = {"new": "1", **({"event_id": source["event_id"]} if source else {"symbol": values["symbol"]} if values["symbol"] else {})}
+        form = (f'<section id="position-form"><h2>记录实际成交</h2><p>已有持仓的追加成交，请选择对应持仓“补录成交”，沿用该持仓的单位和原始来源。</p>'
+                f'<ul class="position-choices">{links}</ul><a href="/positions?{_e(urlencode(query))}#position-form">这是另一笔独立持仓，继续新建</a></section>')
+    if saved and position and not error and draft is None and (position["state_history"] if saved == "state" else position["history"]):
+        message = "已保存当前持仓状态（本次人工核实）" if saved == "state" else "已保存实际成交记录（人工确认）"
+        next_step = (f'<a class="primary-action" href="/position-state?position_id={position_id}#position-form">更新持仓状态</a>'
+                     if position["status"] == "open" else '<span>按记录已无剩余数量，无需确认当前持仓状态。</span>')
+        guidance = ('本次确认的阶段与手记止损见对应持仓，未知字段仍为未知。需要规则复核时，再确认管理输入和实际杠杆。'
+                    if saved == "state" else '下一步：按实际掌握的信息核对阶段与手记止损；未知可留空，无需一次填完管理配置。成交笔数不等于阶段，实际杠杆须另行确认。')
+        form = (f'<section id="save-result" class="save-result" role="status"><h2>{message}</h2>'
+                f'<p>{_e(position["symbol"])} · {_e(position["label"] or position_id[:8])} · 未经交易所对账。</p>'
+                f'<div class="next-actions"><a href="#position-{position_id}">查看对应持仓</a>{next_step}</div>'
+                f'<p>{guidance}</p>'
+                '<p>规则复核需额外管理输入，仅按需查询。保存不会下单、设置交易所止损或启动自动监控；持仓邮件尚未接通。</p></section>')
     return _render_position_page(view, form, stylesheet=stylesheet)
 
 
@@ -179,8 +203,9 @@ def render_position_state_editor(view, *, stylesheet, position_id, draft=None, e
 
 def _render_position_page(view, form, *, stylesheet, form_label="记录成交", page_title="成交与持仓", editable=True):
     cards = render_position_cards(view, editable=editable)
+    form_target = '#position-form' if 'id="position-form"' in form else '/positions#position-form'
     navigation = ('<a href="/">每日复盘</a><a href="#positions">已记录持仓</a>'
-                  f'<a href="#position-form">{form_label}</a>') if editable else '<a href="#position-review">复核快照</a><a href="#positions">持仓记录</a>'
+                  f'<a href="{form_target}">{form_label}</a>') if editable else '<a href="#position-review">复核快照</a><a href="#positions">持仓记录</a>'
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
       <link rel="icon" href="data:,"><title>MU · {_e(page_title)}</title><style>{stylesheet}</style></head><body>
       <header class="masthead"><div class="brand">MU<span>人工成交台账</span></div><nav>{navigation}</nav></header>
