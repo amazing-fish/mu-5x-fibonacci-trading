@@ -187,6 +187,26 @@ _STRATEGY_GROUP_REGISTRATIONS = (
     ),
     StrategyGroupRegistration(
         descriptor=StrategyRuleDescriptor(
+            "mu.baseline_green_only_wide.long_limit.v1",
+            "baseline_green_only_wide",
+            1,
+            "buy",
+            "limit",
+        ),
+        label="新baseline + 仅green信号 + green宽止损（观察候选）",
+        config_factory=lambda symbol: _baseline_config(
+            symbol,
+            allowed_regimes=("green",),
+            yellow_stop_tightening="baseline",
+            green_stop_tightening="wide",
+        ),
+        components=StrategyComponents(
+            entry="仅green创建二次回踩限价信号",
+            exit="yellow baseline / green 宽止损",
+        ),
+    ),
+    StrategyGroupRegistration(
+        descriptor=StrategyRuleDescriptor(
             "mu.baseline_yellow_wide.long_limit.v1",
             "baseline_yellow_wide",
             1,
@@ -441,6 +461,10 @@ def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGrou
 
 def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
     return _build_registered_strategy_group("baseline_green_wide", symbol)
+
+
+def baseline_green_only_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
+    return _build_registered_strategy_group("baseline_green_only_wide", symbol)
 
 
 def baseline_yellow_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
