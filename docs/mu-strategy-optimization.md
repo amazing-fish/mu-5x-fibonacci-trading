@@ -1,5 +1,7 @@
 # MU 策略优化：2026-09-13
 
+**范围更正：本文只记录原 Fibonacci 的局部实验，未满足“使用指定仓库里的策略”。** 平滑止损与 green-only 预设不作为本轮来源策略的推荐结论；当前工作见[指定仓库策略复跑](source-strategy-comparison.md)。
+
 保留两条可执行的研究路线：现有 `baseline_delayed_tighten_smooth` 偏重全期收益；新增 `baseline_green_only_wide` 偏重较少交易和较低回撤。按照运行前固定的“末段优先”排序，后者是本次首选观察候选。二者均未取得新的前向表现，默认运行策略仍是 `baseline`。
 
 ## 具体改动
