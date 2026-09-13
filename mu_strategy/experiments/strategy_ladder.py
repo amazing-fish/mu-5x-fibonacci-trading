@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import html
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -208,6 +209,7 @@ def run_long_only_candidate(
     starting_equity: float = 10_000.0,
     execution_start_time_ms: int | None = None,
     execution_end_time_ms: int | None = None,
+    target_long_by_open_time: Mapping[int, bool] | None = None,
 ) -> BacktestResult:
     if fee_bps_per_side < 0 or slippage_ticks < 0:
         raise ValueError("fee and slippage values must be non-negative")
@@ -235,7 +237,9 @@ def run_long_only_candidate(
             continue
         trade_bar = ordered[index]
         closed = ordered[:index]
-        if definition.family == "overnight_seasonality":
+        if target_long_by_open_time is not None:
+            target_long = target_long_by_open_time[trade_bar.open_time_ms]
+        elif definition.family == "overnight_seasonality":
             target_long = overnight_target_long(closed, trade_bar.open_time_ms)
         elif definition.family == "time_series_momentum":
             if definition.lookback_hours is None:
