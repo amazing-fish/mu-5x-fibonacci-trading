@@ -3,10 +3,19 @@ from datetime import datetime, timezone
 
 from mu_strategy.experiments.mu_source_adaptation import StockBar, events_to_targets, stock_events, payday_events, sector_events, session_date
 from mu_strategy.experiments.source_strategies import Panel, SECTORS, metrics
+from mu_strategy.experiments.strategy_ladder import CandidateDefinition, DEFAULT_MU_INSTRUMENT, run_long_only_candidate
 from mu_strategy.models import Candle
 
 
 class MUSourceAdaptationTests(unittest.TestCase):
+    def test_precomputed_signal_can_execute_on_first_real_bar(self):
+        bars = [Candle(0,100,101,99,100,1),Candle(3600000,110,111,109,110,1)]
+        result = run_long_only_candidate(bars,definition=CandidateDefinition('known','custom','known','source'),
+            fee_bps_per_side=5,slippage_ticks=0,instrument=DEFAULT_MU_INSTRUMENT,
+            target_long_by_open_time={0:True,3600000:True})
+        self.assertEqual(0,result.trades[0].entry_time_ms)
+        self.assertEqual(100,result.trades[0].entry_price)
+
     def test_stock_signal_is_unavailable_until_publication(self):
         bars = [Candle(t,100,101,99,100,1) for t in (0,3600000,7200000)]
         self.assertEqual({0:False,3600000:False,7200000:True},events_to_targets(bars,[(4500000,True)]))

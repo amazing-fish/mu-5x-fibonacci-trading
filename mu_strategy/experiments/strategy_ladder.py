@@ -233,7 +233,7 @@ def run_long_only_candidate(
     open_fill: Fill | None = None
 
     for index in execution_indices:
-        if index == 0:
+        if index == 0 and target_long_by_open_time is None:
             continue
         trade_bar = ordered[index]
         closed = ordered[:index]

@@ -212,6 +212,10 @@ def main():
             result = run_backtest(candles,context,config=config,starting_equity=10000)
             curve = daily_equity(result,lo,hi,900000)
             rows['baseline_1x'] = {**metrics(curve,365),'curve':curve,'trades':result.trade_count,'native_drawdown':result.max_drawdown_pct}
+            anchor = run_backtest(candles,context,config=replace(config,leverage=5),starting_equity=10000)
+            anchor_curve = daily_equity(anchor,lo,hi,900000)
+            rows['baseline_current_5x'] = {**metrics(anchor_curve,365),'curve':anchor_curve,'trades':anchor.trade_count,
+                                            'native_drawdown':anchor.max_drawdown_pct}
             rows['cash'] = {'return':0.,'drawdown':0.,'curve':[10000.]*(1+(hi-lo)//DAY_MS),'trades':0}
             results[phase][scenario] = rows
     # Source lookbacks stay fixed. Do not exclude slow monthly rules for low activity.
@@ -256,12 +260,12 @@ def main():
         values = [row['return'],row['drawdown']]
         tail = [results[p]['base'][s]['return'] for p in ('first','validation','final')]+[results['final']['stress'][s]['return']]
         lines.append('| '+s+' | '+' | '.join(f'{v:.2%}' for v in values)+f" | {row.get('trades','组合')} | "+' | '.join(f'{v:.2%}' for v in tail)+' |')
-    lines += ['', '所有订单模拟在 MU-USDT-SWAP，目标 1 倍本金。原参数保留，移植差异如下：','']+['- '+x for x in report['adaptations']]
+    lines += ['', '所有订单模拟在 MU-USDT-SWAP；来源候选目标1倍本金，baseline_current_5x单列原5倍配置。原参数保留，移植差异如下：','']+['- '+x for x in report['adaptations']]
     (args.output_dir/'mu-source-results.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     if selected:
         chosen_config = {'mode':'research_candidate_not_live_release','symbol':'MU-USDT-SWAP',
             'weights':selected['weights'],'source_files':{s:SOURCE_ROOT+SOURCE_FILES[s] for s in selected['weights'] if s in SOURCE_FILES},
-            'target_notional_per_initial_equity':1.0,'execution':'first whole UTC hour at/after signal event',
+            'target_notional_per_equity_at_entry':1.0,'execution':'first whole UTC hour at/after signal event',
             'live_readiness':'external daily signal refresh and release integration are not implemented',
             'selected_by':'middle60d net return, no worse than buyhold DD; equal-score tie uses first60d only',
             'final_metrics':{k:v for k,v in results['final']['base']['selected'].items() if k!='curve'}}
