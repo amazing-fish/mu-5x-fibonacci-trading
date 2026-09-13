@@ -210,16 +210,26 @@ def run_long_only_candidate(
     execution_start_time_ms: int | None = None,
     execution_end_time_ms: int | None = None,
     target_long_by_open_time: Mapping[int, bool] | None = None,
+    bar_duration_ms: int = HOUR_MS,
 ) -> BacktestResult:
     if fee_bps_per_side < 0 or slippage_ticks < 0:
         raise ValueError("fee and slippage values must be non-negative")
     ordered = sorted(candles_1h, key=lambda bar: bar.open_time_ms)
+    if bar_duration_ms not in (900_000, HOUR_MS):
+        raise ValueError("research execution supports 15m or 1h bars")
+    if bar_duration_ms != HOUR_MS:
+        if target_long_by_open_time is None:
+            raise ValueError("15m execution requires explicit targets; built-in signals are hourly")
+        if any(bar.open_time_ms % bar_duration_ms for bar in ordered) or any(
+            b.open_time_ms - a.open_time_ms != bar_duration_ms for a, b in zip(ordered, ordered[1:])
+        ):
+            raise ValueError("15m execution requires aligned contiguous unique bars")
     execution_indices = [
         index
         for index, bar in enumerate(ordered)
         if (execution_start_time_ms is None or bar.open_time_ms >= execution_start_time_ms)
         and (execution_end_time_ms is None or bar.open_time_ms < execution_end_time_ms)
-        and (execution_end_time_ms is None or bar.open_time_ms + HOUR_MS <= execution_end_time_ms)
+        and (execution_end_time_ms is None or bar.open_time_ms + bar_duration_ms <= execution_end_time_ms)
     ]
     if len(ordered) < 2 or not execution_indices:
         return BacktestResult(starting_equity, starting_equity, [], [])
@@ -236,15 +246,14 @@ def run_long_only_candidate(
         if index == 0 and target_long_by_open_time is None:
             continue
         trade_bar = ordered[index]
-        closed = ordered[:index]
         if target_long_by_open_time is not None:
             target_long = target_long_by_open_time[trade_bar.open_time_ms]
         elif definition.family == "overnight_seasonality":
-            target_long = overnight_target_long(closed, trade_bar.open_time_ms)
+            target_long = overnight_target_long(ordered[:index], trade_bar.open_time_ms)
         elif definition.family == "time_series_momentum":
             if definition.lookback_hours is None:
                 raise ValueError("momentum candidate requires lookback_hours")
-            target_long = momentum_target_long(closed, definition.lookback_hours)
+            target_long = momentum_target_long(ordered[:index], definition.lookback_hours)
         else:
             raise ValueError(f"unsupported local candidate family: {definition.family}")
 
@@ -278,20 +287,20 @@ def run_long_only_candidate(
         marked = equity
         if open_fill is not None:
             marked += (trade_bar.close - open_fill.price) * open_fill.units - open_fill.fee
-        equity_curve.append((trade_bar.open_time_ms + HOUR_MS, marked))
+        equity_curve.append((trade_bar.open_time_ms + bar_duration_ms, marked))
 
     if open_fill is not None:
         final = ordered[execution_indices[-1]]
         equity, trade = _close_long_only_trade(
             open_fill,
-            exit_time_ms=final.open_time_ms + HOUR_MS,
+            exit_time_ms=final.open_time_ms + bar_duration_ms,
             exit_price=final.close - slip,
             equity=equity,
             fee_rate=fee_rate,
             reason="end_of_data",
         )
         trades.append(trade)
-        equity_curve.append((final.open_time_ms + HOUR_MS, equity))
+        equity_curve.append((final.open_time_ms + bar_duration_ms, equity))
 
     return BacktestResult(starting_equity, equity, trades, equity_curve)
 
