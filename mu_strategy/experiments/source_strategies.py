@@ -212,7 +212,7 @@ def main():
                   'Close-to-close NAV drawdown excludes intraday lows.']}
     args.output_dir.mkdir(parents=True,exist_ok=True)
     (args.output_dir/'source-results.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
-    lines = ['# 指定仓库策略：原 ETF 资产池复跑','',f"组合：`{chosen['weights']}`；验证期比较 {chosen['candidates']} 个资金分配。",'',
+    lines = ['# 指定仓库策略：原 ETF 资产池复跑','',f"验证期选出的权重：`{chosen['weights']}`；比较 {chosen['candidates']} 个资金分配。此权重不自动成为推荐，请同时检查后段和等权基准。",'',
              '原参数保留；统一使用已收盘信号、下一交易日开盘成交。资产趋势一项是分钟源码的日线执行适配。收益不是 MU 收益。','',
              '| 策略 | 2009–2017收益 | 2018–2021收益 | 2022至今收益 | 2022至今回撤 | 2022至今年化 | 压力成本收益 |',
              '|---|---:|---:|---:|---:|---:|---:|']
@@ -225,16 +225,27 @@ def main():
     lines += ['', '## 解释范围', '']+['- '+s for s in report['limitations']]
     (args.output_dir/'source-results.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     # Self-contained overview; detailed numerical evidence stays in JSON/Markdown.
-    rendered = '<!doctype html><meta charset="utf-8"><title>指定仓库策略复跑</title><style>body{max-width:1250px;margin:35px auto;font:16px system-ui;background:#f5f7fa;color:#183047}pre{white-space:pre-wrap;line-height:1.8}svg{background:white;border:1px solid #ddd}</style><h1>指定仓库策略：原资产池复跑</h1>'
+    labels = dict(zip((*SOURCES,*BENCHMARKS,'source_equal','selected'),
+                     ('跨资产动量','行业动量轮动','股债配对切换','一月效应','跨资产趋势（日线适配）',
+                      'SPY 买入持有','五资产月度等权','股债 60/40','五策略初始等权','验证期选出的权重')))
+    rendered = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>指定仓库策略复跑</title><style>body{max-width:1180px;margin:35px auto;padding:0 20px;font:16px system-ui;background:#f5f7fa;color:#183047;line-height:1.65}svg,table{background:white;width:100%;border:1px solid #ddd}table{border-collapse:collapse;font-size:14px}th,td{padding:12px;text-align:right;border-bottom:1px solid #e4e9ee}td:first-child,th:first-child{text-align:left}a{color:#086eaa}.note{background:#e7eff7;padding:18px;border-radius:10px}</style><h1>指定仓库策略：原资产池复跑</h1><p class="note">原 ETF 标的与源码参数；2007–2026 数据。以下收益不是 MU 收益。资产趋势保留原参数，但分钟执行适配为日线。</p>'
     names = ('selected','spy_hold','source_equal')
     colors = ('#098577','#dd653d','#5360b7')
     curves = [results['holdout']['base'][s]['curve'] for s in names]
     floor, ceiling = min(map(min,curves)),max(map(max,curves))
-    rendered += '<p>2022 至今权益（同起始本金）；'+ ' / '.join(f'<span style="color:{c}">{s}</span>' for s,c in zip(names,colors))+'</p><svg viewBox="0 0 1100 330" role="img" aria-label="最终检验区间权益曲线">'
+    rendered += '<h2>2022-01 至 2026-09 权益</h2><p>同起始本金 10,000；'+ ' / '.join(f'<span style="color:{c}">{labels[s]}</span>' for s,c in zip(names,colors))+'</p><svg viewBox="0 0 1100 350" role="img" aria-label="最终检验区间权益曲线">'
+    rendered += f'<text x="20" y="18" font-size="13">{ceiling:,.0f}</text><text x="20" y="320" font-size="13">{floor:,.0f}</text><text x="20" y="342" font-size="13">2022-01</text><text x="1010" y="342" font-size="13">2026-09</text>'
     for curve,color in zip(curves,colors):
         points = ' '.join(f'{20+1060*i/(len(curve)-1):.2f},{300-270*(v-floor)/(ceiling-floor or 1):.2f}' for i,v in enumerate(curve))
         rendered += f'<polyline fill="none" stroke="{color}" stroke-width="2" points="{points}"/>'
-    rendered += '</svg><pre>'+html.escape('\n'.join(lines))+'</pre>'
+    rendered += '</svg><h2>后段表现与成本</h2><p>基础每侧 5 bps，压力每侧 15 bps；回撤为日末净权益。</p><table><tr><th>策略</th><th>累计收益</th><th>年化收益</th><th>最大回撤</th><th>压力成本收益</th></tr>'
+    for s,label in labels.items():
+        base = results['holdout']['base'][s]
+        values = (base['return'],base['cagr'],base['drawdown'],results['holdout']['stress'][s]['return'])
+        rendered += '<tr><td>'+label+'</td>'+''.join(f'<td>{v:.2%}</td>' for v in values)+'</tr>'
+    rendered += '</table><h2>权重选择怎么解读</h2><p>仅用 2018–2021 年比较 70 个资金分配，选出的权重为 '+html.escape(str(chosen['weights']))+'。后段用于检验，不用于重新挑赢家。等权组合也必须与 SPY、60/40 比较，不能把低回撤直接说成更高收益。</p><h2>原策略源码</h2><ul>'
+    rendered += ''.join(f'<li><a href="{SOURCE_ROOT+f}">{labels[s]}</a></li>' for s,f in SOURCES.items())
+    rendered += '</ul><p>原始配置、所有区间、输入指纹和执行差异见 <a href="source-results.json">JSON 证据</a>；完整表格见 <a href="source-results.md">Markdown 报告</a>。</p></html>'
     (args.output_dir/'source-results.html').write_text(rendered,encoding='utf-8')
     print(json.dumps({'selection':chosen,'holdout':{s:{k:v for k,v in r.items() if k!='curve'} for s,r in results['holdout']['base'].items()}},indent=2))
 
