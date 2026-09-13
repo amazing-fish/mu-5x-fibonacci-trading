@@ -1,5 +1,6 @@
 import ast
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from mu_strategy.strategies import registry
@@ -14,6 +15,7 @@ REGISTERED_NAMES = (
     "direct_next_open",
     "baseline_half_protect",
     "baseline_green_wide",
+    "baseline_green_only_wide",
     "baseline_yellow_wide",
     "baseline_yellow_green_wide",
     "baseline_half_green_wide",
@@ -43,6 +45,7 @@ PUBLIC_FACTORIES = {
     "direct_next_open": "direct_next_open_strategy_group",
     "baseline_half_protect": "baseline_half_protect_strategy_group",
     "baseline_green_wide": "baseline_green_wide_strategy_group",
+    "baseline_green_only_wide": "baseline_green_only_wide_strategy_group",
     "baseline_yellow_wide": "baseline_yellow_wide_strategy_group",
     "baseline_yellow_green_wide": "baseline_yellow_green_wide_strategy_group",
     "baseline_half_green_wide": "baseline_half_green_wide_strategy_group",
@@ -55,6 +58,18 @@ PUBLIC_FACTORIES = {
 
 
 class StrategyGroupRegistryTests(unittest.TestCase):
+    def test_green_only_wide_is_opt_in_and_matches_the_measured_configuration(self):
+        from mu_strategy.models import Candle, EntryDecisionCode
+        from mu_strategy.strategy import should_enter_long
+
+        group = registry.selected_strategy_groups("MU-USDT-SWAP", ["baseline_green_only_wide"])[0]
+        reference = registry.baseline_green_wide_strategy_group("MU-USDT-SWAP")
+        self.assertEqual(replace(reference.config, allowed_regimes=("green",)), group.config)
+        self.assertNotIn(group.name, registry.default_strategy_names())
+        candle = Candle(1, 101, 103, 98.8, 100.8, 1000)
+        self.assertTrue(should_enter_long(candle, 100, "green", 51, .2, .1, group.config).allowed)
+        self.assertEqual(EntryDecisionCode.REGIME_BLOCKED, should_enter_long(candle, 100, "yellow", 51, .2, .1, group.config).decision_code)
+
     def test_registration_catalog_owns_names_rules_construction_selection_and_defaults(self):
         registrations = registry.strategy_group_registrations()
 

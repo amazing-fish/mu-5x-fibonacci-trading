@@ -14,6 +14,8 @@
 
 ## 当前快照上的回测与实验
 
+2026-09-13 的[趋势过滤与退出优化](mu-strategy-optimization.md)提供固定 8 配置实验命令与完整结果。新增 `baseline_green_only_wide` 为显式选择的观察候选，默认策略集合不变；另保留已有平滑止损预设作收益路线对照。
+
 先按[行情指南](data-guide.md)完成独立刷新。以下入口都只读可信缓存，不接受旧 `--refresh` / `--source` / `--trusted-data` 参数，不联网补齐数据。
 
 ```powershell
