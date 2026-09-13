@@ -1,5 +1,7 @@
 # 指定仓库策略复跑与组合判断（2026-09-13）
 
+**范围定位：本文是原 ETF 策略的参考研究，不能代替 MU 优化交付。** 用户已明确交易对象为 MU；当前主结果见[来源策略用在 MU](mu-source-strategy.md)，其信号来自原规则、成交和收益全部来自 MU 合约。
+
 本轮实际使用 `paperswithbacktest/awesome-systematic-trading/static/strategies/` 中的具体策略，固定来源提交 `4e23dd84c9ff746ddfcbc856316bcbcef0855b81`。之前把“采用优秀策略”做成了自拟 MU 指标和 Fibonacci 参数实验，原因是只借用了概念，没有以源码的资产池、周期和交易规则约束实现。那些报告现已标为历史实验；本轮不再从其中挑出一个当作来源策略。
 
 ## 实际采用哪些策略

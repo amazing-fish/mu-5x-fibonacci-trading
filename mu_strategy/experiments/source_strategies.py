@@ -121,7 +121,7 @@ def simulate(panel: Panel, signals, start: int, end: int, cost: float):
     return {'curve':curve, 'costs':fees, 'orders':orders, 'min_cash':min_cash, **metrics(curve)}
 
 
-def metrics(curve):
+def metrics(curve, periods_per_year=252):
     peak, drawdown = curve[0], 0.
     for value in curve:
         peak = max(peak, value)
@@ -129,8 +129,8 @@ def metrics(curve):
     changes = [b/a-1 for a,b in zip(curve,curve[1:])]
     sd = statistics.pstdev(changes) if len(changes) > 1 else 0
     return {'return':curve[-1]/curve[0]-1, 'drawdown':drawdown,
-            'cagr':(curve[-1]/curve[0])**(252/max(1,len(changes)))-1,
-            'sharpe_zero_rf':statistics.fmean(changes)/sd*math.sqrt(252) if sd else 0.}
+            'cagr':(curve[-1]/curve[0])**(periods_per_year/max(1,len(changes)))-1,
+            'sharpe_zero_rf':statistics.fmean(changes)/sd*math.sqrt(periods_per_year) if sd else 0.}
 
 
 def combine(curves, weights):
@@ -138,15 +138,14 @@ def combine(curves, weights):
             for i in range(len(next(iter(curves.values()))))]
 
 
-def choose_weights(curves, drawdown_limit):
+def choose_weights(curves, drawdown_limit, periods_per_year=252):
     """Select 25-percent fixed initial sleeves on validation data only."""
     names = list(curves)
     candidates = []
-    for units in itertools.product(range(5), repeat=len(names)):
-        if sum(units) != 4:
-            continue
+    for allocation in itertools.combinations_with_replacement(range(len(names)),4):
+        units = [allocation.count(i) for i in range(len(names))]
         weights = {s:u/4 for s,u in zip(names, units) if u}
-        result = metrics(combine(curves,weights))
+        result = metrics(combine(curves,weights),periods_per_year)
         candidates.append({'weights':weights, **result})
     eligible = [c for c in candidates if c['drawdown'] <= drawdown_limit+1e-12]
     if not eligible:
