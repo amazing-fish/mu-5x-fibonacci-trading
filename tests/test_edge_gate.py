@@ -97,6 +97,15 @@ class EdgeGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'weekend'):
             synthetic_path(bars, random.Random(1))
 
+    def test_first_day_is_complete_even_without_a_prior_close(self):
+        from mu_strategy.research.edge_gate import synthetic_path
+
+        bars = walk(8, bars=96)
+        synthetic = synthetic_path(bars, random.Random(1))
+        self.assertEqual([bar.open_time_ms for bar in bars],
+                         [bar.open_time_ms for bar in synthetic])
+        self.assertEqual(bars[0], synthetic[0])
+
     def test_default_universe_uses_every_published_stock_perpetual(self):
         from mu_strategy.research.edge_gate import stock_symbols
 

@@ -66,11 +66,7 @@ def synthetic_path(candles: list[Candle], rng: random.Random) -> list[Candle]:
     centered_drift = statistics.fmean(log_returns)
     complete: dict[str, list[list[int]]] = {"weekday": [], "weekend": []}
     for day, indexes in days.items():
-        if (len(indexes) == 96
-                and candles[indexes[0]].open_time_ms == day * DAY_MS
-                and all(candles[right].open_time_ms - candles[left].open_time_ms == 900_000
-                        for left, right in zip(indexes, indexes[1:]))
-                and indexes[0] > 0):
+        if _is_complete_day(candles, day, indexes):
             complete[_day_stratum(day)].append(indexes)
     for day in days:
         stratum = _day_stratum(day)
@@ -79,12 +75,15 @@ def synthetic_path(candles: list[Candle], rng: random.Random) -> list[Candle]:
 
     source_by_target = list(range(len(candles)))
     for day, indexes in days.items():
-        if len(indexes) != 96 or candles[indexes[0]].open_time_ms != day * DAY_MS:
+        if not _is_complete_day(candles, day, indexes):
             continue
-        if any(candles[right].open_time_ms - candles[left].open_time_ms != 900_000
-               for left, right in zip(indexes, indexes[1:])):
-            continue
-        source = rng.choice(complete[_day_stratum(day)])
+        # The path's first close is an anchor, so its undefined prior return is
+        # never used. A later target day needs a donor with a prior close.
+        candidates = [source for source in complete[_day_stratum(day)]
+                      if source[0] > 0 or indexes[0] == 0]
+        if not candidates:
+            raise ValueError(f"no complete {_day_stratum(day)} UTC day with a prior close")
+        source = rng.choice(candidates)
         for target_index, source_index in zip(indexes, source):
             source_by_target[target_index] = source_index
 
@@ -104,6 +103,13 @@ def synthetic_path(candles: list[Candle], rng: random.Random) -> list[Candle]:
 
 def _day_stratum(day: int) -> str:
     return "weekday" if datetime.fromtimestamp(day * DAY_MS / 1000, timezone.utc).weekday() < 5 else "weekend"
+
+
+def _is_complete_day(candles: list[Candle], day: int, indexes: list[int]) -> bool:
+    return (len(indexes) == 96
+            and candles[indexes[0]].open_time_ms == day * DAY_MS
+            and all(candles[right].open_time_ms - candles[left].open_time_ms == 900_000
+                    for left, right in zip(indexes, indexes[1:])))
 
 
 def _funding_accrual(result: BacktestResult, candles: list[Candle], annual: float) -> dict[int, float]:
