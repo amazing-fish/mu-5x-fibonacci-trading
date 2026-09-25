@@ -172,6 +172,26 @@ class EdgeGateTests(unittest.TestCase):
             assess_symbol('MU-USDT-SWAP', bars, config, simulations=1, seed=9,
                           funding_annual=.08, hourly_candles=extra)
 
+    def test_trusted_hourly_uses_okx_zero_volume_ohlc_policy(self):
+        from mu_strategy.research.edge_gate import assess_symbol
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+        from mu_strategy.strategies.registry import selected_strategy_groups
+
+        bars = walk(12, bars=192)
+        no_trade_price = bars[3].close
+        bars[4] = Candle(bars[4].open_time_ms, no_trade_price, no_trade_price,
+                         no_trade_price, no_trade_price, 0)
+        hourly = aggregate_candles(bars, interval='1h', base_interval='15m',
+                                   ohlc_policy='okx_native')
+        standard = aggregate_candles(bars, interval='1h', base_interval='15m')
+        self.assertNotEqual(hourly[1].open, standard[1].open)
+        config = selected_strategy_groups('MU-USDT-SWAP', ['baseline'])[0].config
+        without = assess_symbol('MU-USDT-SWAP', bars, config, simulations=2, seed=9,
+                                funding_annual=.08)
+        matching = assess_symbol('MU-USDT-SWAP', bars, config, simulations=2, seed=9,
+                                 funding_annual=.08, hourly_candles=hourly)
+        self.assertEqual(without, matching)
+
     def test_funding_rejects_fill_or_exit_outside_candle_times(self):
         from mu_strategy.research.edge_gate import funding_cost
 

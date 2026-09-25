@@ -186,7 +186,7 @@ def assess_symbol(
         raise ValueError("simulations must be positive")
     if len(candles) < 4:
         raise ValueError(f"{symbol}: too few 15m candles")
-    hourly = aggregate_candles(candles, interval="1h", base_interval="15m")
+    hourly = aggregate_candles(candles, interval="1h", base_interval="15m", ohlc_policy="okx_native")
     if hourly_candles is not None:
         by_time = {bar.open_time_ms: bar for bar in hourly}
         for trusted in hourly_candles:
@@ -203,7 +203,7 @@ def assess_symbol(
     null_returns = []
     for _ in range(simulations):
         synthetic = synthetic_path(candles, rng)
-        synthetic_hourly = aggregate_candles(synthetic, interval="1h", base_interval="15m")
+        synthetic_hourly = aggregate_candles(synthetic, interval="1h", base_interval="15m", ohlc_policy="okx_native")
         result = backtest_fn(synthetic, build_hourly_context(synthetic, synthetic_hourly), config=config)
         null_returns.append((result.ending_equity - funding_cost(result, synthetic, funding_annual))
                             / result.starting_equity - 1)
