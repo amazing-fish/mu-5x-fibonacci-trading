@@ -9,6 +9,7 @@ from typing import Callable, Protocol, runtime_checkable
 
 from mu_strategy.market_data.providers.okx import fetch_okx_historical, fetch_okx_incremental, fetch_okx_listing_time
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
+from mu_strategy.market_data.trusted_data.contract_basis import select_consistent_contract_basis
 from mu_strategy.market_data.trusted_data.contracts import (
     AvailabilityState,
     Clock,
@@ -500,11 +501,15 @@ class RefreshTrustedMarketData:
         dict[tuple[str, str], list[Candle]],
         dict[tuple[str, str], DatasetStorage],
     ]:
+        basis_by_interval = {
+            interval: select_consistent_contract_basis(symbol, interval, candidates[(symbol, interval)].candles)
+            for interval in intervals
+        }
         seeds_by_interval = {
             interval: DatasetEvaluationSeed(
                 key=candidates[(symbol, interval)].key,
                 source_file=candidates[(symbol, interval)].source_file,
-                candles=candidates[(symbol, interval)].candles,
+                candles=basis_by_interval[interval][0],
                 prefailed_reason=(
                     candidates[(symbol, interval)].fetch_reason
                     if candidates[(symbol, interval)].fetch_reason is not None and not candidates[(symbol, interval)].had_existing
@@ -518,7 +523,7 @@ class RefreshTrustedMarketData:
                 ),
                 error_type=candidates[(symbol, interval)].error_type,
                 message=candidates[(symbol, interval)].message,
-                warnings=_fetch_warnings(candidates[(symbol, interval)]),
+                warnings=(*_fetch_warnings(candidates[(symbol, interval)]), *basis_by_interval[interval][1]),
             )
             for interval in intervals
         }
