@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -13,6 +14,8 @@ FIFTEEN_MINUTES_MS = 900_000
 ONE_HOUR_MS = 3_600_000
 SYMBOL = "BTC-USDT-SWAP"
 SECOND_SYMBOL = "ETH-USDT-SWAP"
+SPCX_SYMBOL = "SPCX-USDT-SWAP"
+SPCX_REBASE_MS = int(datetime(2026, 6, 2, 7, 10, tzinfo=timezone.utc).timestamp() * 1000)
 
 
 class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
@@ -398,6 +401,142 @@ class TrustedDataSharedWindowRefreshTests(unittest.TestCase):
         self.assertTrue(run.datasets[(SECOND_SYMBOL, "15m")].validation.ok)
         self.assertEqual(DAY_MS + ONE_HOUR_MS, first_15m[0].open_time_ms)
         self.assertEqual(DAY_MS + 45 * 60_000, second_15m[0].open_time_ms)
+
+
+class TrustedContractBasisRefreshTests(unittest.TestCase):
+    def test_spcx_rebase_publishes_only_complete_post_event_candles(self):
+        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five = _spcx_rebase_five_minute_candles()
+        history = {
+            (SPCX_SYMBOL, "5m"): five,
+            (SPCX_SYMBOL, "15m"): aggregate_candles(five, interval="15m", ohlc_policy="okx_native"),
+            (SPCX_SYMBOL, "1h"): aggregate_candles(five, interval="1h", ohlc_policy="okx_native"),
+        }
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            run = RefreshTrustedMarketData(store, _Provider(_ticker_rows(SPCX_SYMBOL), history=history)).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m", "1h"),
+                    days=3,
+                    limit=1,
+                    stock_token_inst_ids={SPCX_SYMBOL},
+                    now_ms=five[-1].open_time_ms + FIVE_MINUTES_MS,
+                )
+            )
+            persisted = {
+                interval: _read_generation_dataset(store, run.run_id, SPCX_SYMBOL, interval)
+                for interval in ("5m", "15m", "1h")
+            } if run.snapshot_usability is SnapshotUsability.USABLE else {}
+
+        self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
+        self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
+        self.assertEqual(SPCX_REBASE_MS, persisted["5m"][0].open_time_ms)
+        self.assertEqual(SPCX_REBASE_MS + FIVE_MINUTES_MS, persisted["15m"][0].open_time_ms)
+        self.assertEqual(SPCX_REBASE_MS + 50 * 60_000, persisted["1h"][0].open_time_ms)
+        for interval, candles in persisted.items():
+            self.assertEqual("partial_available_history", run.datasets[(SPCX_SYMBOL, interval)].coverage_state)
+            self.assertTrue(any("contract_basis_start:" in warning for warning in run.datasets[(SPCX_SYMBOL, interval)].warnings))
+            self.assertTrue(all(candle.open_time_ms >= SPCX_REBASE_MS for candle in candles))
+
+    def test_spcx_later_price_jump_still_fails_closed(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five = _spcx_rebase_five_minute_candles()
+        jump_ms = SPCX_REBASE_MS + 2 * ONE_HOUR_MS
+        five = [
+            Candle(c.open_time_ms, c.open * 2, c.high * 2, c.low * 2, c.close * 2, c.volume)
+            if c.open_time_ms >= jump_ms else c
+            for c in five
+        ]
+        history = {(SPCX_SYMBOL, "5m"): five}
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(TrustedDataStore(data_dir=Path(tmp)), _Provider(_ticker_rows(SPCX_SYMBOL), history=history)).execute(
+                RefreshTrustedMarketDataRequest(requested_intervals=("5m",), days=3, limit=1, stock_token_inst_ids={SPCX_SYMBOL}, now_ms=five[-1].open_time_ms + FIVE_MINUTES_MS)
+            )
+
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual(HealthReason.CONTINUITY_GAP, run.datasets[(SPCX_SYMBOL, "5m")].primary_reason)
+
+    def test_spcx_pre_rebase_only_history_is_not_published(self):
+        from mu_strategy.market_data.trusted_data.contracts import SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five = [bar for bar in _spcx_rebase_five_minute_candles() if bar.open_time_ms < SPCX_REBASE_MS]
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=Path(tmp)),
+                _Provider(_ticker_rows(SPCX_SYMBOL), history={(SPCX_SYMBOL, "5m"): five}),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",), days=3, limit=1, stock_token_inst_ids={SPCX_SYMBOL},
+                    now_ms=five[-1].open_time_ms + FIVE_MINUTES_MS,
+                )
+            )
+
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual(0, run.datasets[(SPCX_SYMBOL, "5m")].rows)
+
+    def test_other_symbol_with_same_price_jump_still_fails_closed(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason, SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five = _spcx_rebase_five_minute_candles()
+        with TemporaryDirectory() as tmp:
+            run = RefreshTrustedMarketData(
+                TrustedDataStore(data_dir=Path(tmp)),
+                _Provider(_ticker_rows(SYMBOL), history={(SYMBOL, "5m"): five}),
+            ).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("5m",), days=3, limit=1, stock_token_inst_ids=set(),
+                    now_ms=five[-1].open_time_ms + FIVE_MINUTES_MS,
+                )
+            )
+
+        self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
+        self.assertEqual(HealthReason.CONTINUITY_GAP, run.datasets[(SYMBOL, "5m")].primary_reason)
+
+    def test_spcx_post_rebase_partial_history_can_be_reused(self):
+        from mu_strategy.market_data.trusted_data.contracts import SnapshotUsability
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+        five = _spcx_rebase_five_minute_candles()
+        request = RefreshTrustedMarketDataRequest(
+            requested_intervals=("5m",), days=3, limit=1, stock_token_inst_ids={SPCX_SYMBOL},
+            now_ms=five[-1].open_time_ms + FIVE_MINUTES_MS,
+        )
+        with TemporaryDirectory() as tmp:
+            store = TrustedDataStore(data_dir=Path(tmp))
+            first = RefreshTrustedMarketData(
+                store, _Provider(_ticker_rows(SPCX_SYMBOL), history={(SPCX_SYMBOL, "5m"): five}),
+            ).execute(request)
+            self.assertEqual(SnapshotUsability.USABLE, first.snapshot_usability)
+            second = RefreshTrustedMarketData(
+                store, _Provider(_ticker_rows(SPCX_SYMBOL), fail_history={(SPCX_SYMBOL, "5m")}),
+            ).execute(request)
+            second_rows = _read_generation_dataset(store, second.run_id, SPCX_SYMBOL, "5m") if second.snapshot_usability is SnapshotUsability.USABLE else []
+
+        self.assertEqual(SnapshotUsability.USABLE, second.snapshot_usability)
+        self.assertEqual(SPCX_REBASE_MS, second_rows[0].open_time_ms)
+        self.assertEqual("partial_available_history", second.datasets[(SPCX_SYMBOL, "5m")].coverage_state)
+        self.assertTrue(any("contract_basis_start:" in warning for warning in second.datasets[(SPCX_SYMBOL, "5m")].warnings))
+
+
+def _spcx_rebase_five_minute_candles() -> list[Candle]:
+    start = SPCX_REBASE_MS - DAY_MS - 10 * 60_000
+    end = SPCX_REBASE_MS + DAY_MS + 50 * 60_000
+    candles = []
+    for timestamp in range(start, end + FIVE_MINUTES_MS, FIVE_MINUTES_MS):
+        price = 2392.1 if timestamp < SPCX_REBASE_MS else 191.06
+        candles.append(Candle(timestamp, price, price, price, price, 1.0))
+    return candles
 
 
 def _ticker_rows(*symbols: str) -> list[dict]:
