@@ -1,5 +1,7 @@
 # 策略与研究指南
 
+离线可迁移择时检验见[策略 edge 门禁](edge-gate.md)。
+
 研究要回答规则是否值得继续验证；输出报告、候选排名或 `baseline` 名称都不授予交易资格。当前模块建设见[架构总览](architecture.md)，样本外与前瞻工作归 [#99](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/99)。
 
 ## 固定策略与规则来源
