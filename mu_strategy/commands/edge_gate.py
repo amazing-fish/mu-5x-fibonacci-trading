@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Fail-closed offline timing-edge assessment.")
     parser.add_argument("--strategy", default="baseline", help="One registered strategy group")
     parser.add_argument("--data-dir", type=Path, default=Path("data/live"))
-    parser.add_argument("--days", type=int, default=28)
+    parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--simulations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--funding-annual", type=float, default=0.08)
@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             "simulations_per_symbol": args.simulations, "fee_profile": "market",
             "taker_fee_per_side": 0.0005, "funding_annual": args.funding_annual,
             "z_threshold": args.z_threshold,
-            "null_method": "UTC trading-day block bootstrap, centered log returns",
+            "null_method": "aligned complete UTC-day block bootstrap stratified by weekday/weekend; partial and gapped days retain centered original returns",
         }
         parameter_digest = hashlib.sha256(json.dumps(parameters, sort_keys=True).encode()).hexdigest()[:10]
         run_name = f"{context.generation_id}-{args.strategy}-seed{args.seed}-n{args.simulations}-{parameter_digest}"

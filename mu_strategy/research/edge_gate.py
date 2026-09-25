@@ -8,6 +8,7 @@ import random
 import statistics
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Callable
 
 from mu_strategy.backtest import run_backtest
@@ -53,24 +54,43 @@ def stock_symbols(context) -> list[str]:
 
 
 def synthetic_path(candles: list[Candle], rng: random.Random) -> list[Candle]:
-    """Sample whole UTC trading-day blocks, then center log close returns."""
+    """Resample aligned complete UTC days within weekday/weekend strata."""
     if len(candles) < 4:
         raise ValueError("at least four 15m candles are required")
-    blocks: dict[int, list[int]] = defaultdict(list)
-    log_returns = []
+    days: dict[int, list[int]] = defaultdict(list)
+    log_returns: list[float] = []
     for index in range(1, len(candles)):
-        blocks[candles[index].open_time_ms // DAY_MS].append(index)
         log_returns.append(math.log(candles[index].close / candles[index - 1].close))
-    day_blocks = list(blocks.values())
+    for index, candle in enumerate(candles):
+        days[candle.open_time_ms // DAY_MS].append(index)
     centered_drift = statistics.fmean(log_returns)
-    sampled: list[int] = []
-    while len(sampled) < len(candles) - 1:
-        sampled.extend(rng.choice(day_blocks))
-    sampled = sampled[:len(candles) - 1]
+    complete: dict[str, list[list[int]]] = {"weekday": [], "weekend": []}
+    for day, indexes in days.items():
+        if (len(indexes) == 96
+                and candles[indexes[0]].open_time_ms == day * DAY_MS
+                and all(candles[right].open_time_ms - candles[left].open_time_ms == 900_000
+                        for left, right in zip(indexes, indexes[1:]))
+                and indexes[0] > 0):
+            complete[_day_stratum(day)].append(indexes)
+    for day in days:
+        stratum = _day_stratum(day)
+        if not complete[stratum]:
+            raise ValueError(f"no complete {stratum} UTC day available for bootstrap")
+
+    source_by_target = list(range(len(candles)))
+    for day, indexes in days.items():
+        if len(indexes) != 96 or candles[indexes[0]].open_time_ms != day * DAY_MS:
+            continue
+        if any(candles[right].open_time_ms - candles[left].open_time_ms != 900_000
+               for left, right in zip(indexes, indexes[1:])):
+            continue
+        source = rng.choice(complete[_day_stratum(day)])
+        for target_index, source_index in zip(indexes, source):
+            source_by_target[target_index] = source_index
 
     output = [candles[0]]
     previous_close = candles[0].close
-    for target, source_index in zip(candles[1:], sampled):
+    for target, source_index in zip(candles[1:], source_by_target[1:]):
         source = candles[source_index]
         prior = candles[source_index - 1]
         opened = previous_close * source.open / prior.close
@@ -82,7 +102,18 @@ def synthetic_path(candles: list[Candle], rng: random.Random) -> list[Candle]:
     return output
 
 
+def _day_stratum(day: int) -> str:
+    return "weekday" if datetime.fromtimestamp(day * DAY_MS / 1000, timezone.utc).weekday() < 5 else "weekend"
+
+
 def _funding_accrual(result: BacktestResult, candles: list[Candle], annual: float) -> dict[int, float]:
+    candle_times = {candle.open_time_ms for candle in candles}
+    for trade in result.trades:
+        if trade.exit_time_ms not in candle_times:
+            raise ValueError(f"funding exit time is not a 15m candle open_time: {trade.exit_time_ms}")
+        for fill in trade.fills:
+            if fill.time_ms not in candle_times:
+                raise ValueError(f"funding fill time is not a 15m candle open_time: {fill.time_ms}")
     if not candles or annual == 0:
         return {c.open_time_ms: 0.0 for c in candles}
     events: dict[int, float] = defaultdict(float)
@@ -149,8 +180,16 @@ def assess_symbol(
         raise ValueError("simulations must be positive")
     if len(candles) < 4:
         raise ValueError(f"{symbol}: too few 15m candles")
-    hourly = hourly_candles if hourly_candles is not None else aggregate_candles(
-        candles, interval="1h", base_interval="15m")
+    hourly = aggregate_candles(candles, interval="1h", base_interval="15m")
+    if hourly_candles is not None:
+        by_time = {bar.open_time_ms: bar for bar in hourly}
+        for trusted in hourly_candles:
+            built = by_time.get(trusted.open_time_ms)
+            if built is None or any(
+                not math.isclose(getattr(trusted, field), getattr(built, field), rel_tol=1e-9, abs_tol=0.0)
+                for field in ("open", "high", "low", "close")
+            ):
+                raise ValueError(f"trusted 1h candle disagrees with 15m aggregation at {trusted.open_time_ms}")
     actual = backtest_fn(candles, build_hourly_context(candles, hourly), config=config)
     actual_funding = funding_cost(actual, candles, funding_annual)
     actual_return = (actual.ending_equity - actual_funding) / actual.starting_equity - 1
