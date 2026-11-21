@@ -1245,6 +1245,34 @@ class JsonlObservationRepository:
                 pass
             raise
 
+    _MIGRATION_COMPLETE_BYTES = b"complete\n"
+
+    @classmethod
+    def _is_migration_marker_active(cls, commit_staging: Path) -> bool:
+        try:
+            return commit_staging.read_bytes() != cls._MIGRATION_COMPLETE_BYTES
+        except FileNotFoundError:
+            return False
+
+    @classmethod
+    def _retire_migration_marker(cls, commit_staging: Path) -> None:
+        """Durably transition the migration marker to ``complete`` in-place before unlinking.
+
+        Because ``complete`` is fsynced to the marker inode before ``unlink()``, a power loss that
+        rolls back the directory-entry removal can never revive an active migration marker, while an
+        ``os.fsync`` failure before ``unlink()`` leaves the marker present so a new repository instance
+        always retries the sync and cleanup before appending.
+        """
+        with commit_staging.open("r+b", buffering=0) as staging_handle:
+            staging_handle.seek(0)
+            _write_all(staging_handle, cls._MIGRATION_COMPLETE_BYTES)
+            staging_handle.truncate(len(cls._MIGRATION_COMPLETE_BYTES))
+            os.fsync(staging_handle.fileno())
+        try:
+            commit_staging.unlink()
+        except FileNotFoundError:
+            pass
+
     def _ensure_storage_initialized(self) -> tuple[ObservationCommitState, bool]:
         """Initialize durable commit + coverage index on initial log creation or legacy bootstrap."""
         log_exists = self.path.exists()
@@ -1254,12 +1282,24 @@ class JsonlObservationRepository:
         commit_staging = Path(f"{self.path}.commit.staging")
 
         if log_size == 0:
+            needs_commit_upgrade = not commit_exists
             if commit_exists:
                 existing, has_unreadable_slot = self.inspect_commit_slots()
                 if existing is not None and existing.offset > 0:
                     raise OSError("observation log truncated before durable commit boundary")
                 if has_unreadable_slot:
-                    raise OSError("observation commit boundary has an unreadable slot")
+                    # Support retrying an empty repository left with a valid 1-slot (160-byte)
+                    # seq=0/offset=0 commit file from an earlier revision; reject all other damage.
+                    if (
+                        existing is not None
+                        and existing.seq == 0
+                        and existing.offset == 0
+                        and self.commit_path.stat().st_size == _COMMIT_SLOT_BYTES
+                        and (not index_exists or self.index_path.stat().st_size == 0)
+                    ):
+                        needs_commit_upgrade = True
+                    else:
+                        raise OSError("observation commit boundary has an unreadable slot")
             initial = ObservationCommitState(
                 seq=0,
                 offset=0,
@@ -1267,7 +1307,7 @@ class JsonlObservationRepository:
                 prefix_max_created_at_ms=-1,
                 chain_sha256=_ZERO_CHAIN_SHA256,
             )
-            if not commit_exists:
+            if needs_commit_upgrade:
                 self._write_commit_slot_atomic(initial)
             if not log_exists:
                 self.path.open("ab").close()
@@ -1277,25 +1317,31 @@ class JsonlObservationRepository:
             self._fsync_parent_directory()
             return initial, False
 
-        if not commit_exists and (not index_exists or commit_staging.exists()):
+        migration_active = self._is_migration_marker_active(commit_staging)
+
+        if not commit_exists and (not index_exists or migration_active):
             return self._bootstrap_legacy_storage(commit_staging=commit_staging), False
 
-        if commit_exists and not index_exists and commit_staging.exists():
+        if commit_exists and not index_exists and migration_active:
             commit, has_unreadable_slot = self.inspect_commit_slots()
             if commit is None:
                 raise OSError("observation commit boundary is unreadable")
+            if has_unreadable_slot:
+                raise OSError(
+                    "observation commit boundary has an unreadable slot; refusing to rebuild index "
+                    "or remove migration marker until the commit file is restored"
+                )
             self._rebuild_index_to_commit_boundary(commit, commit_staging=commit_staging)
-            return commit, has_unreadable_slot
+            return commit, False
 
         if not commit_exists or not index_exists:
             raise OSError("observation commit boundary or index is missing for non-empty log")
 
         if commit_staging.exists():
-            # Prior migration published both sidecars; sync their directory entries, remove the
-            # marker, and sync marker removal before allowing another append.
+            # Prior migration published both sidecars (or failed while retiring the marker);
+            # sync parent directory entries and durably retire + unlink the marker before appending.
             self._fsync_parent_directory()
-            commit_staging.unlink()
-            self._fsync_parent_directory()
+            self._retire_migration_marker(commit_staging)
 
         commit, has_unreadable_slot = self.inspect_commit_slots()
         if commit is None:
@@ -1360,8 +1406,7 @@ class JsonlObservationRepository:
                 os.fsync(idx_handle.fileno())
             os.replace(tmp_index, self.index_path)
             self._fsync_parent_directory()
-            commit_staging.unlink()
-            self._fsync_parent_directory()
+            self._retire_migration_marker(commit_staging)
         except BaseException:
             try:
                 tmp_index.unlink()
@@ -1432,8 +1477,7 @@ class JsonlObservationRepository:
             os.replace(tmp_index, self.index_path)
             os.replace(tmp_commit, self.commit_path)
             self._fsync_parent_directory()
-            commit_staging.unlink()
-            self._fsync_parent_directory()
+            self._retire_migration_marker(commit_staging)
             return state
         except BaseException:
             for leftover in (tmp_index, tmp_commit):
