@@ -238,18 +238,23 @@ class SignalReviewTests(unittest.TestCase):
         self.assertEqual("prior report", target.read_text(encoding="utf-8"))
         self.assertFalse(list(self.root.glob("signal-review-*.tmp")))
 
-    def test_tail_read_stops_early_before_ancient_history_and_caches_unchanged_log(self):
+    def test_tail_read_handles_ancient_history_and_caches_unchanged_log(self):
+        from mu_strategy.signal_review import read_scan_evidence
+
         ancient = [cycle(i, at=NOW - (20 - i) * 86_400_000) for i in range(10)]
         recent = [cycle(100, at=NOW - 600_000), cycle(101, at=NOW)]
         self.initialize([*ancient, *recent])
         first = self.read()["sources"]["observations"]
         self.assertEqual("ok", first["state"])
         self.assertEqual(2, first["total_cycles"])
-        self.assertLess(first["scanned_cycles"], len(ancient) + len(recent))
+        self.assertEqual(len(ancient) + len(recent), first["scanned_cycles"])
         with patch.object(JsonlObservationRepository, "iter_tail_cycles", side_effect=AssertionError("should use cache")):
             cached = self.read()["sources"]["observations"]
         self.assertEqual(first["total_cycles"], cached["total_cycles"])
         self.assertEqual(first["records"], cached["records"])
+        # Evidence lookup stops near the tail without scanning the entire history.
+        evidence = read_scan_evidence(self.data_dir, recent[-1].cycle_id, recent[-1].observations[0].observation_id, clock=self.clock)
+        self.assertEqual(recent[-1].observations[0].observation_id, evidence["observation_id"])
         # Appending invalidates cache and shows the new cycle immediately.
         self.log.append_cycle(cycle(102, at=NOW + 60_000))
         refreshed = self.read()["sources"]["observations"]
@@ -257,6 +262,26 @@ class SignalReviewTests(unittest.TestCase):
         # An invalid marker must bypass cache and fail closed.
         self.log.invalid_marker_path.write_text("interrupted", encoding="utf-8")
         self.assertEqual("unavailable", self.read()["sources"]["observations"]["state"])
+
+    def test_non_monotonic_append_order_does_not_drop_earlier_in_window_cycle(self):
+        recent_a = cycle(1, "ready", at=NOW - 600_000)
+        ancient_b = cycle(2, "wait", at=NOW - 20 * 86_400_000)
+        recent_c = cycle(3, "wait", at=NOW)
+        self.initialize([recent_a, ancient_b, recent_c])
+        source = self.read()["sources"]["observations"]
+        self.assertEqual("ok", source["state"])
+        self.assertTrue(source["complete"])
+        self.assertEqual(2, source["total_cycles"])
+        self.assertEqual(2, source["total_observations"])
+        self.assertEqual(
+            [recent_a.observations[0].observation_id, recent_c.observations[0].observation_id],
+            [row["observation_id"] for row in source["records"]],
+        )
+        # Cached read must preserve the same complete non-monotonic totals.
+        with patch.object(JsonlObservationRepository, "iter_tail_cycles", side_effect=AssertionError("should use cache")):
+            cached = self.read()["sources"]["observations"]
+        self.assertEqual(2, cached["total_cycles"])
+        self.assertEqual(source["records"], cached["records"])
 
 
 if __name__ == "__main__":

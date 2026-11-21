@@ -11,12 +11,22 @@ from mu_strategy.canonical import canonical_sha256
 
 LEGACY_CALENDAR = "weekday_windows_v1"
 US_EQUITIES_CALENDAR = "us_equities_2025_2028_v1"
+US_EQUITIES_ALGORITHMIC_CALENDAR = "us_equities_nyse_algorithmic_v1"
 CONTINUOUS_CALENDAR = "continuous_v1"
-CALENDAR_IDS = (LEGACY_CALENDAR, US_EQUITIES_CALENDAR, CONTINUOUS_CALENDAR)
+CALENDAR_IDS = (
+    LEGACY_CALENDAR,
+    US_EQUITIES_CALENDAR,
+    US_EQUITIES_ALGORITHMIC_CALENDAR,
+    CONTINUOUS_CALENDAR,
+)
 
-# Known extraordinary unscheduled NYSE closures (e.g. National Days of Mourning).
+_US_EQUITIES_V1_YEARS = (2025, 2026, 2027, 2028)
+_ALGORITHMIC_MIN_YEAR = 2018
+
+# Verified extraordinary unscheduled NYSE closures since 2018 (National Days of Mourning).
 _EXCEPTIONAL_NYSE_CLOSURES: frozenset[date] = frozenset({
-    date(2025, 1, 9),  # National Day of Mourning for President Jimmy Carter
+    date(2018, 12, 5),  # National Day of Mourning for President George H. W. Bush
+    date(2025, 1, 9),   # National Day of Mourning for President Jimmy Carter
 })
 
 
@@ -117,7 +127,7 @@ def _nyse_year_schedule(year: int) -> tuple[frozenset[date], frozenset[date]]:
     return frozenset(holidays), frozenset(early_closes)
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def calendar_sha256(calendar_id: str) -> str:
     if calendar_id not in CALENDAR_IDS:
         raise CalendarUnavailable(f"unsupported reference calendar: {calendar_id}")
@@ -128,8 +138,27 @@ def calendar_sha256(calendar_id: str) -> str:
         "weekends_closed": calendar_id != CONTINUOUS_CALENDAR,
     }
     if calendar_id == US_EQUITIES_CALENDAR:
+        holidays = {
+            year: " ".join(day.strftime("%m-%d") for day in sorted(_nyse_year_schedule(year)[0]))
+            for year in _US_EQUITIES_V1_YEARS
+        }
+        early_closes = {
+            year: " ".join(day.strftime("%m-%d") for day in sorted(_nyse_year_schedule(year)[1]))
+            for year in _US_EQUITIES_V1_YEARS
+        }
+        payload.update(
+            holidays=holidays,
+            early_closes=early_closes,
+            coverage=[_US_EQUITIES_V1_YEARS[0], _US_EQUITIES_V1_YEARS[-1]],
+            cash_open="09:30",
+            cash_close="16:00",
+            early_close="13:00",
+            cash_end="exclusive",
+        )
+    elif calendar_id == US_EQUITIES_ALGORITHMIC_CALENDAR:
         payload.update(
             schedule="nyse_algorithmic_v1",
+            min_year=_ALGORITHMIC_MIN_YEAR,
             exceptional_closures=sorted(d.isoformat() for d in _EXCEPTIONAL_NYSE_CLOSURES),
             cash_open="09:30",
             cash_close="16:00",
@@ -217,9 +246,15 @@ def _normalize_windows_key(trading_windows_et) -> tuple[tuple[str, str], ...]:
 
 
 def _session(day: date, calendar_id: str) -> tuple[str, int, int]:
+    if calendar_id == US_EQUITIES_CALENDAR and not (
+        _US_EQUITIES_V1_YEARS[0] <= day.year <= _US_EQUITIES_V1_YEARS[-1]
+    ):
+        raise CalendarUnavailable("reference calendar covers 2025 through 2028 only")
+    if calendar_id == US_EQUITIES_ALGORITHMIC_CALENDAR and day.year < _ALGORITHMIC_MIN_YEAR:
+        raise CalendarUnavailable(f"reference calendar covers {_ALGORITHMIC_MIN_YEAR} onward only")
     if calendar_id != CONTINUOUS_CALENDAR and day.weekday() >= 5:
         return "weekend", 0, 0
-    if calendar_id != US_EQUITIES_CALENDAR:
+    if calendar_id not in (US_EQUITIES_CALENDAR, US_EQUITIES_ALGORITHMIC_CALENDAR):
         return "open", 0, 1440
     holidays, early_closes = _nyse_year_schedule(day.year)
     if day in holidays:
@@ -295,7 +330,10 @@ def _utc_day_allowed_intervals(
         day_end = datetime(day.year, day.month, day.day, 23, 59, tzinfo=eastern)
         if day_start.utcoffset() != day_end.utcoffset():
             return None
-        _, _, _, windows = _session_windows(day, calendar_id, trading_windows_et)
+        try:
+            _, _, _, windows = _session_windows(day, calendar_id, trading_windows_et)
+        except CalendarUnavailable:
+            return None
         if windows:
             midnight_ms = int(day_start.timestamp() * 1000)
             for first_min, end_min in windows:

@@ -7,7 +7,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from mu_strategy.market_data.utils import day_utc_month_id
+from mu_strategy.market_data.utils import day_utc_month_id, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -334,6 +334,7 @@ class TrustedManifestSnapshot:
     provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
+    imported_from_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -613,11 +614,17 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
             )
             for key, health in datasets.items()
         }
+        imported_from_run_id = None
     else:
         layout = _required_str(payload, "storage_layout")
         if layout != TrustedStorageLayout.SEGMENTED_CSV_V1.value:
             raise ManifestSchemaError(f"unsupported manifest storage_layout: {layout}")
-        datasets, storage_by_dataset = _segmented_datasets_from_symbols(symbols)
+        imported_from_run_id = _optional_non_empty_str(payload, "imported_from_run_id")
+        datasets, storage_by_dataset = _segmented_datasets_from_symbols(
+            symbols,
+            run_id=run_id,
+            imported_from_run_id=imported_from_run_id,
+        )
 
     snapshot = TrustedManifestSnapshot(
         schema_version=schema_version,
@@ -634,6 +641,7 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
         provider_failures=_provider_failures(payload.get("provider_failures") or ()),
         warnings=_optional_str_tuple(payload, "warnings"),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
+        imported_from_run_id=imported_from_run_id,
     )
     _validate_manifest_snapshot(snapshot)
     return snapshot
@@ -724,8 +732,50 @@ def utc_month_segment_id(open_time_ms: int) -> str:
         raise ValueError("open_time_ms is outside the supported UTC datetime range") from exc
 
 
+def is_allowed_segment_source(
+    source_file: str | Path,
+    *,
+    symbol: str,
+    interval: str,
+    segment_id: str,
+    run_id: str,
+    imported_from_run_id: str | None,
+    first_reference: bool,
+    start_row: int,
+    first_timestamp_ms: int,
+) -> bool:
+    """Validate canonical UTC-month path or retained first-segment compatibility paths."""
+    if isinstance(source_file, Path):
+        source_value = source_file.as_posix()
+    elif isinstance(source_file, str):
+        source_value = source_file
+    else:
+        return False
+    canonical = f"segments/okx/{symbol}/{interval}/{segment_id}.csv"
+    if source_value == canonical:
+        return True
+    if not first_reference:
+        return False
+    if imported_from_run_id is not None:
+        imported = f"segments/okx/{symbol}/{interval}/{segment_id}.import-{run_id}.csv"
+        if source_value == imported:
+            return True
+    try:
+        partial_start_ms = int(first_timestamp_ms) - (int(start_row) * interval_to_ms(interval))
+        partial_segment_id = utc_month_segment_id(partial_start_ms)
+    except (IndexError, TypeError, ValueError):
+        return False
+    if partial_segment_id != segment_id:
+        return False
+    partial = f"segments/okx/{symbol}/{interval}/{segment_id}.partial-{partial_start_ms}.csv"
+    return source_value == partial
+
+
 def _segmented_datasets_from_symbols(
     symbols: dict[str, Any],
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
 ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], DatasetStorage]]:
     datasets: dict[tuple[str, str], DatasetHealth] = {}
     storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
@@ -740,7 +790,13 @@ def _segmented_datasets_from_symbols(
                 raise ManifestSchemaError("manifest dataset health entries must be objects")
             if "source_file" in payload:
                 raise ManifestSchemaError("schema-v4 dataset must use storage instead of source_file")
-            storage = _dataset_storage_from_dict(str(symbol), str(interval), payload.get("storage"))
+            storage = _dataset_storage_from_dict(
+                str(symbol),
+                str(interval),
+                payload.get("storage"),
+                run_id=run_id,
+                imported_from_run_id=imported_from_run_id,
+            )
             health_payload = dict(payload)
             health_payload.pop("storage", None)
             health_payload["source_file"] = storage.source_root.as_posix()
@@ -755,6 +811,9 @@ def _dataset_storage_from_dict(
     symbol: str,
     interval: str,
     payload: Any,
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
 ) -> DatasetStorage:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 dataset storage must be object")
@@ -774,8 +833,15 @@ def _dataset_storage_from_dict(
     if not isinstance(segment_payloads, list):
         raise ManifestSchemaError("schema-v4 dataset segments must be array")
     segments = tuple(
-        _segment_reference_from_dict(symbol, interval, item)
-        for item in segment_payloads
+        _segment_reference_from_dict(
+            symbol,
+            interval,
+            item,
+            run_id=run_id,
+            imported_from_run_id=imported_from_run_id,
+            first_reference=index == 0,
+        )
+        for index, item in enumerate(segment_payloads)
     )
     return DatasetStorage(
         layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
@@ -788,6 +854,10 @@ def _segment_reference_from_dict(
     symbol: str,
     interval: str,
     payload: Any,
+    *,
+    run_id: str,
+    imported_from_run_id: str | None,
+    first_reference: bool,
 ) -> SegmentReference:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 segment reference must be object")
@@ -817,10 +887,25 @@ def _segment_reference_from_dict(
         raise ManifestSchemaError(str(exc)) from exc
     if first_segment_id != segment_id or last_segment_id != segment_id:
         raise ManifestSchemaError("schema-v4 segment timestamp bounds must belong to segment_id")
-    expected_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.csv"
+    try:
+        interval_to_ms(interval)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ManifestSchemaError(f"schema-v4 segment interval is invalid: {interval}") from exc
     source_file_value = payload.get("source_file")
-    if not isinstance(source_file_value, str) or source_file_value != expected_source_value:
-        raise ManifestSchemaError("schema-v4 segment source_file must equal the canonical month path")
+    if not isinstance(source_file_value, str) or not is_allowed_segment_source(
+        source_file_value,
+        symbol=symbol,
+        interval=interval,
+        segment_id=segment_id,
+        run_id=run_id,
+        imported_from_run_id=imported_from_run_id,
+        first_reference=first_reference,
+        start_row=int(start_row),
+        first_timestamp_ms=int(first_timestamp_ms),
+    ):
+        raise ManifestSchemaError(
+            "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"
+        )
     source_file = Path(source_file_value)
     if not isinstance(content_sha256, str) or not _SHA256_RE.fullmatch(content_sha256):
         raise ManifestSchemaError("schema-v4 segment content_sha256 must be lowercase SHA-256")
@@ -974,6 +1059,15 @@ def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) for item in value):
         raise ManifestSchemaError(f"manifest {key} entries must be strings")
     return tuple(value)
+
+
+def _optional_non_empty_str(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ManifestSchemaError(f"manifest {key} must be non-empty string when present")
+    return value
 
 
 def _required_enum(payload: dict[str, Any], key: str, enum_type):

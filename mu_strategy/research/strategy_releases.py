@@ -23,6 +23,7 @@ __all__ = (
 
 STRATEGY_CONFIG_SCHEMA_VERSION = 2
 _NON_NULL_FIELDS = frozenset({"fee_rate", "trading_calendar_sha256"})
+_V2_OPTIONAL_DEFAULT_NONE_FIELDS = frozenset({"max_account_drawdown_pct", "daily_loss_limit_pct"})
 _LEGACY_V1_DEFAULTS: dict[str, Any] = {"trading_windows_bjt": (("21:45", "23:30"), ("02:30", "03:45"))}
 _LEGACY_V1_KINDS: dict[str, str] = {"trading_windows_bjt": "window_tuple"}
 STRATEGY_CONFIG_V1_FIELD_NAMES = (
@@ -87,6 +88,7 @@ class StrategyConfigPayloadV1:
     values: Mapping[str, Any]
     schema_version: int = 1
     VERSION: ClassVar[int] = 1
+    _OPTIONAL_OMITTABLE_FIELDS: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
     def _field_specs(cls) -> dict[str, str]:
@@ -99,9 +101,15 @@ class StrategyConfigPayloadV1:
         actual, expected = set(self.values), set(specs)
         if unknown := actual - expected:
             raise StrategyReleaseSchemaError(f"strategy config has unknown fields: {sorted(unknown)}")
-        if missing := expected - actual:
+        if missing := (expected - actual) - self._OPTIONAL_OMITTABLE_FIELDS:
             raise StrategyReleaseSchemaError(f"strategy config has missing fields: {sorted(missing)}")
-        normalized = {name: _validate_value(name, kind, self.values[name]) for name, kind in specs.items()}
+        normalized = {
+            name: _validate_value(name, kind, self.values[name])
+            for name, kind in specs.items()
+            if name in self.values
+        }
+        if self.VERSION == 1 and normalized["trading_windows_bjt"] != _LEGACY_V1_DEFAULTS["trading_windows_bjt"]:
+            raise StrategyReleaseSchemaError("V1 only supports the legacy default trading_windows_bjt; use V2")
         object.__setattr__(self, "values", MappingProxyType(normalized))
 
     @property
@@ -110,11 +118,16 @@ class StrategyConfigPayloadV1:
 
     @classmethod
     def from_config(cls, config: StrategyConfig) -> "StrategyConfigPayloadV1":
-        if cls.VERSION == 1 and config.trading_calendar_id != LEGACY_CALENDAR:
-            raise StrategyReleaseSchemaError("V1 cannot encode a reference calendar; use V2")
+        if cls.VERSION == 1:
+            if config.trading_calendar_id != LEGACY_CALENDAR:
+                raise StrategyReleaseSchemaError("V1 cannot encode a reference calendar; use V2")
+            if config.max_account_drawdown_pct is not None or config.daily_loss_limit_pct is not None:
+                raise StrategyReleaseSchemaError("V1 cannot encode account risk limits; use V2")
         encoded: dict[str, Any] = {}
         for name, kind in cls._field_specs().items():
             raw = getattr(config, name) if hasattr(config, name) else _LEGACY_V1_DEFAULTS[name]
+            if raw is None and name in cls._OPTIONAL_OMITTABLE_FIELDS:
+                continue
             encoded[name] = _encode_value(kind, raw)
         return cls(encoded)
 
@@ -146,6 +159,7 @@ class StrategyConfigPayloadV1:
 class StrategyConfigPayloadV2(StrategyConfigPayloadV1):
     schema_version: int = 2
     VERSION: ClassVar[int] = 2
+    _OPTIONAL_OMITTABLE_FIELDS: ClassVar[frozenset[str]] = _V2_OPTIONAL_DEFAULT_NONE_FIELDS
 
     @classmethod
     def _field_specs(cls) -> dict[str, str]:

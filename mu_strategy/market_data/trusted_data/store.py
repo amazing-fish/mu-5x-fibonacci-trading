@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -25,6 +26,7 @@ from mu_strategy.market_data.trusted_data.contracts import (
     SegmentReference,
     TrustedManifestSnapshot,
     TrustedStorageLayout,
+    is_allowed_segment_source,
     trusted_manifest_snapshot_from_dict,
     utc_month_segment_id,
 )
@@ -529,6 +531,8 @@ class TrustedDataStore:
                 storage,
                 symbol=symbol,
                 interval=interval,
+                generation_id=generation_id,
+                imported_from_run_id=snapshot.imported_from_run_id,
                 expected_logical_sha256=expected_hash,
                 need_logical_hash=verify_logical or compute_hash,
             )
@@ -543,6 +547,115 @@ class TrustedDataStore:
                 precomputed_sha256=content_hash,
             )
         return candles, content_hash
+
+    def verify_generation_dataset_bytes(
+        self,
+        snapshot: TrustedManifestSnapshot,
+        *,
+        symbol: str,
+        interval: str,
+        generation_root: Path,
+        generation_id: str,
+    ) -> str | None:
+        """Verify persisted CSV/segment bytes against the manifest SHA-256 without parsing Candles.
+
+        Returns the verified lowercase SHA-256 hex digest only when the on-disk bytes strictly
+        match the manifest header, row counts, segment hashes, and logical dataset hash.
+        Returns None on any read error, mismatch, monkeypatched reader, or non-canonical RFC CSV
+        so the caller falls back to full Candle parsing and canonical verification.
+        """
+        key = (symbol, interval)
+        health = snapshot.datasets.get(key)
+        storage = snapshot.storage_by_dataset.get(key)
+        if (
+            health is None
+            or storage is None
+            or health.integrity is not IntegrityState.VALID
+            or not health.content_sha256
+            or health.rows <= 0
+        ):
+            return None
+        try:
+            if storage.layout is TrustedStorageLayout.FLAT_CSV_V1:
+                if "read_csv" in self.__dict__ or type(self).read_csv is not TrustedDataStore.read_csv:
+                    return None
+                path = self.resolve_source_file(
+                    health.source_file,
+                    generation_root=generation_root,
+                    generation_id=generation_id,
+                )
+                extracted = _extract_unquoted_csv_lines(
+                    Path(path).read_bytes(),
+                    start_row=0,
+                    rows=None,
+                    require_eof=True,
+                )
+                if extracted is None:
+                    return None
+                raw_lines, _ = extracted
+                if len(raw_lines) != health.rows:
+                    return None
+                norm_bytes = b"\n".join(raw_lines) + b"\n"
+                canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
+                digest = hashlib.sha256(canonical_bytes).hexdigest()
+                return digest if digest == health.content_sha256 else None
+
+            if storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
+                expected_root = self.segment_source_root(symbol, interval)
+                if storage.source_root.as_posix() != expected_root.as_posix() or not storage.segments:
+                    return None
+                logical_digest = hashlib.sha256()
+                total_rows = 0
+                _int = int
+                _float = float
+                _candle_cls = Candle
+                for index, reference in enumerate(storage.segments):
+                    if not is_allowed_segment_source(
+                        reference.source_file,
+                        symbol=symbol,
+                        interval=interval,
+                        segment_id=reference.segment_id,
+                        run_id=generation_id,
+                        imported_from_run_id=snapshot.imported_from_run_id,
+                        first_reference=index == 0,
+                        start_row=reference.start_row,
+                        first_timestamp_ms=reference.first_timestamp_ms,
+                    ):
+                        return None
+                    path = self._segment_path_from_source(reference.source_file)
+                    extracted = _extract_unquoted_csv_lines(
+                        Path(path).read_bytes(),
+                        start_row=reference.start_row,
+                        rows=reference.rows,
+                        require_eof=reference.closed,
+                    )
+                    if extracted is None:
+                        return None
+                    raw_lines, _ = extracted
+                    needed = reference.start_row + reference.rows
+                    if len(raw_lines) < needed or (reference.closed and len(raw_lines) != needed):
+                        return None
+                    for prefix_index in range(reference.start_row):
+                        _parse_strict_csv_parts(
+                            raw_lines[prefix_index].decode("utf-8").split(","),
+                            _int,
+                            _float,
+                            _candle_cls,
+                        )
+                    slice_lines = raw_lines[reference.start_row : needed]
+                    norm_bytes = b"\n".join(slice_lines) + b"\n"
+                    canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
+                    if hashlib.sha256(canonical_bytes).hexdigest() != reference.content_sha256:
+                        return None
+                    logical_digest.update(canonical_bytes)
+                    total_rows += reference.rows
+                if total_rows != health.rows:
+                    return None
+                logical_hash = logical_digest.hexdigest()
+                return logical_hash if logical_hash == health.content_sha256 else None
+        except (OSError, ManifestSchemaError, ValueError, UnicodeDecodeError):
+            return None
+        return None
 
     def dataset_path(
         self,
@@ -584,17 +697,16 @@ class TrustedDataStore:
         logical_digest: Any | None = None,
     ) -> tuple[list[Candle], str | None]:
         raw = Path(path).read_bytes()
-        if b'"' not in raw and b"\x00" not in raw:
-            newline_index = raw.find(b"\n")
-            if newline_index == -1:
-                header_bytes = raw.rstrip(b"\r")
-                body_bytes = b""
-            else:
-                header_bytes = raw[:newline_index].rstrip(b"\r")
-                body_bytes = raw[newline_index + 1 :]
-            if header_bytes != _CSV_HEADER_BYTES:
-                raise ManifestSchemaError("trusted CSV header must exactly match CSV_FIELDS")
-            if not body_bytes:
+        extracted = _extract_unquoted_csv_lines(
+            raw,
+            start_row=start_row,
+            rows=rows,
+            require_eof=require_eof,
+        )
+        if extracted is not None:
+            raw_lines, _ = extracted
+            total_lines = len(raw_lines)
+            if total_lines == 0:
                 if start_row > 0:
                     raise ManifestSchemaError(
                         "trusted segment has fewer prefix rows than its manifest start_row"
@@ -602,72 +714,64 @@ class TrustedDataStore:
                 if rows is not None and rows > 0:
                     raise ManifestSchemaError("trusted segment has fewer rows than its manifest reference")
                 return [], (hashlib.sha256().hexdigest() if need_hash else None)
+            if total_lines < start_row:
+                raise ManifestSchemaError(
+                    "trusted segment has fewer prefix rows than its manifest start_row"
+                )
+            if rows is None:
+                end_row = total_lines
+            else:
+                end_row = start_row + rows
+                if end_row > total_lines:
+                    raise ManifestSchemaError("trusted segment has fewer rows than its manifest reference")
+                if require_eof and end_row < total_lines:
+                    raise ManifestSchemaError("closed trusted segment has unreferenced extra rows")
 
-            body_text = body_bytes.decode("utf-8")
-            if "\r\n" in body_text:
-                body_text = body_text.replace("\r\n", "\n")
-            if "\r" not in body_text:
-                if body_text.endswith("\n"):
-                    lines = body_text[:-1].split("\n")
-                else:
-                    lines = body_text.split("\n")
-                total_lines = len(lines)
-                if total_lines < start_row:
-                    raise ManifestSchemaError(
-                        "trusted segment has fewer prefix rows than its manifest start_row"
+            _int = int
+            _float = float
+            _candle_cls = Candle
+            for prefix_index in range(start_row):
+                _parse_strict_csv_parts(
+                    raw_lines[prefix_index].decode("utf-8").split(","),
+                    _int,
+                    _float,
+                    _candle_cls,
+                )
+
+            slice_raw = raw_lines[start_row:end_row]
+            slice_bytes = b"\n".join(slice_raw)
+            slice_lines = slice_bytes.decode("utf-8").split("\n") if slice_raw else []
+            candles: list[Candle] = []
+            append = candles.append
+            for line in slice_lines:
+                parts = line.split(",")
+                if len(parts) != 7:
+                    raise ManifestSchemaError("trusted CSV row does not match CSV_FIELDS")
+                append(
+                    _candle_cls(
+                        _int(parts[0]),
+                        _float(parts[2]),
+                        _float(parts[3]),
+                        _float(parts[4]),
+                        _float(parts[5]),
+                        _float(parts[6]),
                     )
-                _int = int
-                _float = float
-                _candle_cls = Candle
-                for prefix_index in range(start_row):
-                    _parse_strict_csv_parts(lines[prefix_index].split(","), _int, _float, _candle_cls)
+                )
 
-                if rows is None:
-                    end_row = total_lines
-                else:
-                    end_row = start_row + rows
-                    if end_row > total_lines:
-                        raise ManifestSchemaError("trusted segment has fewer rows than its manifest reference")
-                    if require_eof and end_row < total_lines:
-                        raise ManifestSchemaError("closed trusted segment has unreferenced extra rows")
+            if not need_hash and logical_digest is None:
+                return candles, None
 
-                candles: list[Candle] = []
-                append = candles.append
-                for line_index in range(start_row, end_row):
-                    parts = lines[line_index].split(",")
-                    if len(parts) != 7:
-                        raise ManifestSchemaError("trusted CSV row does not match CSV_FIELDS")
-                    append(
-                        _candle_cls(
-                            _int(parts[0]),
-                            _float(parts[2]),
-                            _float(parts[3]),
-                            _float(parts[4]),
-                            _float(parts[5]),
-                            _float(parts[6]),
-                        )
-                    )
-
-                if not need_hash and logical_digest is None:
-                    return candles, None
-
-                # Compute canonical SHA-256 directly from unquoted raw CSV bytes in C.
-                if start_row == 0 and end_row == total_lines:
-                    norm_bytes = body_bytes.replace(b"\r\n", b"\n")
-                    if norm_bytes and not norm_bytes.endswith(b"\n"):
-                        norm_bytes += b"\n"
-                else:
-                    slice_text = "\n".join(lines[start_row:end_row])
-                    norm_bytes = (slice_text + "\n").encode("utf-8") if slice_text else b""
-                canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
-                fast_hash = hashlib.sha256(canonical_bytes).hexdigest()
-                if expected_sha256 is not None and fast_hash == expected_sha256:
-                    if logical_digest is not None:
-                        logical_digest.update(canonical_bytes)
-                    return candles, fast_hash
-                # Fallback to canonical candle serialization if raw CSV formatting was non-canonical or mismatched.
-                actual_hash = candles_content_sha256(candles, digest_sink=logical_digest)
-                return candles, actual_hash
+            # Compute canonical SHA-256 directly from unquoted raw CSV bytes in C.
+            norm_bytes = (slice_bytes + b"\n") if slice_raw else b""
+            canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
+            fast_hash = hashlib.sha256(canonical_bytes).hexdigest()
+            if expected_sha256 is not None and fast_hash == expected_sha256:
+                if logical_digest is not None:
+                    logical_digest.update(canonical_bytes)
+                return candles, fast_hash
+            # Fallback to canonical candle serialization if raw CSV formatting was non-canonical or mismatched.
+            actual_hash = candles_content_sha256(candles, digest_sink=logical_digest)
+            return candles, actual_hash
 
         # Fallback: full RFC CSV parser via csv.reader (e.g., quoted fields or bare CR).
         candles = self._read_csv_slice_reader(path, start_row=start_row, rows=rows, require_eof=require_eof)
@@ -725,6 +829,8 @@ class TrustedDataStore:
         *,
         symbol: str,
         interval: str,
+        generation_id: str,
+        imported_from_run_id: str | None,
         expected_logical_sha256: str | None = None,
         need_logical_hash: bool = False,
     ) -> tuple[list[Candle], str | None]:
@@ -733,11 +839,17 @@ class TrustedDataStore:
             raise ManifestSchemaError("schema-v4 dataset source_root does not match dataset key")
         candles: list[Candle] = []
         logical_digest = hashlib.sha256() if need_logical_hash else None
-        for reference in storage.segments:
-            if not _is_canonical_segment_source(
+        for index, reference in enumerate(storage.segments):
+            if not is_allowed_segment_source(
                 reference.source_file,
-                expected_root=expected_root,
+                symbol=symbol,
+                interval=interval,
                 segment_id=reference.segment_id,
+                run_id=generation_id,
+                imported_from_run_id=imported_from_run_id,
+                first_reference=index == 0,
+                start_row=reference.start_row,
+                first_timestamp_ms=reference.first_timestamp_ms,
             ):
                 raise ManifestSchemaError("schema-v4 segment source_file does not match dataset key")
             path = self._segment_path_from_source(reference.source_file)
@@ -1091,17 +1203,85 @@ def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_r
                 raise ManifestSchemaError(
                     "schema-v4 dataset source_root must equal segments/okx/<symbol>/<interval>"
                 )
-            for reference in storage.segments:
-                if not _is_canonical_segment_source(
+            for index, reference in enumerate(storage.segments):
+                if not is_allowed_segment_source(
                     reference.source_file,
-                    expected_root=expected_root,
+                    symbol=symbol,
+                    interval=interval,
                     segment_id=reference.segment_id,
+                    run_id=snapshot.run_id,
+                    imported_from_run_id=snapshot.imported_from_run_id,
+                    first_reference=index == 0,
+                    start_row=reference.start_row,
+                    first_timestamp_ms=reference.first_timestamp_ms,
                 ):
                     raise ManifestSchemaError(
                         "schema-v4 segment source_file must match symbol/interval/segment_id"
                     )
             continue
         raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
+
+
+def _extract_unquoted_csv_lines(
+    raw: bytes,
+    *,
+    start_row: int,
+    rows: int | None,
+    require_eof: bool,
+) -> tuple[list[bytes], bool] | None:
+    """Fast-path byte extraction for unquoted LF/CRLF CSVs without decoding unreferenced tails.
+
+    Returns (lines, is_full_body), or None to route quoted/NUL/bare-CR files to csv.reader.
+    """
+    newline_index = raw.find(b"\n")
+    if newline_index == -1:
+        header_bytes = raw[:-1] if raw.endswith(b"\r") else raw
+        if b'"' in header_bytes or b"\x00" in header_bytes or b"\r" in header_bytes:
+            return None
+        if header_bytes != _CSV_HEADER_BYTES:
+            raise ManifestSchemaError("trusted CSV header must exactly match CSV_FIELDS")
+        return [], True
+
+    header_raw = raw[:newline_index]
+    header_bytes = header_raw[:-1] if header_raw.endswith(b"\r") else header_raw
+    if b'"' in header_bytes or b"\x00" in header_bytes or b"\r" in header_bytes:
+        return None
+    if header_bytes != _CSV_HEADER_BYTES:
+        raise ManifestSchemaError("trusted CSV header must exactly match CSV_FIELDS")
+
+    body_bytes = raw[newline_index + 1 :]
+    if not body_bytes:
+        return [], True
+
+    if rows is not None and not require_eof:
+        needed = start_row + rows
+        if needed == 0:
+            return [], False
+        parts = body_bytes.split(b"\n", needed)
+        if len(parts) > needed:
+            selected = parts[:needed]
+            is_full_body = False
+        else:
+            selected = parts[:-1] if parts and parts[-1] == b"" else parts
+            is_full_body = True
+        cleaned: list[bytes] = []
+        append = cleaned.append
+        for line in selected:
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            if b'"' in line or b"\x00" in line or b"\r" in line:
+                return None
+            append(line)
+        return cleaned, is_full_body
+
+    if b'"' in body_bytes or b"\x00" in body_bytes:
+        return None
+    norm_body = body_bytes.replace(b"\r\n", b"\n")
+    if b"\r" in norm_body:
+        return None
+    if norm_body.endswith(b"\n"):
+        return norm_body[:-1].split(b"\n"), True
+    return norm_body.split(b"\n"), True
 
 
 def _partition_candles_by_utc_month(candles: list[Candle]) -> dict[str, list[Candle]]:
@@ -1118,15 +1298,6 @@ def _partition_candles_by_utc_month(candles: list[Candle]) -> dict[str, list[Can
         previous_timestamp = candle.open_time_ms
         previous_segment_id = segment_id
     return partitions
-
-
-def _is_canonical_segment_source(
-    source_file: Path,
-    *,
-    expected_root: Path,
-    segment_id: str,
-) -> bool:
-    return source_file.as_posix() == (expected_root / f"{segment_id}.csv").as_posix()
 
 
 def _validate_segment_candles(candles: list[Candle], *, segment_id: str) -> None:
@@ -1257,7 +1428,14 @@ def _candle_open_time_ms(candle: Candle) -> int:
 
 
 def _canonical_candle_equal(left: Candle, right: Candle) -> bool:
-    if left == right:
+    if (
+        left == right
+        and (left.open != 0.0 or math.copysign(1.0, left.open) == math.copysign(1.0, right.open))
+        and (left.high != 0.0 or math.copysign(1.0, left.high) == math.copysign(1.0, right.high))
+        and (left.low != 0.0 or math.copysign(1.0, left.low) == math.copysign(1.0, right.low))
+        and (left.close != 0.0 or math.copysign(1.0, left.close) == math.copysign(1.0, right.close))
+        and (left.volume != 0.0 or math.copysign(1.0, left.volume) == math.copysign(1.0, right.volume))
+    ):
         return True
     return (
         left.open_time_ms == right.open_time_ms

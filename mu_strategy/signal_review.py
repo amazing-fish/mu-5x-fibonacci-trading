@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 BEIJING = timezone(timedelta(hours=8))
 DISPLAY_LIMIT = 2000
 SCAN_LIMIT = 100_000
-EARLY_STOP_MARGIN_MS = 86_400_000
 _CACHE_MAX_ENTRIES = 16
 _OBSERVATION_CACHE: OrderedDict[tuple, dict] = OrderedDict()
 _OBSERVATION_CACHE_LOCK = threading.Lock()
@@ -61,122 +60,137 @@ def _tail_fingerprint(path: Path, size: int) -> bytes:
 
 def _read_observations(path: Path, window: dict, *, clock, display_limit: int, scan_limit: int, evidence_key=None) -> dict:
     repository = JsonlObservationRepository(path)
-    counts = Counter()
-    rows_rev = []
-    latest_obs, latest_all_obs, evidence_obs = {}, {}, None
-    seen = {}
-    total_cycles = total_observations = duplicates = read_cycles = 0
-    first_at = last_at = None
     try:
-        if repository.invalid_marker_path.exists():
-            raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            if repository.invalid_marker_path.exists():
-                raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
-            return _source("missing", clock.now_ms(), "尚无扫描日志。")
-        initial_bytes = stat.st_size
-        cache_key = (
-            str(path.resolve()),
-            initial_bytes,
-            stat.st_mtime_ns,
-            stat.st_ino,
-            _tail_fingerprint(path, initial_bytes),
-            window["start_ms"],
-            window["end_ms"],
-            display_limit,
-            scan_limit,
-            evidence_key,
-        )
-        with _OBSERVATION_CACHE_LOCK:
-            cached = _OBSERVATION_CACHE.get(cache_key)
-            if cached is not None:
+        while True:
+            locked = False
+            counts = Counter()
+            rows_rev = []
+            latest_obs, latest_all_obs, evidence_obs = {}, {}, None
+            seen = {}
+            total_cycles = total_observations = duplicates = read_cycles = 0
+            first_at = last_at = None
+            try:
+                with repository.read_fence() as locked:
+                    if repository.invalid_marker_path.exists():
+                        raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+                    try:
+                        stat = path.stat()
+                    except FileNotFoundError:
+                        if repository.invalid_marker_path.exists():
+                            raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+                        if not locked and repository.lock_path.exists():
+                            continue
+                        return _source("missing", clock.now_ms(), "尚无扫描日志。")
+                    initial_bytes = stat.st_size
+                    cache_key = (
+                        str(path.resolve()),
+                        initial_bytes,
+                        stat.st_mtime_ns,
+                        stat.st_ino,
+                        _tail_fingerprint(path, initial_bytes),
+                        window["start_ms"],
+                        window["end_ms"],
+                        display_limit,
+                        scan_limit,
+                        evidence_key,
+                    )
+                    with _OBSERVATION_CACHE_LOCK:
+                        cached = _OBSERVATION_CACHE.get(cache_key)
+                        if cached is not None:
+                            _OBSERVATION_CACHE.move_to_end(cache_key)
+                            if not repository.invalid_marker_path.exists():
+                                result = copy.deepcopy(cached)
+                                result["read_at_ms"] = clock.now_ms()
+                                return result
+
+                    complete = True
+                    tail = repository.iter_tail_cycles()
+                    try:
+                        for cycle in tail:
+                            if read_cycles >= scan_limit:
+                                complete = False
+                                break
+                            read_cycles += 1
+                            previous = seen.get(cycle.cycle_id)
+                            if previous is not None:
+                                if previous != cycle:
+                                    raise ObservationCorruptionError("cycle identity conflicts")
+                                duplicates += 1
+                                continue
+                            seen[cycle.cycle_id] = cycle
+
+                            for observation in reversed(cycle.observations):
+                                if observation.symbol not in latest_all_obs:
+                                    latest_all_obs[observation.symbol] = observation
+                                if evidence_key is not None and evidence_obs is None and (cycle.cycle_id, observation.observation_id) == evidence_key:
+                                    evidence_obs = observation
+
+                            if evidence_key is not None:
+                                if evidence_obs is not None:
+                                    break
+                                continue
+
+                            # Repository does not enforce monotonic timestamps (clock rollbacks are valid),
+                            # so continue scanning past older records up to scan_limit rather than breaking early.
+                            if cycle.created_at_ms < window["start_ms"] or cycle.created_at_ms >= window["end_ms"]:
+                                continue
+
+                            total_cycles += 1
+                            first_at = cycle.created_at_ms if first_at is None else min(first_at, cycle.created_at_ms)
+                            last_at = cycle.created_at_ms if last_at is None else max(last_at, cycle.created_at_ms)
+                            for observation in reversed(cycle.observations):
+                                counts[observation.outcome.value] += 1
+                                total_observations += 1
+                                if observation.symbol not in latest_obs:
+                                    latest_obs[observation.symbol] = observation
+                                if len(rows_rev) < display_limit:
+                                    rows_rev.append(observation)
+                    finally:
+                        close_tail = getattr(tail, "close", None)
+                        if close_tail is not None:
+                            close_tail()
+
+                    if repository.invalid_marker_path.exists():
+                        raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+                    if path.stat().st_size < initial_bytes:
+                        raise ObservationCorruptionError("observation log was truncated during review")
+                    if not locked and repository.lock_path.exists():
+                        continue
+            except ObservationCorruptionError:
+                if not locked and repository.lock_path.exists():
+                    continue
+                raise
+
+            serialized = {}
+
+            def _payload(observation) -> dict:
+                key = id(observation)
+                value = serialized.get(key)
+                if value is None:
+                    value = observation.to_dict()
+                    serialized[key] = value
+                return value
+
+            result = _source(
+                "ok" if complete else "incomplete", clock.now_ms(),
+                "已读取扫描日志。" if complete else
+                "达到扫描读取上限；以下只是已读取部分，不能代表完整观察窗口。",
+                records=[_payload(item) for item in reversed(rows_rev)],
+                latest=[_payload(item) for item in reversed(list(latest_obs.values()))],
+                latest_all=[_payload(item) for item in reversed(list(latest_all_obs.values()))],
+                evidence=_payload(evidence_obs) if evidence_obs is not None else None,
+                counts=dict(counts),
+                total_cycles=total_cycles, total_observations=total_observations,
+                duplicate_cycles=duplicates, scanned_cycles=read_cycles, read_through_byte=initial_bytes,
+                complete=complete, first_at_ms=first_at, last_at_ms=last_at,
+                display_limit=display_limit, display_truncated=total_observations > display_limit,
+            )
+            with _OBSERVATION_CACHE_LOCK:
+                _OBSERVATION_CACHE[cache_key] = copy.deepcopy(result)
                 _OBSERVATION_CACHE.move_to_end(cache_key)
-                if not repository.invalid_marker_path.exists():
-                    result = copy.deepcopy(cached)
-                    result["read_at_ms"] = clock.now_ms()
-                    return result
-
-        complete = True
-        early_stop_before = window["start_ms"] - EARLY_STOP_MARGIN_MS
-        for cycle in repository.iter_tail_cycles():
-            if read_cycles >= scan_limit:
-                complete = False
-                break
-            read_cycles += 1
-            previous = seen.get(cycle.cycle_id)
-            if previous is not None:
-                if previous != cycle:
-                    raise ObservationCorruptionError("cycle identity conflicts")
-                duplicates += 1
-                continue
-            seen[cycle.cycle_id] = cycle
-
-            for observation in reversed(cycle.observations):
-                if observation.symbol not in latest_all_obs:
-                    latest_all_obs[observation.symbol] = observation
-                if evidence_key is not None and evidence_obs is None and (cycle.cycle_id, observation.observation_id) == evidence_key:
-                    evidence_obs = observation
-
-            if evidence_key is not None:
-                if evidence_obs is not None:
-                    break
-                continue
-
-            if cycle.created_at_ms < window["start_ms"]:
-                if cycle.created_at_ms < early_stop_before:
-                    break
-                continue
-            if cycle.created_at_ms >= window["end_ms"]:
-                continue
-
-            total_cycles += 1
-            first_at = cycle.created_at_ms if first_at is None else min(first_at, cycle.created_at_ms)
-            last_at = cycle.created_at_ms if last_at is None else max(last_at, cycle.created_at_ms)
-            for observation in reversed(cycle.observations):
-                counts[observation.outcome.value] += 1
-                total_observations += 1
-                if observation.symbol not in latest_obs:
-                    latest_obs[observation.symbol] = observation
-                if len(rows_rev) < display_limit:
-                    rows_rev.append(observation)
-
-        if repository.invalid_marker_path.exists():
-            raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
-        if path.stat().st_size < initial_bytes:
-            raise ObservationCorruptionError("observation log was truncated during review")
-
-        serialized = {}
-
-        def _payload(observation) -> dict:
-            key = id(observation)
-            value = serialized.get(key)
-            if value is None:
-                value = observation.to_dict()
-                serialized[key] = value
-            return value
-
-        result = _source(
-            "ok" if complete else "incomplete", clock.now_ms(),
-            "已读取扫描日志。" if complete else
-            "达到扫描读取上限；以下只是已读取部分，不能代表完整观察窗口。",
-            records=[_payload(item) for item in reversed(rows_rev)],
-            latest=[_payload(item) for item in reversed(list(latest_obs.values()))],
-            latest_all=[_payload(item) for item in reversed(list(latest_all_obs.values()))],
-            evidence=_payload(evidence_obs) if evidence_obs is not None else None,
-            counts=dict(counts),
-            total_cycles=total_cycles, total_observations=total_observations,
-            duplicate_cycles=duplicates, scanned_cycles=read_cycles, read_through_byte=initial_bytes,
-            complete=complete, first_at_ms=first_at, last_at_ms=last_at,
-            display_limit=display_limit, display_truncated=total_observations > display_limit,
-        )
-        with _OBSERVATION_CACHE_LOCK:
-            _OBSERVATION_CACHE[cache_key] = copy.deepcopy(result)
-            _OBSERVATION_CACHE.move_to_end(cache_key)
-            while len(_OBSERVATION_CACHE) > _CACHE_MAX_ENTRIES:
-                _OBSERVATION_CACHE.popitem(last=False)
-        return result
+                while len(_OBSERVATION_CACHE) > _CACHE_MAX_ENTRIES:
+                    _OBSERVATION_CACHE.popitem(last=False)
+            return result
     except (OSError, ObservationCorruptionError) as exc:
         logger.warning("Observation log unavailable at %s: %s", path, exc)
         # Never publish plausible-looking partial statistics from a corrupt log.

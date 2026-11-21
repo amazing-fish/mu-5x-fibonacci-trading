@@ -292,7 +292,13 @@ class EmailAlertsTests(unittest.TestCase):
         output = io.StringIO()
         environment = {"MU_SMTP_HOST": CONFIG.host, "MU_SMTP_SENDER": CONFIG.sender,
                        "MU_SMTP_RECIPIENT": CONFIG.recipient, "MU_SMTP_AUTHORIZATION_CODE": "test-only"}
-        with patcher:
+        original_deliver = self.alerts.deliver
+
+        def deliver_with_lock_failure(transport, *, limit=20):
+            with patcher:
+                return original_deliver(transport, limit=limit)
+
+        with patch.object(self.alerts, "deliver", side_effect=deliver_with_lock_failure):
             code = main(["run", "--once", "--send", "--data-dir", str(self.data_dir)],
                         stdout=output, environment=environment, factory=Mock(return_value=self.alerts),
                         transport_factory=Mock(return_value=self.transport))
@@ -1188,13 +1194,20 @@ class EmailAlertsTests(unittest.TestCase):
     def test_log_seek_and_read_io_errors_are_normalized(self):
         self.publish()
         _, cursor = self.alerts.observations.read_batch()
+        original_open = Path.open
         for operation in ("seek", "readline"):
             with self.subTest(operation=operation):
                 handle = Mock()
                 handle.__enter__ = Mock(return_value=handle)
                 handle.__exit__ = Mock(return_value=False)
                 getattr(handle, operation).side_effect = OSError("device unavailable")
-                with patch.object(Path, "open", return_value=handle):
+
+                def intercepted_open(path, *args, **kwargs):
+                    if path == self.alerts.observations.path:
+                        return handle
+                    return original_open(path, *args, **kwargs)
+
+                with patch.object(Path, "open", new=intercepted_open):
                     with self.assertRaises(ObservationCorruptionError):
                         self.alerts.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2])
 
@@ -1313,6 +1326,75 @@ class EmailAlertsTests(unittest.TestCase):
         client.send.assert_not_called()
         self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
         self.assertNotIn("private diagnostic", str(self.alerts.store.status(event_id=self.entry_id())))
+
+    def test_pre_data_rechecks_committed_observation_tail_and_blocks_obsolete_entry(self):
+        self.publish()
+        self.alerts.collect()
+        old_health = self.state
+        self.clock.value += 1
+        wait_cycle = self.publish("wait", append=False)
+        self.state = old_health
+
+        client = smtp_client()
+
+        def append_wait_during_login(*args):
+            # Fence must NOT be held across SMTP setup; writer appends WAIT before publishing new health.
+            with self.alerts.observations.publication_fence(wait=False):
+                pass
+            self.alerts.observations.append_cycle(wait_cycle)
+            return (235, b"ok")
+
+        client.login.side_effect = append_wait_during_login
+        transport = SmtpTransport(CONFIG, factory=Mock(return_value=client), clock=self.clock)
+        self.assertEqual(1, self.alerts.deliver(transport))
+        client.send.assert_not_called()
+        self.assertEqual("failed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+        self.assertEqual("entry_source_unavailable", self.alerts.store.status(event_id=self.entry_id())["history"][-1]["result"])
+        # Fence must be released after pre-DATA check.
+        with self.alerts.observations.publication_fence(wait=False):
+            pass
+
+    def test_pre_data_sends_when_unchanged_and_blocks_on_concurrent_writer_or_suppression(self):
+        self.publish()
+        self.alerts.collect()
+        # Unchanged source must still send.
+        ok_client = smtp_client()
+        self.assertEqual(1, self.alerts.deliver(SmtpTransport(CONFIG, factory=Mock(return_value=ok_client), clock=self.clock)))
+        ok_client.send.assert_called_once()
+        self.assertEqual("confirmed", self.records(AlertKind.ENTRY_REVIEW)[0]["state"])
+
+        # New signal: flush prior signal_replaced invalidation first, then test ENTRY_REVIEW pre-DATA checks.
+        self.clock.value += 10
+        self.publish(signal=99)
+        self.alerts.collect()
+        self.assertEqual(1, self.alerts.deliver(self.transport, limit=1))
+        self.assertEqual(AlertKind.SIGNAL_INVALIDATED, self.transport.send.call_args.args[0].kind)
+
+        busy_client = smtp_client()
+        held_stack = []
+
+        def hold_writer_fence_before_data(*args):
+            cm = self.alerts.observations.publication_fence(wait=False)
+            cm.__enter__()
+            held_stack.append(cm)
+            return (354, b"continue")
+
+        busy_client.docmd.side_effect = hold_writer_fence_before_data
+        try:
+            self.assertEqual(1, self.alerts.deliver(SmtpTransport(CONFIG, factory=Mock(return_value=busy_client), clock=self.clock)))
+        finally:
+            while held_stack:
+                held_stack.pop().__exit__(None, None, None)
+        busy_client.send.assert_not_called()
+        entry_99 = self.records(AlertKind.ENTRY_REVIEW)[0]
+        self.assertEqual("failed", entry_99["state"])
+
+        # Retry after backoff with concurrent source_unavailable during login -> abort before DATA body.
+        self.clock.value += 60_000
+        suppressed_client = smtp_client()
+        suppressed_client.login.side_effect = lambda *args: self.alerts.source_unavailable()
+        self.assertEqual(1, self.alerts.deliver(SmtpTransport(CONFIG, factory=Mock(return_value=suppressed_client), clock=self.clock), limit=1))
+        suppressed_client.send.assert_not_called()
 
     def test_smtp_rechecks_email_deadline_after_354_response(self):
         self.publish()

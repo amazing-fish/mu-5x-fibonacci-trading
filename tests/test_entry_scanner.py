@@ -43,7 +43,7 @@ class EntryScannerTests(unittest.TestCase):
         self.assertIs(EntryDisposition.READY, result.disposition)
         self.assertIs(EntryDecisionStage.PENDING_ENTRY, result.stage)
 
-    def test_scan_entry_second_pullback_enforces_current_bar_blocks_before_entering(self):
+    def test_scan_entry_second_pullback_does_not_reapply_current_filters_to_pending_fill(self):
         from mu_strategy.entry.scanner import scan_entry
 
         candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
@@ -78,13 +78,30 @@ class EntryScannerTests(unittest.TestCase):
                             lookback_bars=4,
                         )
 
-        self.assertEqual("skip", result.action)
-        self.assertEqual("1h regime is red", result.reason)
+        self.assertEqual("enter", result.action)
+        self.assertEqual("recent retest confirmed; resting second-pullback fib limit", result.reason)
         self.assertEqual("red", result.regime_1h)
-        self.assertIsNone(result.trigger_price)
-        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, result.decision_code)
-        self.assertIs(EntryDisposition.BLOCK, result.disposition)
-        self.assertIs(EntryDecisionStage.SIGNAL, result.stage)
+        self.assertEqual(candles[signal_index].open_time_ms, result.signal_time_ms)
+        self.assertAlmostEqual(100.0, result.trigger_price)
+        self.assertIs(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, result.decision_code)
+        self.assertIs(EntryDisposition.READY, result.disposition)
+        self.assertIs(EntryDecisionStage.PENDING_ENTRY, result.stage)
+
+        # Without an active pending order, latest-bar signal filters still block cleanly.
+        with patch("mu_strategy.entry.scanner.build_hourly_context", return_value=hourly_context):
+            with patch("mu_strategy.entry.scanner.rsi", return_value=rsi_values):
+                with patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), hist_values)):
+                    with patch("mu_strategy.entry.scanner.nearest_fib_retest_level", return_value=None):
+                        blocked = scan_entry(
+                            "BTC-USDT-SWAP",
+                            candles,
+                            candles,
+                            config=config,
+                            lookback_bars=4,
+                        )
+
+        self.assertEqual("skip", blocked.action)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, blocked.decision_code)
 
     def test_scan_entry_second_pullback_ignores_signal_filled_by_latest_confirmed_candle(self):
         from mu_strategy.entry.scanner import scan_entry
@@ -156,7 +173,7 @@ class EntryScannerTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, result.trigger_price)
         self.assertIs(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, result.decision_code)
 
-    def test_scan_entry_second_pullback_picks_latest_unfilled_signal_without_duplicate_scan(self):
+    def test_scan_entry_second_pullback_preserves_older_active_pending_signal_without_duplicate_scan(self):
         import mu_strategy.entry.scanner as scanner_mod
         from mu_strategy.entry.scanner import scan_entry
 
@@ -197,9 +214,9 @@ class EntryScannerTests(unittest.TestCase):
 
         self.assertEqual(1, latest_spy.call_count)
         self.assertEqual("enter", result.action)
-        self.assertEqual(candles[later_signal_index].open_time_ms, result.signal_time_ms)
-        self.assertAlmostEqual(105.0, result.trigger_price)
-        self.assertAlmostEqual((105.5 / 105.0) - 1, result.fib_distance_pct)
+        self.assertEqual(candles[first_signal_index].open_time_ms, result.signal_time_ms)
+        self.assertAlmostEqual(100.0, result.trigger_price)
+        self.assertAlmostEqual((105.5 / 100.0) - 1, result.fib_distance_pct)
 
     def test_scan_entry_honors_config_allowed_regimes_for_green_only(self):
         from mu_strategy.entry.scanner import scan_entry
@@ -302,6 +319,29 @@ class EntryScannerTests(unittest.TestCase):
                 self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, result.decision_code)
                 self.assertIs(EntryDisposition.WAIT, result.disposition)
                 self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
+
+    def test_scan_entry_direct_next_open_blocks_prospective_bar_outside_trading_window(self):
+        from mu_strategy.entry.scanner import scan_entry
+
+        # 2026-06-18 (EDT = UTC-4): 15:45 ET = 19:45 UTC (in window); next synthetic bar 16:00 ET = 20:00 UTC (outside).
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 19, 45))
+        candles[-1] = Candle(candles[-1].open_time_ms, 100.0, 101.0, 99.8, 100.5, 1000)
+        config = replace(
+            baseline_strategy_group("BTC-USDT-SWAP").config,
+            entry_execution="direct_next_open",
+        )
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == len(candles) - 1 else None),
+        ):
+            result = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+        self.assertEqual("wait", result.action)
+        self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, result.decision_code)
+        self.assertIs(EntryDisposition.WAIT, result.disposition)
+        self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
 
     def test_scan_entry_second_pullback_places_limit_when_current_close_moved_away_from_fib(self):
         from mu_strategy.entry.scanner import scan_entry

@@ -552,22 +552,20 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         refresh_market_data_once = _refresh_market_data_once
 
         lock = threading.Lock()
-        first_started = threading.Event()
-        second_started = threading.Event()
         active = 0
         max_active = 0
+        seen_symbols: list[str] = []
+        rendezvous: threading.Barrier | None = None
 
         def stateful_fetcher(symbol, interval, *, days):
             nonlocal active, max_active
             with lock:
+                seen_symbols.append(symbol)
                 active += 1
                 max_active = max(max_active, active)
             try:
-                if symbol == "BTC-USDT-SWAP":
-                    first_started.set()
-                    second_started.wait(timeout=0.2)
-                else:
-                    second_started.set()
+                if rendezvous is not None:
+                    rendezvous.wait()
                 return _fake_fetcher(symbol, interval, days=days)
             finally:
                 with lock:
@@ -584,15 +582,14 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 max_concurrency=1,
             )
 
-        self.assertTrue(first_started.is_set())
-        self.assertTrue(second_started.is_set())
+        self.assertEqual({"BTC-USDT-SWAP", "ETH-USDT-SWAP"}, set(seen_symbols))
         self.assertEqual(1, max_active)
         self.assertEqual("success", manifest["attempt_status"])
 
-        first_started.clear()
-        second_started.clear()
+        seen_symbols.clear()
         active = 0
         max_active = 0
+        rendezvous = threading.Barrier(2, timeout=5.0)
         with TemporaryDirectory() as tmp:
             parallel_manifest = refresh_market_data_once(
                 data_dir=Path(tmp),
@@ -603,6 +600,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 now_ms=86_400_000,
             )
 
+        self.assertEqual({"BTC-USDT-SWAP", "ETH-USDT-SWAP"}, set(seen_symbols))
         self.assertGreaterEqual(max_active, 2)
         self.assertEqual("success", parallel_manifest["attempt_status"])
 

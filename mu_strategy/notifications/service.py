@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from mu_strategy.canonical import canonical_sha256
@@ -264,12 +265,22 @@ class EmailAlerts:
                     claimed = self.store.claim(db, now_ms=self.clock.now_ms())
                 if claimed is None:
                     break
+                entry_context = None
                 if claimed.event.kind is AlertKind.ENTRY_REVIEW:
-                    if not self._validate_entry_before_send(db, claimed):
+                    entry_context = self._validate_entry_before_send(db, claimed)
+                    if entry_context is None:
                         continue
                 # Execute network SMTP with ZERO DB transactions and ZERO file locks held.
                 result = (
-                    transport.send(claimed.event, source_is_current=self._source_current_before_data)
+                    transport.send(
+                        claimed.event,
+                        source_is_current=lambda ctx=entry_context, ev=claimed.event: self._source_current_before_data(
+                            event=ev,
+                            cursor=ctx[0],
+                            expected_cycle_sha256=ctx[1],
+                            expected_signal_key=ctx[2],
+                        ),
+                    )
                     if claimed.event.kind is AlertKind.ENTRY_REVIEW
                     else transport.send(claimed.event)
                 )
@@ -285,14 +296,14 @@ class EmailAlerts:
                 delivered += 1
         return delivered
 
-    def _validate_entry_before_send(self, db, claimed) -> bool:
+    def _validate_entry_before_send(self, db, claimed) -> tuple[tuple[int, int, str | None], str, str] | None:
         """Verify entry freshness under a brief local fence, releasing all locks before SMTP."""
         try:
-            with self.observations.publication_fence(wait=False):
+            with self.observations.publication_fence(wait=False, shared=True):
                 with self.store.transaction(db):
                     current = self.store.record(db, claimed.event.event_id)
                     if current is None or current.state is not DeliveryState.UNKNOWN or current.attempts != claimed.attempts:
-                        return False
+                        return None
                     return self._prepare_entry(db, current, self.clock.now_ms())
         except FileLockBusyError:
             with self.store.transaction(db):
@@ -301,23 +312,68 @@ class EmailAlerts:
                     self.store.defer_unstarted(
                         db, current.event.event_id, now_ms=self.clock.now_ms(), reason="source_not_caught_up"
                     )
-            return False
+            return None
 
-    def _source_current_before_data(self) -> bool:
-        # Publication locks are released during SMTP; recheck live health & supervisor liveness before DATA body.
+    def _source_current_before_data(
+        self,
+        *,
+        event: AlertEvent | None = None,
+        cursor: tuple[int, int, str | None] | None = None,
+        expected_cycle_sha256: str | None = None,
+        expected_signal_key: str | None = None,
+    ) -> bool:
+        # Publication locks are released during SMTP; briefly fence and recheck live health,
+        # supervisor liveness, committed observation tail, and signal identity before DATA body.
         try:
-            state, running = self._snapshot()
-        except HealthStateError:
+            with self.observations.publication_fence(wait=False, shared=True):
+                state, running = self._snapshot()
+                if not health_view(state, running=running, now_ms=self.clock.now_ms())["healthy"]:
+                    return False
+                if event is None:
+                    return True
+                latest = state.last_cycle.scan.cycle if state and state.last_cycle else None
+                if latest is None:
+                    return False
+                if expected_cycle_sha256 is not None and canonical_sha256(latest.to_dict()) != expected_cycle_sha256:
+                    return False
+                if cursor is not None:
+                    remaining, _ = self.observations.read_batch(
+                        offset=cursor[0],
+                        anchor_start=cursor[1],
+                        anchor_sha256=cursor[2],
+                        limit=1,
+                    )
+                    if remaining:
+                        return False
+                symbol = event.observation.symbol
+                evidence = next((item for item in latest.observations if item.symbol == symbol), None)
+                if symbol not in state.symbols or evidence is None:
+                    return False
+                signal_key = expected_signal_key if expected_signal_key is not None else self._signal_key(event.observation)
+                if self._signal_key(evidence) != signal_key:
+                    return False
+                with self.store.connection(readonly=True) as ro_db:
+                    current = self.store.record(ro_db, event.event_id)
+                    if (
+                        current is None
+                        or current.suppressed_reason is not None
+                        or not self.store.get_meta(ro_db, "source_ready", False)
+                    ):
+                        return False
+                    stream = self.store.stream(ro_db, symbol)
+                    if stream["active_event_id"] != event.event_id or stream["signal_key"] != signal_key:
+                        return False
+                return True
+        except (FileLockBusyError, HealthStateError, ObservationCorruptionError, NotificationError, sqlite3.Error, OSError):
             return False
-        return bool(health_view(state, running=running, now_ms=self.clock.now_ms())["healthy"])
 
-    def _prepare_entry(self, db, current, now: int) -> bool:
+    def _prepare_entry(self, db, current, now: int) -> tuple[tuple[int, int, str | None], str, str] | None:
         event = current.event
 
         def suppress(reason):
             self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="entry_not_reviewable")
             self.store.suppress(db, event.event_id, reason, now)
-            return False
+            return None
 
         if current.suppressed_reason is not None:
             return suppress(current.suppressed_reason)
@@ -327,15 +383,16 @@ class EmailAlerts:
             state, running = self._snapshot()
         except (HealthStateError, OSError):
             self.store.defer_unstarted(db, event.event_id, now_ms=now)
-            return False
+            return None
         view = health_view(state, running=running, now_ms=now)
         latest = state.last_cycle.scan.cycle if state and state.last_cycle else None
+        latest_sha256 = canonical_sha256(latest.to_dict()) if latest is not None else None
         # A newer or temporarily unreadable source is missing evidence, not a
         # definitive invalidation. Let collect reconcile the full transition first.
-        caught_up = latest is not None and self.store.get_meta(db, "last_cycle_sha256") == canonical_sha256(latest.to_dict())
+        caught_up = latest is not None and self.store.get_meta(db, "last_cycle_sha256") == latest_sha256
         if not view["healthy"] or not self.store.get_meta(db, "source_ready", False) or not caught_up:
             self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="source_not_caught_up")
-            return False
+            return None
         cursor = self.store.get_meta(db, "observation_cursor", [0, 0, None])
         try:
             remaining, _ = self.observations.read_batch(offset=cursor[0], anchor_start=cursor[1], anchor_sha256=cursor[2], limit=1)
@@ -343,12 +400,14 @@ class EmailAlerts:
             remaining = True
         if remaining:
             self.store.defer_unstarted(db, event.event_id, now_ms=now, reason="source_not_caught_up")
-            return False
+            return None
         symbol = event.observation.symbol
         stream = self.store.stream(db, symbol)
         evidence = next((item for item in latest.observations if item.symbol == symbol), None)
         if symbol not in state.symbols or evidence is None:
             return suppress("source_unavailable")
-        if self._signal_key(evidence) != stream["signal_key"] or stream["active_event_id"] != event.event_id:
+        signal_key = self._signal_key(evidence)
+        if signal_key != stream["signal_key"] or stream["active_event_id"] != event.event_id:
             return suppress("decision_changed")
-        return True
+        assert latest_sha256 is not None and signal_key is not None
+        return ((cursor[0], cursor[1], cursor[2]), latest_sha256, signal_key)

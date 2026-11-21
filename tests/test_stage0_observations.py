@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
+from mu_strategy.file_locks import FileLockBusyError
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.observations import (
@@ -299,6 +301,218 @@ class Stage0ObservationContractTests(unittest.TestCase):
             cycle_b = _cycle("cycle-b", "obs-b")
             repository.append_cycle(cycle_b)
             self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
+
+    def test_retry_repairs_unsynced_directory_entries_both_when_cleaned_and_when_remaining(self):
+        # Case 1: Empty created directories rolled back on failure -> fresh repository recreates & syncs all entries.
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+
+            def fail_once(directory):
+                if directory == path.parent.parent:
+                    raise OSError("dir fsync failed")
+
+            with patch("mu_strategy.observations._fsync_directory", side_effect=fail_once):
+                with self.assertRaises(ObservationWriteError):
+                    JsonlObservationRepository(path).append_cycle(_cycle("cycle-a", "obs-a"))
+
+            with patch("mu_strategy.observations._fsync_directory") as retry_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                JsonlObservationRepository(path).append_cycle(cycle_b)
+
+            self.assertEqual(
+                [path.parent.parent, existing_root, path.parent],
+                [call.args[0] for call in retry_fsync.call_args_list],
+            )
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
+
+        # Case 2: Created directories cannot be removed (remain present) -> retry STILL repairs unsynced entries.
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+            repository = JsonlObservationRepository(path)
+
+            def fail_once(directory):
+                if directory == path.parent.parent:
+                    raise OSError("dir fsync failed")
+
+            with patch("mu_strategy.observations._fsync_directory", side_effect=fail_once), \
+                 patch.object(Path, "rmdir", side_effect=OSError("directory busy")):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+
+            self.assertTrue(path.parent.exists())
+            with patch("mu_strategy.observations._fsync_directory") as retry_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                JsonlObservationRepository(path).append_cycle(cycle_b)
+
+            self.assertEqual(
+                [path.parent.parent, existing_root, path.parent],
+                [call.args[0] for call in retry_fsync.call_args_list],
+            )
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
+
+        # Case 3: Initial log creation parent-directory fsync fails -> rolls back uncommitted cycle and syncs on retry.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            with patch("mu_strategy.observations._fsync_directory", side_effect=OSError("parent sync failed")):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            self.assertFalse(repository.invalid_marker_path.exists())
+            self.assertEqual((), repository.read_cycles())
+            with patch("mu_strategy.observations._fsync_directory") as retry_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                repository.append_cycle(cycle_b)
+            self.assertEqual([path.parent], [call.args[0] for call in retry_fsync.call_args_list])
+            self.assertEqual((cycle_b,), repository.read_cycles())
+
+    def test_readers_excluded_during_uncommitted_append_and_rollback_while_concurrent_readers_share_lock(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            repository.append_cycle(first)
+            _, cursor_after_first = repository.read_batch()
+
+            # Concurrent readers must not block each other.
+            with repository.read_fence(wait=False) as locked_1:
+                self.assertTrue(locked_1)
+                with repository.read_fence(wait=False) as locked_2:
+                    self.assertTrue(locked_2)
+                with self.assertRaises(FileLockBusyError):
+                    with repository.publication_fence(wait=False):
+                        self.fail("exclusive writer fence must block while shared reader holds lock")
+
+            in_fsync = threading.Event()
+            release_fsync = threading.Event()
+            writer_errors: list[Exception] = []
+            reader_results: dict[str, object] = {}
+
+            def paused_failing_fsync(fd):
+                in_fsync.set()
+                release_fsync.wait(timeout=5)
+                raise OSError("fsync failed after write")
+
+            def run_writer():
+                try:
+                    with patch("mu_strategy.observations.os.fsync", side_effect=paused_failing_fsync):
+                        repository.append_cycle(second)
+                except Exception as exc:  # noqa: BLE001
+                    writer_errors.append(exc)
+
+            writer = threading.Thread(target=run_writer)
+            writer.start()
+            try:
+                self.assertTrue(in_fsync.wait(timeout=5), "writer did not reach fsync")
+                # While writer is inside fsync with B's bytes on disk, shared read fence MUST be busy.
+                with self.assertRaises(FileLockBusyError):
+                    with repository.read_fence(wait=False):
+                        self.fail("reader acquired lock while writer was mid-append")
+
+                t_batch = threading.Thread(
+                    target=lambda: reader_results.__setitem__(
+                        "batch",
+                        repository.read_batch(
+                            offset=cursor_after_first[0],
+                            anchor_start=cursor_after_first[1],
+                            anchor_sha256=cursor_after_first[2],
+                        ),
+                    )
+                )
+                t_all = threading.Thread(target=lambda: reader_results.__setitem__("all", repository.read_cycles()))
+                t_tail = threading.Thread(target=lambda: reader_results.__setitem__("tail", repository.read_tail(limit=5)))
+                for reader in (t_batch, t_all, t_tail):
+                    reader.start()
+                release_fsync.set()
+                for reader in (t_batch, t_all, t_tail):
+                    reader.join(timeout=5)
+            finally:
+                release_fsync.set()
+                writer.join(timeout=5)
+
+            self.assertEqual(1, len(writer_errors))
+            self.assertIsInstance(writer_errors[0], ObservationWriteError)
+            self.assertEqual(((), cursor_after_first), reader_results["batch"])
+            self.assertEqual((first,), reader_results["all"])
+            self.assertEqual((first,), reader_results["tail"])
+
+    def test_rollback_truncate_failure_quarantines_log_and_blocks_appends_and_reads(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            original_open = Path.open
+
+            class FailingTruncateHandle:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __enter__(self):
+                    self._inner.__enter__()
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self._inner.__exit__(exc_type, exc, tb)
+
+                def fileno(self):
+                    return self._inner.fileno()
+
+                def write(self, data):
+                    # Write only half the record then fail to simulate partial write.
+                    raw = bytes(data)
+                    self._inner.write(raw[: max(1, len(raw) // 2)])
+                    raise OSError("partial write failed")
+
+                def truncate(self, size):
+                    raise OSError("truncate rollback failed")
+
+            def intercept_open(target, mode="r", *args, **kwargs):
+                handle = original_open(target, mode, *args, **kwargs)
+                if target == path and "a" in mode:
+                    return FailingTruncateHandle(handle)
+                return handle
+
+            with patch.object(Path, "open", new=intercept_open):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-b", "obs-b"))
+
+            self.assertTrue(repository.invalid_marker_path.exists())
+            with self.assertRaisesRegex(ObservationWriteError, "invalid marker"):
+                repository.append_cycle(_cycle("cycle-c", "obs-c"))
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_cycles()
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_batch()
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_tail(limit=5)
+
+    def test_read_tail_with_min_created_at_ms_skips_out_of_order_older_cycles(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            c2000 = Stage0ObservationCycle(
+                cycle_id="cycle-2000",
+                created_at_ms=2_000,
+                observations=(_observation(cycle_id="cycle-2000", observation_id="obs-2000", created_at_ms=2_000),),
+            )
+            c1000 = Stage0ObservationCycle(
+                cycle_id="cycle-1000",
+                created_at_ms=1_000,
+                observations=(_observation(cycle_id="cycle-1000", observation_id="obs-1000", created_at_ms=1_000),),
+            )
+            c1800 = Stage0ObservationCycle(
+                cycle_id="cycle-1800",
+                created_at_ms=1_800,
+                observations=(_observation(cycle_id="cycle-1800", observation_id="obs-1800", created_at_ms=1_800),),
+            )
+            repository.append_cycle(c2000)
+            repository.append_cycle(c1000)
+            self.assertEqual((c2000,), repository.read_tail(limit=10, min_created_at_ms=1_500))
+            repository.append_cycle(c1800)
+            self.assertEqual((c2000, c1800), repository.read_tail(limit=10, min_created_at_ms=1_500))
 
     def test_read_tail_and_iter_tail_cycles_reverse_scan_across_chunk_boundaries(self):
         with TemporaryDirectory() as tmp:

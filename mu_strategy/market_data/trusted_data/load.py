@@ -127,14 +127,26 @@ class LoadTrustedBundle:
             if manifest_health is not None:
                 published_health_by_interval[interval] = manifest_health
 
-        # Decouple unnecessary 5m CSV reads and 5m->15m/1h re-aggregation on cache-only reads
-        # when 5m was not requested and both 5m and all requested native intervals are already
-        # published and cross-validated in the manifest.
+        # When 5m was not requested and both 5m and all requested native intervals are already
+        # published and cross-validated in the manifest, cryptographically verify the 5m disk
+        # bytes against the manifest SHA-256 directly without parsing 5m Candle objects or
+        # re-aggregating 5m->15m/1h; fall back to full 5m load on any mismatch or read error.
         skip_base_disk_load = self._can_skip_base_disk_load(
             plan.requested_intervals,
             plan.effective_intervals,
             published_health_by_interval,
         )
+        verified_base_hash: str | None = None
+        if skip_base_disk_load:
+            verified_base_hash = self.store.verify_generation_dataset_bytes(
+                manifest,
+                symbol=resolved.inst_id,
+                interval="5m",
+                generation_root=context.generation_root,
+                generation_id=context.generation_id,
+            )
+            if verified_base_hash is None:
+                skip_base_disk_load = False
         load_intervals = (
             self.planner.plan(query.intervals, include_base_for_validation=False).effective_intervals
             if skip_base_disk_load
@@ -206,12 +218,14 @@ class LoadTrustedBundle:
         if skip_base_disk_load:
             manifest_five = published_health_by_interval["5m"]
             assert manifest_five.first_timestamp_ms is not None and manifest_five.last_timestamp_ms is not None
+            assert verified_base_hash is not None
             window_anchor_bounds_ms = (manifest_five.first_timestamp_ms, manifest_five.last_timestamp_ms)
             synthesized_base_health = self._health_from_manifest_base(
                 manifest_five,
                 source_file=path_by_interval["5m"],
                 days=query.days,
                 now_ms=context.observed_at_ms,
+                verified_content_sha256=verified_base_hash,
             )
 
         evaluation = evaluate_candle_bundle(
@@ -301,8 +315,10 @@ class LoadTrustedBundle:
         source_file: Path,
         days: int,
         now_ms: int,
+        verified_content_sha256: str,
     ) -> DatasetHealth:
         assert manifest_five.first_timestamp_ms is not None and manifest_five.last_timestamp_ms is not None
+        assert verified_content_sha256 == manifest_five.content_sha256
         step_ms = interval_to_ms("5m")
         window_end_ms = manifest_five.last_timestamp_ms
         window_start_ms = window_end_ms - (days * DAY_MS)
@@ -328,7 +344,7 @@ class LoadTrustedBundle:
             updated_at_ms=now_ms,
             source_file=source_file,
             validation=manifest_five.validation or ValidationReport(True, HealthReason.OK),
-            content_sha256=manifest_five.content_sha256,
+            content_sha256=verified_content_sha256,
         )
         merged = _merge_manifest_health(local_health, manifest_five)
         coverage = assess_requested_coverage_bounds(

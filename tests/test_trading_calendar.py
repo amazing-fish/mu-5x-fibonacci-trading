@@ -8,8 +8,10 @@ from unittest.mock import patch
 from mu_strategy.core.trading_calendar import (
     CONTINUOUS_CALENDAR,
     LEGACY_CALENDAR,
+    US_EQUITIES_ALGORITHMIC_CALENDAR,
     US_EQUITIES_CALENDAR,
     CalendarUnavailable,
+    calendar_sha256,
     evaluate_trading_window,
     trading_window_schedule,
 )
@@ -73,27 +75,67 @@ class TradingCalendarTests(unittest.TestCase):
         for date in ((2025, 1, 9), (2026, 9, 6), (2027, 6, 18), (2028, 7, 4)):
             self.assertFalse(is_preferred_us_cash_window(_utc_ms(*date, 14, 0), self.config))
 
-    def test_algorithmic_nyse_calendar_covers_years_beyond_2025_2028(self):
-        # 2029 holidays: New Year's (Jan 1 Mon), Good Friday (Mar 30), Independence Day (Jul 4 Wed), Christmas (Dec 25)
-        for holiday_date in ((2024, 3, 29), (2029, 1, 1), (2029, 3, 30), (2029, 7, 4), (2030, 12, 25)):
+    def test_us_equities_2025_2028_v1_preserves_frozen_digest_and_coverage_bounds(self):
+        self.assertEqual(
+            "0fc82fba68f3dea507d8d20c83fb3f0a72fe700182b3d66b9004eab1a3d1b2c5",
+            calendar_sha256(US_EQUITIES_CALENDAR),
+        )
+        self.assertNotEqual(
+            calendar_sha256(US_EQUITIES_CALENDAR),
+            calendar_sha256(US_EQUITIES_ALGORITHMIC_CALENDAR),
+        )
+        for out_of_range in ((2018, 12, 5), (2024, 3, 29), (2029, 1, 1)):
+            with self.subTest(out_of_range=out_of_range):
+                with self.assertRaisesRegex(CalendarUnavailable, "2025 through 2028"):
+                    evaluate_trading_window(_utc_ms(*out_of_range, 15, 0), self.config)
+                with self.assertRaisesRegex(CalendarUnavailable, "2025 through 2028"):
+                    is_preferred_us_cash_window(_utc_ms(*out_of_range, 15, 0), self.config)
+
+        # UTC day 2029-01-01 begins at 2028-12-31 19:00 ET (still inside 2025-2028 coverage).
+        et_2028_evening = _utc_ms(2029, 1, 1, 1, 0)
+        self.assertFalse(is_preferred_us_cash_window(et_2028_evening, self.config))
+        self.assertEqual("2028-12-31", evaluate_trading_window(et_2028_evening, self.config).eastern_date)
+
+    def test_algorithmic_nyse_calendar_covers_verified_years_and_exceptional_closures(self):
+        alg_config = replace(
+            self.config,
+            trading_calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+            trading_calendar_sha256=None,
+        )
+        # Known extraordinary NYSE closures (Bush 2018-12-05, Carter 2025-01-09) and multi-year holidays.
+        for holiday_date in (
+            (2018, 12, 5),
+            (2024, 3, 29),
+            (2025, 1, 9),
+            (2029, 1, 1),
+            (2029, 3, 30),
+            (2029, 7, 4),
+            (2030, 12, 25),
+        ):
             with self.subTest(holiday_date=holiday_date):
-                decision = evaluate_trading_window(_utc_ms(*holiday_date, 15, 0), self.config)
+                decision = evaluate_trading_window(_utc_ms(*holiday_date, 15, 0), alg_config)
                 self.assertEqual("holiday", decision.session)
                 self.assertFalse(decision.allowed)
-                self.assertFalse(is_preferred_us_cash_window(_utc_ms(*holiday_date, 15, 0), self.config))
+                self.assertFalse(is_preferred_us_cash_window(_utc_ms(*holiday_date, 15, 0), alg_config))
+
+        # Dates before verified historical coverage (2018) fail closed.
+        with self.assertRaisesRegex(CalendarUnavailable, "2018 onward"):
+            evaluate_trading_window(_utc_ms(2017, 6, 15, 15, 0), alg_config)
+        with self.assertRaisesRegex(CalendarUnavailable, "2018 onward"):
+            is_preferred_us_cash_window(_utc_ms(2017, 6, 15, 15, 0), alg_config)
 
         # 2029-01-02 is a regular open trading day; 2029-11-23 is Black Friday early close (13:00 ET).
-        open_decision = evaluate_trading_window(_utc_ms(2029, 1, 2, 15, 0), self.config)
+        open_decision = evaluate_trading_window(_utc_ms(2029, 1, 2, 15, 0), alg_config)
         self.assertEqual("open", open_decision.session)
         self.assertTrue(open_decision.allowed)
-        self.assertTrue(is_preferred_us_cash_window(_utc_ms(2029, 1, 2, 15, 0), self.config))
+        self.assertTrue(is_preferred_us_cash_window(_utc_ms(2029, 1, 2, 15, 0), alg_config))
 
-        early_decision = evaluate_trading_window(_utc_ms(2029, 11, 23, 19, 30), self.config)
+        early_decision = evaluate_trading_window(_utc_ms(2029, 11, 23, 19, 30), alg_config)
         self.assertEqual("early_close", early_decision.session)
         self.assertFalse(early_decision.allowed)
 
         # 2028-01-01 is Saturday: NYSE does NOT observe on prior Friday 2027-12-31.
-        nye_2027 = evaluate_trading_window(_utc_ms(2027, 12, 31, 15, 0), self.config)
+        nye_2027 = evaluate_trading_window(_utc_ms(2027, 12, 31, 15, 0), alg_config)
         self.assertEqual("open", nye_2027.session)
         self.assertTrue(nye_2027.allowed)
 

@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mu_strategy.execution.instruments import OKXInstrumentSpec
+from mu_strategy.market_data.http_pool import ProxyTarget, resolve_proxy
 
 
 OKX_BASE_URL = "https://www.okx.com"
@@ -122,26 +124,42 @@ class _PooledHTTPTransport:
         self._lock = threading.Lock()
         self._all_connections: set[http.client.HTTPConnection] = set()
 
-    def _pool(self) -> dict[tuple[str, str, int, int], http.client.HTTPConnection]:
+    def _pool(self) -> dict[tuple[Any, ...], http.client.HTTPConnection]:
         pool = getattr(self._local, "connections", None)
         if pool is None:
             pool = {}
             self._local.connections = pool
         return pool
 
-    def _acquire(self, key: tuple[str, str, int, int]) -> tuple[http.client.HTTPConnection, bool]:
+    def _acquire(self, key: tuple[Any, ...]) -> tuple[http.client.HTTPConnection, bool]:
         pool = self._pool()
         conn = pool.get(key)
         if conn is not None:
             if conn.sock is not None:
                 return conn, True
             self._evict(key, conn)
-        scheme, host, port, timeout = key
+        if len(key) == 4:
+            scheme, host, port, timeout = key
+            proxy = resolve_proxy(scheme, host, port)
+        else:
+            scheme, host, port, timeout, proxy = key
         if scheme == "https":
             context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
-            conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+            if isinstance(proxy, ProxyTarget):
+                conn = http.client.HTTPSConnection(proxy.host, proxy.port, timeout=timeout, context=context)
+                tunnel_headers = {"Proxy-Authorization": proxy.auth_header} if proxy.auth_header else None
+                conn.set_tunnel(host, port=port, headers=tunnel_headers)
+            else:
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
         elif scheme == "http":
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            if isinstance(proxy, ProxyTarget):
+                if proxy.scheme == "https":
+                    context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
+                    conn = http.client.HTTPSConnection(proxy.host, proxy.port, timeout=timeout, context=context)
+                else:
+                    conn = http.client.HTTPConnection(proxy.host, proxy.port, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
         else:
             raise ValueError(f"unsupported URL scheme: {scheme}")
         pool[key] = conn
@@ -149,7 +167,7 @@ class _PooledHTTPTransport:
             self._all_connections.add(conn)
         return conn, False
 
-    def _evict(self, key: tuple[str, str, int, int], conn: http.client.HTTPConnection) -> None:
+    def _evict(self, key: tuple[Any, ...], conn: http.client.HTTPConnection) -> None:
         pool = self._pool()
         if pool.get(key) is conn:
             del pool[key]
@@ -200,11 +218,48 @@ class _PooledHTTPTransport:
         if not any(key.lower() == "connection" for key in request_headers):
             request_headers["Connection"] = "keep-alive"
 
-        key = (scheme, host, port, timeout)
+        proxy = resolve_proxy(scheme, host, parsed.port)
+        if proxy is not None and proxy.scheme not in {"http", "https"}:
+            ssl_context = (
+                self.ssl_context
+                if self.ssl_context is not None
+                else (_default_ssl_context() if scheme == "https" else None)
+            )
+            for attempt in range(1, max_attempts + 1):
+                req = urllib.request.Request(url, data=encoded_body, headers=request_headers, method=method_upper)
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except urllib.error.HTTPError as exc:
+                    raw_body = exc.read() if exc.fp is not None else b""
+                    retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+                    error = _decode_http_error(exc.code, raw_body, url=url)
+                    if idempotent and (exc.code in _RETRYABLE_GET_STATUSES or 500 <= exc.code < 600) and attempt < max_attempts:
+                        delay = _parse_retry_after(retry_after)
+                        self.sleeper(delay if delay is not None else self.backoff_seconds * attempt)
+                        continue
+                    raise error from exc
+                except (OSError, http.client.HTTPException, urllib.error.URLError):
+                    if not idempotent or attempt >= max_attempts:
+                        raise
+                    self.sleeper(self.backoff_seconds * attempt)
+                    continue
+            raise RuntimeError("unreachable")
+
+        if scheme == "http" and proxy is not None:
+            host_part = f"[{host}]" if ":" in host else host
+            netloc = f"{host_part}:{parsed.port}" if parsed.port is not None else host_part
+            request_target = f"http://{netloc}{target}"
+            if proxy.auth_header and not any(k.lower() == "proxy-authorization" for k in request_headers):
+                request_headers["Proxy-Authorization"] = proxy.auth_header
+        else:
+            request_target = target
+
+        key: tuple[Any, ...] = (scheme, host, port, timeout, proxy)
         for attempt in range(1, max_attempts + 1):
             conn, reused = self._acquire(key)
             try:
-                conn.request(method_upper, target, body=encoded_body, headers=request_headers)
+                conn.request(method_upper, request_target, body=encoded_body, headers=request_headers)
                 response = conn.getresponse()
                 raw_body = response.read()
                 status = response.status

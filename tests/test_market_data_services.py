@@ -1,5 +1,9 @@
+import base64
+import json
 import ssl
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 
@@ -41,6 +45,119 @@ class HttpPoolSslContextTests(unittest.TestCase):
                     http_pool._new_connection("https", "www.okx.com", 443, 20.0, context=custom_context)
 
         self.assertIs(custom_context, captured["context"])
+
+    def test_https_proxy_tunnels_with_auth_and_honors_bypass_and_direct_pooling(self):
+        from mu_strategy.market_data import http_pool
+
+        fake_context = MagicMock(spec=ssl.SSLContext)
+        created = []
+
+        def fake_https_connection(host, *, port=None, timeout=None, context=None):
+            conn = MagicMock()
+            created.append((host, port, timeout, context, conn))
+            return conn
+
+        with (
+            patch.object(http_pool, "_DEFAULT_SSL_CONTEXT", fake_context),
+            patch("mu_strategy.market_data.http_pool.http.client.HTTPSConnection", side_effect=fake_https_connection),
+        ):
+            # 1. Configured HTTPS proxy with credentials -> connects to proxy & sets CONNECT tunnel.
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://alice:s%40cret@proxy.internal:8080"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+            ):
+                http_pool._new_connection("https", "www.okx.com", None, 15.0)
+
+            host, port, timeout, ctx, conn = created[-1]
+            self.assertEqual(("proxy.internal", 8080, 15.0), (host, port, timeout))
+            self.assertIs(fake_context, ctx)
+            expected_auth = "Basic " + base64.b64encode(b"alice:s@cret").decode("ascii")
+            conn.set_tunnel.assert_called_once_with(
+                "www.okx.com",
+                port=443,
+                headers={"Proxy-Authorization": expected_auth},
+            )
+
+            # 2. NO_PROXY / proxy_bypass -> connects directly without tunneling.
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://proxy.internal:8080"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=True),
+            ):
+                http_pool._new_connection("https", "www.okx.com", 443, 15.0)
+
+            host, port, _timeout, _ctx, conn = created[-1]
+            self.assertEqual(("www.okx.com", 443), (host, port))
+            conn.set_tunnel.assert_not_called()
+
+            # 3. No proxy configured -> connects directly without tunneling.
+            with patch("mu_strategy.market_data.http_pool.urllib.request.getproxies", return_value={}):
+                http_pool._new_connection("https", "fapi.binance.com", None, 10.0)
+
+            host, port, _timeout, _ctx, conn = created[-1]
+            self.assertEqual(("fapi.binance.com", None), (host, port))
+            conn.set_tunnel.assert_not_called()
+
+    def test_http_proxy_forwards_absolute_uri_with_keep_alive_pooling(self):
+        from mu_strategy.market_data import http_pool
+
+        connections = []
+        seen_requests = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                seen_requests.append(
+                    (self.path, self.headers.get("Host"), self.headers.get("Proxy-Authorization"))
+                )
+                body = json.dumps({"ok": True, "n": len(seen_requests)}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(http_pool.close_pooled_connections)
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
+
+        proxy_url = f"http://bob:pw@127.0.0.1:{server.server_port}"
+        with (
+            patch("mu_strategy.market_data.http_pool.urllib.request.getproxies", return_value={"http": proxy_url}),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            first = http_pool.get_json("http://exchange.invalid/api/v5/ping?x=1")
+            second = http_pool.get_json("http://exchange.invalid/api/v5/ping?x=2")
+
+        self.assertEqual({"ok": True, "n": 1}, first)
+        self.assertEqual({"ok": True, "n": 2}, second)
+        self.assertEqual(1, len(connections), "expected HTTP proxy keep-alive socket reuse")
+        expected_auth = "Basic " + base64.b64encode(b"bob:pw").decode("ascii")
+        self.assertEqual(
+            [
+                ("http://exchange.invalid/api/v5/ping?x=1", "exchange.invalid", expected_auth),
+                ("http://exchange.invalid/api/v5/ping?x=2", "exchange.invalid", expected_auth),
+            ],
+            seen_requests,
+        )
 
 
 class MarketDataSymbolTests(unittest.TestCase):

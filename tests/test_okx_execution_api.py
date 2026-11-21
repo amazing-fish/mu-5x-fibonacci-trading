@@ -713,6 +713,92 @@ class PooledHTTPTransportTests(unittest.TestCase):
 
         self.assertIs(custom_context, captured["context"])
 
+    def test_https_transport_honors_configured_proxy_and_bypass(self):
+        fake_context = MagicMock(spec=ssl.SSLContext)
+        created = []
+
+        def fake_https_connection(host, port, *, timeout=None, context=None):
+            conn = MagicMock()
+            conn.sock = None
+            created.append((host, port, timeout, context, conn))
+            return conn
+
+        transport = _PooledHTTPTransport(ssl_context=fake_context)
+        self.addCleanup(transport.close)
+        with patch("mu_strategy.live.okx.http.client.HTTPSConnection", side_effect=fake_https_connection):
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://u:p@proxy.local:8443"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+            ):
+                transport._acquire(("https", "www.okx.com", 443, 20))
+
+            host, port, timeout, ctx, conn = created[-1]
+            self.assertEqual(("proxy.local", 8443, 20), (host, port, timeout))
+            self.assertIs(fake_context, ctx)
+            conn.set_tunnel.assert_called_once()
+            self.assertEqual(("www.okx.com",), conn.set_tunnel.call_args.args)
+            self.assertEqual(443, conn.set_tunnel.call_args.kwargs["port"])
+            self.assertIn("Proxy-Authorization", conn.set_tunnel.call_args.kwargs["headers"])
+
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://proxy.local:8443"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=True),
+            ):
+                transport._acquire(("https", "aws.okx.com", 443, 20))
+
+            host, port, _timeout, _ctx, conn = created[-1]
+            self.assertEqual(("aws.okx.com", 443), (host, port))
+            conn.set_tunnel.assert_not_called()
+
+    def test_http_proxy_routes_client_requests_with_keep_alive(self):
+        connections = []
+        seen_paths = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                seen_paths.append((self.path, self.headers.get("Host")))
+                payload = json.dumps({"code": "0", "data": [{"ok": len(seen_paths)}], "msg": ""}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        proxy_url = self._start_server(ProxyHandler)
+        with (
+            patch("mu_strategy.market_data.http_pool.urllib.request.getproxies", return_value={"http": proxy_url}),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            with OKXRestClient(credentials=None, demo=True, base_url="http://okx.invalid") as client:
+                first = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+                second = client.get_instruments(inst_type="SWAP", inst_id="BTC-USDT-SWAP")
+
+        self.assertEqual("0", first["code"])
+        self.assertEqual("0", second["code"])
+        self.assertEqual(1, len(connections))
+        self.assertEqual(
+            [
+                ("http://okx.invalid/api/v5/public/instruments?instType=SWAP&instId=MU-USDT-SWAP", "okx.invalid"),
+                ("http://okx.invalid/api/v5/public/instruments?instType=SWAP&instId=BTC-USDT-SWAP", "okx.invalid"),
+            ],
+            seen_paths,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

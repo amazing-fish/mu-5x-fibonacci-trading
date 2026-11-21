@@ -137,6 +137,52 @@ def _scan_entry(
     last_hist = _series_value(hist_values, last_index)
     previous_hist = _series_value(hist_values, max(0, last_index - 1))
 
+    if config.entry_execution == "second_pullback":
+        pending_signal = _latest_recent_signal(
+            candles_15m,
+            hourly_context,
+            rsi_values,
+            hist_values,
+            config=config,
+            lookback_bars=_effective_lookback_bars(config, lookback_bars),
+        )
+        if pending_signal is not None:
+            return _result_for_recent_signal(
+                symbol=symbol,
+                candles=candles_15m,
+                hourly_context=hourly_context,
+                last_candle=last_candle,
+                regime=last_regime,
+                rsi14=last_rsi,
+                macd_hist=last_hist,
+                macd_hist_prev=previous_hist,
+                signal=pending_signal,
+                max_fib_distance_pct=max_fib_distance_pct,
+                config=config,
+            )
+        blocked = _blocked_result(
+            symbol=symbol,
+            last_candle=last_candle,
+            regime=last_regime,
+            rsi14=last_rsi,
+            macd_hist=last_hist,
+            macd_hist_prev=previous_hist,
+            config=config,
+        )
+        if blocked is not None:
+            return blocked
+        return EntryScanResult(
+            symbol=symbol,
+            action="wait",
+            reason="filters are not fully blocked, but no recent confirmed fib retest",
+            last_close=last_candle.close,
+            regime_1h=last_regime,
+            rsi14=last_rsi,
+            macd_hist=last_hist,
+            macd_hist_prev=previous_hist,
+            decision_code=EntryDecisionCode.NO_RECENT_CONFIRMED_FIB_RETEST,
+        )
+
     blocked = _blocked_result(
         symbol=symbol,
         last_candle=last_candle,
@@ -302,6 +348,21 @@ def _result_for_recent_signal(
                 signal_time_ms=signal_candle.open_time_ms,
                 decision_code=execution.decision_code,
             )
+        if not is_preferred_us_cash_window(prospective.open_time_ms, config):
+            return EntryScanResult(
+                symbol=symbol,
+                action="wait",
+                reason="next execution candle is outside configured trading window",
+                last_close=last_candle.close,
+                regime_1h=regime,
+                rsi14=rsi14,
+                macd_hist=macd_hist,
+                macd_hist_prev=macd_hist_prev,
+                fib_level=fib_level,
+                fib_distance_pct=distance_pct,
+                signal_time_ms=signal_candle.open_time_ms,
+                decision_code=EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW,
+            )
         trigger_price = execution.entry_price
     else:
         # break_high on the latest bar: validate signal/price filters at the planned breakout
@@ -427,7 +488,12 @@ def _latest_recent_signal(
     lookback_bars: int,
 ) -> tuple[int, Candle, float, float | None] | None:
     start = max(1, len(candles) - max(1, lookback_bars))
-    for index in range(len(candles) - 1, start - 1, -1):
+    indices = (
+        range(start, len(candles))
+        if config.entry_execution == "second_pullback"
+        else range(len(candles) - 1, start - 1, -1)
+    )
+    for index in indices:
         candle = candles[index]
         if not is_preferred_us_cash_window(candle.open_time_ms, config):
             continue

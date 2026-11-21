@@ -55,6 +55,50 @@ class StrategyConfigPayloadTests(unittest.TestCase):
         with self.assertRaises(StrategyReleaseSchemaError):
             StrategyConfigPayloadV1.from_config(modern)
 
+    def test_v2_decodes_pre_risk_limit_payloads_and_preserves_original_digest(self):
+        config = baseline_strategy_group("MU-USDT-SWAP").config
+        payload = StrategyConfigPayloadV2.from_config(config)
+        wire = payload.to_dict()
+        # Default StrategyConfig omits unset optional risk limits to preserve base V2 hash identity.
+        self.assertNotIn("max_account_drawdown_pct", wire["fields"])
+        self.assertNotIn("daily_loss_limit_pct", wire["fields"])
+
+        restored = parse_strategy_config_payload(wire)
+        self.assertEqual(payload.strategy_config_sha256, restored.strategy_config_sha256)
+        self.assertIsNone(restored.to_strategy_config().max_account_drawdown_pct)
+        self.assertIsNone(restored.to_strategy_config().daily_loss_limit_pct)
+
+        # Explicit null risk-limit fields are also accepted and preserve their exact wire representation.
+        explicit_null_wire = {
+            **wire,
+            "fields": {**wire["fields"], "max_account_drawdown_pct": None, "daily_loss_limit_pct": None},
+        }
+        restored_nulls = parse_strategy_config_payload(explicit_null_wire)
+        self.assertEqual(explicit_null_wire, restored_nulls.to_dict())
+        self.assertEqual(config, restored_nulls.to_strategy_config())
+
+        # Non-null risk limits are serialized, change digest, and round-trip cleanly.
+        bounded = replace(config, max_account_drawdown_pct=0.15, daily_loss_limit_pct=0.05)
+        bounded_payload = StrategyConfigPayloadV2.from_config(bounded)
+        self.assertEqual("0.15", bounded_payload.to_dict()["fields"]["max_account_drawdown_pct"])
+        self.assertEqual("0.05", bounded_payload.to_dict()["fields"]["daily_loss_limit_pct"])
+        self.assertNotEqual(payload.strategy_config_sha256, bounded_payload.strategy_config_sha256)
+        self.assertEqual(bounded, parse_strategy_config_payload(bounded_payload.to_dict()).to_strategy_config())
+
+    def test_v1_rejects_risk_limits_and_non_default_bjt_windows(self):
+        for risk_kwargs in ({"daily_loss_limit_pct": 0.05}, {"max_account_drawdown_pct": 0.15}):
+            with self.subTest(risk_kwargs=risk_kwargs):
+                with self.assertRaisesRegex(StrategyReleaseSchemaError, "V2"):
+                    StrategyConfigPayloadV1.from_config(StrategyConfig(**risk_kwargs))
+
+        legacy_wire = StrategyConfigPayloadV1.from_config(StrategyConfig()).to_dict()
+        custom_bjt = {
+            **legacy_wire,
+            "fields": {**legacy_wire["fields"], "trading_windows_bjt": [["22:00", "23:00"]]},
+        }
+        with self.assertRaisesRegex(StrategyReleaseSchemaError, "trading_windows_bjt"):
+            parse_strategy_config_payload(custom_bjt)
+
     def test_trusted_experiment_dataset_validation(self):
         digest = "a" * 64
         dataset = TrustedExperimentDatasetV1(

@@ -5,16 +5,18 @@ import json
 import math
 import os
 import re
+import threading
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, unique
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterator, Mapping, Protocol
 
+from mu_strategy import file_locks
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.core.trading_calendar import calendar_sha256
-from mu_strategy.file_locks import locked_file
 from mu_strategy.fs_durability import fsync_directory as _fsync_directory
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition, entry_decision_metadata
@@ -440,30 +442,75 @@ def _decode_cycle_bytes(raw: bytes, *, strict_unique: bool = True) -> Stage0Obse
         raise ObservationCorruptionError(f"invalid observation record: {type(exc).__name__}") from exc
 
 
+_PENDING_SYNC_LOCK = threading.Lock()
+_PENDING_CREATED_DIRS: dict[Path, list[Path]] = {}
+_PENDING_PARENT_SYNC: set[Path] = set()
+
+
+class _RetryLockedRead(Exception):
+    pass
+
+
 class JsonlObservationRepository:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.invalid_marker_path = Path(f"{self.path}.invalid")
         self.lock_path = Path(f"{self.path}.lock")
 
-    def publication_fence(self, *, wait: bool = True, timeout_seconds: float | None = None):
+    def publication_fence(
+        self,
+        *,
+        wait: bool = True,
+        shared: bool = False,
+        timeout_seconds: float | None = None,
+    ):
         """Serialize committed appends with a consumer's local pre-send readiness check."""
-        if timeout_seconds is None:
-            return locked_file(self.lock_path, wait=wait)
-        return locked_file(self.lock_path, wait=wait, timeout_seconds=timeout_seconds)
+        kwargs: dict[str, Any] = {"wait": wait}
+        if shared:
+            kwargs["shared"] = True
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return file_locks.locked_file(self.lock_path, **kwargs)
+
+    @contextmanager
+    def read_fence(self, *, wait: bool = True, timeout_seconds: float | None = None) -> Iterator[bool]:
+        """Acquire a shared reader lock on an existing lock file without mutating missing/read-only dirs."""
+        try:
+            stream = self.lock_path.open("rb")
+        except FileNotFoundError:
+            yield False
+            return
+        with stream:
+            kwargs: dict[str, Any] = {"shared": True, "wait": wait}
+            if timeout_seconds is not None:
+                kwargs["timeout_seconds"] = timeout_seconds
+            file_locks.lock_file(stream, **kwargs)
+            try:
+                yield True
+            finally:
+                file_locks.unlock_file(stream)
 
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")
         try:
             created_directories = self._create_parent_directories()
+            if created_directories:
+                self._record_pending_created_directories(created_directories)
+                try:
+                    self._flush_pending_created_directories()
+                except OSError:
+                    self._rollback_empty_created_directories(created_directories)
+                    raise
             with self.publication_fence():
                 if self.invalid_marker_path.exists():
                     raise OSError("observation repository has an unresolved invalid marker")
-                if created_directories:
-                    self._fsync_created_directory_entries(created_directories)
+                self._flush_pending_created_directories()
                 log_existed = self.path.exists()
                 with self.path.open("ab", buffering=0) as handle:
                     original_size = os.fstat(handle.fileno()).st_size
+                    need_parent_sync = (not log_existed) or original_size == 0 or self._has_pending_parent_sync()
+                    if need_parent_sync:
+                        self._mark_pending_parent_sync()
                     try:
                         written = 0
                         view = memoryview(encoded)
@@ -473,38 +520,55 @@ class JsonlObservationRepository:
                                 raise OSError(f"short observation write: {written}/{len(encoded)} bytes")
                             written += chunk
                         os.fsync(handle.fileno())
-                    except OSError:
+                        if need_parent_sync:
+                            self._fsync_parent_directory()
+                            self._clear_pending_parent_sync()
+                    except BaseException:
                         try:
                             handle.truncate(original_size)
                         except OSError:
-                            pass
+                            self._quarantine_invalid_marker(cycle.cycle_id)
                         raise
-                if not log_existed:
-                    self._fsync_parent_directory()
         except OSError as exc:
             raise ObservationWriteError(f"observation cycle write failed: {type(exc).__name__}: {exc}") from exc
 
     def read_cycles(self) -> tuple[Stage0ObservationCycle, ...]:
-        self._reject_invalid_marker()
-        if not self.path.exists():
-            return ()
-        cycles: list[Stage0ObservationCycle] = []
-        try:
-            with self.path.open("rb") as handle:
-                for line_number, raw_line in enumerate(handle, start=1):
-                    if not raw_line.endswith(b"\n"):
-                        raise ObservationCorruptionError(f"corrupted observation record at line {line_number}: incomplete")
+        while True:
+            locked = False
+            try:
+                with self.read_fence() as locked:
+                    self._reject_invalid_marker()
                     try:
-                        payload = json.loads(raw_line.decode("utf-8"))
-                        cycles.append(Stage0ObservationCycle.from_dict(payload))
-                    except (UnicodeDecodeError, json.JSONDecodeError, ObservationSchemaError, ValueError) as exc:
-                        raise ObservationCorruptionError(
-                            f"corrupted observation record at line {line_number}: {type(exc).__name__}"
-                        ) from exc
-        except OSError as exc:
-            raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
-        self._reject_invalid_marker()
-        return tuple(cycles)
+                        handle = self.path.open("rb")
+                    except FileNotFoundError:
+                        self._reject_invalid_marker()
+                        if not locked and self.lock_path.exists():
+                            continue
+                        return ()
+                    cycles: list[Stage0ObservationCycle] = []
+                    with handle:
+                        for line_number, raw_line in enumerate(handle, start=1):
+                            if not raw_line.endswith(b"\n"):
+                                raise ObservationCorruptionError(
+                                    f"corrupted observation record at line {line_number}: incomplete"
+                                )
+                            try:
+                                payload = json.loads(raw_line.decode("utf-8"))
+                                cycles.append(Stage0ObservationCycle.from_dict(payload))
+                            except (UnicodeDecodeError, json.JSONDecodeError, ObservationSchemaError, ValueError) as exc:
+                                raise ObservationCorruptionError(
+                                    f"corrupted observation record at line {line_number}: {type(exc).__name__}"
+                                ) from exc
+                    self._reject_invalid_marker()
+                    if not locked and self.lock_path.exists():
+                        continue
+                    return tuple(cycles)
+            except ObservationCorruptionError:
+                if not locked and self.lock_path.exists():
+                    continue
+                raise
+            except OSError as exc:
+                raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
     def read_batch(
         self, *, offset: int = 0, anchor_start: int = 0, anchor_sha256: str | None = None, limit: int = 100,
@@ -520,36 +584,47 @@ class JsonlObservationRepository:
                 or (offset > 0 and (anchor_start >= offset or not isinstance(anchor_sha256, str)
                                    or not _SHA256_PATTERN.fullmatch(anchor_sha256)))):
             raise ObservationCorruptionError("invalid observation cursor")
-        try:
-            self._reject_invalid_marker()
-            cursor = (offset, anchor_start, anchor_sha256)
+        while True:
+            locked = False
             try:
-                handle = self.path.open("rb")
-            except FileNotFoundError:
-                self._reject_invalid_marker()
-                if offset:
-                    raise ObservationCorruptionError("observation log missing at persisted cursor")
-                return (), cursor
-            cycles = []
-            with handle:
-                if offset:
-                    handle.seek(anchor_start)
-                    anchor = handle.readline(_MAX_RECORD_BYTES + 1)
-                    if handle.tell() != offset or not anchor.endswith(b"\n") or hashlib.sha256(anchor).hexdigest() != anchor_sha256:
-                        raise ObservationCorruptionError("observation cursor boundary changed")
-                for _ in range(limit):
-                    start = handle.tell()
-                    raw = handle.readline(_MAX_RECORD_BYTES + 1)
-                    if not raw:
-                        break
-                    if len(raw) > _MAX_RECORD_BYTES or not raw.endswith(b"\n"):
-                        raise ObservationCorruptionError("observation record incomplete or oversized")
-                    cycles.append(_decode_cycle_bytes(raw))
-                    cursor = (handle.tell(), start, hashlib.sha256(raw).hexdigest())
-            self._reject_invalid_marker()
-            return tuple(cycles), cursor
-        except OSError as exc:
-            raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
+                with self.read_fence() as locked:
+                    self._reject_invalid_marker()
+                    cursor = (offset, anchor_start, anchor_sha256)
+                    try:
+                        handle = self.path.open("rb")
+                    except FileNotFoundError:
+                        self._reject_invalid_marker()
+                        if not locked and self.lock_path.exists():
+                            continue
+                        if offset:
+                            raise ObservationCorruptionError("observation log missing at persisted cursor")
+                        return (), cursor
+                    cycles = []
+                    with handle:
+                        if offset:
+                            handle.seek(anchor_start)
+                            anchor = handle.readline(_MAX_RECORD_BYTES + 1)
+                            if handle.tell() != offset or not anchor.endswith(b"\n") or hashlib.sha256(anchor).hexdigest() != anchor_sha256:
+                                raise ObservationCorruptionError("observation cursor boundary changed")
+                        for _ in range(limit):
+                            start = handle.tell()
+                            raw = handle.readline(_MAX_RECORD_BYTES + 1)
+                            if not raw:
+                                break
+                            if len(raw) > _MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                                raise ObservationCorruptionError("observation record incomplete or oversized")
+                            cycles.append(_decode_cycle_bytes(raw))
+                            cursor = (handle.tell(), start, hashlib.sha256(raw).hexdigest())
+                    self._reject_invalid_marker()
+                    if not locked and self.lock_path.exists():
+                        continue
+                    return tuple(cycles), cursor
+            except ObservationCorruptionError:
+                if not locked and self.lock_path.exists():
+                    continue
+                raise
+            except OSError as exc:
+                raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
     def iter_tail_cycles(
         self,
@@ -562,54 +637,76 @@ class JsonlObservationRepository:
             raise ObservationCorruptionError("invalid max_cycles")
         if type(chunk_size) is not int or chunk_size < 1:
             raise ObservationCorruptionError("invalid chunk_size")
-        try:
-            self._reject_invalid_marker()
+        while True:
+            locked = False
+            yielded_any = False
             try:
-                handle = self.path.open("rb")
-            except FileNotFoundError:
-                self._reject_invalid_marker()
-                return
-            yielded = 0
-            with handle:
-                handle.seek(0, os.SEEK_END)
-                pos = handle.tell()
-                if pos == 0:
+                with self.read_fence() as locked:
+                    self._reject_invalid_marker()
+                    try:
+                        handle = self.path.open("rb")
+                    except FileNotFoundError:
+                        self._reject_invalid_marker()
+                        if not locked and self.lock_path.exists():
+                            continue
+                        return
+                    if not locked and self.lock_path.exists():
+                        handle.close()
+                        continue
+                    yielded = 0
+                    with handle:
+                        handle.seek(0, os.SEEK_END)
+                        pos = handle.tell()
+                        if pos == 0:
+                            self._reject_invalid_marker()
+                            if not locked and self.lock_path.exists():
+                                continue
+                            return
+                        remainder = b""
+                        at_eof = True
+                        while pos > 0 and (max_cycles is None or yielded < max_cycles):
+                            read_size = min(chunk_size, pos)
+                            pos -= read_size
+                            handle.seek(pos)
+                            chunk = handle.read(read_size)
+                            if len(chunk) != read_size:
+                                raise ObservationCorruptionError("observation log shrank during reverse read")
+                            buffer = chunk + remainder
+                            if at_eof:
+                                at_eof = False
+                                if not buffer.endswith(b"\n"):
+                                    raise ObservationCorruptionError("observation record incomplete or oversized")
+                                buffer = buffer[:-1]
+                            parts = buffer.split(b"\n")
+                            if pos > 0:
+                                remainder = parts[0]
+                                if len(remainder) + 1 > _MAX_RECORD_BYTES:
+                                    raise ObservationCorruptionError("observation record incomplete or oversized")
+                                lines = parts[1:]
+                            else:
+                                remainder = b""
+                                lines = parts
+                            for raw_line in reversed(lines):
+                                if len(raw_line) + 1 > _MAX_RECORD_BYTES:
+                                    raise ObservationCorruptionError("observation record incomplete or oversized")
+                                decoded = _decode_cycle_bytes(raw_line)
+                                if not yielded_any and not locked and self.lock_path.exists():
+                                    raise _RetryLockedRead()
+                                yielded_any = True
+                                yield decoded
+                                yielded += 1
+                                if max_cycles is not None and yielded >= max_cycles:
+                                    break
                     self._reject_invalid_marker()
                     return
-                remainder = b""
-                at_eof = True
-                while pos > 0 and (max_cycles is None or yielded < max_cycles):
-                    read_size = min(chunk_size, pos)
-                    pos -= read_size
-                    handle.seek(pos)
-                    chunk = handle.read(read_size)
-                    if len(chunk) != read_size:
-                        raise ObservationCorruptionError("observation log shrank during reverse read")
-                    buffer = chunk + remainder
-                    if at_eof:
-                        at_eof = False
-                        if not buffer.endswith(b"\n"):
-                            raise ObservationCorruptionError("observation record incomplete or oversized")
-                        buffer = buffer[:-1]
-                    parts = buffer.split(b"\n")
-                    if pos > 0:
-                        remainder = parts[0]
-                        if len(remainder) + 1 > _MAX_RECORD_BYTES:
-                            raise ObservationCorruptionError("observation record incomplete or oversized")
-                        lines = parts[1:]
-                    else:
-                        remainder = b""
-                        lines = parts
-                    for raw_line in reversed(lines):
-                        if len(raw_line) + 1 > _MAX_RECORD_BYTES:
-                            raise ObservationCorruptionError("observation record incomplete or oversized")
-                        yield _decode_cycle_bytes(raw_line)
-                        yielded += 1
-                        if max_cycles is not None and yielded >= max_cycles:
-                            break
-            self._reject_invalid_marker()
-        except OSError as exc:
-            raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
+            except _RetryLockedRead:
+                continue
+            except ObservationCorruptionError:
+                if not yielded_any and not locked and self.lock_path.exists():
+                    continue
+                raise
+            except OSError as exc:
+                raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
     def read_tail(
         self,
@@ -624,12 +721,13 @@ class JsonlObservationRepository:
         if min_created_at_ms is not None and (type(min_created_at_ms) is not int or min_created_at_ms < 0):
             raise ObservationCorruptionError("invalid min_created_at_ms")
         collected: list[Stage0ObservationCycle] = []
-        for cycle in self.iter_tail_cycles(chunk_size=chunk_size):
-            if min_created_at_ms is not None and cycle.created_at_ms < min_created_at_ms:
-                break
-            collected.append(cycle)
-            if len(collected) >= limit:
-                break
+        with closing(self.iter_tail_cycles(chunk_size=chunk_size)) as tail:
+            for cycle in tail:
+                if min_created_at_ms is not None and cycle.created_at_ms < min_created_at_ms:
+                    continue
+                collected.append(cycle)
+                if len(collected) >= limit:
+                    break
         self._reject_invalid_marker()
         collected.reverse()
         return tuple(collected)
@@ -637,6 +735,80 @@ class JsonlObservationRepository:
     def _reject_invalid_marker(self) -> None:
         if self.invalid_marker_path.exists():
             raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+
+    def _quarantine_invalid_marker(self, cycle_id: str) -> None:
+        """Write an invalid marker only when write rollback cannot restore the committed boundary."""
+        try:
+            with self.invalid_marker_path.open("wb") as marker:
+                marker.write(cycle_id.encode("utf-8"))
+                marker.flush()
+                try:
+                    os.fsync(marker.fileno())
+                except OSError:
+                    pass
+            try:
+                self._fsync_parent_directory()
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    def _sync_key(self) -> Path:
+        return self.path.resolve()
+
+    def _record_pending_created_directories(self, created_directories: tuple[Path, ...]) -> None:
+        key = self._sync_key()
+        with _PENDING_SYNC_LOCK:
+            pending = _PENDING_CREATED_DIRS.setdefault(key, [])
+            for directory in created_directories:
+                if directory not in pending:
+                    pending.append(directory)
+
+    def _flush_pending_created_directories(self) -> None:
+        key = self._sync_key()
+        while True:
+            with _PENDING_SYNC_LOCK:
+                pending = _PENDING_CREATED_DIRS.get(key)
+                if not pending:
+                    _PENDING_CREATED_DIRS.pop(key, None)
+                    return
+                directory = pending[0]
+            _fsync_directory(directory.parent)
+            with _PENDING_SYNC_LOCK:
+                pending = _PENDING_CREATED_DIRS.get(key)
+                if pending and directory in pending:
+                    pending.remove(directory)
+                    if not pending:
+                        _PENDING_CREATED_DIRS.pop(key, None)
+
+    def _rollback_empty_created_directories(self, created_directories: tuple[Path, ...]) -> None:
+        key = self._sync_key()
+        for directory in created_directories:
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+            with _PENDING_SYNC_LOCK:
+                pending = _PENDING_CREATED_DIRS.get(key)
+                if pending and directory in pending:
+                    pending.remove(directory)
+                    if not pending:
+                        _PENDING_CREATED_DIRS.pop(key, None)
+
+    def _mark_pending_parent_sync(self) -> None:
+        key = self._sync_key()
+        with _PENDING_SYNC_LOCK:
+            _PENDING_PARENT_SYNC.add(key)
+
+    def _has_pending_parent_sync(self) -> bool:
+        key = self._sync_key()
+        with _PENDING_SYNC_LOCK:
+            return key in _PENDING_PARENT_SYNC
+
+    def _clear_pending_parent_sync(self) -> None:
+        key = self._sync_key()
+        with _PENDING_SYNC_LOCK:
+            _PENDING_PARENT_SYNC.discard(key)
 
     def _fsync_parent_directory(self) -> None:
         _fsync_directory(self.path.parent)

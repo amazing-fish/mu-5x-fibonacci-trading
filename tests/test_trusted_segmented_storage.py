@@ -1259,6 +1259,110 @@ class FlatGenerationCompatTests(unittest.TestCase):
             incremental.assert_not_called()
             tickers.assert_not_called()
 
+    def test_retained_v4_partial_and_import_first_segment_paths_remain_exact_readable(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store, provider = _published_store(data_dir)
+            manifest_path = store.generation_manifest_path(RUN_A)
+            original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            segments = original_manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"]
+            first = segments[0]
+            canonical_path = data_dir / first["source_file"]
+            expected_rows = provider.rows
+
+            # 1. Retained first-segment .partial-<physical_first_timestamp_ms>.csv replays identically.
+            partial_start_ms = first["first_timestamp_ms"] - (first["start_row"] * STEP_MS)
+            partial_rel = f"segments/okx/{SYMBOL}/5m/{first['segment_id']}.partial-{partial_start_ms}.csv"
+            (data_dir / partial_rel).write_bytes(canonical_path.read_bytes())
+            partial_manifest = json.loads(json.dumps(original_manifest))
+            partial_manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0]["source_file"] = partial_rel
+            manifest_path.write_text(json.dumps(partial_manifest, sort_keys=True), encoding="utf-8")
+
+            manifest_result = store.read_generation_manifest(RUN_A)
+            self.assertTrue(manifest_result.ok, manifest_result.message)
+            self.assertEqual(expected_rows, _read_exact(store, RUN_A))
+            self.assertEqual(
+                manifest_result.snapshot.datasets[(SYMBOL, "5m")].content_sha256,
+                store.verify_generation_dataset_bytes(
+                    manifest_result.snapshot,
+                    symbol=SYMBOL,
+                    interval="5m",
+                    generation_root=store.generation_root(RUN_A),
+                    generation_id=RUN_A,
+                ),
+            )
+
+            # 2. Retained first-segment .import-<run_id>.csv with imported_from_run_id replays identically.
+            import_rel = f"segments/okx/{SYMBOL}/5m/{first['segment_id']}.import-{RUN_A}.csv"
+            (data_dir / import_rel).write_bytes(canonical_path.read_bytes())
+            import_manifest = json.loads(json.dumps(original_manifest))
+            import_manifest["imported_from_run_id"] = "v3-source-run"
+            import_manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0]["source_file"] = import_rel
+            manifest_path.write_text(json.dumps(import_manifest, sort_keys=True), encoding="utf-8")
+
+            imported_result = store.read_generation_manifest(RUN_A)
+            self.assertTrue(imported_result.ok, imported_result.message)
+            self.assertEqual("v3-source-run", imported_result.snapshot.imported_from_run_id)
+            self.assertEqual(expected_rows, _read_exact(store, RUN_A))
+
+            # 3. .import-<run_id>.csv without imported_from_run_id or on non-first ref still fails closed.
+            import_manifest.pop("imported_from_run_id")
+            manifest_path.write_text(json.dumps(import_manifest, sort_keys=True), encoding="utf-8")
+            self.assertFalse(store.read_generation_manifest(RUN_A).ok)
+
+            bad_second = json.loads(json.dumps(original_manifest))
+            bad_second["imported_from_run_id"] = "v3-source-run"
+            second = bad_second["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][1]
+            second["source_file"] = f"segments/okx/{SYMBOL}/5m/{second['segment_id']}.import-{RUN_A}.csv"
+            manifest_path.write_text(json.dumps(bad_second, sort_keys=True), encoding="utf-8")
+            self.assertFalse(store.read_generation_manifest(RUN_A).ok)
+
+    def test_store_csv_bare_cr_bounded_open_read_and_signed_zero_overlap_guard(self):
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            rows = _window_candles(JAN_START_MS, JAN_START_MS + 2 * STEP_MS)
+
+            # 1. Bare-CR CSV falls back cleanly to csv.reader instead of rejecting header.
+            bare_cr_path = data_dir / "bare_cr.csv"
+            store.write_csv(rows, bare_cr_path)
+            lf_text = bare_cr_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+            bare_cr_path.write_bytes(lf_text.replace("\n", "\r").encode("utf-8"))
+            self.assertEqual(rows, store.read_csv(bare_cr_path))
+
+            # 2. Open-segment bounded read (require_eof=False) does not decode unreferenced trailing bytes.
+            open_seg_path = data_dir / "open_seg.csv"
+            store.write_csv(rows[:2], open_seg_path)
+            with open_seg_path.open("ab") as handle:
+                handle.write(b"bad,\xff\xfe,trailing,unreferenced,row,0,0\n")
+            bounded_candles, bounded_hash = store._read_csv_slice_with_hash(
+                open_seg_path,
+                start_row=0,
+                rows=2,
+                require_eof=False,
+                expected_sha256=candles_content_sha256(rows[:2]),
+                need_hash=True,
+            )
+            self.assertEqual(rows[:2], bounded_candles)
+            self.assertEqual(candles_content_sha256(rows[:2]), bounded_hash)
+
+            # 3. Signed zero (-0.0 vs +0.0) in overlap is rejected before mutating the shared segment.
+            zero_rows = [
+                Candle(JAN_START_MS, 100.0, 101.0, 99.0, 100.5, 0.0),
+                Candle(JAN_START_MS + STEP_MS, 100.5, 101.5, 99.5, 101.0, 10.0),
+            ]
+            store.write_segmented_dataset(zero_rows, symbol=SYMBOL, interval="5m")
+            seg_path = store.segment_path(SYMBOL, "5m", "2026-01")
+            before_bytes = seg_path.read_bytes()
+            neg_zero_candidate = [
+                Candle(JAN_START_MS, 100.0, 101.0, 99.0, 100.5, -0.0),
+                Candle(JAN_START_MS + STEP_MS, 100.5, 101.5, 99.5, 101.0, 10.0),
+                Candle(JAN_START_MS + 2 * STEP_MS, 101.0, 102.0, 100.0, 101.5, 11.0),
+            ]
+            with self.assertRaises(SegmentCorrectionError):
+                store.write_segmented_dataset(neg_zero_candidate, symbol=SYMBOL, interval="5m")
+            self.assertEqual(before_bytes, seg_path.read_bytes())
+
 
 def _candles_through(end_ms: int) -> list[Candle]:
     return _window_candles(JAN_START_MS, end_ms)

@@ -120,26 +120,33 @@ class ReviewLiveServerTests(unittest.TestCase):
         self.assertTrue(self.server.daemon_threads)
         entered = threading.Event()
         release = threading.Event()
+        call_lock = threading.Lock()
         original_read = fixtures.read_signal_review
         calls = 0
 
         def slow_first_read(*args, **kwargs):
             nonlocal calls
-            calls += 1
-            if calls == 1:
+            with call_lock:
+                calls += 1
+                is_first = calls == 1
+            if is_first:
                 entered.set()
-                release.wait(timeout=3)
+                release.wait()
             return original_read(*args, **kwargs)
 
         results = {}
         with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=slow_first_read):
             t1 = threading.Thread(target=lambda: results.__setitem__("first", self.request("/report")[0]))
             t1.start()
-            self.assertTrue(entered.wait(timeout=2), "first request did not reach handler")
-            # Second concurrent request must complete without waiting for the blocked first request.
-            second_status = self.request("/report")[0]
-            release.set()
-            t1.join(timeout=3)
+            try:
+                self.assertTrue(entered.wait(timeout=2), "first request did not reach handler")
+                # Second concurrent request must finish while the first read remains blocked.
+                second_status = self.request("/report")[0]
+                self.assertTrue(t1.is_alive(), "first request must remain blocked until explicitly released")
+            finally:
+                release.set()
+                t1.join(timeout=3)
+        self.assertFalse(t1.is_alive(), "first request thread did not finish after release")
         self.assertEqual(200, second_status)
         self.assertEqual(200, results.get("first"))
 
