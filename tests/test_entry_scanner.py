@@ -320,28 +320,81 @@ class EntryScannerTests(unittest.TestCase):
                 self.assertIs(EntryDisposition.WAIT, result.disposition)
                 self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
 
-    def test_scan_entry_direct_next_open_blocks_prospective_bar_outside_trading_window(self):
+    def test_scan_entry_direct_next_open_and_break_high_block_prospective_bar_outside_trading_window(self):
         from mu_strategy.entry.scanner import scan_entry
 
         # 2026-06-18 (EDT = UTC-4): 15:45 ET = 19:45 UTC (in window); next synthetic bar 16:00 ET = 20:00 UTC (outside).
         candles = _candles_ending_at(_utc_ms(2026, 6, 18, 19, 45))
         candles[-1] = Candle(candles[-1].open_time_ms, 100.0, 101.0, 99.8, 100.5, 1000)
+        for execution in ("direct_next_open", "break_high"):
+            with self.subTest(execution=execution):
+                config = replace(
+                    baseline_strategy_group("BTC-USDT-SWAP").config,
+                    entry_execution=execution,
+                )
+                with (
+                    patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+                    patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+                    patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+                    patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == len(candles) - 1 else None),
+                ):
+                    result = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+                self.assertEqual("wait", result.action)
+                self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, result.decision_code)
+                self.assertIs(EntryDisposition.WAIT, result.disposition)
+                self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
+
+    def test_scan_entry_second_pullback_does_not_revive_signal_suppressed_by_earlier_order(self):
+        from mu_strategy.entry.scanner import scan_entry
+
+        # A confirms at bar i (100), B confirms at i+2 (105) while A is active (wait_bars=8 -> expires at i+8),
+        # and C confirms at i+9 (110) after A expires unfilled.
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 15, 0))
+        base = len(candles) - 10  # i = 30, i+2 = 32, i+8 = 38, i+9 = 39
+        idx_a, idx_b, idx_c = base, base + 2, base + 9
+        for idx in range(base, len(candles)):
+            candles[idx] = Candle(candles[idx].open_time_ms, 106.0, 107.0, 105.5, 106.5, 1000)
+        candles[idx_a] = Candle(candles[idx_a].open_time_ms, 100.0, 101.0, 99.8, 100.5, 1000)
+        candles[idx_b] = Candle(candles[idx_b].open_time_ms, 105.0, 106.0, 104.8, 105.2, 1000)
+        candles[idx_c] = Candle(candles[idx_c].open_time_ms, 110.0, 111.0, 109.8, 110.5, 1000)
+
         config = replace(
             baseline_strategy_group("BTC-USDT-SWAP").config,
-            entry_execution="direct_next_open",
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            trading_windows_et=(("00:00", "23:59"),),
         )
-        with (
-            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
-            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
-            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
-            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == len(candles) - 1 else None),
-        ):
-            result = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
 
-        self.assertEqual("wait", result.action)
-        self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, result.decision_code)
-        self.assertIs(EntryDisposition.WAIT, result.disposition)
-        self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
+        def run_scan(slice_end: int, *, include_c: bool):
+            sub = candles[:slice_end]
+            fib_map = {idx_a: 100.0, idx_b: 105.0}
+            if include_c:
+                fib_map[idx_c] = 110.0
+            with (
+                patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in sub}),
+                patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(sub)),
+                patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(sub), [0.0] * len(sub), [0.2] * len(sub))),
+                patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: fib_map.get(idx)),
+            ):
+                return scan_entry("BTC-USDT-SWAP", sub, sub, config=config, lookback_bars=8)
+
+        # 1. Before expiry (ending at i+7): A remains active at 100.
+        before_expiry = run_scan(base + 8, include_c=False)
+        self.assertEqual("enter", before_expiry.action)
+        self.assertEqual(candles[idx_a].open_time_ms, before_expiry.signal_time_ms)
+        self.assertAlmostEqual(100.0, before_expiry.trigger_price)
+
+        # 2. At expiry (ending at i+8, no C yet): A expired and suppressed B must NOT be revived.
+        at_expiry = run_scan(base + 9, include_c=False)
+        self.assertEqual("wait", at_expiry.action)
+        self.assertIs(EntryDecisionCode.NO_RECENT_CONFIRMED_FIB_RETEST, at_expiry.decision_code)
+
+        # 3. After expiry (ending at i+9 with C at 110): C becomes active, NOT suppressed B at 105.
+        after_expiry = run_scan(base + 10, include_c=True)
+        self.assertEqual("enter", after_expiry.action)
+        self.assertEqual(candles[idx_c].open_time_ms, after_expiry.signal_time_ms)
+        self.assertAlmostEqual(110.0, after_expiry.trigger_price)
 
     def test_scan_entry_second_pullback_places_limit_when_current_close_moved_away_from_fib(self):
         from mu_strategy.entry.scanner import scan_entry

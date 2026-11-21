@@ -245,85 +245,60 @@ class PositionManagementTests(PositionManagementFixture):
             self.assertIsNone(unknown['evaluation'])
         self.assertEqual(before, self.ledger.path.read_bytes())
 
-    def test_ancient_exchange_gap_before_warmup_is_tolerated_and_short_window_requested(self):
+    def test_short_review_window_requested_and_gaps_fail_closed(self):
         identity = self.ready()
         loader = self.loader()
-        # Inject an isolated ancient exchange-maintenance gap well before the 35-bar warmup.
-        del loader.execute.return_value.candles_by_interval["15m"][10]
-        del loader.execute.return_value.candles_by_interval["1h"][5]
         result = self.review(identity, loader)
         self.assertEqual("evaluated", result["status"], result)
         query = loader.execute.call_args.args[0]
         self.assertEqual(2, query.days)
 
-    def test_real_trusted_store_tolerates_pre_warmup_gap_and_blocks_warmup_review_tamper_and_stale(self):
-        from tests.factories.trusted_publication import write_generation_publication
+        # Any gap in the loaded sequence strictly fails closed.
+        for interval in ("15m", "1h"):
+            with self.subTest(interval=interval):
+                gapped_loader = self.loader()
+                del gapped_loader.execute.return_value.candles_by_interval[interval][5]
+                self.assertEqual("data_blocked", self.review(identity, gapped_loader)["status"])
 
+    def test_refresh_produced_generation_evaluates_clean_window_and_blocks_gapped_or_stale(self):
         identity = self.ready()
-        end = fixtures.NOW + 4 * BAR_MS  # 1 hour after confirmation (fixtures.NOW)
-        start = end - 96 * 3_600_000  # 4 full days of history
+        end = fixtures.NOW + 4 * BAR_MS  # 1 hour after confirmation
+        start = int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
-        def publish_dataset(*, drop_15m_hours_ago=None, drop_all_hours_ago=None, run_id="gap-run", tamper_15m=False):
+        def refresh_with(*, drop_15m_hours_ago=None, run_id="a" * 32):
+            gap_ts = end - drop_15m_hours_ago * 3_600_000 if drop_15m_hours_ago is not None else None
             five = [
                 Candle(at, 100.0, 101.0, 94.0 if at == fixtures.NOW else 99.0, 100.0, 1.0)
                 for at in range(start, end, 300_000)
+                if gap_ts is None or not (gap_ts <= at < gap_ts + BAR_MS)
             ]
             fifteen = aggregate_candles(five, interval="15m")
             hourly = aggregate_candles(five, interval="1h")
-            if drop_15m_hours_ago is not None:
-                gap_ts = end - drop_15m_hours_ago * 3_600_000
-                fifteen = [c for c in fifteen if c.open_time_ms != gap_ts]
-            if drop_all_hours_ago is not None:
-                gap_ts = end - drop_all_hours_ago * 3_600_000
-                five = [c for c in five if not (gap_ts <= c.open_time_ms < gap_ts + 3_600_000)]
-                fifteen = [c for c in fifteen if not (gap_ts <= c.open_time_ms < gap_ts + 3_600_000)]
-                hourly = [c for c in hourly if c.open_time_ms != gap_ts]
-            write_generation_publication(
-                self.fixture.data_dir,
-                symbol=fixtures.SYMBOL,
-                candles_by_interval={"5m": five, "15m": fifteen, "1h": hourly},
-                run_id=run_id,
+            store = TrustedDataStore(data_dir=self.fixture.data_dir)
+            return RefreshTrustedMarketData(store, _BundleProvider({"5m": five, "15m": fifteen, "1h": hourly})).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m", "1h"), symbols=(fixtures.SYMBOL,), days=7, now_ms=end, run_id=run_id
+                )
             )
-            if tamper_15m:
-                store = TrustedDataStore(data_dir=self.fixture.data_dir)
-                path = store.generation_cache_path(run_id, fixtures.SYMBOL, "15m")
-                tampered = list(fifteen)
-                tampered[-1] = replace(tampered[-1], close=999.0, high=999.0)
-                store.write_csv(tampered, path)
 
-        # 1) 15m gap 50 hours ago (before 48h window) -> fast path evaluates cleanly.
-        publish_dataset(drop_15m_hours_ago=50, run_id="gap-50h")
-        res_50h = self.review(identity)
-        self.assertEqual("evaluated", res_50h["status"], res_50h)
-        self.assertEqual("exit_review", res_50h["evaluation"]["outcome"])
+        # Refresh generation with a 15m gap (40h ago) is rejected by RefreshTrustedMarketData (INVALID/TIMESTAMP_GAP)
+        # and strictly blocked by position review.
+        gapped_run = refresh_with(drop_15m_hours_ago=40, run_id="b" * 32)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, gapped_run.datasets[(fixtures.SYMBOL, "15m")].primary_reason)
+        blocked = self.review(identity)
+        self.assertEqual("data_blocked", blocked["status"])
 
-        # 2) 15m gap 40 hours ago (inside 2-day integer window, BEFORE 35-hour warmup) -> suffix recovery evaluates cleanly.
-        publish_dataset(drop_15m_hours_ago=40, run_id="gap-40h-15m")
-        res_40h_15m = self.review(identity)
-        self.assertEqual("evaluated", res_40h_15m["status"], res_40h_15m)
-        self.assertEqual("exit_review", res_40h_15m["evaluation"]["outcome"])
+        # Clean refresh generation evaluates cleanly with tight 2-day window.
+        clean_run = refresh_with(run_id="c" * 32)
+        self.assertEqual(HealthReason.OK, clean_run.datasets[(fixtures.SYMBOL, "15m")].primary_reason)
+        ok = self.review(identity)
+        self.assertEqual("evaluated", ok["status"], ok)
+        self.assertEqual(2, ok["provenance"]["requested_days"])
+        self.assertEqual("exit_review", ok["evaluation"]["outcome"])
 
-        # 3) Coordinated 5m/15m/1h exchange maintenance gap 40 hours ago (BEFORE 35-hour warmup) -> evaluates cleanly.
-        publish_dataset(drop_all_hours_ago=40, run_id="gap-40h-all")
-        res_40h_all = self.review(identity)
-        self.assertEqual("evaluated", res_40h_all["status"], res_40h_all)
-        self.assertEqual("exit_review", res_40h_all["evaluation"]["outcome"])
-
-        # 4) Gap INSIDE 35-hour warmup (20 hours ago) -> strictly blocked.
-        publish_dataset(drop_all_hours_ago=20, run_id="gap-20h-warmup")
-        self.assertEqual("data_blocked", self.review(identity)["status"])
-
-        # 5) Gap INSIDE post-confirmation review window -> strictly blocked.
-        publish_dataset(drop_15m_hours_ago=1, run_id="gap-review")
-        self.assertEqual("data_blocked", self.review(identity)["status"])
-
-        # 6) Pre-warmup gap combined with tampered 15m file -> hash mismatch strictly blocked.
-        publish_dataset(drop_15m_hours_ago=40, run_id="gap-40h-tampered", tamper_15m=True)
-        self.assertEqual("data_blocked", self.review(identity)["status"])
-
-        # 7) Pre-warmup gap combined with stale evaluation clock -> freshness strictly blocked.
-        publish_dataset(drop_15m_hours_ago=40, run_id="gap-40h-stale")
-        self.assertEqual("data_blocked", self.review(identity, at=end + 24 * 4 * BAR_MS)["status"])
+        # Advancing clock past freshness SLA strictly blocks the same generation.
+        stale = self.review(identity, at=end + 2 * 3_600_000)
+        self.assertEqual("data_blocked", stale["status"])
 
     def test_programming_bugs_propagate_instead_of_masking_as_data_blocked(self):
         identity = self.ready()

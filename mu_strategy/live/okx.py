@@ -12,7 +12,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mu_strategy.execution.instruments import OKXInstrumentSpec
-from mu_strategy.market_data.http_pool import ProxyTarget, resolve_proxy
+from mu_strategy.market_data.http_pool import ProxyTarget, resolve_proxy, validate_proxy_for_target
 
 
 OKX_BASE_URL = "https://www.okx.com"
@@ -143,6 +142,7 @@ class _PooledHTTPTransport:
             proxy = resolve_proxy(scheme, host, port)
         else:
             scheme, host, port, timeout, proxy = key
+        validate_proxy_for_target(scheme, proxy if isinstance(proxy, ProxyTarget) else None)
         if scheme == "https":
             context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
             if isinstance(proxy, ProxyTarget):
@@ -219,32 +219,7 @@ class _PooledHTTPTransport:
             request_headers["Connection"] = "keep-alive"
 
         proxy = resolve_proxy(scheme, host, parsed.port)
-        if proxy is not None and proxy.scheme not in {"http", "https"}:
-            ssl_context = (
-                self.ssl_context
-                if self.ssl_context is not None
-                else (_default_ssl_context() if scheme == "https" else None)
-            )
-            for attempt in range(1, max_attempts + 1):
-                req = urllib.request.Request(url, data=encoded_body, headers=request_headers, method=method_upper)
-                try:
-                    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
-                        return json.loads(resp.read().decode("utf-8"))
-                except urllib.error.HTTPError as exc:
-                    raw_body = exc.read() if exc.fp is not None else b""
-                    retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
-                    error = _decode_http_error(exc.code, raw_body, url=url)
-                    if idempotent and (exc.code in _RETRYABLE_GET_STATUSES or 500 <= exc.code < 600) and attempt < max_attempts:
-                        delay = _parse_retry_after(retry_after)
-                        self.sleeper(delay if delay is not None else self.backoff_seconds * attempt)
-                        continue
-                    raise error from exc
-                except (OSError, http.client.HTTPException, urllib.error.URLError):
-                    if not idempotent or attempt >= max_attempts:
-                        raise
-                    self.sleeper(self.backoff_seconds * attempt)
-                    continue
-            raise RuntimeError("unreachable")
+        validate_proxy_for_target(scheme, proxy)
 
         if scheme == "http" and proxy is not None:
             host_part = f"[{host}]" if ":" in host else host

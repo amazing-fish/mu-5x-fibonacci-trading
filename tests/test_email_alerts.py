@@ -1235,11 +1235,11 @@ class EmailAlertsTests(unittest.TestCase):
     def test_duplicate_json_fields_and_missing_log_at_cursor_are_rejected(self):
         self.publish()
         path = self.alerts.observations.path
-        original = path.read_text(encoding="utf-8")
-        path.write_text(original.replace('"schema_version":2', '"schema_version":2,"schema_version":2', 1), encoding="utf-8")
+        original = path.read_bytes()
+        path.write_bytes(original.replace(b'"schema_version":2', b'"schema_version":2,"schema_version":2', 1))
         with self.assertRaises(ObservationCorruptionError):
             self.alerts.collect()
-        path.write_text(original, encoding="utf-8")
+        path.write_bytes(original)
         self.alerts.collect()
         path.unlink()
         with self.assertRaises(ObservationCorruptionError):

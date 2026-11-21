@@ -392,6 +392,21 @@ def _result_for_recent_signal(
                 signal_time_ms=signal_candle.open_time_ms,
                 decision_code=execution.decision_code,
             )
+        if not is_preferred_us_cash_window(prospective.open_time_ms, config):
+            return EntryScanResult(
+                symbol=symbol,
+                action="wait",
+                reason="next execution candle is outside configured trading window",
+                last_close=last_candle.close,
+                regime_1h=regime,
+                rsi14=rsi14,
+                macd_hist=macd_hist,
+                macd_hist_prev=macd_hist_prev,
+                fib_level=fib_level,
+                fib_distance_pct=distance_pct,
+                signal_time_ms=signal_candle.open_time_ms,
+                decision_code=EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW,
+            )
         return EntryScanResult(
             symbol=symbol,
             action="wait",
@@ -488,12 +503,16 @@ def _latest_recent_signal(
     lookback_bars: int,
 ) -> tuple[int, Candle, float, float | None] | None:
     start = max(1, len(candles) - max(1, lookback_bars))
-    indices = (
-        range(start, len(candles))
-        if config.entry_execution == "second_pullback"
-        else range(len(candles) - 1, start - 1, -1)
-    )
-    for index in indices:
+    if config.entry_execution == "second_pullback":
+        return _active_second_pullback_signal(
+            candles,
+            hourly_context,
+            rsi_values,
+            hist_values,
+            config=config,
+            min_signal_index=start,
+        )
+    for index in range(len(candles) - 1, start - 1, -1):
         candle = candles[index]
         if not is_preferred_us_cash_window(candle.open_time_ms, config):
             continue
@@ -512,27 +531,73 @@ def _latest_recent_signal(
         )
         if not entry_signal.allowed:
             continue
-        if config.entry_execution == "second_pullback":
-            if _second_pullback_signal_already_filled(candles, index, fib_level, config):
-                continue
         return (index, candle, fib_level, entry_signal.stop_price)
     return None
 
 
-def _second_pullback_signal_already_filled(
+def _active_second_pullback_signal(
     candles: list[Candle],
-    signal_index: int,
-    fib_level: float,
+    hourly_context: dict[int, str],
+    rsi_values: list[float],
+    hist_values: list[float],
+    *,
     config: StrategyConfig,
-) -> bool:
-    expires_index = min(len(candles) - 1, signal_index + config.second_pullback_wait_bars)
-    for index in range(signal_index + 1, expires_index + 1):
+    min_signal_index: int,
+) -> tuple[int, Candle, float, float | None] | None:
+    """Replay second-pullback order lifetimes so orders suppressed by an earlier active limit are never revived."""
+    # (signal_index, signal_candle, fib_level, stop_price, expires_index)
+    pending: tuple[int, Candle, float, float | None, int] | None = None
+    allowed_regimes = config.allowed_regimes
+    rsi_floor = config.rsi_floor
+    wait_bars = config.second_pullback_wait_bars
+
+    for index in range(1, len(candles)):
         candle = candles[index]
+        if pending is not None:
+            _, _, pending_fib, _, expires_index = pending
+            if index > expires_index:
+                pending = None
+            else:
+                if candle.low <= pending_fib and is_preferred_us_cash_window(candle.open_time_ms, config):
+                    pending = None
+                continue
+
         if not is_preferred_us_cash_window(candle.open_time_ms, config):
             continue
-        if candle.low <= fib_level:
-            return True
-    return False
+        regime = hourly_context.get(candle.open_time_ms, "yellow")
+        if regime not in allowed_regimes:
+            continue
+        rsi_val = _series_value(rsi_values, index)
+        if rsi_val < rsi_floor:
+            continue
+        hist_val = _series_value(hist_values, index)
+        previous_hist = _series_value(hist_values, max(0, index - 1))
+        if hist_val < previous_hist and hist_val < 0:
+            continue
+        fib_level = nearest_fib_retest_level(candles, index, config)
+        if fib_level is None:
+            continue
+        entry_signal = should_enter_long(
+            candle,
+            fib_level,
+            regime,
+            rsi_val,
+            hist_val,
+            previous_hist,
+            config,
+        )
+        if not entry_signal.allowed:
+            continue
+        pending = (index, candle, fib_level, entry_signal.stop_price, index + wait_bars)
+
+    if pending is None:
+        return None
+    sig_idx, sig_candle, fib_level, sig_stop, expires_index = pending
+    # The upcoming live bar is at index len(candles); an order whose expires_index < len(candles)
+    # already reached its final valid fill bar on candles[-1] and has expired.
+    if len(candles) > expires_index or sig_idx < min_signal_index:
+        return None
+    return (sig_idx, sig_candle, fib_level, sig_stop)
 
 
 def _effective_lookback_bars(config: StrategyConfig, requested_lookback_bars: int) -> int:

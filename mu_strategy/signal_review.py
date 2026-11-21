@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import re
 import sqlite3
 import threading
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -14,7 +15,13 @@ from mu_strategy.market_data.trusted_data.contracts import SystemClock
 from mu_strategy.manual_positions import ManualPositionLedger
 from mu_strategy.notifications.events import NotificationError
 from mu_strategy.notifications.store import NotificationStore
-from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError, canonical_payload_sha256
+from mu_strategy.observations import (
+    JsonlObservationRepository,
+    ObservationCorruptionError,
+    _INDEX_ENTRY_BYTES,
+    _unpack_index_entry,
+    canonical_payload_sha256,
+)
 from mu_strategy.core.trading_calendar import trading_window_schedule
 from mu_strategy.strategies.registry import baseline_strategy_group, selected_strategy_groups
 from mu_strategy.service_health import HealthStateError, HealthStore, health_view
@@ -49,13 +56,247 @@ def _source(state: str, at_ms: int, message: str, **extra) -> dict:
     return {"state": state, "read_at_ms": at_ms, "message": message, **extra}
 
 
-def _tail_fingerprint(path: Path, size: int) -> bytes:
-    if size <= 0:
-        return b""
-    read_len = min(64, size)
+def _file_content_digest(path: Path) -> bytes:
     with path.open("rb") as handle:
-        handle.seek(size - read_len)
-        return handle.read(read_len)
+        return hashlib.file_digest(handle, "blake2b").digest()
+
+
+def _scan_indexed_evidence(
+    repository: JsonlObservationRepository,
+    *,
+    total_count: int,
+    commit_offset: int,
+    evidence_key: tuple[str, str],
+) -> tuple[object | None, int]:
+    """Validate index integrity and cycle-ID uniqueness across all entries before resolving evidence_key."""
+    target_cycle_id, target_obs_id = evidence_key
+    target_id_hash16 = hashlib.sha256(target_cycle_id.encode("utf-8")).digest()[:16]
+    id_to_first: dict[bytes, tuple[bytes, int, int]] = {}
+    matching_spans: list[tuple[int, int]] = []
+    chunk_entries = 1024
+    expected_offset = 0
+    expected_prefix_max: int | None = None
+    with repository.index_path.open("rb") as index_handle, repository.path.open("rb") as log_handle:
+        remaining = total_count
+        while remaining > 0:
+            take = min(remaining, chunk_entries)
+            raw = index_handle.read(take * _INDEX_ENTRY_BYTES)
+            if len(raw) != take * _INDEX_ENTRY_BYTES:
+                raise ObservationCorruptionError("truncated observation index")
+            mv = memoryview(raw)
+            for idx in range(take):
+                entry = _unpack_index_entry(mv[idx * _INDEX_ENTRY_BYTES : (idx + 1) * _INDEX_ENTRY_BYTES].tobytes())
+                if entry.offset != expected_offset or entry.length <= 0:
+                    raise ObservationCorruptionError("observation index offset discontinuity")
+                expected_offset += entry.length
+                expected_prefix_max = (
+                    entry.created_at_ms
+                    if expected_prefix_max is None
+                    else max(expected_prefix_max, entry.created_at_ms)
+                )
+                if entry.prefix_max_created_at_ms != expected_prefix_max:
+                    raise ObservationCorruptionError("observation index prefix_max corrupted")
+                first = id_to_first.get(entry.cycle_id_hash16)
+                if first is None:
+                    id_to_first[entry.cycle_id_hash16] = (entry.content_hash16, entry.offset, entry.length)
+                elif first[0] != entry.content_hash16:
+                    c1, d1 = repository.read_cycle_at(log_handle, offset=first[1], length=first[2])
+                    c2, d2 = repository.read_cycle_at(log_handle, offset=entry.offset, length=entry.length)
+                    if c1.cycle_id == c2.cycle_id and d1 != d2:
+                        raise ObservationCorruptionError("cycle identity conflicts")
+                if entry.cycle_id_hash16 == target_id_hash16:
+                    matching_spans.append((entry.offset, entry.length))
+            remaining -= take
+        if expected_offset != commit_offset:
+            raise ObservationCorruptionError("observation index end disagrees with commit boundary")
+
+        target_digest: str | None = None
+        evidence_obs = None
+        for offset, length in matching_spans:
+            cycle, digest = repository.read_cycle_at(log_handle, offset=offset, length=length)
+            if cycle.cycle_id != target_cycle_id:
+                continue
+            if target_digest is not None and target_digest != digest:
+                raise ObservationCorruptionError("cycle identity conflicts")
+            target_digest = digest
+            if evidence_obs is None:
+                for observation in cycle.observations:
+                    if observation.observation_id == target_obs_id:
+                        evidence_obs = observation
+                        break
+        return evidence_obs, len(matching_spans)
+
+
+def _scan_indexed_window(
+    repository: JsonlObservationRepository,
+    *,
+    total_count: int,
+    commit_offset: int,
+    window: dict,
+    display_limit: int,
+    scan_limit: int,
+) -> tuple[bool, deque, dict, dict, Counter, int, int, int, int, int | None, int | None]:
+    """Use monotonic prefix_max_created_at_ms coverage index when total_count exceeds scan_limit."""
+    with repository.index_path.open("rb") as index_handle, repository.path.open("rb") as log_handle:
+        first_in_window = repository.find_first_index_with_prefix_max_ge(index_handle, total_count, window["start_ms"])
+        start_idx = min(first_in_window, total_count - 1) if total_count > 0 else 0
+        window_covered = (total_count - start_idx) <= scan_limit
+        if not window_covered:
+            start_idx = total_count - scan_limit
+        complete = window_covered
+
+        suffix_count = total_count - start_idx
+        index_handle.seek(start_idx * _INDEX_ENTRY_BYTES)
+        suffix_raw = index_handle.read(suffix_count * _INDEX_ENTRY_BYTES)
+        if len(suffix_raw) != suffix_count * _INDEX_ENTRY_BYTES:
+            raise ObservationCorruptionError("truncated observation index")
+        suffix_entries = [
+            _unpack_index_entry(suffix_raw[i * _INDEX_ENTRY_BYTES : (i + 1) * _INDEX_ENTRY_BYTES])
+            for i in range(suffix_count)
+        ]
+
+        suffix_id_hashes = {entry.cycle_id_hash16 for entry in suffix_entries}
+        prefix_matches: dict[bytes, list[tuple[int, int, bytes]]] = {}
+        prefix_first_by_id: dict[bytes, tuple[bytes, int, int]] = {}
+        last_distinct_prefix_entry = None
+        expected_offset = 0
+        expected_prefix_max: int | None = None
+        if start_idx > 0:
+            index_handle.seek(0)
+            chunk_entries = 1024
+            remaining = start_idx
+            while remaining > 0:
+                take = min(remaining, chunk_entries)
+                raw = index_handle.read(take * _INDEX_ENTRY_BYTES)
+                if len(raw) != take * _INDEX_ENTRY_BYTES:
+                    raise ObservationCorruptionError("truncated observation index")
+                mv = memoryview(raw)
+                for idx in range(take):
+                    entry = _unpack_index_entry(mv[idx * _INDEX_ENTRY_BYTES : (idx + 1) * _INDEX_ENTRY_BYTES].tobytes())
+                    if entry.offset != expected_offset or entry.length <= 0:
+                        raise ObservationCorruptionError("observation index offset discontinuity")
+                    expected_offset += entry.length
+                    expected_prefix_max = (
+                        entry.created_at_ms
+                        if expected_prefix_max is None
+                        else max(expected_prefix_max, entry.created_at_ms)
+                    )
+                    if entry.prefix_max_created_at_ms != expected_prefix_max:
+                        raise ObservationCorruptionError("observation index prefix_max corrupted")
+                    first = prefix_first_by_id.get(entry.cycle_id_hash16)
+                    if first is None:
+                        prefix_first_by_id[entry.cycle_id_hash16] = (entry.content_hash16, entry.offset, entry.length)
+                        last_distinct_prefix_entry = entry
+                    elif first[0] != entry.content_hash16:
+                        c1, d1 = repository.read_cycle_at(log_handle, offset=first[1], length=first[2])
+                        c2, d2 = repository.read_cycle_at(log_handle, offset=entry.offset, length=entry.length)
+                        if c1.cycle_id == c2.cycle_id and d1 != d2:
+                            raise ObservationCorruptionError("cycle identity conflicts")
+                    if entry.cycle_id_hash16 in suffix_id_hashes:
+                        prefix_matches.setdefault(entry.cycle_id_hash16, []).append(
+                            (entry.offset, entry.length, entry.content_hash16)
+                        )
+                remaining -= take
+
+        counts = Counter()
+        rows: deque = deque(maxlen=display_limit)
+        latest_obs: dict = {}
+        latest_all_obs: dict = {}
+        seen: dict[str, str] = {}
+        total_cycles = total_observations = duplicates = read_cycles = 0
+        first_at = last_at = None
+
+        for entry in suffix_entries:
+            if entry.offset != expected_offset or entry.length <= 0:
+                raise ObservationCorruptionError("observation index offset discontinuity")
+            expected_offset += entry.length
+            expected_prefix_max = (
+                entry.created_at_ms
+                if expected_prefix_max is None
+                else max(expected_prefix_max, entry.created_at_ms)
+            )
+            if entry.prefix_max_created_at_ms != expected_prefix_max:
+                raise ObservationCorruptionError("observation index prefix_max corrupted")
+
+            read_cycles += 1
+            cycle, digest = repository.read_cycle_at(log_handle, offset=entry.offset, length=entry.length)
+            if (
+                cycle.created_at_ms != entry.created_at_ms
+                or hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16] != entry.cycle_id_hash16
+                or bytes.fromhex(digest)[:16] != entry.content_hash16
+            ):
+                raise ObservationCorruptionError("observation index disagrees with log")
+
+            if entry.cycle_id_hash16 in prefix_matches:
+                replayed_from_prefix = False
+                for p_offset, p_length, _ in prefix_matches[entry.cycle_id_hash16]:
+                    p_cycle, p_digest = repository.read_cycle_at(log_handle, offset=p_offset, length=p_length)
+                    if p_cycle.cycle_id != cycle.cycle_id:
+                        continue
+                    if p_digest != digest:
+                        raise ObservationCorruptionError("cycle identity conflicts")
+                    replayed_from_prefix = True
+                    seen[cycle.cycle_id] = digest
+                if replayed_from_prefix:
+                    duplicates += 1
+                    continue
+
+            previous_digest = seen.get(cycle.cycle_id)
+            if previous_digest is not None:
+                if previous_digest != digest:
+                    raise ObservationCorruptionError("cycle identity conflicts")
+                duplicates += 1
+                continue
+            seen[cycle.cycle_id] = digest
+
+            for observation in cycle.observations:
+                latest_all_obs[observation.symbol] = observation
+
+            if cycle.created_at_ms < window["start_ms"] or cycle.created_at_ms >= window["end_ms"]:
+                continue
+
+            total_cycles += 1
+            first_at = cycle.created_at_ms if first_at is None else min(first_at, cycle.created_at_ms)
+            last_at = cycle.created_at_ms if last_at is None else max(last_at, cycle.created_at_ms)
+            for observation in cycle.observations:
+                counts[observation.outcome.value] += 1
+                total_observations += 1
+                latest_obs[observation.symbol] = observation
+                rows.append(observation)
+
+        if expected_offset != commit_offset:
+            raise ObservationCorruptionError("observation index end disagrees with commit boundary")
+
+        # If every suffix entry was an exact replay of a prefix cycle, resolve the latest distinct
+        # cycle from the prefix so current_conclusions stays anchored on the newest distinct cycle.
+        if not latest_all_obs and last_distinct_prefix_entry is not None:
+            cycle, digest = repository.read_cycle_at(
+                log_handle,
+                offset=last_distinct_prefix_entry.offset,
+                length=last_distinct_prefix_entry.length,
+            )
+            if (
+                cycle.created_at_ms != last_distinct_prefix_entry.created_at_ms
+                or hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16] != last_distinct_prefix_entry.cycle_id_hash16
+                or bytes.fromhex(digest)[:16] != last_distinct_prefix_entry.content_hash16
+            ):
+                raise ObservationCorruptionError("observation index disagrees with log")
+            for observation in cycle.observations:
+                latest_all_obs[observation.symbol] = observation
+
+        return (
+            complete,
+            rows,
+            latest_obs,
+            latest_all_obs,
+            counts,
+            total_cycles,
+            total_observations,
+            duplicates,
+            read_cycles,
+            first_at,
+            last_at,
+        )
 
 
 def _read_observations(path: Path, window: dict, *, clock, display_limit: int, scan_limit: int, evidence_key=None) -> dict:
@@ -64,15 +305,17 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
         while True:
             locked = False
             counts = Counter()
-            rows_rev = []
+            rows: deque = deque(maxlen=display_limit)
             latest_obs, latest_all_obs, evidence_obs = {}, {}, None
-            seen = {}
+            seen: dict[str, str] = {}
             total_cycles = total_observations = duplicates = read_cycles = 0
             first_at = last_at = None
+            complete = True
             try:
                 with repository.read_fence() as locked:
                     if repository.invalid_marker_path.exists():
                         raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+                    commit = repository.read_commit_state()
                     try:
                         stat = path.stat()
                     except FileNotFoundError:
@@ -80,14 +323,18 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                             raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
                         if not locked and repository.lock_path.exists():
                             continue
+                        if commit is not None and commit.offset > 0:
+                            raise ObservationCorruptionError("observation log missing before durable commit boundary")
                         return _source("missing", clock.now_ms(), "尚无扫描日志。")
                     initial_bytes = stat.st_size
+                    if commit is not None and initial_bytes != commit.offset:
+                        raise ObservationCorruptionError("observation log size disagrees with durable commit boundary")
+                    content_digest = _file_content_digest(path)
                     cache_key = (
                         str(path.resolve()),
                         initial_bytes,
-                        stat.st_mtime_ns,
-                        stat.st_ino,
-                        _tail_fingerprint(path, initial_bytes),
+                        content_digest,
+                        commit.chain_sha256 if commit is not None else None,
                         window["start_ms"],
                         window["end_ms"],
                         display_limit,
@@ -103,52 +350,86 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                                 result["read_at_ms"] = clock.now_ms()
                                 return result
 
-                    complete = True
-                    tail = repository.iter_tail_cycles()
-                    try:
-                        for cycle in tail:
-                            if read_cycles >= scan_limit:
-                                complete = False
-                                break
-                            read_cycles += 1
-                            previous = seen.get(cycle.cycle_id)
-                            if previous is not None:
-                                if previous != cycle:
-                                    raise ObservationCorruptionError("cycle identity conflicts")
-                                duplicates += 1
-                                continue
-                            seen[cycle.cycle_id] = cycle
+                    index_available = (
+                        commit is not None
+                        and commit.seq > 0
+                        and repository.index_path.exists()
+                        and repository.index_path.stat().st_size == commit.index_offset
+                        and commit.index_offset == commit.seq * _INDEX_ENTRY_BYTES
+                    )
 
-                            for observation in reversed(cycle.observations):
-                                if observation.symbol not in latest_all_obs:
-                                    latest_all_obs[observation.symbol] = observation
-                                if evidence_key is not None and evidence_obs is None and (cycle.cycle_id, observation.observation_id) == evidence_key:
-                                    evidence_obs = observation
-
-                            if evidence_key is not None:
-                                if evidence_obs is not None:
+                    if evidence_key is not None and index_available and commit.seq > scan_limit:
+                        evidence_obs, read_cycles = _scan_indexed_evidence(
+                            repository,
+                            total_count=commit.seq,
+                            commit_offset=commit.offset,
+                            evidence_key=evidence_key,
+                        )
+                        complete = True
+                    elif evidence_key is None and index_available and commit.seq > scan_limit:
+                        (
+                            complete,
+                            rows,
+                            latest_obs,
+                            latest_all_obs,
+                            counts,
+                            total_cycles,
+                            total_observations,
+                            duplicates,
+                            read_cycles,
+                            first_at,
+                            last_at,
+                        ) = _scan_indexed_window(
+                            repository,
+                            total_count=commit.seq,
+                            commit_offset=commit.offset,
+                            window=window,
+                            display_limit=display_limit,
+                            scan_limit=scan_limit,
+                        )
+                    else:
+                        stream = repository.iter_forward_cycles()
+                        try:
+                            for _, _, cycle, digest in stream:
+                                if read_cycles >= scan_limit:
+                                    complete = False
                                     break
-                                continue
+                                read_cycles += 1
+                                previous_digest = seen.get(cycle.cycle_id)
+                                if previous_digest is not None:
+                                    if previous_digest != digest:
+                                        raise ObservationCorruptionError("cycle identity conflicts")
+                                    duplicates += 1
+                                    continue
+                                seen[cycle.cycle_id] = digest
 
-                            # Repository does not enforce monotonic timestamps (clock rollbacks are valid),
-                            # so continue scanning past older records up to scan_limit rather than breaking early.
-                            if cycle.created_at_ms < window["start_ms"] or cycle.created_at_ms >= window["end_ms"]:
-                                continue
+                                if evidence_key is not None:
+                                    if evidence_obs is None and cycle.cycle_id == evidence_key[0]:
+                                        for observation in cycle.observations:
+                                            if observation.observation_id == evidence_key[1]:
+                                                evidence_obs = observation
+                                                break
+                                    # Continue validating remaining records for conflicting cycle IDs.
+                                    continue
 
-                            total_cycles += 1
-                            first_at = cycle.created_at_ms if first_at is None else min(first_at, cycle.created_at_ms)
-                            last_at = cycle.created_at_ms if last_at is None else max(last_at, cycle.created_at_ms)
-                            for observation in reversed(cycle.observations):
-                                counts[observation.outcome.value] += 1
-                                total_observations += 1
-                                if observation.symbol not in latest_obs:
+                                for observation in cycle.observations:
+                                    latest_all_obs[observation.symbol] = observation
+
+                                if cycle.created_at_ms < window["start_ms"] or cycle.created_at_ms >= window["end_ms"]:
+                                    continue
+
+                                total_cycles += 1
+                                first_at = cycle.created_at_ms if first_at is None else min(first_at, cycle.created_at_ms)
+                                last_at = cycle.created_at_ms if last_at is None else max(last_at, cycle.created_at_ms)
+                                for observation in cycle.observations:
+                                    counts[observation.outcome.value] += 1
+                                    total_observations += 1
                                     latest_obs[observation.symbol] = observation
-                                if len(rows_rev) < display_limit:
-                                    rows_rev.append(observation)
-                    finally:
-                        close_tail = getattr(tail, "close", None)
-                        if close_tail is not None:
-                            close_tail()
+                                    rows.append(observation)
+                        finally:
+                            close_stream = getattr(stream, "close", None)
+                            if close_stream is not None:
+                                close_stream()
 
                     if repository.invalid_marker_path.exists():
                         raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
@@ -175,10 +456,10 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                 "ok" if complete else "incomplete", clock.now_ms(),
                 "已读取扫描日志。" if complete else
                 "达到扫描读取上限；以下只是已读取部分，不能代表完整观察窗口。",
-                records=[_payload(item) for item in reversed(rows_rev)],
-                latest=[_payload(item) for item in reversed(list(latest_obs.values()))],
-                latest_all=[_payload(item) for item in reversed(list(latest_all_obs.values()))],
-                evidence=_payload(evidence_obs) if evidence_obs is not None else None,
+                records=[_payload(item) for item in rows],
+                latest=[_payload(item) for item in latest_obs.values()],
+                latest_all=[_payload(item) for item in latest_all_obs.values()],
+                evidence=_payload(evidence_obs) if (complete and evidence_obs is not None) else None,
                 counts=dict(counts),
                 total_cycles=total_cycles, total_observations=total_observations,
                 duplicate_cycles=duplicates, scanned_cycles=read_cycles, read_through_byte=initial_bytes,

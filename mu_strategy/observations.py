@@ -5,7 +5,9 @@ import json
 import math
 import os
 import re
-import threading
+import shutil
+import struct
+import uuid
 from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum, unique
@@ -442,9 +444,125 @@ def _decode_cycle_bytes(raw: bytes, *, strict_unique: bool = True) -> Stage0Obse
         raise ObservationCorruptionError(f"invalid observation record: {type(exc).__name__}") from exc
 
 
-_PENDING_SYNC_LOCK = threading.Lock()
-_PENDING_CREATED_DIRS: dict[Path, list[Path]] = {}
-_PENDING_PARENT_SYNC: set[Path] = set()
+_COMMIT_SLOT_BYTES = 160
+_INDEX_ENTRY_STRUCT = struct.Struct("<QQQq16s16s")
+_INDEX_ENTRY_BYTES = _INDEX_ENTRY_STRUCT.size
+_ZERO_CHAIN_SHA256 = "0" * 64
+
+
+@dataclass(frozen=True)
+class ObservationCommitState:
+    seq: int
+    offset: int
+    index_offset: int
+    prefix_max_created_at_ms: int
+    chain_sha256: str
+
+
+@dataclass(frozen=True)
+class ObservationIndexEntry:
+    offset: int
+    length: int
+    created_at_ms: int
+    prefix_max_created_at_ms: int
+    cycle_id_hash16: bytes
+    content_hash16: bytes
+
+
+def _write_all(handle, payload: bytes) -> None:
+    written = 0
+    view = memoryview(payload)
+    while written < len(payload):
+        chunk = handle.write(view[written:])
+        if chunk is None or chunk <= 0:
+            raise OSError(f"short observation write: {written}/{len(payload)} bytes")
+        written += chunk
+
+
+def _encode_commit_slot(state: ObservationCommitState) -> bytes:
+    payload = (
+        f"v1 {state.seq} {state.offset} {state.index_offset} "
+        f"{state.prefix_max_created_at_ms} {state.chain_sha256}"
+    )
+    tag = hashlib.sha256(payload.encode("ascii")).hexdigest()[:16]
+    line = f"{payload} {tag}"
+    if len(line) >= _COMMIT_SLOT_BYTES:
+        raise OSError("observation commit slot overflow")
+    return (line.ljust(_COMMIT_SLOT_BYTES - 1) + "\n").encode("ascii")
+
+
+def _decode_commit_slot(raw: bytes) -> ObservationCommitState | None:
+    if len(raw) != _COMMIT_SLOT_BYTES or not raw.endswith(b"\n"):
+        return None
+    try:
+        parts = raw.decode("ascii").strip().split()
+    except UnicodeDecodeError:
+        return None
+    if len(parts) != 7 or parts[0] != "v1":
+        return None
+    try:
+        seq = int(parts[1])
+        offset = int(parts[2])
+        index_offset = int(parts[3])
+        prefix_max = int(parts[4])
+    except ValueError:
+        return None
+    chain_sha256 = parts[5]
+    tag = parts[6]
+    if (
+        seq < 0
+        or offset < 0
+        or index_offset < 0
+        or index_offset != seq * _INDEX_ENTRY_BYTES
+        or (seq == 0 and (offset != 0 or prefix_max != -1))
+        or (seq > 0 and prefix_max < 0)
+        or not _SHA256_PATTERN.fullmatch(chain_sha256)
+    ):
+        return None
+    payload = f"v1 {seq} {offset} {index_offset} {prefix_max} {chain_sha256}"
+    expected_tag = hashlib.sha256(payload.encode("ascii")).hexdigest()[:16]
+    if tag != expected_tag:
+        return None
+    return ObservationCommitState(
+        seq=seq,
+        offset=offset,
+        index_offset=index_offset,
+        prefix_max_created_at_ms=prefix_max,
+        chain_sha256=chain_sha256,
+    )
+
+
+def _pack_index_entry(
+    *,
+    offset: int,
+    length: int,
+    created_at_ms: int,
+    prefix_max_created_at_ms: int,
+    cycle_id_hash16: bytes,
+    content_hash16: bytes,
+) -> bytes:
+    return _INDEX_ENTRY_STRUCT.pack(
+        offset,
+        length,
+        created_at_ms,
+        prefix_max_created_at_ms,
+        cycle_id_hash16,
+        content_hash16,
+    )
+
+
+def _unpack_index_entry(raw: bytes) -> ObservationIndexEntry:
+    if len(raw) != _INDEX_ENTRY_BYTES:
+        raise ObservationCorruptionError("truncated observation index entry")
+    offset, length, created_at_ms, prefix_max, cycle_id_hash16, content_hash16 = _INDEX_ENTRY_STRUCT.unpack(raw)
+    return ObservationIndexEntry(
+        offset=offset,
+        length=length,
+        created_at_ms=created_at_ms,
+        prefix_max_created_at_ms=prefix_max,
+        cycle_id_hash16=cycle_id_hash16,
+        content_hash16=content_hash16,
+    )
 
 
 class _RetryLockedRead(Exception):
@@ -456,6 +574,9 @@ class JsonlObservationRepository:
         self.path = Path(path)
         self.invalid_marker_path = Path(f"{self.path}.invalid")
         self.lock_path = Path(f"{self.path}.lock")
+        self.commit_path = Path(f"{self.path}.commit")
+        self.index_path = Path(f"{self.path}.index")
+        self.dirsync_path = Path(f"{self.path}.dirsync")
 
     def publication_fence(
         self,
@@ -490,46 +611,184 @@ class JsonlObservationRepository:
             finally:
                 file_locks.unlock_file(stream)
 
+    def read_commit_state(self) -> ObservationCommitState | None:
+        """Read the highest valid slot from the 2-slot ping-pong commit file, or None if absent."""
+        try:
+            raw = self.commit_path.read_bytes()
+        except FileNotFoundError:
+            return None
+        if not raw or len(raw) > 2 * _COMMIT_SLOT_BYTES:
+            raise ObservationCorruptionError("corrupted observation commit boundary")
+        candidates: list[ObservationCommitState] = []
+        for slot_start in (0, _COMMIT_SLOT_BYTES):
+            chunk = raw[slot_start : slot_start + _COMMIT_SLOT_BYTES]
+            if len(chunk) == _COMMIT_SLOT_BYTES:
+                parsed = _decode_commit_slot(chunk)
+                if parsed is not None:
+                    candidates.append(parsed)
+        if not candidates:
+            raise ObservationCorruptionError("corrupted observation commit boundary")
+        return max(candidates, key=lambda item: item.seq)
+
+    @staticmethod
+    def read_index_entry(index_handle, index: int) -> ObservationIndexEntry:
+        index_handle.seek(index * _INDEX_ENTRY_BYTES)
+        return _unpack_index_entry(index_handle.read(_INDEX_ENTRY_BYTES))
+
+    @staticmethod
+    def find_first_index_with_prefix_max_ge(index_handle, count: int, target_ms: int) -> int:
+        """Binary search monotonic prefix_max_created_at_ms for the first entry >= target_ms."""
+        lo, hi = 0, count
+        while lo < hi:
+            mid = (lo + hi) // 2
+            entry = JsonlObservationRepository.read_index_entry(index_handle, mid)
+            if entry.prefix_max_created_at_ms < target_ms:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    @staticmethod
+    def read_cycle_at(handle, *, offset: int, length: int) -> tuple[Stage0ObservationCycle, str]:
+        """Read and decode a single record at an exact byte span, returning (cycle, canonical_sha256)."""
+        if length <= 0 or length > _MAX_RECORD_BYTES:
+            raise ObservationCorruptionError("observation record incomplete or oversized")
+        handle.seek(offset)
+        raw = handle.read(length)
+        if len(raw) != length or not raw.endswith(b"\n"):
+            raise ObservationCorruptionError("observation record incomplete or oversized")
+        cycle = _decode_cycle_bytes(raw)
+        return cycle, canonical_sha256(cycle.to_dict())
+
+    def iter_forward_cycles(self, *, start_offset: int = 0) -> Iterator[tuple[int, int, Stage0ObservationCycle, str]]:
+        """Yield validated (offset, length, cycle, canonical_sha256) tuples in publication order from start_offset."""
+        if type(start_offset) is not int or start_offset < 0:
+            raise ObservationCorruptionError("invalid start_offset")
+        while True:
+            locked = False
+            yielded_any = False
+            try:
+                with self.read_fence() as locked:
+                    self._reject_invalid_marker()
+                    commit = self.read_commit_state()
+                    try:
+                        handle = self.path.open("rb")
+                    except FileNotFoundError:
+                        self._reject_invalid_marker()
+                        if not locked and self.lock_path.exists():
+                            continue
+                        if start_offset or (commit is not None and commit.offset > 0):
+                            raise ObservationCorruptionError("observation log missing before durable commit boundary")
+                        return
+                    if not locked and self.lock_path.exists():
+                        handle.close()
+                        continue
+                    with handle:
+                        handle.seek(0, os.SEEK_END)
+                        file_size = handle.tell()
+                        if commit is not None and file_size < commit.offset:
+                            raise ObservationCorruptionError("observation log truncated before durable commit boundary")
+                        if commit is not None and file_size > commit.offset:
+                            raise ObservationCorruptionError("uncommitted observation bytes beyond durable commit boundary")
+                        if start_offset > file_size:
+                            raise ObservationCorruptionError("observation start_offset exceeds file size")
+                        handle.seek(start_offset)
+                        while True:
+                            pos = handle.tell()
+                            raw = handle.readline(_MAX_RECORD_BYTES + 1)
+                            if not raw:
+                                break
+                            if len(raw) > _MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                                raise ObservationCorruptionError("observation record incomplete or oversized")
+                            cycle = _decode_cycle_bytes(raw)
+                            digest = canonical_sha256(cycle.to_dict())
+                            if not yielded_any and not locked and self.lock_path.exists():
+                                raise _RetryLockedRead()
+                            yielded_any = True
+                            yield pos, len(raw), cycle, digest
+                    self._reject_invalid_marker()
+                    return
+            except _RetryLockedRead:
+                continue
+            except ObservationCorruptionError:
+                if not yielded_any and not locked and self.lock_path.exists():
+                    continue
+                raise
+            except OSError as exc:
+                raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
+
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")
+        if len(encoded) > _MAX_RECORD_BYTES:
+            raise ObservationWriteError(
+                f"observation cycle exceeds maximum record size ({len(encoded)} > {_MAX_RECORD_BYTES} bytes)"
+            )
         try:
-            created_directories = self._create_parent_directories()
-            if created_directories:
-                self._record_pending_created_directories(created_directories)
-                try:
-                    self._flush_pending_created_directories()
-                except OSError:
-                    self._rollback_empty_created_directories(created_directories)
-                    raise
+            self._ensure_parent_directories_staged()
             with self.publication_fence():
                 if self.invalid_marker_path.exists():
                     raise OSError("observation repository has an unresolved invalid marker")
-                self._flush_pending_created_directories()
-                log_existed = self.path.exists()
-                with self.path.open("ab", buffering=0) as handle:
-                    original_size = os.fstat(handle.fileno()).st_size
-                    need_parent_sync = (not log_existed) or original_size == 0 or self._has_pending_parent_sync()
-                    if need_parent_sync:
-                        self._mark_pending_parent_sync()
+                self._flush_dirsync_marker()
+                commit = self._ensure_storage_initialized()
+                cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
+                content_hash16 = hashlib.sha256(encoded[:-1]).digest()[:16]
+                new_prefix_max = (
+                    cycle.created_at_ms
+                    if commit.seq == 0
+                    else max(commit.prefix_max_created_at_ms, cycle.created_at_ms)
+                )
+                with self.path.open("ab", buffering=0) as log_handle, self.index_path.open("ab", buffering=0) as index_handle:
+                    original_size = os.fstat(log_handle.fileno()).st_size
+                    original_index_size = os.fstat(index_handle.fileno()).st_size
+                    if original_size != commit.offset or original_index_size != commit.index_offset:
+                        raise OSError("observation log size disagrees with durable commit boundary")
+                    index_entry = _pack_index_entry(
+                        offset=original_size,
+                        length=len(encoded),
+                        created_at_ms=cycle.created_at_ms,
+                        prefix_max_created_at_ms=new_prefix_max,
+                        cycle_id_hash16=cycle_id_hash16,
+                        content_hash16=content_hash16,
+                    )
+                    new_chain = hashlib.sha256(
+                        bytes.fromhex(commit.chain_sha256) + encoded + index_entry
+                    ).hexdigest()
+                    index_written = False
                     try:
-                        written = 0
-                        view = memoryview(encoded)
-                        while written < len(encoded):
-                            chunk = handle.write(view[written:])
-                            if chunk is None or chunk <= 0:
-                                raise OSError(f"short observation write: {written}/{len(encoded)} bytes")
-                            written += chunk
-                        os.fsync(handle.fileno())
-                        if need_parent_sync:
-                            self._fsync_parent_directory()
-                            self._clear_pending_parent_sync()
+                        _write_all(log_handle, encoded)
+                        os.fsync(log_handle.fileno())
+                        index_written = True
+                        _write_all(index_handle, index_entry)
+                        os.fsync(index_handle.fileno())
                     except BaseException:
+                        rollback_ok = True
                         try:
-                            handle.truncate(original_size)
+                            log_handle.truncate(original_size)
+                            os.fsync(log_handle.fileno())
                         except OSError:
+                            rollback_ok = False
+                        if index_written:
+                            try:
+                                index_handle.truncate(original_index_size)
+                                os.fsync(index_handle.fileno())
+                            except OSError:
+                                rollback_ok = False
+                        if not rollback_ok:
                             self._quarantine_invalid_marker(cycle.cycle_id)
                         raise
-        except OSError as exc:
+                next_commit = ObservationCommitState(
+                    seq=commit.seq + 1,
+                    offset=original_size + len(encoded),
+                    index_offset=original_index_size + _INDEX_ENTRY_BYTES,
+                    prefix_max_created_at_ms=new_prefix_max,
+                    chain_sha256=new_chain,
+                )
+                try:
+                    self._write_commit_slot(next_commit)
+                except BaseException:
+                    self._quarantine_invalid_marker(cycle.cycle_id)
+                    raise
+        except (OSError, ObservationCorruptionError) as exc:
             raise ObservationWriteError(f"observation cycle write failed: {type(exc).__name__}: {exc}") from exc
 
     def read_cycles(self) -> tuple[Stage0ObservationCycle, ...]:
@@ -538,12 +797,15 @@ class JsonlObservationRepository:
             try:
                 with self.read_fence() as locked:
                     self._reject_invalid_marker()
+                    commit = self.read_commit_state()
                     try:
                         handle = self.path.open("rb")
                     except FileNotFoundError:
                         self._reject_invalid_marker()
                         if not locked and self.lock_path.exists():
                             continue
+                        if commit is not None and commit.offset > 0:
+                            raise ObservationCorruptionError("observation log missing before durable commit boundary")
                         return ()
                     cycles: list[Stage0ObservationCycle] = []
                     with handle:
@@ -554,11 +816,19 @@ class JsonlObservationRepository:
                                 )
                             try:
                                 payload = json.loads(raw_line.decode("utf-8"))
-                                cycles.append(Stage0ObservationCycle.from_dict(payload))
+                                cycle = Stage0ObservationCycle.from_dict(payload)
                             except (UnicodeDecodeError, json.JSONDecodeError, ObservationSchemaError, ValueError) as exc:
                                 raise ObservationCorruptionError(
                                     f"corrupted observation record at line {line_number}: {type(exc).__name__}"
                                 ) from exc
+                            if commit is not None and handle.tell() > commit.offset:
+                                raise ObservationCorruptionError(
+                                    f"corrupted observation record at line {line_number}: uncommitted trailing record"
+                                )
+                            cycles.append(cycle)
+                        final_pos = handle.tell()
+                    if commit is not None and final_pos != commit.offset:
+                        raise ObservationCorruptionError("observation log size disagrees with durable commit boundary")
                     self._reject_invalid_marker()
                     if not locked and self.lock_path.exists():
                         continue
@@ -589,6 +859,7 @@ class JsonlObservationRepository:
             try:
                 with self.read_fence() as locked:
                     self._reject_invalid_marker()
+                    commit = self.read_commit_state()
                     cursor = (offset, anchor_start, anchor_sha256)
                     try:
                         handle = self.path.open("rb")
@@ -596,11 +867,17 @@ class JsonlObservationRepository:
                         self._reject_invalid_marker()
                         if not locked and self.lock_path.exists():
                             continue
-                        if offset:
+                        if offset or (commit is not None and commit.offset > 0):
                             raise ObservationCorruptionError("observation log missing at persisted cursor")
                         return (), cursor
                     cycles = []
                     with handle:
+                        if commit is not None:
+                            file_size = self.path.stat().st_size
+                            if file_size < commit.offset:
+                                raise ObservationCorruptionError("observation log truncated before durable commit boundary")
+                            if file_size > commit.offset:
+                                raise ObservationCorruptionError("uncommitted observation bytes beyond durable commit boundary")
                         if offset:
                             handle.seek(anchor_start)
                             anchor = handle.readline(_MAX_RECORD_BYTES + 1)
@@ -643,12 +920,15 @@ class JsonlObservationRepository:
             try:
                 with self.read_fence() as locked:
                     self._reject_invalid_marker()
+                    commit = self.read_commit_state()
                     try:
                         handle = self.path.open("rb")
                     except FileNotFoundError:
                         self._reject_invalid_marker()
                         if not locked and self.lock_path.exists():
                             continue
+                        if commit is not None and commit.offset > 0:
+                            raise ObservationCorruptionError("observation log missing before durable commit boundary")
                         return
                     if not locked and self.lock_path.exists():
                         handle.close()
@@ -657,6 +937,27 @@ class JsonlObservationRepository:
                     with handle:
                         handle.seek(0, os.SEEK_END)
                         pos = handle.tell()
+                        if commit is not None and pos < commit.offset:
+                            raise ObservationCorruptionError("observation log truncated before durable commit boundary")
+                        if commit is not None and pos > commit.offset:
+                            # Validate affected trailing record(s) first so corrupt/duplicate fields surface
+                            # their specific diagnostic, then fail closed without yielding uncommitted data.
+                            scan_from = commit.offset
+                            if scan_from > 0:
+                                handle.seek(scan_from - 1)
+                                if handle.read(1) != b"\n":
+                                    back_start = max(0, scan_from - _MAX_RECORD_BYTES)
+                                    handle.seek(back_start)
+                                    prefix_chunk = handle.read(scan_from - back_start)
+                                    nl_pos = prefix_chunk.rfind(b"\n")
+                                    scan_from = back_start + nl_pos + 1 if nl_pos >= 0 else back_start
+                            handle.seek(scan_from)
+                            trailing = handle.read(_MAX_RECORD_BYTES + 1)
+                            if not trailing.endswith(b"\n") or len(trailing) > _MAX_RECORD_BYTES:
+                                raise ObservationCorruptionError("observation record incomplete or oversized")
+                            for line in trailing.splitlines():
+                                _decode_cycle_bytes(line)
+                            raise ObservationCorruptionError("uncommitted observation bytes beyond durable commit boundary")
                         if pos == 0:
                             self._reject_invalid_marker()
                             if not locked and self.lock_path.exists():
@@ -737,7 +1038,7 @@ class JsonlObservationRepository:
             raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
 
     def _quarantine_invalid_marker(self, cycle_id: str) -> None:
-        """Write an invalid marker only when write rollback cannot restore the committed boundary."""
+        """Write an invalid marker only when write rollback or commit advancement fails ambiguously."""
         try:
             with self.invalid_marker_path.open("wb") as marker:
                 marker.write(cycle_id.encode("utf-8"))
@@ -753,83 +1054,157 @@ class JsonlObservationRepository:
         except OSError:
             pass
 
-    def _sync_key(self) -> Path:
-        return self.path.resolve()
+    def _write_commit_slot(self, state: ObservationCommitState) -> None:
+        slot_bytes = _encode_commit_slot(state)
+        slot_offset = (state.seq % 2) * _COMMIT_SLOT_BYTES
+        mode = "r+b" if self.commit_path.exists() else "w+b"
+        with self.commit_path.open(mode, buffering=0) as commit_handle:
+            commit_handle.seek(slot_offset)
+            _write_all(commit_handle, slot_bytes)
+            os.fsync(commit_handle.fileno())
 
-    def _record_pending_created_directories(self, created_directories: tuple[Path, ...]) -> None:
-        key = self._sync_key()
-        with _PENDING_SYNC_LOCK:
-            pending = _PENDING_CREATED_DIRS.setdefault(key, [])
-            for directory in created_directories:
-                if directory not in pending:
-                    pending.append(directory)
+    def _ensure_storage_initialized(self) -> ObservationCommitState:
+        """Initialize durable commit + coverage index on initial log creation or legacy bootstrap."""
+        log_exists = self.path.exists()
+        log_size = self.path.stat().st_size if log_exists else 0
+        commit_exists = self.commit_path.exists()
+        index_exists = self.index_path.exists()
 
-    def _flush_pending_created_directories(self) -> None:
-        key = self._sync_key()
-        while True:
-            with _PENDING_SYNC_LOCK:
-                pending = _PENDING_CREATED_DIRS.get(key)
-                if not pending:
-                    _PENDING_CREATED_DIRS.pop(key, None)
-                    return
-                directory = pending[0]
-            _fsync_directory(directory.parent)
-            with _PENDING_SYNC_LOCK:
-                pending = _PENDING_CREATED_DIRS.get(key)
-                if pending and directory in pending:
-                    pending.remove(directory)
-                    if not pending:
-                        _PENDING_CREATED_DIRS.pop(key, None)
+        if log_size == 0:
+            if commit_exists:
+                existing = self.read_commit_state()
+                if existing is not None and existing.offset > 0:
+                    raise OSError("observation log truncated before durable commit boundary")
+            initial = ObservationCommitState(
+                seq=0,
+                offset=0,
+                index_offset=0,
+                prefix_max_created_at_ms=-1,
+                chain_sha256=_ZERO_CHAIN_SHA256,
+            )
+            self._write_commit_slot(initial)
+            if not log_exists:
+                self.path.open("ab").close()
+            if not index_exists or self.index_path.stat().st_size != 0:
+                with self.index_path.open("wb", buffering=0) as idx:
+                    os.fsync(idx.fileno())
+            self._fsync_parent_directory()
+            return initial
 
-    def _rollback_empty_created_directories(self, created_directories: tuple[Path, ...]) -> None:
-        key = self._sync_key()
-        for directory in created_directories:
+        if not commit_exists and not index_exists:
+            return self._bootstrap_legacy_storage()
+
+        if not commit_exists or not index_exists:
+            raise OSError("observation commit boundary or index is missing for non-empty log")
+
+        commit = self.read_commit_state()
+        if commit is None:
+            raise OSError("observation commit boundary is unreadable")
+        return commit
+
+    def _bootstrap_legacy_storage(self) -> ObservationCommitState:
+        """Build durable commit and index files for a pre-existing legacy JSONL log."""
+        seq = 0
+        offset = 0
+        index_offset = 0
+        prefix_max = -1
+        chain = _ZERO_CHAIN_SHA256
+        index_chunks: list[bytes] = []
+        with self.path.open("rb") as handle:
+            while True:
+                start = handle.tell()
+                raw = handle.readline(_MAX_RECORD_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > _MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                    raise OSError("legacy observation record incomplete or oversized")
+                cycle = _decode_cycle_bytes(raw)
+                prefix_max = cycle.created_at_ms if seq == 0 else max(prefix_max, cycle.created_at_ms)
+                cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
+                content_hash16 = bytes.fromhex(canonical_sha256(cycle.to_dict()))[:16]
+                entry = _pack_index_entry(
+                    offset=start,
+                    length=len(raw),
+                    created_at_ms=cycle.created_at_ms,
+                    prefix_max_created_at_ms=prefix_max,
+                    cycle_id_hash16=cycle_id_hash16,
+                    content_hash16=content_hash16,
+                )
+                index_chunks.append(entry)
+                chain = hashlib.sha256(bytes.fromhex(chain) + raw + entry).hexdigest()
+                seq += 1
+                offset = handle.tell()
+                index_offset += _INDEX_ENTRY_BYTES
+        with self.index_path.open("wb", buffering=0) as idx_handle:
+            if index_chunks:
+                _write_all(idx_handle, b"".join(index_chunks))
+            os.fsync(idx_handle.fileno())
+        state = ObservationCommitState(
+            seq=seq,
+            offset=offset,
+            index_offset=index_offset,
+            prefix_max_created_at_ms=prefix_max,
+            chain_sha256=chain,
+        )
+        self._write_commit_slot(state)
+        self._fsync_parent_directory()
+        return state
+
+    def _ensure_parent_directories_staged(self) -> None:
+        """Create missing parent directories atomically with a durable .dirsync list before visibility."""
+        for _ in range(8):
+            if self.path.parent.exists():
+                return
+            missing: list[Path] = []
+            directory = self.path.parent
+            while not directory.exists():
+                missing.append(directory)
+                parent = directory.parent
+                if parent == directory:
+                    raise OSError("observation repository has no existing parent directory")
+                directory = parent
+            top_missing = missing[-1]
+            existing_ancestor = top_missing.parent
+            staging_root = existing_ancestor / f".{top_missing.name}.init-{uuid.uuid4().hex}"
             try:
-                directory.rmdir()
-            except OSError:
-                break
-            with _PENDING_SYNC_LOCK:
-                pending = _PENDING_CREATED_DIRS.get(key)
-                if pending and directory in pending:
-                    pending.remove(directory)
-                    if not pending:
-                        _PENDING_CREATED_DIRS.pop(key, None)
+                rel_leaf = self.path.parent.relative_to(top_missing)
+                staged_leaf = staging_root / rel_leaf if rel_leaf != Path(".") else staging_root
+                staged_leaf.mkdir(parents=True, exist_ok=True)
+                staged_marker = staged_leaf / self.dirsync_path.name
+                marker_bytes = json.dumps([str(item) for item in missing], ensure_ascii=True).encode("utf-8")
+                with staged_marker.open("wb", buffering=0) as marker_handle:
+                    _write_all(marker_handle, marker_bytes)
+                    os.fsync(marker_handle.fileno())
+                try:
+                    os.rename(staging_root, top_missing)
+                except OSError:
+                    shutil.rmtree(staging_root, ignore_errors=True)
+                    if top_missing.exists():
+                        continue
+                    raise
+                return
+            except BaseException:
+                shutil.rmtree(staging_root, ignore_errors=True)
+                raise
+        if not self.path.parent.exists():
+            raise OSError("failed to initialize observation repository parent directories")
 
-    def _mark_pending_parent_sync(self) -> None:
-        key = self._sync_key()
-        with _PENDING_SYNC_LOCK:
-            _PENDING_PARENT_SYNC.add(key)
-
-    def _has_pending_parent_sync(self) -> bool:
-        key = self._sync_key()
-        with _PENDING_SYNC_LOCK:
-            return key in _PENDING_PARENT_SYNC
-
-    def _clear_pending_parent_sync(self) -> None:
-        key = self._sync_key()
-        with _PENDING_SYNC_LOCK:
-            _PENDING_PARENT_SYNC.discard(key)
+    def _flush_dirsync_marker(self) -> None:
+        """Sync any newly created ancestor directory entries recorded in .dirsync before first commit."""
+        if not self.dirsync_path.exists():
+            return
+        try:
+            raw_dirs = json.loads(self.dirsync_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise OSError(f"unreadable observation dirsync marker: {exc}") from exc
+        if not isinstance(raw_dirs, list) or not all(isinstance(item, str) and item for item in raw_dirs):
+            raise OSError("invalid observation dirsync marker")
+        for directory_str in raw_dirs:
+            _fsync_directory(Path(directory_str).parent)
+        self.dirsync_path.unlink()
 
     def _fsync_parent_directory(self) -> None:
         _fsync_directory(self.path.parent)
-
-    def _create_parent_directories(self) -> tuple[Path, ...]:
-        created_directories: list[Path] = []
-        directory = self.path.parent
-        while not directory.exists():
-            created_directories.append(directory)
-            parent = directory.parent
-            if parent == directory:
-                raise OSError("observation repository has no existing parent directory")
-            directory = parent
-        if created_directories:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-        return tuple(created_directories)
-
-    @staticmethod
-    def _fsync_created_directory_entries(created_directories: tuple[Path, ...]) -> None:
-        for directory in created_directories:
-            _fsync_directory(directory.parent)
 
 
 def build_stage0_observation(

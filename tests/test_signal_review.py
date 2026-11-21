@@ -1,6 +1,8 @@
 import hashlib
 import io
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -13,13 +15,13 @@ from mu_strategy.market_data.trusted_data.contracts import HealthReason, Refresh
 from mu_strategy.models import EntryDecisionCode
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState
 from mu_strategy.notifications.store import NotificationStore
-from mu_strategy.observations import JsonlObservationRepository, Stage0ObservationCycle
+from mu_strategy.observations import JsonlObservationRepository, ObservationCorruptionError, Stage0ObservationCycle
 from mu_strategy.scan_cycle import ScanCycle
 from mu_strategy.service_health import (
     CycleHealth, HealthSnapshotUnstableError, HealthStore, Phase, RefreshHealth,
     ScanHealth, ServiceState, StepStatus,
 )
-from mu_strategy.signal_review import BEIJING, read_signal_review, review_window
+from mu_strategy.signal_review import BEIJING, read_scan_evidence, read_signal_review, review_window
 from mu_strategy.strategies.registry import baseline_strategy_group
 from mu_strategy.viz.signal_review import render_signal_review
 from tests.factories.scan_cycle import scan_result, trusted_scan_bundle
@@ -27,6 +29,29 @@ from tests.factories.scan_cycle import scan_result, trusted_scan_bundle
 
 NOW = int(datetime(2026, 9, 6, 12, tzinfo=BEIJING).timestamp() * 1000)
 SYMBOL = "MU-USDT-SWAP"
+
+
+def sqlite_logical_snapshot(root: Path) -> dict[str, dict[str, list[tuple]]]:
+    """Read logical SQLite table rows via read-only connections (includes uncommitted-to-main WAL state)."""
+    snapshot: dict[str, dict[str, list[tuple]]] = {}
+    for db_path in sorted(root.rglob("*.sqlite3")):
+        if not db_path.is_file():
+            continue
+        con = sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            tables = [
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                )
+            ]
+            snapshot[str(db_path.relative_to(root))] = {
+                table: con.execute(f'SELECT * FROM "{table}"').fetchall()
+                for table in tables
+            }
+        finally:
+            con.close()
+    return snapshot
 
 
 def cycle(number, kind="wait", *, at=NOW, symbol=SYMBOL, reason="fixture reason"):
@@ -205,6 +230,7 @@ class SignalReviewTests(unittest.TestCase):
             for p in self.root.rglob("*")
             if p.is_file() and not p.name.endswith(("-wal", "-shm"))
         }
+        before_db = sqlite_logical_snapshot(self.root)
         with patch("mu_strategy.notifications.service.EmailAlerts.collect", side_effect=AssertionError("must not collect")), \
              patch("mu_strategy.notifications.smtp.SmtpConfig.from_environment", side_effect=AssertionError("must not read secrets")), \
              patch.object(NotificationStore, "initialize", side_effect=AssertionError("must not initialize")), \
@@ -216,6 +242,7 @@ class SignalReviewTests(unittest.TestCase):
             if p.is_file() and not p.name.endswith(("-wal", "-shm"))
         }
         self.assertEqual(before, after)
+        self.assertEqual(before_db, sqlite_logical_snapshot(self.root))
         self.assertNotIn(hostile, page)
         self.assertIn("&lt;/script&gt;", page)
         self.assertEqual(1, page.count("<script>"))
@@ -239,8 +266,6 @@ class SignalReviewTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob("signal-review-*.tmp")))
 
     def test_tail_read_handles_ancient_history_and_caches_unchanged_log(self):
-        from mu_strategy.signal_review import read_scan_evidence
-
         ancient = [cycle(i, at=NOW - (20 - i) * 86_400_000) for i in range(10)]
         recent = [cycle(100, at=NOW - 600_000), cycle(101, at=NOW)]
         self.initialize([*ancient, *recent])
@@ -248,11 +273,10 @@ class SignalReviewTests(unittest.TestCase):
         self.assertEqual("ok", first["state"])
         self.assertEqual(2, first["total_cycles"])
         self.assertEqual(len(ancient) + len(recent), first["scanned_cycles"])
-        with patch.object(JsonlObservationRepository, "iter_tail_cycles", side_effect=AssertionError("should use cache")):
+        with patch.object(JsonlObservationRepository, "iter_forward_cycles", side_effect=AssertionError("should use cache")):
             cached = self.read()["sources"]["observations"]
         self.assertEqual(first["total_cycles"], cached["total_cycles"])
         self.assertEqual(first["records"], cached["records"])
-        # Evidence lookup stops near the tail without scanning the entire history.
         evidence = read_scan_evidence(self.data_dir, recent[-1].cycle_id, recent[-1].observations[0].observation_id, clock=self.clock)
         self.assertEqual(recent[-1].observations[0].observation_id, evidence["observation_id"])
         # Appending invalidates cache and shows the new cycle immediately.
@@ -278,10 +302,108 @@ class SignalReviewTests(unittest.TestCase):
             [row["observation_id"] for row in source["records"]],
         )
         # Cached read must preserve the same complete non-monotonic totals.
-        with patch.object(JsonlObservationRepository, "iter_tail_cycles", side_effect=AssertionError("should use cache")):
+        with patch.object(JsonlObservationRepository, "iter_forward_cycles", side_effect=AssertionError("should use cache")):
             cached = self.read()["sources"]["observations"]
         self.assertEqual(2, cached["total_cycles"])
         self.assertEqual(source["records"], cached["records"])
+
+    def test_cache_invalidates_when_earlier_record_changes_with_same_size_mtime_and_tail(self):
+        first = cycle(1, "wait", at=NOW - 600_000, reason="reason-alpha")
+        second = cycle(2, "wait", at=NOW, reason="reason-tail-unchanged")
+        self.initialize([first, second])
+        before = self.read()["sources"]["observations"]
+        self.assertEqual("reason-alpha", before["records"][0]["compatibility_reason"])
+
+        stat = self.log.path.stat()
+        raw = self.log.path.read_bytes()
+        updated = raw.replace(b"reason-alpha", b"reason-bravo", 1)
+        self.assertEqual(len(raw), len(updated))
+        self.log.path.write_bytes(updated)
+        os.utime(self.log.path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        after = self.read()["sources"]["observations"]
+        self.assertEqual("ok", after["state"])
+        self.assertEqual("reason-bravo", after["records"][0]["compatibility_reason"])
+
+    def test_exact_replay_preserves_first_publication_order_and_keeps_latest_distinct_cycle(self):
+        first_a = cycle(1, "ready", at=NOW - 600_000)
+        second_b = cycle(2, "wait", at=NOW)
+        self.initialize([first_a, second_b])
+        # Replay A byte-for-byte after B; service health still references B.
+        self.log.append_cycle(first_a)
+        report = self.read()
+        source = report["sources"]["observations"]
+        self.assertEqual("ok", source["state"])
+        self.assertEqual(1, source["duplicate_cycles"])
+        self.assertEqual(second_b.observations[0].observation_id, source["latest_all"][0]["observation_id"])
+        self.assertEqual(second_b.observations[0].observation_id, source["latest"][0]["observation_id"])
+        self.assertEqual(
+            [first_a.observations[0].observation_id, second_b.observations[0].observation_id],
+            [row["observation_id"] for row in source["records"]],
+        )
+        # current_conclusions must align with health (B), not reject due to replayed A.
+        self.assertEqual(second_b.observations[0].observation_id, report["current_conclusions"][0]["latest"]["observation_id"])
+        self.assertNotIn("未对齐", report["current_conclusions"][0]["message"])
+
+    def test_scan_evidence_rejects_conflicting_cycle_ids_both_within_and_above_scan_limit(self):
+        first = cycle(1, "ready", at=NOW - 600_000)
+        conflict = replace(first, observations=(replace(first.observations[0], compatibility_reason="different"),))
+        other = cycle(2, "wait", at=NOW)
+        self.initialize([first, other, conflict])
+        self.assertEqual("unavailable", self.read()["sources"]["observations"]["state"])
+        with self.assertRaises(ObservationCorruptionError):
+            read_scan_evidence(self.data_dir, first.cycle_id, first.observations[0].observation_id, clock=self.clock)
+
+        # Also exercise indexed path (total cycles > scan_limit) via _read_observations directly.
+        from mu_strategy.signal_review import _read_observations
+
+        res = _read_observations(
+            self.log.path,
+            {"start_ms": 0, "end_ms": 2**63},
+            clock=self.clock,
+            display_limit=1,
+            scan_limit=2,
+            evidence_key=(first.cycle_id, first.observations[0].observation_id),
+        )
+        self.assertEqual("unavailable", res["state"])
+
+    def test_indexed_log_exceeding_scan_limit_stays_complete_when_window_is_covered(self):
+        ancient = [cycle(i, "wait", at=NOW - (25 - i) * 86_400_000) for i in range(12)]
+        recent_1 = cycle(100, "ready", at=NOW - 600_000)
+        recent_2 = cycle(101, "wait", at=NOW)
+        self.initialize([*ancient, recent_1, recent_2])
+
+        # Total cycles (14) > scan_limit (4), but monotonic prefix_max proves all in-window cycles are in the 2-cycle tail.
+        report = self.read(scan_limit=4)
+        source = report["sources"]["observations"]
+        self.assertEqual("ok", source["state"])
+        self.assertTrue(source["complete"])
+        self.assertTrue(report["sources_readable"])
+        self.assertEqual(2, source["total_cycles"])
+        self.assertEqual(2, source["scanned_cycles"])
+        self.assertEqual(recent_2.observations[0].observation_id, source["latest_all"][0]["observation_id"])
+        self.assertNotIn("来源读取不完整", report["current_conclusions"][0]["message"])
+
+        # Replaying an ancient prefix cycle at the end must NOT overwrite recent_2 as latest_all.
+        self.log.append_cycle(ancient[0])
+        replayed = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("ok", replayed["state"])
+        self.assertEqual(1, replayed["duplicate_cycles"])
+        self.assertEqual(recent_2.observations[0].observation_id, replayed["latest_all"][0]["observation_id"])
+
+        # Non-monotonic log where an in-window cycle precedes > scan_limit older cycles MUST stay incomplete.
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir2 = Path(tmp) / "live"
+            health2 = HealthStore(data_dir2)
+            store2 = NotificationStore(data_dir2)
+            store2.initialize()
+            log2 = JsonlObservationRepository(health2.root / "observations.jsonl")
+            mixed = [cycle(1, "ready", at=NOW - 600_000), *[cycle(i + 2, "wait", at=NOW - 20 * 86_400_000) for i in range(8)], cycle(99, "wait", at=NOW)]
+            for item in mixed:
+                log2.append_cycle(item)
+            res2 = read_signal_review(data_dir2, self.window, clock=self.clock, scan_limit=4)["sources"]["observations"]
+            self.assertEqual("incomplete", res2["state"])
+            self.assertFalse(res2["complete"])
 
 
 if __name__ == "__main__":

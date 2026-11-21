@@ -108,12 +108,14 @@ class ReviewLiveServerTests(unittest.TestCase):
                 if p.is_file() and not p.name.endswith(("-wal", "-shm"))
             }
         before = files()
+        before_db = fixtures.sqlite_logical_snapshot(self.fixture.root)
         self.assertEqual(200, self.request()[0])
         self.assertEqual(404, self.request("/observations.jsonl")[0])
         self.assertEqual(405, self.request("/", method="POST")[0])
         self.assertEqual(403, self.request(headers={"Host": "attacker.example"})[0])
         self.assertEqual(403, self.request(headers={"Origin": "https://attacker.example"})[0])
         self.assertEqual(before, files())
+        self.assertEqual(before_db, fixtures.sqlite_logical_snapshot(self.fixture.root))
 
     def test_server_uses_threading_http_server_and_serves_concurrent_requests(self):
         self.assertIsInstance(self.server, ThreadingHTTPServer)

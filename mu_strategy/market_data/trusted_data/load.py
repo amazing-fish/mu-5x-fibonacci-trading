@@ -453,6 +453,18 @@ def _verify_manifest_bound_content(
             content_sha256=actual_hash,
             message="manifest dataset row count does not match cached candles",
         )
+    if (
+        cached_candles[0].open_time_ms != manifest_health.first_timestamp_ms
+        or cached_candles[-1].open_time_ms != manifest_health.last_timestamp_ms
+    ):
+        return replace(
+            cache_health,
+            integrity=IntegrityState.INVALID,
+            freshness=FreshnessState.STALE,
+            reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
+            content_sha256=actual_hash,
+            message="manifest dataset timestamp bounds do not match cached candles",
+        )
     if not expected_hash:
         return replace(
             cache_health,

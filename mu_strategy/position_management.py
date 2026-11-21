@@ -10,25 +10,9 @@ from mu_strategy.canonical import canonical_sha256
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.indicators import macd, rsi
 from mu_strategy.live_exit import evaluate_exit
-from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
-from mu_strategy.market_data.trusted_data.contracts import (
-    AvailabilityState,
-    FreshnessState,
-    HealthReason,
-    IntegrityState,
-    RefreshAttemptStatus,
-    SnapshotUsability,
-)
 from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
 from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.market_data.trusted_data.validation import (
-    aggregate_candles,
-    clip_parent_candles_to_complete_base_window,
-    normalize_and_validate_candles,
-    validate_built_native_candles,
-)
-from mu_strategy.market_data.utils import interval_to_ms
 from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2, parse_strategy_config_payload
 from mu_strategy.strategies.position_rules import PositionFillSnapshot, PositionStateSnapshot, decide_pyramid_add
 from mu_strategy.strategies.registry import baseline_strategy_group
@@ -41,106 +25,6 @@ DAY_MS = 86_400_000
 MAX_MAPPED_FILLS = 32
 WARMUP_BARS = 35
 MIN_REVIEW_DAYS = 2
-
-
-def _contiguous_suffix(rows: list, *, interval_ms: int, now_ms: int) -> list:
-    """Return the longest gap-free trailing suffix of closed, strictly ascending candles."""
-    if not rows or rows[-1].open_time_ms + interval_ms > now_ms:
-        raise ValueError("incomplete closed-candle sequence")
-    start = len(rows) - 1
-    for index in range(len(rows) - 1, 0, -1):
-        delta = rows[index].open_time_ms - rows[index - 1].open_time_ms
-        if delta <= 0:
-            raise ValueError("non-monotonic candle sequence")
-        if delta == interval_ms and start == index:
-            start = index - 1
-    return rows[start:]
-
-
-def _recover_contiguous_suffix_after_historical_gap(
-    loader: LoadTrustedBundle,
-    symbol: str,
-    *,
-    context,
-    bundle,
-    now_ms: int,
-) -> tuple[list, list, dict[str, str]] | None:
-    """Validate gap-free trailing suffixes when a strict integer-day load fails only on a pre-warmup gap."""
-    if bundle.load_context != context or not bundle.run_id or bundle.run_id != context.manifest.run_id:
-        return None
-    manifest = context.manifest
-    if (
-        manifest.attempt_status == RefreshAttemptStatus.FAILED
-        or manifest.snapshot_usability == SnapshotUsability.INVALID
-    ):
-        return None
-    resolved = resolve_okx_swap_symbol(symbol)
-    suffixes: dict[str, list] = {}
-    manifest_hashes: dict[str, str] = {}
-    for interval in ("5m", "15m", "1h"):
-        health = bundle.health_by_interval.get(interval)
-        manifest_health = manifest.datasets.get((resolved.inst_id, interval))
-        if (
-            health is None
-            or health.availability != AvailabilityState.AVAILABLE
-            or manifest_health is None
-            or manifest_health.availability != AvailabilityState.AVAILABLE
-            or manifest_health.integrity != IntegrityState.VALID
-            or not manifest_health.content_sha256
-            or manifest_health.rows <= 0
-        ):
-            return None
-        allowed_reasons = (
-            {HealthReason.OK, HealthReason.TIMESTAMP_GAP, HealthReason.STALE_BY_CLOCK}
-            if interval == "5m"
-            else {HealthReason.OK, HealthReason.TIMESTAMP_GAP}
-        )
-        if health.integrity != IntegrityState.VALID and not set(health.reasons).issubset(allowed_reasons):
-            return None
-        raw_rows, actual_hash = loader.store.read_generation_dataset_with_hash(
-            manifest,
-            symbol=resolved.inst_id,
-            interval=interval,
-            generation_root=context.generation_root,
-            generation_id=context.generation_id,
-            verify_logical=False,
-            compute_hash=True,
-        )
-        if len(raw_rows) != manifest_health.rows or actual_hash != manifest_health.content_sha256:
-            return None
-        suffix = _contiguous_suffix(raw_rows, interval_ms=interval_to_ms(interval), now_ms=now_ms)
-        normalized, report = normalize_and_validate_candles(suffix, interval=interval)
-        if not report.ok or not normalized:
-            return None
-        if interval in ("15m", "1h"):
-            freshness = loader.freshness_policy.assess(
-                now_ms=context.observed_at_ms,
-                interval=interval,
-                last_confirmed_open_time_ms=normalized[-1].open_time_ms,
-            )
-            if freshness.state != FreshnessState.FRESH:
-                return None
-        suffixes[interval] = normalized
-        manifest_hashes[interval] = actual_hash
-
-    five_suffix = suffixes["5m"]
-    validated: dict[str, list] = {}
-    for interval in ("15m", "1h"):
-        native_suffix = suffixes[interval]
-        overlap_start = max(five_suffix[0].open_time_ms, native_suffix[0].open_time_ms)
-        five_overlap = [candle for candle in five_suffix if candle.open_time_ms >= overlap_start]
-        if not five_overlap:
-            return None
-        built = aggregate_candles(five_overlap, interval=interval, ohlc_policy="okx_native")
-        built = clip_parent_candles_to_complete_base_window(built, base_candles=five_overlap, interval=interval)
-        clipped_native = clip_parent_candles_to_complete_base_window(
-            native_suffix, base_candles=five_overlap, interval=interval
-        )
-        report = validate_built_native_candles(built, clipped_native, interval=interval)
-        if not report.ok or not clipped_native:
-            return None
-        validated[interval] = clipped_native
-    return validated["15m"], validated["1h"], manifest_hashes
 
 
 def baseline_configuration(symbol):
@@ -243,9 +127,9 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
     result.update(confirmed_at_ms=confirmed_at, first_eligible_open_ms=first_open)
     if now_ms < confirmed_at:
         return {**result, "status": "data_blocked", "messages": ["查询时间早于人工确认时间，暂不能复核。"]}
-    # Load only the exact post-confirmation span plus 35 hourly warmup bars
-    # (+1h alignment margin) instead of over-fetching older history that may
-    # contain unrelated historical gaps before the warmup suffix.
+    # Request the tightest integer-day window covering the post-confirmation span
+    # plus 35 hourly warmup bars (+1h alignment margin), rather than over-fetching
+    # older history; integrity and freshness remain strictly owned by trading_strict_policy().
     required_hourly_start = (first_open // HOURLY_BAR_MS - WARMUP_BARS) * HOURLY_BAR_MS
     required_span_ms = max(0, now_ms - required_hourly_start) + HOURLY_BAR_MS
     days = max(MIN_REVIEW_DAYS, (required_span_ms + DAY_MS - 1) // DAY_MS)
@@ -256,40 +140,31 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         context = loader.open_context(now_ms=now_ms)
         bundle = loader.execute(LoadTrustedBundleQuery(position["symbol"], ("15m", "1h"), days, now_ms),
                                 trading_strict_policy(), context=context)
-        recovered = None
         if not bundle.trust_decision.allowed:
-            if bundle.trust_decision.reason is HealthReason.TIMESTAMP_GAP and isinstance(loader, LoadTrustedBundle):
-                recovered = _recover_contiguous_suffix_after_historical_gap(
-                    loader, position["symbol"], context=context, bundle=bundle, now_ms=now_ms
-                )
-            if recovered is None:
-                return {**result, "status": "data_blocked",
-                        "messages": ["可信行情未通过当前交易严格校验，请检查行情来源后重新复核。"],
-                        "data_reason": bundle.trust_decision.reason.value}
+            return {**result, "status": "data_blocked",
+                    "messages": ["可信行情未通过当前交易严格校验，请检查行情来源后重新复核。"],
+                    "data_reason": bundle.trust_decision.reason.value}
         if bundle.load_context != context or not bundle.run_id or bundle.run_id != context.manifest.run_id:
             raise ValueError("unpinned management input")
-        if recovered is not None:
-            raw_candles, raw_hourly, hashes = recovered
-        else:
-            raw_candles = bundle.candles_by_interval.get("15m")
-            raw_hourly = bundle.candles_by_interval.get("1h")
-            required_hash_intervals = tuple(
-                interval for interval in ("5m", "15m", "1h")
-                if interval in bundle.health_by_interval or interval in ("15m", "1h")
-            )
-            hashes = {
-                interval: bundle.health_by_interval[interval].content_sha256
-                for interval in required_hash_intervals
-                if interval in bundle.health_by_interval
-            }
-            if len(hashes) != len(required_hash_intervals) or not all(hashes.values()):
-                raise ValueError("missing canonical content hashes")
-        if not raw_candles or not raw_hourly:
-            raise ValueError("incomplete closed-candle sequence")
-        # Require a gap-free contiguous suffix covering warmup + post-confirmation range,
-        # while tolerating isolated ancient exchange-maintenance gaps before that suffix.
-        candles = _contiguous_suffix(raw_candles, interval_ms=BAR_MS, now_ms=now_ms)
-        hourly = _contiguous_suffix(raw_hourly, interval_ms=HOURLY_BAR_MS, now_ms=now_ms)
+        candles = bundle.candles_by_interval.get("15m")
+        hourly = bundle.candles_by_interval.get("1h")
+        # The loader owns integrity validation. These checks enforce this
+        # review's complete post-confirmation range and causal indicator input.
+        for rows, interval_ms in ((candles, BAR_MS), (hourly, HOURLY_BAR_MS)):
+            if not rows or rows[-1].open_time_ms + interval_ms > now_ms or any(
+                    right.open_time_ms - left.open_time_ms != interval_ms for left, right in zip(rows, rows[1:])):
+                raise ValueError("incomplete closed-candle sequence")
+        required_hash_intervals = tuple(
+            interval for interval in ("5m", "15m", "1h")
+            if interval in bundle.health_by_interval or interval in ("15m", "1h")
+        )
+        hashes = {
+            interval: bundle.health_by_interval[interval].content_sha256
+            for interval in required_hash_intervals
+            if interval in bundle.health_by_interval
+        }
+        if len(hashes) != len(required_hash_intervals) or not all(hashes.values()):
+            raise ValueError("missing canonical content hashes")
         first_index = next((index for index, candle in enumerate(candles) if candle.open_time_ms >= first_open), None)
         provenance = {"generation_id": context.generation_id, "run_id": bundle.run_id,
                       "content_sha256": hashes, "configuration_sha256": inputs["configuration_sha256"],
@@ -300,8 +175,6 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
                       "evaluated_at_ms": now_ms, "leverage_source": "manual_confirmation"}
         result["provenance"] = provenance
         if first_index is None:
-            if len(candles) < min(WARMUP_BARS, len(raw_candles)) or len(hourly) < min(WARMUP_BARS, len(raw_hourly)):
-                raise ValueError("incomplete closed-candle sequence")
             return {**result, "status": "waiting", "messages": ["等待确认后的第一根完整 15m K 线；不会把当前止损回投到确认前的行情。"]}
         if candles[first_index].open_time_ms != first_open or first_index < WARMUP_BARS or sum(
                 candle.open_time_ms + HOURLY_BAR_MS <= first_open for candle in hourly) < WARMUP_BARS:

@@ -1363,6 +1363,78 @@ class FlatGenerationCompatTests(unittest.TestCase):
                 store.write_segmented_dataset(neg_zero_candidate, symbol=SYMBOL, interval="5m")
             self.assertEqual(before_bytes, seg_path.read_bytes())
 
+    def test_canonical_creation_checks_retained_partial_overlap_and_partial_first_month_expands(self):
+        # 1. Retained .partial- file overlap is checked before creating a missing canonical month file.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            full_jan = _window_candles(JAN_START_MS, JAN_START_MS + 10 * STEP_MS)
+            partial_start = full_jan[5].open_time_ms
+            partial_path = data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{partial_start}.csv"
+            store.write_csv(full_jan[5:], partial_path)
+
+            conflicting = list(full_jan)
+            conflicting[6] = Candle(
+                conflicting[6].open_time_ms,
+                conflicting[6].open + 5.0,
+                conflicting[6].high + 5.0,
+                conflicting[6].low,
+                conflicting[6].close + 5.0,
+                conflicting[6].volume,
+            )
+            with self.assertRaises(SegmentCorrectionError):
+                store.write_segmented_dataset(conflicting, symbol=SYMBOL, interval="5m")
+            self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
+
+            storage = store.write_segmented_dataset(full_jan, symbol=SYMBOL, interval="5m")
+            self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-01"), storage.segments[0].source_file)
+            self.assertEqual(full_jan, store.read_csv(store.segment_path(SYMBOL, "5m", "2026-01")))
+
+        # 2. A mid-month 2026-01.csv remains expandable when earlier Jan 1 rows arrive without shifting old offsets.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            short_rows = _window_candles(JAN_START_MS, JAN_START_MS + DAY_MS)
+            full_rows = _window_candles(JAN_MONTH_START_MS, JAN_START_MS + DAY_MS)
+            extended_rows = _window_candles(JAN_MONTH_START_MS, JAN_START_MS + DAY_MS + 3 * STEP_MS)
+
+            run_short = _refresh(
+                store,
+                MutableHistoryProvider(short_rows),
+                RUN_A,
+                days=10,
+                now_ms=short_rows[-1].open_time_ms + STEP_MS,
+            )
+            self.assertEqual("success", run_short.attempt_status.value)
+            self.assertEqual("partial_available_history", run_short.datasets[(SYMBOL, "5m")].coverage_state)
+            canonical_jan = store.segment_path(SYMBOL, "5m", "2026-01")
+            canonical_bytes_before = canonical_jan.read_bytes()
+
+            run_full = _refresh(
+                store,
+                MutableHistoryProvider(full_rows),
+                RUN_B,
+                days=22,
+                now_ms=full_rows[-1].open_time_ms + STEP_MS,
+            )
+            self.assertEqual("success", run_full.attempt_status.value)
+            # Original 2026-01.csv stays byte-identical so RUN_A remains exact-readable.
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+            self.assertEqual(short_rows, _read_exact(store, RUN_A))
+            self.assertEqual(full_rows, _read_exact(store, RUN_B))
+
+            # Subsequent refresh extending the tail reuses and grows the expanded representation cleanly.
+            run_ext = _refresh(
+                store,
+                MutableHistoryProvider(extended_rows),
+                RUN_C,
+                days=22,
+                now_ms=extended_rows[-1].open_time_ms + STEP_MS,
+            )
+            self.assertEqual("success", run_ext.attempt_status.value)
+            self.assertEqual(extended_rows[-run_ext.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_C))
+            self.assertEqual(full_rows, _read_exact(store, RUN_B))
+
 
 def _candles_through(end_ms: int) -> list[Candle]:
     return _window_candles(JAN_START_MS, end_ms)

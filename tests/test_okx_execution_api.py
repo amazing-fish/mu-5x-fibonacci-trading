@@ -799,6 +799,32 @@ class PooledHTTPTransportTests(unittest.TestCase):
             seen_paths,
         )
 
+    def test_transport_rejects_https_proxy_for_https_target_and_socks_proxy_before_io(self):
+        transport = _PooledHTTPTransport(max_get_attempts=3, backoff_seconds=0.0, sleeper=lambda _s: None)
+        self.addCleanup(transport.close)
+        with (
+            patch(
+                "mu_strategy.live.okx.http.client.HTTPSConnection",
+                side_effect=AssertionError("must fail closed before opening socket"),
+            ),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"https": "https://user:s3cr3t@proxy.local:443"},
+            ):
+                with self.assertRaisesRegex(ValueError, "TLS-in-TLS") as raised:
+                    transport("GET", "https://www.okx.com/api/v5/public/time", headers={}, body=None, timeout=10)
+                self.assertNotIn("s3cr3t", str(raised.exception))
+                self.assertNotIn("user", str(raised.exception))
+
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"all": "socks5://127.0.0.1:1080"},
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported proxy scheme 'socks5'"):
+                    transport("GET", "https://www.okx.com/api/v5/public/time", headers={}, body=None, timeout=10)
+
 
 if __name__ == "__main__":
     unittest.main()

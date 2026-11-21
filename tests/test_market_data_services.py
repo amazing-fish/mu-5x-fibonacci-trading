@@ -159,6 +159,39 @@ class HttpPoolSslContextTests(unittest.TestCase):
             seen_requests,
         )
 
+    def test_rejects_https_proxy_for_https_target_and_unsupported_proxy_schemes_before_io(self):
+        from mu_strategy.market_data import http_pool
+
+        self.addCleanup(http_pool.close_pooled_connections)
+        with (
+            patch(
+                "mu_strategy.market_data.http_pool.http.client.HTTPSConnection",
+                side_effect=AssertionError("must fail closed before opening socket"),
+            ),
+            patch(
+                "mu_strategy.market_data.http_pool.urllib.request.urlopen",
+                side_effect=AssertionError("must never silently delegate unsupported proxy to urlopen"),
+            ),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            # 1. https:// proxy for https:// target would leak CONNECT/Proxy-Authorization before proxy TLS.
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"https": "https://alice:topsecret@proxy.internal:443"},
+            ):
+                with self.assertRaisesRegex(ValueError, "TLS-in-TLS") as raised:
+                    http_pool.get_json("https://www.okx.com/api/v5/public/time", retries=2)
+                self.assertNotIn("topsecret", str(raised.exception))
+                self.assertNotIn("alice", str(raised.exception))
+
+            # 2. socks5:// via ALL_PROXY must fail explicitly instead of silently bypassing via urllib.
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"all": "socks5://127.0.0.1:1080"},
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported proxy scheme 'socks5'"):
+                    http_pool.get_json("https://www.okx.com/api/v5/public/time", retries=2)
+
 
 class MarketDataSymbolTests(unittest.TestCase):
     def test_resolve_okx_swap_symbol_normalizes_common_inputs(self):

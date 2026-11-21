@@ -23,6 +23,34 @@ CALENDAR_IDS = (
 _US_EQUITIES_V1_YEARS = (2025, 2026, 2027, 2028)
 _ALGORITHMIC_MIN_YEAR = 2018
 
+# Immutable NYSE 2025-2028 cash-equity schedule for the frozen us_equities_2025_2028_v1 ID.
+# Kept independent of _nyse_year_schedule so future algorithmic updates never alter saved digests.
+_FIXED_US_EQUITIES_2025_2028_HOLIDAYS: dict[int, str] = {
+    2025: "01-01 01-09 01-20 02-17 04-18 05-26 06-19 07-04 09-01 11-27 12-25",
+    2026: "01-01 01-19 02-16 04-03 05-25 06-19 07-03 09-07 11-26 12-25",
+    2027: "01-01 01-18 02-15 03-26 05-31 06-18 07-05 09-06 11-25 12-24",
+    2028: "01-17 02-21 04-14 05-29 06-19 07-04 09-04 11-23 12-25",
+}
+_FIXED_US_EQUITIES_2025_2028_EARLY_CLOSES: dict[int, str] = {
+    2025: "07-03 11-28 12-24",
+    2026: "11-27 12-24",
+    2027: "11-26",
+    2028: "07-03 11-24",
+}
+_FIXED_US_EQUITIES_2025_2028_DATES: dict[int, tuple[frozenset[date], frozenset[date]]] = {
+    year: (
+        frozenset(
+            date(year, int(token[:2]), int(token[3:]))
+            for token in _FIXED_US_EQUITIES_2025_2028_HOLIDAYS[year].split()
+        ),
+        frozenset(
+            date(year, int(token[:2]), int(token[3:]))
+            for token in _FIXED_US_EQUITIES_2025_2028_EARLY_CLOSES[year].split()
+        ),
+    )
+    for year in _US_EQUITIES_V1_YEARS
+}
+
 # Verified extraordinary unscheduled NYSE closures since 2018 (National Days of Mourning).
 _EXCEPTIONAL_NYSE_CLOSURES: frozenset[date] = frozenset({
     date(2018, 12, 5),  # National Day of Mourning for President George H. W. Bush
@@ -138,17 +166,9 @@ def calendar_sha256(calendar_id: str) -> str:
         "weekends_closed": calendar_id != CONTINUOUS_CALENDAR,
     }
     if calendar_id == US_EQUITIES_CALENDAR:
-        holidays = {
-            year: " ".join(day.strftime("%m-%d") for day in sorted(_nyse_year_schedule(year)[0]))
-            for year in _US_EQUITIES_V1_YEARS
-        }
-        early_closes = {
-            year: " ".join(day.strftime("%m-%d") for day in sorted(_nyse_year_schedule(year)[1]))
-            for year in _US_EQUITIES_V1_YEARS
-        }
         payload.update(
-            holidays=holidays,
-            early_closes=early_closes,
+            holidays=_FIXED_US_EQUITIES_2025_2028_HOLIDAYS,
+            early_closes=_FIXED_US_EQUITIES_2025_2028_EARLY_CLOSES,
             coverage=[_US_EQUITIES_V1_YEARS[0], _US_EQUITIES_V1_YEARS[-1]],
             cash_open="09:30",
             cash_close="16:00",
@@ -256,7 +276,10 @@ def _session(day: date, calendar_id: str) -> tuple[str, int, int]:
         return "weekend", 0, 0
     if calendar_id not in (US_EQUITIES_CALENDAR, US_EQUITIES_ALGORITHMIC_CALENDAR):
         return "open", 0, 1440
-    holidays, early_closes = _nyse_year_schedule(day.year)
+    if calendar_id == US_EQUITIES_CALENDAR:
+        holidays, early_closes = _FIXED_US_EQUITIES_2025_2028_DATES[day.year]
+    else:
+        holidays, early_closes = _nyse_year_schedule(day.year)
     if day in holidays:
         return "holiday", 0, 0
     if day in early_closes:

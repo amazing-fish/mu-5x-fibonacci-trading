@@ -1186,6 +1186,42 @@ class TrustedDataRefreshTests(unittest.TestCase):
                         self.assertEqual(AvailabilityState.MISSING, bundle.health_by_interval["5m"].availability)
                         self.assertEqual(HealthReason.CACHE_READ_FAILED, bundle.health_by_interval["5m"].primary_reason)
 
+                # 3. Shifting manifest 5m first_timestamp_ms without touching CSV bytes must fail byte verification.
+                five_file.write_bytes(original_bytes)
+                res = store.read_manifest()
+                assert res.ok and res.manifest_path is not None and res.payload is not None
+                shifted = json.loads(res.manifest_path.read_text(encoding="utf-8"))
+                five_meta = shifted["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"]
+                five_meta["first_timestamp_ms"] += 3_600_000
+                if layout_kind == "v4_segmented":
+                    five_meta["storage"]["segments"][0]["first_timestamp_ms"] += 3_600_000
+                res.manifest_path.write_text(json.dumps(shifted, sort_keys=True), encoding="utf-8")
+
+                shifted_res = store.read_manifest()
+                assert shifted_res.ok and shifted_res.snapshot is not None
+                assert shifted_res.generation_root is not None and shifted_res.generation_id is not None
+                self.assertIsNone(
+                    store.verify_generation_dataset_bytes(
+                        shifted_res.snapshot,
+                        symbol="MU-USDT-SWAP",
+                        interval="5m",
+                        generation_root=shifted_res.generation_root,
+                        generation_id=shifted_res.generation_id,
+                    )
+                )
+                bundle = LoadTrustedBundle(store).execute(
+                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=2, now_ms=end_ms),
+                    research_strict_policy(),
+                )
+                self.assertFalse(bundle.trust_decision.allowed)
+                self.assertEqual(IntegrityState.INVALID, bundle.health_by_interval["5m"].integrity)
+                expected_reason = (
+                    HealthReason.CACHE_READ_FAILED
+                    if layout_kind == "v4_segmented"
+                    else HealthReason.CACHE_CONTENT_MISMATCH
+                )
+                self.assertEqual(expected_reason, bundle.health_by_interval["5m"].primary_reason)
+
 
 class TrustedDemoConsumerTests(unittest.TestCase):
     def test_demo_uses_trusted_manifest_universe_and_blocks_invalid_data_before_scanner(self):

@@ -79,6 +79,24 @@ def resolve_proxy(scheme: str, host: str, port: int | None = None) -> ProxyTarge
     )
 
 
+def validate_proxy_for_target(scheme: str, proxy: ProxyTarget | None) -> None:
+    """Fail closed before network I/O on unsupported or insecure proxy combinations."""
+    if proxy is None:
+        return
+    target_scheme = scheme.lower()
+    if proxy.scheme not in {"http", "https"}:
+        raise ValueError(
+            f"unsupported proxy scheme '{proxy.scheme}' for {target_scheme} target; "
+            "only http:// proxies (and https:// proxies for http:// targets) are supported"
+        )
+    if target_scheme == "https" and proxy.scheme == "https":
+        raise ValueError(
+            "unsupported proxy configuration: https:// proxy tunneling for https:// targets "
+            "(TLS-in-TLS) is not supported by stdlib http.client and would transmit CONNECT/credentials "
+            "before proxy TLS; configure an http:// proxy URL instead"
+        )
+
+
 def _default_ssl_context() -> ssl.SSLContext:
     """Cache the default TLS context once per process (avoids multi-second Windows cert-store reloads)."""
     global _DEFAULT_SSL_CONTEXT
@@ -109,6 +127,7 @@ def _create_connection(
     context: ssl.SSLContext | None = None,
     proxy: ProxyTarget | None = None,
 ) -> http.client.HTTPConnection:
+    validate_proxy_for_target(scheme, proxy)
     if scheme == "https":
         ssl_context = context if context is not None else _default_ssl_context()
         if proxy is not None:
@@ -203,15 +222,7 @@ def _request_once(
     context: ssl.SSLContext | None = None,
 ) -> bytes:
     proxy = resolve_proxy(scheme, host, port)
-    if proxy is not None and proxy.scheme not in {"http", "https"}:
-        ssl_context = (
-            context
-            if context is not None
-            else (_default_ssl_context() if scheme == "https" else None)
-        )
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
-            return resp.read()
+    validate_proxy_for_target(scheme, proxy)
 
     if scheme == "http" and proxy is not None:
         host_part = f"[{host}]" if ":" in host else host

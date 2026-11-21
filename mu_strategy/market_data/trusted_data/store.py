@@ -253,6 +253,7 @@ class TrustedDataStore:
         require_complete_start_month: bool,
     ) -> DatasetStorage:
         physical_rows_by_segment: dict[str, list[Candle]] = {}
+        source_files_by_segment: dict[str, Path] = {}
         first_logical_segment_id = next(iter(logical_partitions))
         retained_predecessor_ids: set[str] = set()
         prior_physical_segment_ids = [
@@ -298,6 +299,7 @@ class TrustedDataStore:
                     last_candidate_rows[-1],
                 )
         for segment_id, candidate_rows in physical_partitions.items():
+            canonical_source = self.segment_source_file(symbol, interval, segment_id)
             path = self.segment_path(symbol, interval, segment_id)
             if not path.exists():
                 if (
@@ -315,7 +317,15 @@ class TrustedDataStore:
                     segment_id,
                     candidate_rows[0],
                 )
+                self._validate_other_segment_representation_overlaps(
+                    symbol,
+                    interval,
+                    segment_id,
+                    candidate_rows,
+                    excluded_path=path,
+                )
                 self.write_csv(candidate_rows, path)
+                source_files_by_segment[segment_id] = canonical_source
                 physical_rows_by_segment[segment_id] = list(candidate_rows)
                 continue
 
@@ -330,6 +340,85 @@ class TrustedDataStore:
                 segment_id=segment_id,
                 target="trusted segment",
             )
+            self._validate_other_segment_representation_overlaps(
+                symbol,
+                interval,
+                segment_id,
+                candidate_rows,
+                excluded_path=path,
+            )
+            if (
+                segment_id == first_logical_segment_id
+                and candidate_rows[0].open_time_ms < existing[0].open_time_ms
+            ):
+                if (
+                    candidate_rows[-1].open_time_ms > existing[-1].open_time_ms
+                    and self._has_later_segment(symbol, interval, segment_id)
+                ):
+                    raise SegmentCorrectionError(
+                        f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
+                    )
+                if existing[-1].open_time_ms > candidate_rows[-1].open_time_ms:
+                    tail_start = bisect_left(
+                        existing,
+                        candidate_rows[-1].open_time_ms + 1,
+                        key=_candle_open_time_ms,
+                    )
+                    expanded = [*candidate_rows, *existing[tail_start:]]
+                else:
+                    expanded = list(candidate_rows)
+                _validate_candidate_segment_continuity(
+                    expanded,
+                    symbol=symbol,
+                    interval=interval,
+                    segment_id=segment_id,
+                )
+                expanded_source = (
+                    self.segment_source_root(symbol, interval)
+                    / f"{segment_id}.partial-{expanded[0].open_time_ms}.csv"
+                )
+                expanded_path = self._segment_path_from_source(expanded_source)
+                if expanded_path.exists():
+                    expanded_existing_bytes = expanded_path.read_bytes()
+                    expanded_existing = self.read_csv(expanded_path)
+                    _validate_segment_candles(expanded_existing, segment_id=segment_id)
+                    _validate_candidate_overlap(
+                        expanded_existing,
+                        expanded,
+                        symbol=symbol,
+                        interval=interval,
+                        segment_id=segment_id,
+                        target=f"trusted segment representation {expanded_path.name}",
+                    )
+                    exp_suffix_start = bisect_left(
+                        expanded,
+                        expanded_existing[-1].open_time_ms + 1,
+                        key=_candle_open_time_ms,
+                    )
+                    exp_suffix = expanded[exp_suffix_start:]
+                    if exp_suffix:
+                        expanded_combined = [*expanded_existing, *exp_suffix]
+                        _validate_candidate_segment_continuity(
+                            expanded_combined,
+                            symbol=symbol,
+                            interval=interval,
+                            segment_id=segment_id,
+                        )
+                        self.write_csv(
+                            expanded_combined,
+                            expanded_path,
+                            required_prefix=expanded_existing_bytes,
+                        )
+                        physical_rows_by_segment[segment_id] = expanded_combined
+                    else:
+                        physical_rows_by_segment[segment_id] = expanded_existing
+                else:
+                    self.write_csv(expanded, expanded_path)
+                    physical_rows_by_segment[segment_id] = expanded
+                source_files_by_segment[segment_id] = expanded_source
+                continue
+
+            source_files_by_segment[segment_id] = canonical_source
             suffix_start = bisect_left(
                 candidate_rows,
                 existing[-1].open_time_ms + 1,
@@ -382,7 +471,7 @@ class TrustedDataStore:
             references.append(
                 SegmentReference(
                     segment_id=segment_id,
-                    source_file=self.segment_source_file(symbol, interval, segment_id),
+                    source_file=source_files_by_segment[segment_id],
                     start_row=start_row,
                     rows=len(segment_candles),
                     first_timestamp_ms=segment_candles[0].open_time_ms,
@@ -469,6 +558,44 @@ class TrustedDataStore:
             raise SegmentCorrectionError(
                 f"new trusted segment is not adjacent to its canonical successor: "
                 f"{symbol}/{interval}/{segment_id}->{next_id}"
+            )
+
+    def _validate_other_segment_representation_overlaps(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        candidate_rows: list[Candle],
+        *,
+        excluded_path: Path,
+    ) -> None:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        if not segment_dir.exists():
+            return
+        representation_name = re.compile(
+            rf"{re.escape(segment_id)}(?:\.csv|\.(?:partial--?[0-9]+|"
+            rf"import-[A-Za-z0-9][A-Za-z0-9._-]{{0,127}})\.csv)"
+        )
+        for discovered_path in sorted(segment_dir.glob(f"{segment_id}*.csv")):
+            if discovered_path == excluded_path or representation_name.fullmatch(discovered_path.name) is None:
+                continue
+            source_file = discovered_path.relative_to(self.data_dir)
+            path = self._segment_path_from_source(source_file)
+            existing = self.read_csv(path)
+            _validate_segment_candles(existing, segment_id=segment_id)
+            _validate_candidate_segment_continuity(
+                existing,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+            )
+            _validate_candidate_overlap(
+                existing,
+                candidate_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+                target=f"trusted segment representation {path.name}",
             )
 
     def read_generation_dataset(
@@ -593,7 +720,13 @@ class TrustedDataStore:
                 if extracted is None:
                     return None
                 raw_lines, _ = extracted
-                if len(raw_lines) != health.rows:
+                if (
+                    len(raw_lines) != health.rows
+                    or health.first_timestamp_ms is None
+                    or health.last_timestamp_ms is None
+                    or _line_open_time_ms(raw_lines[0]) != health.first_timestamp_ms
+                    or _line_open_time_ms(raw_lines[-1]) != health.last_timestamp_ms
+                ):
                     return None
                 norm_bytes = b"\n".join(raw_lines) + b"\n"
                 canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
@@ -602,7 +735,14 @@ class TrustedDataStore:
 
             if storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
                 expected_root = self.segment_source_root(symbol, interval)
-                if storage.source_root.as_posix() != expected_root.as_posix() or not storage.segments:
+                if (
+                    storage.source_root.as_posix() != expected_root.as_posix()
+                    or not storage.segments
+                    or health.first_timestamp_ms is None
+                    or health.last_timestamp_ms is None
+                    or storage.segments[0].first_timestamp_ms != health.first_timestamp_ms
+                    or storage.segments[-1].last_timestamp_ms != health.last_timestamp_ms
+                ):
                     return None
                 logical_digest = hashlib.sha256()
                 total_rows = 0
@@ -643,6 +783,12 @@ class TrustedDataStore:
                             _candle_cls,
                         )
                     slice_lines = raw_lines[reference.start_row : needed]
+                    if (
+                        not slice_lines
+                        or _line_open_time_ms(slice_lines[0]) != reference.first_timestamp_ms
+                        or _line_open_time_ms(slice_lines[-1]) != reference.last_timestamp_ms
+                    ):
+                        return None
                     norm_bytes = b"\n".join(slice_lines) + b"\n"
                     canonical_bytes = norm_bytes.replace(b",", b"\x00").replace(b"\n", b"\x00\n")
                     if hashlib.sha256(canonical_bytes).hexdigest() != reference.content_sha256:
@@ -1220,6 +1366,13 @@ def _validate_generation_storage(snapshot: TrustedManifestSnapshot, generation_r
                     )
             continue
         raise ManifestSchemaError(f"unsupported trusted storage layout: {storage.layout}")
+
+
+def _line_open_time_ms(line: bytes) -> int | None:
+    comma = line.find(b",")
+    if comma <= 0:
+        return None
+    return int(line[:comma])
 
 
 def _extract_unquoted_csv_lines(
