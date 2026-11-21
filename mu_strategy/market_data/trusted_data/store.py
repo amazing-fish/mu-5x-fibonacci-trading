@@ -348,6 +348,8 @@ class TrustedDataStore:
                 candidate_rows,
                 excluded_path=path,
             )
+            step_ms = interval_to_ms(interval)
+            is_closed = self._has_later_segment(symbol, interval, segment_id)
             covering_partial = (
                 self._find_covering_partial_representation(
                     symbol,
@@ -361,7 +363,7 @@ class TrustedDataStore:
                     candidate_rows[0].open_time_ms < existing[0].open_time_ms
                     or (
                         candidate_rows[-1].open_time_ms > existing[-1].open_time_ms
-                        and self._has_later_segment(symbol, interval, segment_id)
+                        and (is_closed or candidate_rows[0].open_time_ms > existing[-1].open_time_ms + step_ms)
                     )
                 )
                 else None
@@ -373,21 +375,6 @@ class TrustedDataStore:
                     or covering_partial is not None
                 )
             ):
-                if existing[-1].open_time_ms > candidate_rows[-1].open_time_ms:
-                    tail_start = bisect_left(
-                        existing,
-                        candidate_rows[-1].open_time_ms + 1,
-                        key=_candle_open_time_ms,
-                    )
-                    expanded = [*candidate_rows, *existing[tail_start:]]
-                else:
-                    expanded = list(candidate_rows)
-                _validate_candidate_segment_continuity(
-                    expanded,
-                    symbol=symbol,
-                    interval=interval,
-                    segment_id=segment_id,
-                )
                 if covering_partial is not None:
                     expanded_start_ms, expanded_source, expanded_path = covering_partial
                     expanded_existing_bytes = expanded_path.read_bytes()
@@ -397,22 +384,30 @@ class TrustedDataStore:
                         raise SegmentCorrectionError(
                             f"trusted segment representation start timestamp mismatch: {expanded_path.name}"
                         )
+                    _validate_candidate_segment_continuity(
+                        expanded_existing,
+                        symbol=symbol,
+                        interval=interval,
+                        segment_id=segment_id,
+                    )
                     _validate_candidate_overlap(
                         expanded_existing,
-                        expanded,
+                        candidate_rows,
                         symbol=symbol,
                         interval=interval,
                         segment_id=segment_id,
                         target=f"trusted segment representation {expanded_path.name}",
                     )
-                    exp_suffix_start = bisect_left(
-                        expanded,
-                        expanded_existing[-1].open_time_ms + 1,
-                        key=_candle_open_time_ms,
-                    )
-                    exp_suffix = expanded[exp_suffix_start:]
-                    if exp_suffix:
-                        if self._has_later_segment(symbol, interval, segment_id):
+                    if candidate_rows[-1].open_time_ms <= expanded_existing[-1].open_time_ms:
+                        physical_rows_by_segment[segment_id] = expanded_existing
+                    else:
+                        exp_suffix_start = bisect_left(
+                            candidate_rows,
+                            expanded_existing[-1].open_time_ms + 1,
+                            key=_candle_open_time_ms,
+                        )
+                        exp_suffix = candidate_rows[exp_suffix_start:]
+                        if is_closed:
                             raise SegmentCorrectionError(
                                 f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
                             )
@@ -429,23 +424,42 @@ class TrustedDataStore:
                             required_prefix=expanded_existing_bytes,
                         )
                         physical_rows_by_segment[segment_id] = expanded_combined
-                    else:
-                        physical_rows_by_segment[segment_id] = expanded_existing
+                    source_files_by_segment[segment_id] = expanded_source
+                    continue
+
+                if existing[-1].open_time_ms > candidate_rows[-1].open_time_ms:
+                    tail_start = bisect_left(
+                        existing,
+                        candidate_rows[-1].open_time_ms + 1,
+                        key=_candle_open_time_ms,
+                    )
+                    expanded = [*candidate_rows, *existing[tail_start:]]
                 else:
-                    if (
-                        expanded[-1].open_time_ms > existing[-1].open_time_ms
-                        and self._has_later_segment(symbol, interval, segment_id)
-                    ):
+                    expanded = list(candidate_rows)
+                _validate_candidate_segment_continuity(
+                    expanded,
+                    symbol=symbol,
+                    interval=interval,
+                    segment_id=segment_id,
+                )
+                if is_closed:
+                    closed_boundary_ms = self._closed_segment_boundary_ms(
+                        symbol,
+                        interval,
+                        segment_id,
+                        existing,
+                    )
+                    if expanded[-1].open_time_ms != closed_boundary_ms:
                         raise SegmentCorrectionError(
                             f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
                         )
-                    expanded_source = (
-                        self.segment_source_root(symbol, interval)
-                        / f"{segment_id}.partial-{expanded[0].open_time_ms}.csv"
-                    )
-                    expanded_path = self._segment_path_from_source(expanded_source)
-                    self.write_csv(expanded, expanded_path)
-                    physical_rows_by_segment[segment_id] = expanded
+                expanded_source = (
+                    self.segment_source_root(symbol, interval)
+                    / f"{segment_id}.partial-{expanded[0].open_time_ms}.csv"
+                )
+                expanded_path = self._segment_path_from_source(expanded_source)
+                self.write_csv(expanded, expanded_path)
+                physical_rows_by_segment[segment_id] = expanded
                 source_files_by_segment[segment_id] = expanded_source
                 continue
 
@@ -538,6 +552,7 @@ class TrustedDataStore:
         segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
         if not segment_dir.exists():
             return None
+        step_ms = interval_to_ms(interval)
         partial_pattern = re.compile(rf"{re.escape(segment_id)}\.partial-(-?[0-9]+)\.csv")
         candidates: list[tuple[bool, int, Path, Path]] = []
         for discovered_path in sorted(segment_dir.glob(f"{segment_id}.partial-*.csv")):
@@ -555,12 +570,97 @@ class TrustedDataStore:
                 raise SegmentCorrectionError(
                     f"trusted segment representation start timestamp mismatch: {path.name}"
                 )
+            if rows[-1].open_time_ms + step_ms < first_timestamp_ms:
+                continue
             covers_end = rows[-1].open_time_ms >= last_timestamp_ms
             candidates.append((not covers_end, partial_start_ms, source_file, path))
         if not candidates:
             return None
         _, chosen_start_ms, chosen_source, chosen_path = min(candidates, key=lambda item: (item[0], item[1]))
         return chosen_start_ms, chosen_source, chosen_path
+
+    def _has_validated_covering_partial_ending_at(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        canonical_rows: list[Candle],
+        target_end_ms: int,
+    ) -> bool:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        if not segment_dir.exists():
+            return False
+        partial_pattern = re.compile(rf"{re.escape(segment_id)}\.partial-(-?[0-9]+)\.csv")
+        for discovered_path in sorted(segment_dir.glob(f"{segment_id}.partial-*.csv")):
+            match = partial_pattern.fullmatch(discovered_path.name)
+            if match is None:
+                continue
+            partial_source = discovered_path.relative_to(self.data_dir)
+            partial_path = self._segment_path_from_source(partial_source)
+            partial_rows = self.read_csv(partial_path)
+            _validate_segment_candles(partial_rows, segment_id=segment_id)
+            if partial_rows[0].open_time_ms != int(match.group(1)):
+                raise SegmentCorrectionError(
+                    f"trusted segment representation start timestamp mismatch: {partial_path.name}"
+                )
+            _validate_candidate_segment_continuity(
+                partial_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+            )
+            _validate_candidate_overlap(
+                canonical_rows,
+                partial_rows,
+                symbol=symbol,
+                interval=interval,
+                segment_id=segment_id,
+                target=f"trusted segment representation {partial_path.name}",
+            )
+            if (
+                partial_rows[0].open_time_ms <= canonical_rows[0].open_time_ms
+                and partial_rows[-1].open_time_ms >= canonical_rows[-1].open_time_ms
+                and partial_rows[-1].open_time_ms == target_end_ms
+            ):
+                return True
+        return False
+
+    def _closed_segment_boundary_ms(
+        self,
+        symbol: str,
+        interval: str,
+        segment_id: str,
+        canonical_rows: list[Candle],
+    ) -> int:
+        segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
+        next_ids = [
+            candidate.stem
+            for candidate in segment_dir.glob("*.csv")
+            if _UTC_MONTH_RE.fullmatch(candidate.stem) and candidate.stem > segment_id
+        ]
+        if not next_ids:
+            return canonical_rows[-1].open_time_ms
+        next_id = min(next_ids)
+        next_rows = self.read_csv(self.segment_path(symbol, interval, next_id))
+        _validate_segment_candles(next_rows, segment_id=next_id)
+        _validate_candidate_segment_continuity(
+            next_rows,
+            symbol=symbol,
+            interval=interval,
+            segment_id=next_id,
+        )
+        target_end_ms = next_rows[0].open_time_ms - interval_to_ms(interval)
+        if canonical_rows[-1].open_time_ms == target_end_ms:
+            return target_end_ms
+        if self._has_validated_covering_partial_ending_at(
+            symbol,
+            interval,
+            segment_id,
+            canonical_rows,
+            target_end_ms,
+        ):
+            return target_end_ms
+        return canonical_rows[-1].open_time_ms
 
     def _validate_previous_canonical_segment_adjacency(
         self,
@@ -614,40 +714,14 @@ class TrustedDataStore:
         )
         if first_candidate.open_time_ms == previous_rows[-1].open_time_ms + step_ms:
             return
-
-        partial_pattern = re.compile(rf"{re.escape(previous_id)}\.partial-(-?[0-9]+)\.csv")
-        for discovered_path in sorted(segment_dir.glob(f"{previous_id}.partial-*.csv")):
-            match = partial_pattern.fullmatch(discovered_path.name)
-            if match is None:
-                continue
-            partial_source = discovered_path.relative_to(self.data_dir)
-            partial_path = self._segment_path_from_source(partial_source)
-            partial_rows = self.read_csv(partial_path)
-            _validate_segment_candles(partial_rows, segment_id=previous_id)
-            if partial_rows[0].open_time_ms != int(match.group(1)):
-                raise SegmentCorrectionError(
-                    f"trusted segment representation start timestamp mismatch: {partial_path.name}"
-                )
-            _validate_candidate_segment_continuity(
-                partial_rows,
-                symbol=symbol,
-                interval=interval,
-                segment_id=previous_id,
-            )
-            _validate_candidate_overlap(
-                previous_rows,
-                partial_rows,
-                symbol=symbol,
-                interval=interval,
-                segment_id=previous_id,
-                target=f"trusted segment representation {partial_path.name}",
-            )
-            if (
-                partial_rows[0].open_time_ms <= previous_rows[0].open_time_ms
-                and partial_rows[-1].open_time_ms >= previous_rows[-1].open_time_ms
-                and first_candidate.open_time_ms == partial_rows[-1].open_time_ms + step_ms
-            ):
-                return
+        if self._has_validated_covering_partial_ending_at(
+            symbol,
+            interval,
+            previous_id,
+            previous_rows,
+            first_candidate.open_time_ms - step_ms,
+        ):
+            return
 
         raise SegmentCorrectionError(
             f"new trusted segment is not adjacent to its canonical predecessor: "

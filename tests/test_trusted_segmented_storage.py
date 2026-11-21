@@ -1445,7 +1445,13 @@ class FlatGenerationCompatTests(unittest.TestCase):
                 [jan_partial_path.name],
                 sorted(p.name for p in canonical_jan.parent.glob("2026-01.partial-*.csv")),
             )
-            self.assertEqual(extended_feb1[-run_ext.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_C))
+            expected_ext = [
+                row
+                for row in extended_feb1
+                if row.open_time_ms >= extended_feb1[-1].open_time_ms - 20 * DAY_MS
+            ]
+            self.assertLess(expected_ext[0].open_time_ms, JAN_START_MS)
+            self.assertEqual(expected_ext, _read_exact(store, RUN_C))
             self.assertEqual(full_through_feb1, _read_exact(store, RUN_B))
 
             # Later incremental refresh (Feb 13, days=20 -> logical start Jan 24 > Jan 22) still reuses expanded partial
@@ -1459,7 +1465,14 @@ class FlatGenerationCompatTests(unittest.TestCase):
             )
             self.assertEqual("success", run_later.attempt_status.value)
             self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
-            self.assertEqual(later_feb_rows[-run_later.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_D))
+            expected_later = [
+                row
+                for row in later_feb_rows
+                if row.open_time_ms >= later_feb_rows[-1].open_time_ms - 20 * DAY_MS
+            ]
+            self.assertGreater(expected_later[0].open_time_ms, JAN_START_MS)
+            self.assertLess(expected_later[0].open_time_ms, FEB_START_MS)
+            self.assertEqual(expected_later, _read_exact(store, RUN_D))
             self.assertEqual(short_rows, _read_exact(store, RUN_A))
             self.assertEqual(full_through_feb1, _read_exact(store, RUN_B))
 
@@ -1487,6 +1500,116 @@ class FlatGenerationCompatTests(unittest.TestCase):
             self.assertEqual(("2026-02",), tuple(ref.segment_id for ref in feb_storage.segments))
             self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
             self.assertEqual(feb_rows, store.read_csv(store.segment_path(SYMBOL, "5m", "2026-02")))
+
+    def test_partial_representation_open_month_extension_subwindow_reuse_and_closed_earlier_backfill(self):
+        jan10_ms = JAN_MONTH_START_MS + 9 * DAY_MS
+        jan11_ms = JAN_MONTH_START_MS + 10 * DAY_MS
+        jan24_ms = JAN_START_MS + 2 * DAY_MS
+        jan25_ms = JAN_START_MS + 3 * DAY_MS
+        jan30_end_ms = FEB_START_MS - DAY_MS - STEP_MS
+        jan31_end_ms = FEB_START_MS - STEP_MS
+
+        # 1. Open month (no Feb yet): canonical Jan 22-23 + partial Jan 1-30 ->
+        #    Jan 25-31 reuses & appends to the partial with byte-prefix check, while contiguous Jan 24-25 still
+        #    uses canonical 2026-01.csv, and Jan 10-11 reuses the covering partial without appending canonical tail.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            canonical_rows = _window_candles(JAN_START_MS, JAN_START_MS + 2 * DAY_MS - STEP_MS)  # Jan 22-23
+            partial_jan1_30 = _window_candles(JAN_MONTH_START_MS, jan30_end_ms)
+            jan25_31 = _window_candles(jan25_ms, jan31_end_ms)
+            jan10_11 = _window_candles(jan10_ms, jan11_ms)
+            contiguous_jan24 = _window_candles(jan24_ms, jan24_ms + 3 * STEP_MS)
+
+            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
+            canonical_jan = store.segment_path(SYMBOL, "5m", "2026-01")
+            canonical_bytes_before = canonical_jan.read_bytes()
+
+            store.write_segmented_dataset(partial_jan1_30, symbol=SYMBOL, interval="5m")
+            jan_partial = data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{JAN_MONTH_START_MS}.csv"
+            partial_prefix_bytes = jan_partial.read_bytes()
+
+            # Jan 25-31 is not contiguous with Jan 22-23 canonical, so it reuses & extends Jan 1-30 partial through Jan 31.
+            ext_storage = store.write_segmented_dataset(jan25_31, symbol=SYMBOL, interval="5m")
+            self.assertEqual(jan_partial.relative_to(data_dir), ext_storage.segments[0].source_file)
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+            extended_partial_bytes = jan_partial.read_bytes()
+            self.assertTrue(extended_partial_bytes.startswith(partial_prefix_bytes))
+            self.assertEqual(_window_candles(JAN_MONTH_START_MS, jan31_end_ms), store.read_csv(jan_partial))
+
+            # Sub-window Jan 10-11 (before canonical Jan 22-23) is already covered by Jan 1-31 partial;
+            # it must reuse that partial directly without appending canonical tail or rejecting a gap.
+            sub_storage = store.write_segmented_dataset(jan10_11, symbol=SYMBOL, interval="5m")
+            self.assertEqual(jan_partial.relative_to(data_dir), sub_storage.segments[0].source_file)
+            self.assertEqual(len(jan10_11), sub_storage.segments[0].rows)
+            self.assertEqual(extended_partial_bytes, jan_partial.read_bytes())
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+
+            # Ordinary contiguous append right after canonical EOF (Jan 24 00:00) still appends to canonical 2026-01.csv.
+            contig_storage = store.write_segmented_dataset(contiguous_jan24, symbol=SYMBOL, interval="5m")
+            self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-01"), contig_storage.segments[0].source_file)
+            self.assertTrue(canonical_jan.read_bytes().startswith(canonical_bytes_before))
+            self.assertEqual(extended_partial_bytes, jan_partial.read_bytes())
+
+        # 2. Closed month (Feb exists): canonical Jan 22-23 + retained partial Jan 10-31 + Feb 1 ->
+        #    continuous Jan 1-Feb 1 backfill creates Jan 1 partial without mutating canonical or Jan 10 partial,
+        #    while changing the closed endpoint or introducing a conflict still fails closed.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            canonical_rows = _window_candles(JAN_START_MS, JAN_START_MS + 2 * DAY_MS - STEP_MS)  # Jan 22-23
+            jan10_through_feb1 = _window_candles(jan10_ms, FEB_START_MS + 2 * STEP_MS)
+            jan1_through_feb1 = _window_candles(JAN_MONTH_START_MS, FEB_START_MS + 2 * STEP_MS)
+            jan1_truncated_end = _window_candles(JAN_MONTH_START_MS, jan31_end_ms - STEP_MS)
+
+            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
+            canonical_jan = store.segment_path(SYMBOL, "5m", "2026-01")
+            canonical_bytes = canonical_jan.read_bytes()
+
+            store.write_segmented_dataset(jan10_through_feb1, symbol=SYMBOL, interval="5m")
+            jan10_partial = data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{jan10_ms}.csv"
+            jan10_bytes = jan10_partial.read_bytes()
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+
+            # Changing the closed endpoint (ending before Jan 31 23:55) must still be rejected.
+            with self.assertRaisesRegex(SegmentCorrectionError, "closed trusted segment cannot grow"):
+                store.write_segmented_dataset(jan1_truncated_end, symbol=SYMBOL, interval="5m")
+            jan1_partial = data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{JAN_MONTH_START_MS}.csv"
+            self.assertFalse(jan1_partial.exists())
+
+            # Conflicting candle on Jan 15 against retained Jan 10 partial must still fail closed.
+            conflicting = list(jan1_through_feb1)
+            conflict_idx = (jan10_ms + 5 * DAY_MS - JAN_MONTH_START_MS) // STEP_MS
+            bad = conflicting[conflict_idx]
+            conflicting[conflict_idx] = Candle(bad.open_time_ms, bad.open + 3.0, bad.high + 3.0, bad.low, bad.close + 3.0, bad.volume)
+            with self.assertRaisesRegex(SegmentCorrectionError, "historical correction"):
+                store.write_segmented_dataset(conflicting, symbol=SYMBOL, interval="5m")
+            self.assertFalse(jan1_partial.exists())
+
+            # Valid earlier start with unchanged closed endpoint (Jan 31 23:55) succeeds cleanly.
+            backfill_storage = store.write_segmented_dataset(jan1_through_feb1, symbol=SYMBOL, interval="5m")
+            self.assertEqual(("2026-01", "2026-02"), tuple(ref.segment_id for ref in backfill_storage.segments))
+            self.assertEqual(jan1_partial.relative_to(data_dir), backfill_storage.segments[0].source_file)
+            self.assertEqual(canonical_bytes, canonical_jan.read_bytes())
+            self.assertEqual(jan10_bytes, jan10_partial.read_bytes())
+            self.assertEqual(_window_candles(JAN_MONTH_START_MS, jan31_end_ms), store.read_csv(jan1_partial))
+
+        # 3. Closed month where NO retained representation reaches the Feb 1 boundary still rejects earlier expansion.
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            canonical_rows = _window_candles(JAN_START_MS, JAN_START_MS + 2 * DAY_MS - STEP_MS)
+            jan10_short = _window_candles(jan10_ms, jan30_end_ms)
+            feb_rows = _window_candles(FEB_START_MS, FEB_START_MS + 2 * STEP_MS)
+            jan1_through_jan31 = _window_candles(JAN_MONTH_START_MS, jan31_end_ms)
+
+            store.write_csv(canonical_rows, store.segment_path(SYMBOL, "5m", "2026-01"))
+            store.write_csv(jan10_short, data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{jan10_ms}.csv")
+            store.write_csv(feb_rows, store.segment_path(SYMBOL, "5m", "2026-02"))
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "closed trusted segment cannot grow"):
+                store.write_segmented_dataset(jan1_through_jan31, symbol=SYMBOL, interval="5m")
+            self.assertFalse((data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{JAN_MONTH_START_MS}.csv").exists())
 
 
 def _candles_through(end_ms: int) -> list[Candle]:

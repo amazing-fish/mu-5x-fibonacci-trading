@@ -623,24 +623,34 @@ class JsonlObservationRepository:
             finally:
                 file_locks.unlock_file(stream)
 
-    def read_commit_state(self) -> ObservationCommitState | None:
-        """Read the highest valid slot from the 2-slot ping-pong commit file, or None if absent."""
+    def inspect_commit_slots(self) -> tuple[ObservationCommitState | None, bool]:
+        """Inspect both ping-pong commit slots, returning ``(highest_valid_state, has_unreadable_slot)``."""
         try:
             raw = self.commit_path.read_bytes()
         except FileNotFoundError:
-            return None
+            return None, False
         if not raw or len(raw) > 2 * _COMMIT_SLOT_BYTES:
             raise ObservationCorruptionError("corrupted observation commit boundary")
+        has_unreadable_slot = len(raw) not in (_COMMIT_SLOT_BYTES, 2 * _COMMIT_SLOT_BYTES)
         candidates: list[ObservationCommitState] = []
-        for slot_start in (0, _COMMIT_SLOT_BYTES):
-            chunk = raw[slot_start : slot_start + _COMMIT_SLOT_BYTES]
-            if len(chunk) == _COMMIT_SLOT_BYTES:
-                parsed = _decode_commit_slot(chunk)
-                if parsed is not None:
-                    candidates.append(parsed)
+        slot_count = len(raw) // _COMMIT_SLOT_BYTES
+        for slot_idx in range(slot_count):
+            start = slot_idx * _COMMIT_SLOT_BYTES
+            parsed = _decode_commit_slot(raw[start : start + _COMMIT_SLOT_BYTES])
+            if parsed is None:
+                has_unreadable_slot = True
+            else:
+                candidates.append(parsed)
         if not candidates:
             raise ObservationCorruptionError("corrupted observation commit boundary")
-        return max(candidates, key=lambda item: item.seq)
+        if len(candidates) == 2 and abs(candidates[0].seq - candidates[1].seq) > 1:
+            has_unreadable_slot = True
+        return max(candidates, key=lambda item: item.seq), has_unreadable_slot
+
+    def read_commit_state(self) -> ObservationCommitState | None:
+        """Read the highest valid slot from the 2-slot ping-pong commit file, or None if absent."""
+        state, _ = self.inspect_commit_slots()
+        return state
 
     @staticmethod
     def read_index_entry(index_handle, index: int) -> ObservationIndexEntry:
@@ -730,30 +740,50 @@ class JsonlObservationRepository:
                 raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
     def repair_uncommitted_tail(self) -> bool:
-        """Truncate and fsync any uncommitted trailing log/index bytes past the durable commit boundary."""
+        """Truncate and fsync provably uncommitted trailing log/index bytes past a clean commit boundary.
+
+        Explicit safety policy: if any commit slot is unreadable (cannot distinguish post-acknowledgment
+        slot damage from a torn slot write), fail closed without truncating so acknowledged cycles are
+        never silently deleted.
+        """
         try:
             if not self.path.parent.exists():
                 return False
             with self.publication_fence():
                 if self.invalid_marker_path.exists():
                     raise OSError("observation repository has an unresolved invalid marker")
-                commit = self.read_commit_state()
+                commit, has_unreadable_slot = self.inspect_commit_slots()
                 if commit is None:
                     return False
                 if not self.path.exists() or not self.index_path.exists():
                     raise OSError("observation log or index missing for committed repository")
-                return self._repair_uncommitted_tail_locked(commit)
+                return self._repair_uncommitted_tail_locked(commit, has_unreadable_slot=has_unreadable_slot)
         except (OSError, ObservationCorruptionError) as exc:
             raise ObservationWriteError(f"observation commit-boundary repair failed: {type(exc).__name__}: {exc}") from exc
 
-    def _repair_uncommitted_tail_locked(self, commit: ObservationCommitState) -> bool:
-        """Must be called under publication_fence(). Truncates verified uncommitted trailing bytes only."""
+    def _repair_uncommitted_tail_locked(
+        self,
+        commit: ObservationCommitState,
+        *,
+        has_unreadable_slot: bool,
+    ) -> bool:
+        """Must be called under publication_fence().
+
+        Truncates trailing bytes ONLY when every slot in ``.commit`` is valid and consistent (proving
+        no commit slot write could cover the extra bytes). When any commit slot is unreadable, fails
+        closed without truncating so a previously acknowledged cycle is never silently deleted.
+        """
         log_size = self.path.stat().st_size
         index_size = self.index_path.stat().st_size
         if log_size < commit.offset or index_size < commit.index_offset:
             raise OSError("observation log or index truncated before durable commit boundary")
         if log_size == commit.offset and index_size == commit.index_offset:
             return False
+        if has_unreadable_slot:
+            raise OSError(
+                "observation commit boundary has an unreadable slot; refusing automatic tail truncation "
+                "to preserve potentially acknowledged cycles"
+            )
 
         # Verify the committed boundary is intact before discarding uncommitted trailing bytes.
         if commit.seq > 0:
@@ -801,8 +831,8 @@ class JsonlObservationRepository:
                 if self.invalid_marker_path.exists():
                     raise OSError("observation repository has an unresolved invalid marker")
                 self._flush_dirsync_marker()
-                commit = self._ensure_storage_initialized()
-                self._repair_uncommitted_tail_locked(commit)
+                commit, has_unreadable_slot = self._ensure_storage_initialized()
+                self._repair_uncommitted_tail_locked(commit, has_unreadable_slot=has_unreadable_slot)
                 cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
                 content_hash16 = hashlib.sha256(encoded[:-1]).digest()[:16]
                 symbols_hash16 = _symbols_hash16(cycle)
@@ -1154,7 +1184,7 @@ class JsonlObservationRepository:
                 pass
             raise
 
-    def _ensure_storage_initialized(self) -> ObservationCommitState:
+    def _ensure_storage_initialized(self) -> tuple[ObservationCommitState, bool]:
         """Initialize durable commit + coverage index on initial log creation or legacy bootstrap."""
         log_exists = self.path.exists()
         log_size = self.path.stat().st_size if log_exists else 0
@@ -1164,9 +1194,11 @@ class JsonlObservationRepository:
 
         if log_size == 0:
             if commit_exists:
-                existing = self.read_commit_state()
+                existing, has_unreadable_slot = self.inspect_commit_slots()
                 if existing is not None and existing.offset > 0:
                     raise OSError("observation log truncated before durable commit boundary")
+                if has_unreadable_slot:
+                    raise OSError("observation commit boundary has an unreadable slot")
             initial = ObservationCommitState(
                 seq=0,
                 offset=0,
@@ -1182,23 +1214,26 @@ class JsonlObservationRepository:
                 with self.index_path.open("wb", buffering=0) as idx:
                     os.fsync(idx.fileno())
             self._fsync_parent_directory()
-            return initial
+            return initial, False
 
-        if not commit_exists and (not index_exists or commit_staging.exists()):
-            return self._bootstrap_legacy_storage(commit_staging=commit_staging)
+        if (not commit_exists and not index_exists) or (
+            commit_staging.exists() and (not commit_exists or not index_exists)
+        ):
+            return self._bootstrap_legacy_storage(commit_staging=commit_staging), False
 
         if not commit_exists or not index_exists:
             raise OSError("observation commit boundary or index is missing for non-empty log")
 
         if commit_staging.exists():
-            # Prior legacy migration published both files but failed before parent directory fsync completed.
+            # Prior legacy migration published both files; ensure their directory entries are durable,
+            # then remove the marker.
             self._fsync_parent_directory()
             commit_staging.unlink()
 
-        commit = self.read_commit_state()
+        commit, has_unreadable_slot = self.inspect_commit_slots()
         if commit is None:
             raise OSError("observation commit boundary is unreadable")
-        return commit
+        return commit, has_unreadable_slot
 
     def _bootstrap_legacy_storage(self, *, commit_staging: Path) -> ObservationCommitState:
         """Stage and atomically publish durable commit + index sidecars for a legacy JSONL log."""
@@ -1252,14 +1287,17 @@ class JsonlObservationRepository:
                 os.fsync(idx_handle.fileno())
             with tmp_commit.open("wb", buffering=0) as commit_handle:
                 if state.seq % 2 == 1:
-                    _write_all(commit_handle, b"\x00" * _COMMIT_SLOT_BYTES)
+                    # Populate both slots with the valid odd-seq state so .commit has zero invalid slots
+                    # while keeping slot 0 ready to accept the next even sequence number (state.seq + 1).
+                    _write_all(commit_handle, slot_bytes)
                 _write_all(commit_handle, slot_bytes)
                 os.fsync(commit_handle.fileno())
-            # Record migration in progress before exposing index_path, and keep marker until
-            # parent directory fsync succeeds so any interruption remains recognizable and retryable.
+            # Persist and directory-sync the migration marker BEFORE exposing either final sidecar so
+            # a power loss after the first os.replace() always leaves the marker durable for retry.
             with commit_staging.open("wb", buffering=0) as staging_handle:
                 _write_all(staging_handle, b"migrating\n")
                 os.fsync(staging_handle.fileno())
+            self._fsync_parent_directory()
             os.replace(tmp_index, self.index_path)
             os.replace(tmp_commit, self.commit_path)
             self._fsync_parent_directory()

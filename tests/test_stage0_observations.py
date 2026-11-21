@@ -329,6 +329,55 @@ class Stage0ObservationContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ObservationWriteError, "truncated"):
                 repository.append_cycle(_cycle("cycle-d", "obs-d"))
 
+    def test_unreadable_newest_commit_slot_refuses_truncation_and_preserves_acknowledged_cycles(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            third = _cycle("cycle-c", "obs-c")
+            repository.append_cycle(first)
+            repository.append_cycle(second)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            commit_bytes = bytearray(repository.commit_path.read_bytes())
+
+            # Damage newest slot (slot 0, seq=2) while leaving older slot 1 (seq=1) valid.
+            commit_bytes[0:10] = b"CORRUPTED!"
+            repository.commit_path.write_bytes(bytes(commit_bytes))
+
+            older_state, has_unreadable = repository.inspect_commit_slots()
+            self.assertEqual(1, older_state.seq)
+            self.assertTrue(has_unreadable)
+
+            # Neither repair_uncommitted_tail() nor append_cycle() may delete acknowledged cycle-b!
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(third)
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
+        # Also verify a torn short write of slot 1 (between 160 and 320 bytes) fails closed without truncating.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            raw_commit = repository.commit_path.read_bytes()
+            repository.commit_path.write_bytes(raw_commit[:200])
+
+            _, has_unreadable = repository.inspect_commit_slots()
+            self.assertTrue(has_unreadable)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-b", "obs-b"))
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
     def test_failed_initial_commit_slot_write_recovers_cleanly_while_corrupt_commit_rejected(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
@@ -374,20 +423,30 @@ class Stage0ObservationContractTests(unittest.TestCase):
             self.assertFalse(repository.index_path.exists())
             self.assertFalse(repository.commit_path.exists())
 
-            # Fault 2: Crash between publishing .index and renaming commit.staging -> .commit is recognized & retried.
+            # Fault 2: Parent directory MUST be fsynced after writing .commit.staging and BEFORE publishing
+            # either final sidecar; crash between publishing .index and .commit stays retryable.
             real_replace = __import__("os").replace
-            replace_calls = 0
+            events: list[tuple[str, str]] = []
+
+            def record_dir_fsync(directory):
+                events.append(("dir_fsync", str(directory)))
+                self.assertTrue(Path(f"{path}.commit.staging").exists())
 
             def fail_final_commit_rename(src, dst):
-                nonlocal replace_calls
-                replace_calls += 1
+                events.append(("replace", Path(dst).name))
                 if Path(dst) == repository.commit_path:
                     raise OSError("final commit rename failed")
                 return real_replace(src, dst)
 
-            with patch("mu_strategy.observations.os.replace", side_effect=fail_final_commit_rename):
+            with patch("mu_strategy.observations._fsync_directory", side_effect=record_dir_fsync), patch(
+                "mu_strategy.observations.os.replace", side_effect=fail_final_commit_rename
+            ):
                 with self.assertRaisesRegex(ObservationWriteError, "final commit rename failed"):
                     repository.append_cycle(second)
+            self.assertEqual(
+                [("dir_fsync", str(path.parent)), ("replace", repository.index_path.name), ("replace", repository.commit_path.name)],
+                events,
+            )
             self.assertEqual(legacy_bytes, path.read_bytes())
             self.assertTrue(repository.index_path.exists())
             self.assertFalse(repository.commit_path.exists())
@@ -399,10 +458,17 @@ class Stage0ObservationContractTests(unittest.TestCase):
             self.assertTrue(repository.commit_path.exists())
             self.assertEqual((first, second), repository.read_cycles())
 
-            # Externally deleting .commit on an already-migrated repo (no staging marker) still fails closed.
+            # Symmetric partial state (commit exists, index missing, durable staging marker present) also retries cleanly.
+            repository.index_path.unlink()
+            Path(f"{path}.commit.staging").write_bytes(b"migrating\n")
+            repository.append_cycle(third)
+            self.assertFalse(Path(f"{path}.commit.staging").exists())
+            self.assertEqual((first, second, third), repository.read_cycles())
+
+            # Externally deleting .commit or .index on an already-migrated repo (no staging marker) still fails closed.
             repository.commit_path.unlink()
             with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
-                repository.append_cycle(third)
+                repository.append_cycle(_cycle("cycle-d", "obs-d"))
 
     def test_oversized_cycle_rejected_before_writing_and_limit_boundary_matches_readers(self):
         with TemporaryDirectory() as tmp:
