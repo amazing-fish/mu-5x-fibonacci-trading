@@ -553,20 +553,22 @@ class Stage0ObservationContractTests(unittest.TestCase):
             # Fault 3: Failure syncing marker retirement leaves marker on disk so a NEW repository instance
             # retries directory sync + durable marker retirement before allowing append to proceed.
             real_fsync = __import__("os").fsync
-            fsync_count = 0
+            staging_path = Path(f"{path}.commit.staging")
 
             def fail_marker_retire_fsync(fd):
-                nonlocal fsync_count
-                fsync_count += 1
-                # Call 1=tmp_index, 2=tmp_commit, 3=commit_staging("migrating"), 4=commit_staging("complete")
-                if fsync_count == 4:
+                if (
+                    repository.commit_path.exists()
+                    and staging_path.exists()
+                    and staging_path.read_bytes() == b"complete\n"
+                ):
                     raise OSError("retire marker fsync failed")
                 return real_fsync(fd)
 
             with patch("mu_strategy.observations.os.fsync", side_effect=fail_marker_retire_fsync):
                 with self.assertRaisesRegex(ObservationWriteError, "retire marker fsync failed"):
                     repository.append_cycle(second)
-            self.assertTrue(Path(f"{path}.commit.staging").exists())
+            self.assertTrue(staging_path.exists())
+            self.assertTrue(repository.index_path.exists())
             self.assertTrue(repository.commit_path.exists())
             self.assertEqual(legacy_bytes, path.read_bytes())
 
@@ -594,12 +596,17 @@ class Stage0ObservationContractTests(unittest.TestCase):
             # Uncommitted extra cycle was truncated by normal repair, never promoted into commit!
             self.assertEqual((first, second, third), repository.read_cycles())
 
-            # Simulated power loss reviving a retired ("complete\n") marker when a sidecar is missing
-            # MUST NOT be treated as an active migration (fails closed!).
+            # Simulated power loss reviving a retired ("complete\n") marker when one OR both sidecars are
+            # missing MUST NOT be treated as an active migration or legacy bootstrap (fails closed!).
             repository.index_path.unlink()
             Path(f"{path}.commit.staging").write_bytes(b"complete\n")
             with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
                 JsonlObservationRepository(path).append_cycle(_cycle("cycle-d", "obs-d"))
+            repository.commit_path.unlink()
+            with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
+                JsonlObservationRepository(path).append_cycle(_cycle("cycle-d", "obs-d"))
+            self.assertFalse(repository.commit_path.exists())
+            self.assertFalse(repository.index_path.exists())
             Path(f"{path}.commit.staging").unlink()
 
         # Even-count (2-cycle) legacy fixture: verify BOTH commit slots decode to the migration state

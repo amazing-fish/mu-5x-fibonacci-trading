@@ -1317,9 +1317,10 @@ class JsonlObservationRepository:
             self._fsync_parent_directory()
             return initial, False
 
-        migration_active = self._is_migration_marker_active(commit_staging)
+        staging_exists = commit_staging.exists()
+        migration_active = self._is_migration_marker_active(commit_staging) if staging_exists else False
 
-        if not commit_exists and (not index_exists or migration_active):
+        if not commit_exists and ((not index_exists and not staging_exists) or migration_active):
             return self._bootstrap_legacy_storage(commit_staging=commit_staging), False
 
         if commit_exists and not index_exists and migration_active:
@@ -1337,7 +1338,7 @@ class JsonlObservationRepository:
         if not commit_exists or not index_exists:
             raise OSError("observation commit boundary or index is missing for non-empty log")
 
-        if commit_staging.exists():
+        if staging_exists:
             # Prior migration published both sidecars (or failed while retiring the marker);
             # sync parent directory entries and durably retire + unlink the marker before appending.
             self._fsync_parent_directory()
