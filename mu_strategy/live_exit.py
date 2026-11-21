@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from mu_strategy.core.risk import evaluate_risk_exit
 from mu_strategy.core.trading_calendar import CalendarUnavailable
 from mu_strategy.models import Candle
 from mu_strategy.strategies.position_rules import (
@@ -72,10 +73,11 @@ class MappedPositionSnapshot:
 class OkxExitObservation:
     """Serializable shadow output for one OKX position row.
 
-    ``decision_status`` remains ``unknown`` for aggregate OKX rows because
-    the exchange response does not contain the fill history or carried stop
-    state. ``assumption_evaluation`` is deliberately separate from the actual
-    decision so consumers cannot mistake the degraded estimate for fact.
+    ``decision_status`` reports the actionable shadow exit status derived from
+    ``assumption_evaluation``: ``"exit"`` when a stop or non-session liquidation
+    condition triggered, ``"hold"`` when no exit triggered, or ``"unknown"``
+    when the row/candles are unavailable or the calendar could not be evaluated.
+    ``state_quality`` and ``assumptions`` continue to disclose aggregate-row limits.
     """
 
     symbol: str
@@ -101,25 +103,37 @@ def evaluate_exit(
 ) -> ExitObservation:
     """Evaluate a known position without mutating state or placing orders."""
 
-    calendar_error = None
+    calendar_error: str | None = None
+    in_session: bool | None
     try:
-        non_session_liquidation_risk = _has_non_session_liquidation_risk(candle, position, config)
+        in_session = is_preferred_us_cash_window(candle.open_time_ms, config)
     except CalendarUnavailable as exc:
         # A missing reference session cannot invalidate a known carried stop,
         # nor justify claiming that every exit condition is clear.
-        non_session_liquidation_risk = None
+        in_session = None
         calendar_error = str(exc)
-    stop_triggered = candle.low <= position.stop_price
-    exit_triggered = True if non_session_liquidation_risk or stop_triggered else non_session_liquidation_risk
-    if non_session_liquidation_risk:
-        exit_reason = "non_session_liquidation_risk"
-        trigger_basis = "candle_low_at_or_below_non_session_liquidation_risk_price"
-    elif stop_triggered:
-        exit_reason = "stop"
-        trigger_basis = "candle_low_at_or_below_stop_before_candle"
-    else:
+
+    risk = evaluate_risk_exit(
+        candle,
+        entry_price=position.entry_price,
+        stop_price=position.stop_price,
+        config=config,
+        stop_reason="stop",
+        in_session=True if in_session is None else in_session,
+    )
+    if risk is not None:
+        exit_triggered: bool | None = True
+        exit_reason: str | None = risk.reason
+        trigger_basis = risk.trigger_basis
+    elif calendar_error is not None:
+        exit_triggered = None
         exit_reason = None
-        trigger_basis = "calendar_unavailable" if calendar_error else "none"
+        trigger_basis = "calendar_unavailable"
+    else:
+        exit_triggered = False
+        exit_reason = None
+        trigger_basis = "none"
+
     outcome = tighten_stop(
         position,
         candle,
@@ -271,7 +285,7 @@ def observe_okx_position(
     config: StrategyConfig,
     unavailable_reason: str | None = None,
 ) -> OkxExitObservation:
-    """Return an honest shadow observation for one aggregate OKX row."""
+    """Return an honest, actionable shadow observation for one aggregate OKX row."""
 
     if not candles:
         symbol = str(row.get("instId") or "")
@@ -321,9 +335,15 @@ def observe_okx_position(
             regime=regime,
             config=config,
         )
+    if evaluation is None or evaluation.exit_triggered is None:
+        decision_status = "unknown"
+    elif evaluation.exit_triggered:
+        decision_status = "exit"
+    else:
+        decision_status = "hold"
     return OkxExitObservation(
         symbol=mapped.symbol,
-        decision_status="unknown",
+        decision_status=decision_status,
         state_quality=mapped.state_quality,
         position_size=mapped.position_size,
         average_entry_price=mapped.average_entry_price,
@@ -343,16 +363,3 @@ def _finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
-
-
-def _has_non_session_liquidation_risk(
-    candle: Candle,
-    position: PositionStateSnapshot,
-    config: StrategyConfig,
-) -> bool:
-    if is_preferred_us_cash_window(candle.open_time_ms, config):
-        return False
-    if config.leverage <= 0:
-        raise ValueError("leverage must be positive")
-    liquidation_risk_price = position.entry_price * max(0.0, 1 - (1 / config.leverage))
-    return candle.low <= liquidation_risk_price

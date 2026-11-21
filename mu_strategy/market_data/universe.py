@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-import json
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
+
+from mu_strategy.market_data.http_pool import get_json
 
 
 OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
+_OKX_TICKER_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0",
+}
 
 
 @dataclass(frozen=True)
@@ -19,15 +23,7 @@ class OKXSwapTicker:
 
 def fetch_okx_swap_tickers() -> list[dict]:
     url = f"{OKX_TICKERS_URL}?{urllib.parse.urlencode({'instType': 'SWAP'})}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = get_json(url, headers=_OKX_TICKER_HEADERS, timeout=20.0, retries=1)
     if payload.get("code") != "0":
         raise RuntimeError(f"OKX tickers request failed: {payload.get('msg') or payload.get('code')}")
     return list(payload.get("data") or [])

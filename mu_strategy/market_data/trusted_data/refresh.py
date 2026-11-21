@@ -28,7 +28,12 @@ from mu_strategy.market_data.trusted_data.contracts import (
     UniverseSnapshot,
     utc_month_segment_id,
 )
-from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, classify_publication_health, evaluate_candle_bundle, exception_failure
+from mu_strategy.market_data.trusted_data.evaluate import (
+    DatasetEvaluationSeed,
+    classify_publication_health,
+    evaluate_candle_bundle,
+    exception_failure,
+)
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner
 from mu_strategy.market_data.trusted_data.store import (
     SegmentCorrectionError,
@@ -43,8 +48,8 @@ from mu_strategy.models import Candle
 
 
 DEFAULT_INTERVALS = ("5m", "15m", "1h")
-DEFAULT_MAX_CONCURRENCY = 2
-DEFAULT_REQUEST_MAX_CONCURRENCY = 1
+DEFAULT_MAX_CONCURRENCY = 4
+DEFAULT_REQUEST_MAX_CONCURRENCY = 4
 # Seed the complete UTC month containing any logical-window start without
 # changing requested-days health or manifest coverage semantics.
 SEGMENT_MONTH_LOOKBEHIND_DAYS = 32
@@ -166,13 +171,6 @@ class DatasetRefreshCandidate:
     fetch_reason: HealthReason | None = None
     error_type: str | None = None
     message: str | None = None
-    prior_partial_start_source_file: Path | None = None
-
-
-@dataclass(frozen=True)
-class ReusablePriorDataset:
-    candles: list[Candle]
-    partial_start_source_file: Path | None = None
 
 
 class ReusablePriorDatasetReadError(Exception):
@@ -226,8 +224,7 @@ class RefreshTrustedMarketData:
                 ),
                 cycle_error=failure,
             )
-            run = self._persist_run(run)
-            return run
+            return self._persist_run(run)
 
         datasets: dict[tuple[str, str], DatasetHealth] = {}
         storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
@@ -289,8 +286,7 @@ class RefreshTrustedMarketData:
             warnings=tuple(warnings),
             refresh_segments=tuple(refresh_segments_by_key.values()),
         )
-        run = self._persist_run(run)
-        return run
+        return self._persist_run(run)
 
     def _fetch_dataset_candidates(
         self,
@@ -313,10 +309,10 @@ class RefreshTrustedMarketData:
                 previous_manifest=previous_manifest,
             )
 
-        if max_concurrency == 1:
+        if max_concurrency == 1 or len(tasks) <= 1:
             return {key: fetch(*key) for key in tasks}
 
-        with ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix="trusted-refresh") as executor:
+        with ThreadPoolExecutor(max_workers=min(max_concurrency, len(tasks)), thread_name_prefix="trusted-refresh") as executor:
             futures = [executor.submit(fetch, *key) for key in tasks]
             return {key: future.result() for key, future in zip(tasks, futures)}
 
@@ -351,15 +347,13 @@ class RefreshTrustedMarketData:
         path = self.store.data_dir / self.store.segment_source_root(symbol, interval)
         source_file = self.store.segment_source_root(symbol, interval)
         existing: list[Candle] = []
-        reusable_prior: ReusablePriorDataset | None = None
         try:
-            reusable_prior = self._load_reusable_prior_dataset(
+            existing = self._load_reusable_prior_dataset(
                 previous_manifest,
                 symbol,
                 interval,
                 days=days,
-            )
-            existing = reusable_prior.candles if reusable_prior is not None else []
+            ) or []
             if existing:
                 since_time_ms = existing[-2].open_time_ms if len(existing) >= 2 else existing[0].open_time_ms
                 fetched = self.provider.fetch_incremental(symbol, interval, since_time_ms=since_time_ms)
@@ -390,11 +384,6 @@ class RefreshTrustedMarketData:
                     reused_prior_generation=bool(existing),
                 ),
                 had_existing=bool(existing),
-                prior_partial_start_source_file=(
-                    reusable_prior.partial_start_source_file
-                    if reusable_prior is not None
-                    else None
-                ),
             )
         except ReusablePriorDatasetReadError as exc:
             prior_failure = exception_failure(exc.__cause__ if exc.__cause__ is not None else exc)
@@ -426,32 +415,36 @@ class RefreshTrustedMarketData:
                         message=prior_failure["message"],
                     ),
                 )
-            except Exception:
-                failure = prior_failure
-            return DatasetRefreshCandidate(
-                key=DatasetKey(symbol, interval),
-                path=path,
-                source_file=source_file,
-                candles=[],
-                diagnostics=_segment_diagnostics(
-                    symbol=symbol,
-                    interval=interval,
-                    fetch_mode="cache_read_failed",
-                    started_at_ms=started_at_ms,
-                    completed_at_ms=self.clock.now_ms(),
-                    existing_rows=0,
-                    fetched_rows=0,
-                    output_rows=0,
-                    had_existing=False,
-                    reused_prior_generation=False,
-                    fetch_reason=HealthReason.CACHE_READ_FAILED,
-                    error_type=failure["error_type"],
-                    message=failure["message"],
-                ),
-                fetch_reason=HealthReason.CACHE_READ_FAILED,
-                error_type=failure["error_type"],
-                message=failure["message"],
-            )
+            except Exception as fetch_exc:
+                fetch_failure = exception_failure(fetch_exc)
+                combined_message = (
+                    f"{fetch_failure['message']} "
+                    f"(prior cache read failed: {prior_failure['error_type']}: {prior_failure['message']})"
+                )
+                return DatasetRefreshCandidate(
+                    key=DatasetKey(symbol, interval),
+                    path=path,
+                    source_file=source_file,
+                    candles=[],
+                    diagnostics=_segment_diagnostics(
+                        symbol=symbol,
+                        interval=interval,
+                        fetch_mode="prior_read_and_history_failed",
+                        started_at_ms=started_at_ms,
+                        completed_at_ms=self.clock.now_ms(),
+                        existing_rows=0,
+                        fetched_rows=0,
+                        output_rows=0,
+                        had_existing=False,
+                        reused_prior_generation=False,
+                        fetch_reason=HealthReason.REFRESH_FAILED,
+                        error_type=fetch_failure["error_type"],
+                        message=combined_message,
+                    ),
+                    fetch_reason=HealthReason.REFRESH_FAILED,
+                    error_type=fetch_failure["error_type"],
+                    message=combined_message,
+                )
         except Exception as exc:
             reason = HealthReason.INCREMENTAL_REFRESH_FAILED if existing else HealthReason.REFRESH_FAILED
             failure = exception_failure(exc)
@@ -480,11 +473,6 @@ class RefreshTrustedMarketData:
                 fetch_reason=reason,
                 error_type=failure["error_type"],
                 message=failure["message"],
-                prior_partial_start_source_file=(
-                    reusable_prior.partial_start_source_file
-                    if reusable_prior is not None
-                    else None
-                ),
             )
 
     def _materialize_symbol_bundle(
@@ -560,9 +548,6 @@ class RefreshTrustedMarketData:
             if listing_time_ms is None or utc_month_segment_id(listing_time_ms) != month:
                 return False
             step = interval_to_ms(interval)
-            # Require the first 5m bucket containing listing, or the first
-            # parent bucket fully covered by that base window. Missing even
-            # one leading base bucket is not evidence of an exchange boundary.
             base_step = interval_to_ms("5m")
             first_base_bucket = (listing_time_ms // base_step) * base_step
             expected = ((first_base_bucket + step - 1) // step) * step
@@ -583,17 +568,14 @@ class RefreshTrustedMarketData:
                 candidate.diagnostics.fetch_mode in {"full_history", "prior_read_failed_full_history"}
                 and coverage.covered
             )
-            isolate_start = coverage.coverage_state == "partial_available_history"
             if require_complete_start_month and verified_listing_month_start(interval, seed.candles, candles):
-                isolate_start = True
+                require_complete_start_month = False
             storage_by_dataset[(symbol, interval)] = self.store.write_segmented_dataset(
                 candles,
                 symbol=symbol,
                 interval=interval,
                 physical_candles=seed.candles,
                 require_complete_start_month=require_complete_start_month,
-                isolate_partial_start_month=isolate_start,
-                reuse_partial_start_source_file=candidate.prior_partial_start_source_file,
             )
             return candles_content_sha256(candles)
 
@@ -641,7 +623,7 @@ class RefreshTrustedMarketData:
         interval: str,
         *,
         days: int,
-    ) -> ReusablePriorDataset | None:
+    ) -> list[Candle] | None:
         if (
             not manifest_result.ok
             or manifest_result.snapshot is None
@@ -665,10 +647,7 @@ class RefreshTrustedMarketData:
             )
         except Exception as exc:
             raise ReusablePriorDatasetReadError from exc
-        if (
-            storage.layout is not TrustedStorageLayout.SEGMENTED_CSV_V1
-            or manifest_result.snapshot.imported_from_run_id is not None
-        ):
+        if storage.layout is not TrustedStorageLayout.SEGMENTED_CSV_V1:
             return None
         base_health = manifest_result.snapshot.datasets.get((symbol, "5m"))
         if (
@@ -677,9 +656,6 @@ class RefreshTrustedMarketData:
             or base_health.last_timestamp_ms is None
         ):
             return None
-        # Reuse must assess the same shared 5m window as evaluation. Native
-        # parents omit an incomplete trailing bucket; using their own end
-        # shifts the requested start and incorrectly rejects complete caches.
         coverage = assess_requested_coverage(
             cached,
             interval=interval,
@@ -688,20 +664,7 @@ class RefreshTrustedMarketData:
         )
         if not coverage.covered and not _is_reusable_partial_history(health, requested_days=days):
             return None
-        partial_start_source_file = None
-        if storage.segments:
-            first_reference = storage.segments[0]
-            canonical_source_file = self.store.segment_source_file(
-                symbol,
-                interval,
-                first_reference.segment_id,
-            )
-            if first_reference.source_file.as_posix() != canonical_source_file.as_posix():
-                partial_start_source_file = first_reference.source_file
-        return ReusablePriorDataset(
-            candles=cached,
-            partial_start_source_file=partial_start_source_file,
-        )
+        return cached
 
 
 def _is_reusable_prior_health(health: DatasetHealth) -> bool:

@@ -34,10 +34,11 @@ class BacktestTests(unittest.TestCase):
     def test_initial_stop_loss_is_ten_percent_of_committed_margin_at_5x(self):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),))
         candles_15m = [
-            candle(0, 100, 102, 99, 101),
-            candle(1, 101, 101.5, 99.5, 100.8),
-            candle(2, 100.8, 103, 100.7, 102.5),
-            candle(3, 102.5, 103.5, 98.6, 100.1),
+            candle(0, 99.5, 101.0, 99.0, 100.5),
+            candle(1, 100.5, 102.0, 100.2, 101.5),
+            candle(2, 101.2, 101.6, 98.5, 100.9),
+            candle(3, 101.0, 103.0, 100.7, 102.5),
+            candle(4, 102.5, 103.5, 98.6, 100.1),
         ]
         hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
 
@@ -49,15 +50,17 @@ class BacktestTests(unittest.TestCase):
     def test_fees_are_included_in_trade_return(self):
         config = StrategyConfig(fee_rate=0.001, trading_windows_et=(("00:00", "23:59"),))
         candles_15m = [
-            candle(0, 100, 102, 99, 101),
-            candle(1, 101, 101.5, 99.5, 100.8),
-            candle(2, 100.8, 103.2, 100.7, 102.5),
-            candle(3, 102.5, 103.5, 98.6, 100.1),
+            candle(0, 99.5, 101.0, 99.0, 100.5),
+            candle(1, 100.5, 102.0, 100.2, 101.5),
+            candle(2, 101.2, 101.6, 98.5, 100.9),
+            candle(3, 101.0, 103.2, 100.7, 102.5),
+            candle(4, 102.5, 103.5, 98.6, 100.1),
         ]
         hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
 
         result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
 
+        self.assertEqual(result.trade_count, 1)
         self.assertLess(result.trades[0].return_pct, -0.10)
 
     def test_trade_return_on_margin_is_stable_across_equity_levels(self):
@@ -83,12 +86,12 @@ class BacktestTests(unittest.TestCase):
     def test_pyramid_adds_only_when_filters_are_green(self):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),))
         candles_15m = [
-            candle(0, 100, 102, 99, 101),
-            candle(1, 101, 101.5, 99.5, 100.8),
-            candle(2, 100.8, 103.2, 100.7, 102.6),
-            candle(3, 102.6, 105.4, 102.2, 104.6),
-            candle(4, 104.6, 107.5, 104.1, 106.8),
-            candle(5, 106.8, 108.0, 105.5, 107.2),
+            candle(0, 99.5, 101.0, 99.0, 100.5),
+            candle(1, 100.5, 102.0, 100.2, 101.5),
+            candle(2, 101.2, 101.6, 100.4, 100.9),
+            candle(3, 101.0, 103.8, 100.8, 103.5),
+            candle(4, 103.7, 106.0, 103.0, 105.5),
+            candle(5, 105.8, 108.0, 105.0, 107.2),
         ]
         hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
 
@@ -106,18 +109,19 @@ class BacktestTests(unittest.TestCase):
             second_pullback_wait_bars=3,
         )
         candles_15m = [
-            candle(0, 100, 102, 99, 101),
-            candle(1, 101, 101.5, 99.5, 100.8),
-            candle(2, 101.1, 101.4, 101.0, 101.2),
-            candle(3, 101.0, 101.2, 100.7, 101.0),
-            candle(4, 101.0, 103.5, 100.9, 103.0),
+            candle(0, 99.5, 101.0, 99.0, 100.5),
+            candle(1, 100.5, 102.0, 100.2, 101.5),
+            candle(2, 101.2, 101.6, 100.4, 100.9),
+            candle(3, 101.1, 101.4, 101.0, 101.2),
+            candle(4, 101.0, 101.2, 100.7, 101.0),
+            candle(5, 101.0, 103.5, 100.9, 103.0),
         ]
         hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
 
         result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
 
         self.assertEqual(result.trade_count, 1)
-        self.assertEqual(candles_15m[3].open_time_ms, result.trades[0].entry_time_ms)
+        self.assertEqual(candles_15m[4].open_time_ms, result.trades[0].entry_time_ms)
 
     def test_second_pullback_does_not_fill_when_tolerance_bar_never_trades_limit(self):
         config = StrategyConfig(
@@ -173,7 +177,7 @@ class BacktestTests(unittest.TestCase):
         config = StrategyConfig(fee_rate=0, trading_windows_et=(("00:00", "23:59"),), entry_execution="direct_next_open")
         candles_15m = [
             candle(0, 100, 102, 99, 101),
-            candle(1, 101, 102, 99, 101),
+            candle(1, 101, 102, 98, 101),
             candle(2, 100, 101, 99, 100),
             candle(3, 95, 97, 94, 96),
             candle(4, 96, 97, 95, 96),
@@ -200,7 +204,7 @@ class BacktestTests(unittest.TestCase):
         )
         candles_15m = [
             candle(0, 100, 102, 99, 101),
-            candle(1, 101, 102, 99, 101),
+            candle(1, 100, 102, 98, 100),
             candle(2, 100, 101, 99, 100),
             candle(3, 100, 103, 97, 102),
             candle(4, 102, 103, 101, 102),
@@ -228,7 +232,7 @@ class BacktestTests(unittest.TestCase):
         )
         candles_15m = [
             candle(0, 100, 102, 99, 101),
-            candle(1, 101, 102, 99, 101),
+            candle(1, 101, 102, 98, 101),
             candle(2, 100, 101, 99, 100),
             candle(3, 101, 103, 99, 102.5),
             candle(4, 101, 102, 99.5, 100),
@@ -419,27 +423,196 @@ class BacktestTests(unittest.TestCase):
             entry_execution="direct_next_open",
             trading_windows_et=(("09:45", "11:30"), ("14:30", "15:45")),
         )
-        candles_15m = [
+        base_candles = [
             utc_candle(2026, 6, 11, 13, 15, 100, 105, 99, 104),
             utc_candle(2026, 6, 11, 13, 30, 104, 110, 103, 109),
             utc_candle(2026, 6, 11, 13, 45, 109, 112, 102.5, 105),
             utc_candle(2026, 6, 11, 14, 0, 105, 108, 103, 107),
+        ]
+        # Case 1: continuous drop outside session (open=107 -> low=80) hits active stop FIRST (no teleport to liq).
+        continuous = base_candles + [
             utc_candle(2026, 6, 11, 20, 15, 107, 108, 80, 82),
             utc_candle(2026, 6, 11, 20, 30, 82, 83, 81, 82),
         ]
-        hourly_context = {bar.open_time_ms: "green" for bar in candles_15m}
+        with (
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(continuous)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(continuous), [0] * len(continuous), [0, 0.1, 0.2, 0.3, 0.4, 0.5])),
+        ):
+            res_stop = run_backtest(continuous, {b.open_time_ms: "green" for b in continuous}, config=config, starting_equity=10_000)
+        self.assertEqual(1, res_stop.trade_count)
+        self.assertEqual("stop", res_stop.trades[0].exit_reason)
+        self.assertAlmostEqual(102.9, res_stop.trades[0].exit_price)
 
-        with patch("mu_strategy.backtest.rsi", return_value=[55] * len(candles_15m)):
-            with patch(
-                "mu_strategy.backtest.macd",
-                return_value=([0] * len(candles_15m), [0] * len(candles_15m), [0, 0.1, 0.2, 0.3, 0.4, 0.5]),
-            ):
-                result = run_backtest(candles_15m, hourly_context, config=config, starting_equity=10_000)
+        # Case 2: overnight gap below liquidation at bar open (open=80 <= liq=84) reports non_session_liquidation_risk.
+        gapped = base_candles + [
+            utc_candle(2026, 6, 11, 20, 15, 80, 85, 78, 82),
+            utc_candle(2026, 6, 11, 20, 30, 82, 83, 81, 82),
+        ]
+        with (
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(gapped)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(gapped), [0] * len(gapped), [0, 0.1, 0.2, 0.3, 0.4, 0.5])),
+        ):
+            res_liq = run_backtest(gapped, {b.open_time_ms: "green" for b in gapped}, config=config, starting_equity=10_000)
+
+        self.assertEqual(1, res_liq.trade_count)
+        self.assertEqual("non_session_liquidation_risk", res_liq.trades[0].exit_reason)
+        self.assertEqual(gapped[4].open_time_ms, res_liq.trades[0].exit_time_ms)
+        self.assertAlmostEqual(80.0, res_liq.trades[0].exit_price)
+
+    def test_backtest_honors_tighter_signal_stop_price(self):
+        for execution in ("second_pullback", "direct_next_open"):
+            with self.subTest(execution=execution):
+                config = StrategyConfig(
+                    fee_rate=0,
+                    trading_windows_et=(("00:00", "23:59"),),
+                    entry_execution=execution,
+                )
+                # Signal bar has low=99.2 -> signal.stop_price = max(100.5*0.98=98.49, 99.2) = 99.2.
+                # Entry fills at 100.0; bar 3 drops to 99.0 (> hard stop 98.0, <= technical stop 99.2) -> exits at 99.2!
+                bars = [
+                    candle(0, 100, 101, 99, 100),
+                    candle(1, 100.2, 101.0, 99.2, 100.5),
+                    candle(2, 100.0, 101.0, 99.6, 100.4),
+                    candle(3, 100.4, 100.6, 99.0, 100.2),
+                ]
+                with (
+                    patch("mu_strategy.backtest.nearest_fib_retest_level", side_effect=lambda c, i, cfg: 100.0 if i == 1 else None),
+                    patch("mu_strategy.backtest.rsi", return_value=[55] * len(bars)),
+                    patch("mu_strategy.backtest.macd", return_value=([0] * len(bars), [0] * len(bars), [1] * len(bars))),
+                ):
+                    result = run_backtest(bars, {b.open_time_ms: "green" for b in bars}, config=config, starting_equity=10_000)
+
+                self.assertEqual(1, result.trade_count)
+                self.assertEqual("stop", result.trades[0].exit_reason)
+                self.assertAlmostEqual(99.2, result.trades[0].exit_price)
+
+    def test_bankrupt_account_stops_trading_cleanly_without_negative_units(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+            leverage=5.0,
+            margin_steps=(1.0,),
+        )
+        # Entry at 100 with 100% margin @ 5x (notional=50,000). Gap down to 70 wipes out equity (-15,000 -> equity=-5,000).
+        bars = [
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 98, 100),
+            candle(2, 100, 101, 99, 100),
+            candle(3, 70, 72, 69, 71),
+            candle(4, 71, 72, 69, 71),
+            candle(5, 71, 73, 70, 72),
+            candle(6, 72, 74, 71, 73),
+        ]
+        with (
+            patch("mu_strategy.backtest.nearest_fib_retest_level", side_effect=lambda c, i, cfg: c[i].close if i in (1, 4) else None),
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(bars)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(bars), [0] * len(bars), [1] * len(bars))),
+        ):
+            result = run_backtest(bars, {b.open_time_ms: "green" for b in bars}, config=config, starting_equity=10_000)
 
         self.assertEqual(1, result.trade_count)
-        self.assertEqual("non_session_liquidation_risk", result.trades[0].exit_reason)
-        self.assertEqual(candles_15m[4].open_time_ms, result.trades[0].exit_time_ms)
-        self.assertAlmostEqual(result.trades[0].entry_price * (1 - 1 / config.leverage), result.trades[0].exit_price)
+        self.assertLessEqual(result.ending_equity, 0.0)
+        self.assertTrue(all(fill.units > 0 and fill.notional > 0 for t in result.trades for fill in t.fills))
+
+    def test_account_drawdown_stop_caps_loss_and_halts_reentry(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+            leverage=5.0,
+            margin_steps=(1.0,),
+            max_account_drawdown_pct=0.04,
+        )
+        # Full-size 5x notional=50,000 at entry=100 -> 4% account drawdown floor=9,600 triggers at price=99.2 (> price stop 98).
+        bars = [
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 98, 100),
+            candle(2, 100, 101, 99.5, 100),
+            candle(3, 100, 100.5, 98.5, 99.5),
+            candle(4, 99.5, 101, 98, 100),
+            candle(5, 100, 102, 99.5, 101),
+        ]
+        with (
+            patch("mu_strategy.backtest.nearest_fib_retest_level", side_effect=lambda c, i, cfg: 100.0 if i in (1, 4) else None),
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(bars)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(bars), [0] * len(bars), [1] * len(bars))),
+        ):
+            result = run_backtest(bars, {b.open_time_ms: "green" for b in bars}, config=config, starting_equity=10_000)
+
+        self.assertEqual(1, result.trade_count)
+        self.assertEqual("account_drawdown_stop", result.trades[0].exit_reason)
+        self.assertAlmostEqual(99.2, result.trades[0].exit_price)
+        self.assertAlmostEqual(9_600.0, result.ending_equity)
+        self.assertAlmostEqual(-0.04, result.max_drawdown_pct)
+
+    def test_daily_loss_stop_blocks_same_day_reentry_and_resumes_next_day(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("09:45", "15:45"),),
+            entry_execution="direct_next_open",
+            leverage=5.0,
+            margin_steps=(1.0,),
+            daily_loss_limit_pct=0.04,
+        )
+        # Day 1 (2026-06-11): trade 1 hits 4% daily loss stop at 99.2; same-day signal at 14:45 is blocked.
+        # Day 2 (2026-06-12): daily loss resets; new signal at 14:00 enters cleanly!
+        bars = [
+            utc_candle(2026, 6, 11, 13, 45, 100, 101, 99, 100),
+            utc_candle(2026, 6, 11, 14, 0, 100, 101, 98, 100),    # signal 1 (day 1)
+            utc_candle(2026, 6, 11, 14, 15, 100, 101, 99.5, 100), # entry 1
+            utc_candle(2026, 6, 11, 14, 30, 100, 100.5, 98.5, 99.5),  # hits daily_loss_stop at 99.2
+            utc_candle(2026, 6, 11, 14, 45, 100, 101, 98, 100),   # signal 2 (same day -> blocked!)
+            utc_candle(2026, 6, 11, 15, 0, 100, 102, 99.5, 101),
+            utc_candle(2026, 6, 12, 14, 0, 100, 101, 98, 100),    # signal 3 (next ET day -> allowed!)
+            utc_candle(2026, 6, 12, 14, 15, 100, 102, 99.5, 101), # entry 2
+        ]
+        with (
+            patch("mu_strategy.backtest.nearest_fib_retest_level", side_effect=lambda c, i, cfg: 100.0 if i in (1, 4, 6) else None),
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(bars)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(bars), [0] * len(bars), [1] * len(bars))),
+        ):
+            result = run_backtest(bars, {b.open_time_ms: "green" for b in bars}, config=config, starting_equity=10_000)
+
+        self.assertEqual(2, result.trade_count)
+        self.assertEqual("daily_loss_stop", result.trades[0].exit_reason)
+        self.assertAlmostEqual(99.2, result.trades[0].exit_price)
+        self.assertEqual(bars[7].open_time_ms, result.trades[1].entry_time_ms)
+        self.assertEqual("end_of_data", result.trades[1].exit_reason)
+
+    def test_account_drawdown_stop_tracks_peak_equity_across_pyramid_fill_samples(self):
+        config = StrategyConfig(
+            fee_rate=0,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+            leverage=5.0,
+            margin_steps=(0.20, 0.20, 0.20, 0.40),
+            max_account_drawdown_pct=0.04,
+        )
+        # Bar 2 enters stage 1 at 100 (notional=10,000, units=100).
+        # Bar 3 plans stage-2 add (trigger=102).
+        # Bar 4 opens at 114 -> stage-2 fills at 114, spiking equity_curve to 11,400, then closes lower at 108.
+        # Bar 5 opens at 112 and drops to 105 -> must trigger account_drawdown_stop against peak 11,400 (floor=10,944)!
+        bars = [
+            candle(0, 100, 101, 99, 100),
+            candle(1, 100, 101, 98, 100),
+            candle(2, 100, 101, 99, 100),
+            candle(3, 101, 103, 100, 102),
+            candle(4, 114, 115, 107, 108),
+            candle(5, 112, 113, 105, 106),
+        ]
+        with (
+            patch("mu_strategy.backtest.nearest_fib_retest_level", side_effect=lambda c, i, cfg: 100.0 if i == 1 else None),
+            patch("mu_strategy.backtest.rsi", return_value=[55] * len(bars)),
+            patch("mu_strategy.backtest.macd", return_value=([0] * len(bars), [0] * len(bars), [1] * len(bars))),
+        ):
+            result = run_backtest(bars, {b.open_time_ms: "green" for b in bars}, config=config, starting_equity=10_000)
+
+        self.assertEqual(1, result.trade_count)
+        self.assertEqual(2, result.trades[0].max_stage)
+        self.assertEqual("account_drawdown_stop", result.trades[0].exit_reason)
+        self.assertEqual(bars[5].open_time_ms, result.trades[0].exit_time_ms)
+        self.assertAlmostEqual(11_400.0 * 0.96, result.ending_equity, places=6)
 
     def test_next_open_entry_is_skipped_when_actual_fill_bar_is_outside_cash_session(self):
         config = StrategyConfig(

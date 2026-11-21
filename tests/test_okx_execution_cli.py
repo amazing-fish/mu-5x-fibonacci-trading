@@ -317,6 +317,23 @@ class OKXExecutionCLITests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         from_env.assert_called_once_with(source=None)
 
+    def test_read_only_command_warns_when_okx_response_omits_code(self):
+        class EmptyCodeClient:
+            def __init__(self, *, credentials, demo):
+                pass
+
+            def get_instruments(self, *, inst_type, inst_id):
+                return {}
+
+        stdout = io.StringIO()
+        with patch("mu_strategy.live.okx_cli.OKXRestClient", EmptyCodeClient):
+            exit_code = main(["read-only", "--demo", "--public-only"], stdout=stdout)
+
+        self.assertEqual(0, exit_code)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("warning", output["status"])
+        self.assertEqual("instrument", output["warnings"][0]["component"])
+
 
 if __name__ == "__main__":
     unittest.main()

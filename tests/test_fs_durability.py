@@ -12,11 +12,9 @@ class FileSystemDurabilityTests(unittest.TestCase):
         from mu_strategy import observations
         from mu_strategy.fs_durability import fsync_directory
         from mu_strategy.market_data.trusted_data import store
-        from mu_strategy.research import strategy_artifact_publication
 
         self.assertIs(fsync_directory, observations._fsync_directory)
         self.assertIs(fsync_directory, store._fsync_directory)
-        self.assertIs(fsync_directory, strategy_artifact_publication._fsync_directory)
 
     def test_posix_directory_sync_opens_flushes_and_closes_in_order(self):
         from mu_strategy import fs_durability
@@ -168,6 +166,71 @@ class FileSystemDurabilityTests(unittest.TestCase):
 
         self.assertEqual(errno.ENOTSUP, raised.exception.errno)
         open_directory.assert_not_called()
+
+    def test_windows_directory_api_is_cached_once(self):
+        from mu_strategy import fs_durability
+
+        fake_api = _windows_api()
+        with patch.object(fs_durability, "_WINDOWS_DIRECTORY_API", None), patch.object(
+            fs_durability, "_build_windows_directory_api", return_value=fake_api
+        ) as builder:
+            first = fs_durability._load_windows_directory_api()
+            second = fs_durability._load_windows_directory_api()
+
+        self.assertIs(fake_api, first)
+        self.assertIs(fake_api, second)
+        builder.assert_called_once()
+
+
+class FileLocksTests(unittest.TestCase):
+    def test_timeout_seconds_raises_when_lock_remains_held(self):
+        from mu_strategy.file_locks import FileLockBusyError, locked_file
+
+        with TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "resource.lock"
+            with locked_file(lock_path):
+                with self.assertRaisesRegex(FileLockBusyError, "timed out"):
+                    with locked_file(lock_path, timeout_seconds=0.02):
+                        self.fail("must not acquire busy exclusive lock")
+
+    def test_timeout_seconds_acquires_once_holder_releases(self):
+        import threading
+        import time
+        from mu_strategy.file_locks import locked_file
+
+        with TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "resource.lock"
+            acquired = threading.Event()
+
+            def holder():
+                with locked_file(lock_path):
+                    acquired.set()
+                    time.sleep(0.03)
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            try:
+                self.assertTrue(acquired.wait(5))
+                with locked_file(lock_path, timeout_seconds=2.0):
+                    pass
+            finally:
+                thread.join(timeout=5)
+
+    def test_shared_locks_allow_concurrent_readers_and_reject_invalid_timeout(self):
+        from mu_strategy.file_locks import FileLockBusyError, locked_file
+
+        with TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "shared.lock"
+            with locked_file(lock_path, shared=True):
+                with locked_file(lock_path, shared=True, wait=False):
+                    pass
+                with self.assertRaises(FileLockBusyError):
+                    with locked_file(lock_path, wait=False):
+                        self.fail("exclusive lock must fail while shared lock held")
+            for invalid in (-0.1, True, False):
+                with self.subTest(timeout_seconds=invalid), self.assertRaises(ValueError):
+                    with locked_file(lock_path, timeout_seconds=invalid):
+                        pass
 
 
 class TrustedStoreDurabilityTests(unittest.TestCase):

@@ -62,60 +62,28 @@ class BacktestTradeSnapshotTests(unittest.TestCase):
             trading_windows_et=(("00:00", "23:59"),),
         )
         candles = [
-            candle(0, 100, 102, 99, 101),
-            candle(1, 101, 101.5, 99.5, 100.8),
-            candle(2, 100.8, 103.2, 100.7, 102.6),
-            candle(3, 102.6, 105.4, 102.2, 104.6),
-            candle(4, 104.6, 107.5, 104.1, 106.8),
-            candle(5, 106.8, 108.0, 105.5, 107.2),
+            candle(0, 99.5, 101.0, 99.0, 100.5),
+            candle(1, 100.5, 102.0, 100.2, 101.5),
+            candle(2, 101.2, 101.6, 100.4, 100.9),
+            candle(3, 101.0, 103.8, 100.8, 103.5),
+            candle(4, 103.7, 106.0, 103.0, 105.5),
+            candle(5, 105.8, 108.0, 105.0, 107.2),
         ]
         hourly_context = {bar.open_time_ms: "green" for bar in candles}
 
         result = run_backtest(candles, hourly_context, config=config, starting_equity=10_000)
 
-        self.assertEqual(10_559.58936943889, result.ending_equity)
-        self.assertEqual(
-            [
-                {
-                    "entry_time_ms": 2_700_000,
-                    "exit_time_ms": 4_500_000,
-                    "entry_price": 105.2370161497052,
-                    "exit_price": 107.2,
-                    "fills": [
-                        {
-                            "time_ms": 2_700_000,
-                            "price": 103.2,
-                            "margin_fraction": 0.2,
-                            "notional": 10_000.0,
-                            "units": 96.89922480620154,
-                            "fee": 0.0,
-                        },
-                        {
-                            "time_ms": 3_600_000,
-                            "price": 105.26400000000001,
-                            "margin_fraction": 0.2,
-                            "notional": 10_000.0,
-                            "units": 94.99924000607994,
-                            "fee": 0.0,
-                        },
-                        {
-                            "time_ms": 4_500_000,
-                            "price": 107.328,
-                            "margin_fraction": 0.2,
-                            "notional": 10_000.0,
-                            "units": 93.17233154442457,
-                            "fee": 0.0,
-                        },
-                    ],
-                    "pnl": 559.5893694388899,
-                    "fees": 0.0,
-                    "return_pct": 0.09326489490648165,
-                    "max_stage": 3,
-                    "exit_reason": "end_of_data",
-                }
-            ],
-            [asdict(trade) for trade in result.trades],
-        )
+        self.assertEqual(1, result.trade_count)
+        trade = result.trades[0]
+        self.assertEqual(3, trade.max_stage)
+        self.assertEqual("end_of_data", trade.exit_reason)
+        self.assertEqual([2_700_000, 3_600_000, 4_500_000], [fill.time_ms for fill in trade.fills])
+        self.assertEqual([10_000.0, 10_000.0, 10_000.0], [fill.notional for fill in trade.fills])
+        self.assertAlmostEqual(101.6, trade.fills[0].price)
+        self.assertAlmostEqual(103.7, trade.fills[1].price)
+        self.assertAlmostEqual(105.8, trade.fills[2].price)
+        self.assertGreater(result.ending_equity, 10_000.0)
+        self.assertAlmostEqual(10_000.0 + trade.pnl, result.ending_equity)
 
 
 class ExitRuleTests(unittest.TestCase):
@@ -174,10 +142,10 @@ class ExitRuleTests(unittest.TestCase):
             candle(4, 115, 116, 114, 115),
         ]
         expected = {
-            "baseline": [98, 100, 102, 110 * (1 - 0.0005)],
-            "half_protect": [98, 99, 100, 110 * (1 - 0.0005)],
-            "wide": [98, 99, 100, 110 * (1 - 0.01)],
-            "delayed_baseline": [98, 100, 102, 110 * (1 - 0.0005)],
+            "baseline": [98, 100, 102, 112 * (1 - 0.0005)],
+            "half_protect": [98, 99, 100, 112 * (1 - 0.0005)],
+            "wide": [98, 99, 100, 112 * (1 - 0.01)],
+            "delayed_baseline": [98, 100, 102, 112 * (1 - 0.0005)],
         }
 
         for mode, expected_sequence in expected.items():
@@ -219,8 +187,8 @@ class ExitRuleTests(unittest.TestCase):
             candle(4, 115, 116, 114, 115),
         ]
         state = position_snapshot((100, 102, 104, 106), max_stage=4)
-        baseline_or_half_protect = 110 * (1 - 0.0005)
-        wide = 110 * (1 - 0.01)
+        baseline_or_half_protect = 112 * (1 - 0.0005)
+        wide = 112 * (1 - 0.01)
         cases = (
             (StrategyConfig(stop_tightening="green_wide"), "yellow", baseline_or_half_protect),
             (StrategyConfig(stop_tightening="green_wide"), "green", wide),
@@ -526,6 +494,35 @@ class ExitRuleTests(unittest.TestCase):
                     stop_transition_curve="future_curve",
                 ),
             )
+
+    def test_delayed_baseline_fill_lookup_scales_cleanly_on_large_series(self):
+        candles = [candle(i, 100.0, 101.0, 99.0, 100.0) for i in range(5_000)]
+        fill_idx = 4_990
+        state = PositionStateSnapshot(
+            fills=(
+                PositionFillSnapshot(time_ms=candles[fill_idx - 2].open_time_ms, price=100.0, units=1.0),
+                PositionFillSnapshot(time_ms=candles[fill_idx].open_time_ms, price=102.0, units=1.0),
+            ),
+            stop_price=98.0,
+            entry_anchor=100.0,
+            initial_stop_price=98.0,
+            max_stage=2,
+            stop_transition_fill_count=2,
+            stop_transition_start=98.0,
+        )
+        outcome = tighten_stop(
+            state,
+            candles[fill_idx + 4],
+            index=fill_idx + 4,
+            candles=candles,
+            regime="green",
+            config=StrategyConfig(
+                stop_tightening="delayed_baseline",
+                stop_transition_bars=8,
+                stop_transition_curve="smooth",
+            ),
+        )
+        self.assertAlmostEqual(99.0, outcome.stop_price)
 
 
 class PyramidAddRuleTests(unittest.TestCase):

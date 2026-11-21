@@ -200,13 +200,21 @@ class SignalReviewTests(unittest.TestCase):
     def test_output_is_read_only_and_escapes_untrusted_text(self):
         hostile = '</script><script>alert("unsafe")</script><img src=x onerror=alert(1)>'
         self.initialize([cycle(1, reason=hostile)])
-        before = {p.relative_to(self.root): hashlib.sha256(p.read_bytes()).hexdigest() for p in self.root.rglob("*") if p.is_file()}
+        before = {
+            p.relative_to(self.root): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in self.root.rglob("*")
+            if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+        }
         with patch("mu_strategy.notifications.service.EmailAlerts.collect", side_effect=AssertionError("must not collect")), \
              patch("mu_strategy.notifications.smtp.SmtpConfig.from_environment", side_effect=AssertionError("must not read secrets")), \
              patch.object(NotificationStore, "initialize", side_effect=AssertionError("must not initialize")), \
              patch.object(HealthStore, "prepare", side_effect=AssertionError("must not prepare")):
             page = render_signal_review(self.read())
-        after = {p.relative_to(self.root): hashlib.sha256(p.read_bytes()).hexdigest() for p in self.root.rglob("*") if p.is_file()}
+        after = {
+            p.relative_to(self.root): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in self.root.rglob("*")
+            if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+        }
         self.assertEqual(before, after)
         self.assertNotIn(hostile, page)
         self.assertIn("&lt;/script&gt;", page)
@@ -229,6 +237,26 @@ class SignalReviewTests(unittest.TestCase):
             self.assertEqual(2, main(["--data-dir", str(self.data_dir), "--output", str(target)], clock=self.clock, stdout=io.StringIO()))
         self.assertEqual("prior report", target.read_text(encoding="utf-8"))
         self.assertFalse(list(self.root.glob("signal-review-*.tmp")))
+
+    def test_tail_read_stops_early_before_ancient_history_and_caches_unchanged_log(self):
+        ancient = [cycle(i, at=NOW - (20 - i) * 86_400_000) for i in range(10)]
+        recent = [cycle(100, at=NOW - 600_000), cycle(101, at=NOW)]
+        self.initialize([*ancient, *recent])
+        first = self.read()["sources"]["observations"]
+        self.assertEqual("ok", first["state"])
+        self.assertEqual(2, first["total_cycles"])
+        self.assertLess(first["scanned_cycles"], len(ancient) + len(recent))
+        with patch.object(JsonlObservationRepository, "iter_tail_cycles", side_effect=AssertionError("should use cache")):
+            cached = self.read()["sources"]["observations"]
+        self.assertEqual(first["total_cycles"], cached["total_cycles"])
+        self.assertEqual(first["records"], cached["records"])
+        # Appending invalidates cache and shows the new cycle immediately.
+        self.log.append_cycle(cycle(102, at=NOW + 60_000))
+        refreshed = self.read()["sources"]["observations"]
+        self.assertEqual(3, refreshed["total_cycles"])
+        # An invalid marker must bypass cache and fail closed.
+        self.log.invalid_marker_path.write_text("interrupted", encoding="utf-8")
+        self.assertEqual("unavailable", self.read()["sources"]["observations"]["state"])
 
 
 if __name__ == "__main__":

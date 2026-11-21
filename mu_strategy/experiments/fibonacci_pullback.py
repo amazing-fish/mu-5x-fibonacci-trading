@@ -9,6 +9,7 @@ from pathlib import Path
 from mu_strategy.backtest import run_backtest
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.market_data.service import refresh_trusted_candle_bundle
+from mu_strategy.market_data.symbols import OKX_SWAP_ALIASES, resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import TrustedLoadContext
 from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
@@ -62,33 +63,26 @@ class HorizonVerdict:
     max_drawdown_pct: float | None
 
 
-ASSET_ALIASES = {
-    "MU": AssetSpec("MU", "MU-USDT-SWAP", "okx", "OKX MU-USDT-SWAP mapping"),
-    "MUUSDT": AssetSpec("MU", "MU-USDT-SWAP", "okx", "OKX MU-USDT-SWAP mapping"),
-    "MU-USDT-SWAP": AssetSpec("MU", "MU-USDT-SWAP", "okx", "OKX MU-USDT-SWAP mapping"),
-    "SPACEX": AssetSpec("SPACEX", "SPCX-USDT-SWAP", "okx", "SPACEX alias mapped to OKX SPCX-USDT-SWAP"),
-    "SPACE X": AssetSpec("SPACEX", "SPCX-USDT-SWAP", "okx", "SPACEX alias mapped to OKX SPCX-USDT-SWAP"),
-    "SPCX": AssetSpec("SPACEX", "SPCX-USDT-SWAP", "okx", "SPACEX alias mapped to OKX SPCX-USDT-SWAP"),
-    "SPCX-USDT-SWAP": AssetSpec("SPACEX", "SPCX-USDT-SWAP", "okx", "SPACEX alias mapped to OKX SPCX-USDT-SWAP"),
-    "META": AssetSpec("META", "META-USDT-SWAP", "okx", "OKX META-USDT-SWAP mapping"),
-    "META-USDT-SWAP": AssetSpec("META", "META-USDT-SWAP", "okx", "OKX META-USDT-SWAP mapping"),
-    "BTC": AssetSpec("BTC", "BTC-USDT-SWAP", "okx", "OKX BTC-USDT-SWAP mapping"),
-    "BTCUSDT": AssetSpec("BTC", "BTC-USDT-SWAP", "okx", "OKX BTC-USDT-SWAP mapping"),
-    "BTC-USDT-SWAP": AssetSpec("BTC", "BTC-USDT-SWAP", "okx", "OKX BTC-USDT-SWAP mapping"),
-}
+_OKX_USDT_BASES = frozenset({"MU", "META", "BTC"})
 
 
 def resolve_asset(value: str) -> AssetSpec:
     key = value.strip().upper()
-    if key in ASSET_ALIASES:
-        return ASSET_ALIASES[key]
-    if key.endswith("-USDT-SWAP"):
-        requested = key.removesuffix("-USDT-SWAP")
-        return AssetSpec(requested, key, "okx", "explicit OKX swap symbol")
-    if key.endswith("USDT"):
-        requested = key.removesuffix("USDT")
-        return AssetSpec(requested, key, "binance", "explicit Binance futures symbol")
-    raise ValueError(f"unknown asset alias: {value}")
+    compact = "".join(ch for ch in key if ch.isalnum())
+    if not compact:
+        raise ValueError(f"unknown asset alias: {value}")
+    if key.endswith("USDT") and not key.endswith("-USDT-SWAP"):
+        base = key.removesuffix("USDT")
+        if base not in _OKX_USDT_BASES and base not in OKX_SWAP_ALIASES:
+            return AssetSpec(base, key, "binance", "explicit Binance futures symbol")
+    resolved = resolve_okx_swap_symbol(key)
+    if key in OKX_SWAP_ALIASES or compact in OKX_SWAP_ALIASES:
+        requested = compact
+        note = f"{requested} alias mapped to OKX {resolved.inst_id}"
+    else:
+        requested = resolved.inst_id.removesuffix("-USDT-SWAP")
+        note = f"OKX {resolved.inst_id} mapping"
+    return AssetSpec(requested, resolved.inst_id, resolved.source, note)
 
 
 def fib_lookback_bars(hours: int, *, candle_minutes: int = 15) -> int:

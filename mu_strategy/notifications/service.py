@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
 from pathlib import Path
 
 from mu_strategy.canonical import canonical_sha256
@@ -107,7 +106,6 @@ class EmailAlerts:
 
     def _observe(self, db, observation: Stage0Observation, now: int, *, service_run_id: str | None,
                  collection_run_id: str | None) -> None:
-        observation = Stage0Observation.from_dict(observation.to_dict())
         stream = self.store.stream(db, observation.symbol)
         if service_run_id is not None and stream["service_run_id"] != service_run_id:
             # Only a matching authoritative cycle can establish a new ordering
@@ -239,32 +237,20 @@ class EmailAlerts:
                     self._invalidate(db, symbol, stream, "source_unavailable", now)
 
     def observation_unavailable(self) -> bool:
-        """Defer lifecycle changes for a possibly in-progress append, never sending entries.
-
-        The existing writer marks every append invalid until its fsync completes.
-        Persist a 30-second retry window so one overlapping poll does not withdraw
-        a valid signal; an unresolved marker/corruption still becomes a fault.
-        """
-        now = self.clock.now_ms()
-        with self.store.connection() as db, self.store.transaction(db):
-            self.store.validate(db)
-            since = self.store.get_meta(db, "log_unavailable_since_ms")
-            if since is None or now < since:
-                since = now
-                self.store.set_meta(db, "log_unavailable_since_ms", since)
-            self.store.set_meta(db, "source_ready", False)
-        if since <= now < since + 30_000:
-            return False
+        """Immediately mark the observation source unavailable on corruption or I/O failure."""
         self.source_unavailable()
         return True
 
     def deliver(self, transport, *, limit: int = 20) -> int:
-        """Reserve UNKNOWN durably before network; serialize result/manual reconciliation.
+        """Claim due deliveries in a short write tx, release all locks for SMTP I/O, then finalize.
 
-        The second transaction spans SMTP. A killed sender rolls that transaction
-        back to the already committed UNKNOWN reservation; another sender cannot
-        replay it, and an operator cannot resolve an attempt still using the DB.
+        1) Short SQLite write tx: reserve next due delivery as UNKNOWN (`attempts += 1`) and commit.
+        2) For ENTRY_REVIEW, run local pre-send readiness checks under a brief fence, then release
+           BOTH the SQLite transaction and `observations.jsonl.lock` BEFORE network I/O.
+        3) With ZERO DB transactions open and ZERO file locks held: execute SMTP send.
+        4) Short SQLite write tx: record sent/failed outcome and retry schedule.
         """
+        max_items = integer(limit, minimum=1)
         delivered = 0
         with self.store.connection() as db:
             with self.store.transaction(db):
@@ -273,33 +259,52 @@ class EmailAlerts:
                 if target is not None and target != transport.target_fingerprint:
                     raise NotificationError("SMTP destination differs from persisted delivery target")
                 self.store.set_meta(db, "delivery_target", transport.target_fingerprint)
-            for _ in range(integer(limit, minimum=1)):
+            for _ in range(max_items):
                 with self.store.transaction(db):
                     claimed = self.store.claim(db, now_ms=self.clock.now_ms())
                 if claimed is None:
                     break
-                with self.store.transaction(db), ExitStack() as fence:
-                    current = self.store.record(db, claimed.event.event_id)
-                    if current.state is not DeliveryState.UNKNOWN or current.attempts != claimed.attempts:
+                if claimed.event.kind is AlertKind.ENTRY_REVIEW:
+                    if not self._validate_entry_before_send(db, claimed):
                         continue
-                    now = self.clock.now_ms()
-                    if current.event.kind is AlertKind.ENTRY_REVIEW:
-                        try:
-                            fence.enter_context(self.observations.publication_fence(wait=False))
-                        except FileLockBusyError:
-                            self.store.defer_unstarted(db, current.event.event_id, now_ms=now, reason="source_not_caught_up")
-                            continue
-                        if not self._prepare_entry(db, current, now):
-                            continue
-                    result = (transport.send(current.event, source_is_current=self._source_current_before_data)
-                              if current.event.kind is AlertKind.ENTRY_REVIEW else transport.send(current.event))
-                    self.store.finish(db, current.event.event_id, state=result.state, now_ms=self.clock.now_ms(),
-                                      code=result.code, retryable=result.retryable)
-                    delivered += 1
+                # Execute network SMTP with ZERO DB transactions and ZERO file locks held.
+                result = (
+                    transport.send(claimed.event, source_is_current=self._source_current_before_data)
+                    if claimed.event.kind is AlertKind.ENTRY_REVIEW
+                    else transport.send(claimed.event)
+                )
+                with self.store.transaction(db):
+                    self.store.finish(
+                        db,
+                        claimed.event.event_id,
+                        state=result.state,
+                        now_ms=self.clock.now_ms(),
+                        code=result.code,
+                        retryable=result.retryable,
+                    )
+                delivered += 1
         return delivered
 
+    def _validate_entry_before_send(self, db, claimed) -> bool:
+        """Verify entry freshness under a brief local fence, releasing all locks before SMTP."""
+        try:
+            with self.observations.publication_fence(wait=False):
+                with self.store.transaction(db):
+                    current = self.store.record(db, claimed.event.event_id)
+                    if current is None or current.state is not DeliveryState.UNKNOWN or current.attempts != claimed.attempts:
+                        return False
+                    return self._prepare_entry(db, current, self.clock.now_ms())
+        except FileLockBusyError:
+            with self.store.transaction(db):
+                current = self.store.record(db, claimed.event.event_id)
+                if current is not None and current.state is DeliveryState.UNKNOWN and current.attempts == claimed.attempts:
+                    self.store.defer_unstarted(
+                        db, current.event.event_id, now_ms=self.clock.now_ms(), reason="source_not_caught_up"
+                    )
+            return False
+
     def _source_current_before_data(self) -> bool:
-        # Publication is still fenced, but time and supervisor liveness can change.
+        # Publication locks are released during SMTP; recheck live health & supervisor liveness before DATA body.
         try:
             state, running = self._snapshot()
         except HealthStateError:

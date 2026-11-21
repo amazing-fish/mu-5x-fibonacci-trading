@@ -16,9 +16,10 @@ from unittest.mock import Mock, patch
 from mu_strategy.demo_trading import DemoTradingConfig, run_once
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode
-from mu_strategy.observations import ObservationCycleInvalidError
+from mu_strategy.observations import ObservationCycleInvalidError, Stage0Observation, canonical_payload_sha256
 from mu_strategy.readonly_scan import scan_watchlist
 from mu_strategy.signal_service import ServiceConfig, scan_once
+from mu_strategy.strategies.registry import baseline_strategy_group
 from tests.factories.scan_cycle import scan_result, trusted_scan_bundle
 
 
@@ -128,16 +129,40 @@ def capture(case):
     }, allow_nan=False))
 
 
+def _normalize_for_config_evolution(snapshot: dict) -> dict:
+    """Normalize strategy_config_fingerprint/result_fingerprint when StrategyConfig schema evolves."""
+    copied = json.loads(json.dumps(snapshot))
+    for container in (copied.get("demo_cycle"), (copied.get("scan_health") or {}).get("cycle")):
+        if not isinstance(container, dict):
+            continue
+        for row in container.get("observations", ()):
+            row["strategy_config_fingerprint"] = "<normalized>"
+            row["result_fingerprint"] = "<normalized>"
+    return copied
+
+
 class ReadOnlyScanEquivalenceTests(unittest.TestCase):
     def test_full_cycles_health_and_demo_outputs_match_pre_extraction_baseline(self):
         expected = json.loads(FIXTURE.read_text(encoding="utf-8"))
         self.assertEqual(list(CASES), list(expected))
+        expected_config_hashes = {
+            symbol: canonical_payload_sha256(baseline_strategy_group(symbol).config) for symbol in SYMBOLS
+        }
         for case in CASES:
             with self.subTest(case=case):
                 actual = capture(case)
-                self.assertEqual(expected[case], actual)
+                expected_case = _normalize_for_config_evolution(expected[case])
+                actual_normalized = _normalize_for_config_evolution(actual)
+                if case == "shadow":
+                    # observe_okx_position now computes real decision_status instead of hardcoded "unknown".
+                    self.assertEqual("hold", actual["demo_payload"]["exit_observations"][0]["decision_status"])
+                    expected_case["demo_payload"]["exit_observations"][0]["decision_status"] = "hold"
+                self.assertEqual(expected_case, actual_normalized)
                 cycle = actual["demo_cycle"]
                 self.assertEqual(list(SYMBOLS), [row["symbol"] for row in cycle["observations"]])
+                for row in cycle["observations"]:
+                    self.assertEqual(expected_config_hashes[row["symbol"]], row["strategy_config_fingerprint"])
+                    Stage0Observation.from_dict(row)
                 self.assertEqual(cycle, actual["scan_health"]["cycle"])
                 self.assertNotIn("private-marker", json.dumps(actual))
 

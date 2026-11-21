@@ -11,7 +11,14 @@ from typing import Any
 from mu_strategy.backtest import run_backtest
 from mu_strategy.cli import build_hourly_context
 from mu_strategy.data import read_csv
-from mu_strategy.market_data.utils import interval_to_ms
+from mu_strategy.market_data.trusted_data.contracts import (
+    AvailabilityState,
+    IntegrityState,
+    RefreshAttemptStatus,
+    SnapshotUsability,
+)
+from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import BacktestResult, Candle
 from mu_strategy.reporting import render_markdown_report
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, fee_profile_label, fee_rate_for_profile, with_fee_profile
@@ -26,6 +33,8 @@ class LocalDataset:
     nominal_days: int
     file_15m: Path
     file_1h: Path
+    generation_id: str | None = None
+    store_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -56,7 +65,7 @@ class DataQualityAudit:
     top_prev_close_open_gaps: list[CandleMove]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run baseline backtests for every existing local MU dataset.")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--report-dir", type=Path, default=Path("reports/live"))
@@ -70,17 +79,20 @@ def main() -> None:
     parser.add_argument("--open-close-warning-pct", type=float, default=0.05)
     parser.add_argument("--high-low-warning-pct", type=float, default=0.05)
     parser.add_argument("--prev-close-open-warning-pct", type=float, default=0.01)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    rows = run_all_existing_data_backtests(
-        data_dir=args.data_dir,
-        report_dir=args.report_dir,
-        strategy=args.strategy,
-        fee_profile=args.fee_profile,
-        open_close_warning_pct=args.open_close_warning_pct,
-        high_low_warning_pct=args.high_low_warning_pct,
-        prev_close_open_warning_pct=args.prev_close_open_warning_pct,
-    )
+    try:
+        rows = run_all_existing_data_backtests(
+            data_dir=args.data_dir,
+            report_dir=args.report_dir,
+            strategy=args.strategy,
+            fee_profile=args.fee_profile,
+            open_close_warning_pct=args.open_close_warning_pct,
+            high_low_warning_pct=args.high_low_warning_pct,
+            prev_close_open_warning_pct=args.prev_close_open_warning_pct,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     md_path = args.report_dir / "mu_all_existing_data_backtests.md"
     html_path = args.report_dir / "mu_all_existing_data_backtests.html"
@@ -132,11 +144,16 @@ def run_all_existing_data_backtests(
     high_low_warning_pct: float = 0.05,
     prev_close_open_warning_pct: float = 0.01,
 ) -> list[dict[str, Any]]:
+    datasets = discover_datasets(data_dir)
+    if not datasets:
+        raise FileNotFoundError(
+            f"no local datasets found under {data_dir} "
+            "(expected trusted generations under generations/<run_id>/manifest.json or legacy *_15m_*d.csv pairs)"
+        )
     report_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
-    for dataset in discover_datasets(data_dir):
-        candles_15m = read_csv(dataset.file_15m)
-        candles_1h = read_csv(dataset.file_1h)
+    for dataset in datasets:
+        candles_15m, candles_1h = _load_dataset_candles(dataset)
         group = selected_strategy_groups(dataset.symbol, [strategy])[0]
         config = with_fee_profile(group.config, fee_profile)
         context = build_hourly_context(candles_15m, candles_1h)
@@ -152,7 +169,8 @@ def run_all_existing_data_backtests(
         audit_1h = audit_candles(candles_1h, "1h")
 
         fee_slug = "" if config.fee_profile == "market" else f"_{config.fee_profile}"
-        slug = f"mu_{dataset.source}_{dataset.symbol.replace('-', '_')}_{dataset.nominal_days}d_{strategy}{fee_slug}"
+        source_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", dataset.source)
+        slug = f"mu_{source_slug}_{dataset.symbol.replace('-', '_')}_{dataset.nominal_days}d_{strategy}{fee_slug}"
         report_path = report_dir / f"{slug}_backtest.md"
         chart_path = report_dir / f"{slug}_backtest.html"
         report_path.write_text(
@@ -219,25 +237,136 @@ def run_all_existing_data_backtests(
     return rows
 
 
+def _load_dataset_candles(dataset: LocalDataset) -> tuple[list[Candle], list[Candle]]:
+    if dataset.generation_id is not None and dataset.store_dir is not None:
+        store = TrustedDataStore(data_dir=dataset.store_dir)
+        manifest_result = store.read_generation_manifest(dataset.generation_id)
+        if not manifest_result.ok or manifest_result.snapshot is None:
+            detail = manifest_result.message or (
+                manifest_result.reason.value if manifest_result.reason is not None else "invalid manifest"
+            )
+            raise ValueError(f"trusted generation {dataset.generation_id} cannot be read: {detail}")
+        generation_root = store.generation_root(dataset.generation_id)
+        candles_15m = store.read_generation_dataset(
+            manifest_result.snapshot,
+            symbol=dataset.symbol,
+            interval="15m",
+            generation_root=generation_root,
+            generation_id=dataset.generation_id,
+        )
+        candles_1h = store.read_generation_dataset(
+            manifest_result.snapshot,
+            symbol=dataset.symbol,
+            interval="1h",
+            generation_root=generation_root,
+            generation_id=dataset.generation_id,
+        )
+        return candles_15m, candles_1h
+    return read_csv(dataset.file_15m), read_csv(dataset.file_1h)
+
+
 def discover_datasets(data_dir: Path) -> list[LocalDataset]:
     datasets: list[LocalDataset] = []
-    for file_15m in data_dir.glob("*_15m_*d.csv"):
-        okx_match = re.fullmatch(r"OKX_(.+)_15m_(\d+)d\.csv", file_15m.name)
-        if okx_match:
-            symbol, nominal_days = okx_match.groups()
-            file_1h = data_dir / f"OKX_{symbol}_1h_{nominal_days}d.csv"
-            if file_1h.exists():
-                datasets.append(LocalDataset("okx", symbol, int(nominal_days), file_15m, file_1h))
-            continue
+    if data_dir.is_dir():
+        for file_15m in data_dir.glob("*_15m_*d.csv"):
+            okx_match = re.fullmatch(r"OKX_(.+)_15m_(\d+)d\.csv", file_15m.name)
+            if okx_match:
+                symbol, nominal_days = okx_match.groups()
+                file_1h = data_dir / f"OKX_{symbol}_1h_{nominal_days}d.csv"
+                if file_1h.exists():
+                    datasets.append(LocalDataset("okx", symbol, int(nominal_days), file_15m, file_1h))
+                continue
 
-        binance_match = re.fullmatch(r"(.+)_15m_(\d+)d\.csv", file_15m.name)
-        if not binance_match:
-            continue
-        symbol, nominal_days = binance_match.groups()
-        file_1h = data_dir / f"{symbol}_1h_{nominal_days}d.csv"
-        if file_1h.exists():
-            datasets.append(LocalDataset("binance", symbol, int(nominal_days), file_15m, file_1h))
-    return sorted(datasets, key=lambda item: (item.source, item.symbol, item.nominal_days))
+            binance_match = re.fullmatch(r"(.+)_15m_(\d+)d\.csv", file_15m.name)
+            if not binance_match:
+                continue
+            symbol, nominal_days = binance_match.groups()
+            file_1h = data_dir / f"{symbol}_1h_{nominal_days}d.csv"
+            if file_1h.exists():
+                datasets.append(LocalDataset("binance", symbol, int(nominal_days), file_15m, file_1h))
+
+        datasets.extend(_discover_trusted_generation_datasets(data_dir))
+    return sorted(datasets, key=lambda item: (item.source, item.symbol, item.nominal_days, item.generation_id or ""))
+
+
+def _discover_trusted_generation_datasets(data_dir: Path) -> list[LocalDataset]:
+    candidate_roots: list[Path] = []
+    seen_roots: set[Path] = set()
+    for root in (data_dir, data_dir / "live"):
+        if (root / "generations").is_dir():
+            resolved = root.resolve()
+            if resolved not in seen_roots:
+                seen_roots.add(resolved)
+                candidate_roots.append(root)
+
+    datasets: list[LocalDataset] = []
+    for store_root in candidate_roots:
+        store = TrustedDataStore(data_dir=store_root)
+        for entry in sorted(store.generations_dir.iterdir()):
+            manifest_path = entry / "manifest.json"
+            if not entry.is_dir() or not manifest_path.is_file():
+                continue
+            run_id = entry.name
+            manifest_result = store.read_generation_manifest(run_id)
+            if not manifest_result.ok or manifest_result.snapshot is None:
+                continue
+            snapshot = manifest_result.snapshot
+            if (
+                snapshot.attempt_status is RefreshAttemptStatus.FAILED
+                or snapshot.snapshot_usability is not SnapshotUsability.USABLE
+            ):
+                continue
+            generation_root = store.generation_root(run_id)
+            symbols = sorted({symbol for symbol, _interval in snapshot.datasets})
+            for symbol in symbols:
+                health_15m = snapshot.datasets.get((symbol, "15m"))
+                health_1h = snapshot.datasets.get((symbol, "1h"))
+                if (
+                    health_15m is None
+                    or health_1h is None
+                    or health_15m.availability is not AvailabilityState.AVAILABLE
+                    or health_1h.availability is not AvailabilityState.AVAILABLE
+                    or health_15m.integrity is not IntegrityState.VALID
+                    or health_1h.integrity is not IntegrityState.VALID
+                ):
+                    continue
+                if health_15m.effective_days is not None and health_15m.effective_days > 0:
+                    nominal_days = max(1, int(round(health_15m.effective_days)))
+                elif health_15m.first_timestamp_ms is not None and health_15m.last_timestamp_ms is not None:
+                    span_ms = health_15m.last_timestamp_ms + interval_to_ms("15m") - health_15m.first_timestamp_ms
+                    nominal_days = max(1, int(round(span_ms / DAY_MS)))
+                else:
+                    nominal_days = int(health_15m.requested_days or 0)
+                try:
+                    file_15m = store.dataset_path(
+                        snapshot,
+                        symbol=symbol,
+                        interval="15m",
+                        generation_root=generation_root,
+                        generation_id=run_id,
+                    )
+                    file_1h = store.dataset_path(
+                        snapshot,
+                        symbol=symbol,
+                        interval="1h",
+                        generation_root=generation_root,
+                        generation_id=run_id,
+                    )
+                except ValueError:
+                    file_15m = manifest_path
+                    file_1h = manifest_path
+                datasets.append(
+                    LocalDataset(
+                        source=f"trusted_{run_id[:8]}",
+                        symbol=symbol,
+                        nominal_days=nominal_days,
+                        file_15m=file_15m,
+                        file_1h=file_1h,
+                        generation_id=run_id,
+                        store_dir=store_root,
+                    )
+                )
+    return datasets
 
 
 def audit_candles(
@@ -400,7 +529,9 @@ def render_summary_markdown(
     for row in rows:
         lines.append(_summary_markdown_row(row))
     lines.extend(["", "## Price-Range Audit", ""])
-    if all(row["range_anomalies"] == 0 for row in rows):
+    if not rows:
+        lines.append("- FAIL: no datasets audited.")
+    elif all(row["range_anomalies"] == 0 for row in rows):
         lines.append(
             "- PASS: every fill and exit price is inside its corresponding 15m candle and corresponding 1h chart candle for all datasets."
         )
@@ -412,7 +543,9 @@ def render_summary_markdown(
                     f"range anomalies={row['range_anomalies']}"
                 )
     lines.extend(["", "## Data Quality Review", ""])
-    if all(_data_quality_issue_count(row) == 0 for row in rows):
+    if not rows:
+        lines.append("- FAIL: no datasets audited.")
+    elif all(_data_quality_issue_count(row) == 0 for row in rows):
         lines.append("- PASS: no duplicate timestamps, 15m gaps, OHLC invalid rows, or configured large-move warnings.")
     else:
         for row in rows:

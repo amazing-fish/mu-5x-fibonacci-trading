@@ -306,6 +306,8 @@ class BacktestResult:
 
     @property
     def total_return_pct(self) -> float:
+        if self.starting_equity == 0:
+            return 0.0
         return (self.ending_equity / self.starting_equity) - 1
 
     @property
@@ -330,9 +332,12 @@ class BacktestResult:
         peak = self.equity_curve[0][1]
         max_dd = 0.0
         for _, equity in self.equity_curve:
-            peak = max(peak, equity)
-            if peak:
-                max_dd = min(max_dd, (equity / peak) - 1)
+            if equity > peak:
+                peak = equity
+            if peak > 0:
+                dd = (equity / peak) - 1
+                if dd < max_dd:
+                    max_dd = dd
         return max_dd
 
 

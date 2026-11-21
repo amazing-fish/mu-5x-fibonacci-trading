@@ -20,6 +20,7 @@ python -B -m mu_strategy.commands.render_signal_review --data-dir data/live --se
 
 ```powershell
 python -B -m mu_strategy.commands.refresh_market_data --symbol MU-USDT-SWAP --days 180 --data-dir data/live --html-output reports/live/data_health.html
+python -B -m mu_strategy.cli --list-strategies
 python -B -m mu_strategy.cli --days 180 --strategy baseline --report reports/live/mu_okx_backtest.md
 python -B -m mu_strategy.visualize --days 180 --strategy baseline --output reports/live/mu_okx_backtest.html
 ```
@@ -38,13 +39,13 @@ python -B -m unittest discover -s tests
 |---|---|
 | 各模块建成了什么，哪里尚未接通 | [架构与建设现状](docs/architecture.md) |
 | S1/S2 的目标、依赖与剩余工作 | [产品路线](docs/product-roadmap.md) |
-| 刷新范围、数据错误、存储和迁移 | [可信行情指南](docs/data-guide.md) |
+| 刷新范围、数据错误与存储 | [可信行情指南](docs/data-guide.md) |
 | baseline、历史回放、实验和结果解释 | [研究指南](docs/research-guide.md) |
 | 标的日历、休市、提前收盘和策略窗口 | [标的交易日历](docs/trading-calendar.md) |
 | 持续扫描、健康查询、Windows 常驻与恢复 | [信号服务](docs/signal-service.md) |
 | 网易邮箱配置、去重、送达和前瞻准备 | [邮件提醒](docs/email-alerts.md) |
 | 每日复盘、反馈、人工成交和状态确认 | [复盘手册](docs/signal-review.md) |
 | 只读 OKX、shadow 和显式确认的 Demo 操作 | [Demo 操作指南](docs/demo-guide.md) |
-| 策略 release、执行 Stage 0–4 与冻结契约 | [发布溯源](docs/strategy-release-provenance.md) · [执行设计](docs/execution-roadmap.md) |
+| 策略配置溯源与执行阶段设计 | [发布溯源](docs/strategy-release-provenance.md) · [执行设计](docs/execution-roadmap.md) |
 
 生成报告默认放在 ignored 的 `reports/live/`。历史报告和 `candidate` 状态不代表当前策略有效或获得交易授权；“手动交易”反馈、实际成交记录、策略建议和交易所状态各自保留来源。

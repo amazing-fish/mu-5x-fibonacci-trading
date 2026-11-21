@@ -2,6 +2,8 @@ import hashlib
 import http.client
 import threading
 import unittest
+from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from mu_strategy.signal_review_server import make_review_server
 from mu_strategy.viz.signal_review import group_scan_records
@@ -100,8 +102,11 @@ class ReviewLiveServerTests(unittest.TestCase):
 
     def test_readonly_routes_and_loopback_host_boundary(self):
         def files():
-            return {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in self.fixture.root.rglob("*") if p.is_file()}
+            return {
+                str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in self.fixture.root.rglob("*")
+                if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+            }
         before = files()
         self.assertEqual(200, self.request()[0])
         self.assertEqual(404, self.request("/observations.jsonl")[0])
@@ -109,6 +114,47 @@ class ReviewLiveServerTests(unittest.TestCase):
         self.assertEqual(403, self.request(headers={"Host": "attacker.example"})[0])
         self.assertEqual(403, self.request(headers={"Origin": "https://attacker.example"})[0])
         self.assertEqual(before, files())
+
+    def test_server_uses_threading_http_server_and_serves_concurrent_requests(self):
+        self.assertIsInstance(self.server, ThreadingHTTPServer)
+        self.assertTrue(self.server.daemon_threads)
+        entered = threading.Event()
+        release = threading.Event()
+        original_read = fixtures.read_signal_review
+        calls = 0
+
+        def slow_first_read(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(timeout=3)
+            return original_read(*args, **kwargs)
+
+        results = {}
+        with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=slow_first_read):
+            t1 = threading.Thread(target=lambda: results.__setitem__("first", self.request("/report")[0]))
+            t1.start()
+            self.assertTrue(entered.wait(timeout=2), "first request did not reach handler")
+            # Second concurrent request must complete without waiting for the blocked first request.
+            second_status = self.request("/report")[0]
+            release.set()
+            t1.join(timeout=3)
+        self.assertEqual(200, second_status)
+        self.assertEqual(200, results.get("first"))
+
+    def test_server_logs_503_operational_error_and_returns_500_on_unexpected_bug(self):
+        with self.assertLogs("mu_strategy.signal_review_server", level="WARNING") as cm:
+            with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=OSError("disk busy")):
+                status_503, _, _ = self.request("/report")
+        self.assertEqual(503, status_503)
+        self.assertTrue(any("disk busy" in line for line in cm.output))
+
+        with self.assertLogs("mu_strategy.signal_review_server", level="ERROR") as cm:
+            with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=KeyError("unexpected_bug")):
+                status_500, _, _ = self.request("/report")
+        self.assertEqual(500, status_500)
+        self.assertTrue(any("unexpected_bug" in line for line in cm.output))
 
 
 if __name__ == "__main__":

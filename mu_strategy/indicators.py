@@ -7,56 +7,69 @@ def ema(values: list[float], period: int) -> list[float]:
     if not values:
         return []
 
-    alpha = 2 / (period + 1)
+    alpha = 2.0 / (period + 1)
+    one_minus_alpha = 1.0 - alpha
     output: list[float] = []
+    append = output.append
     previous = float(values[0])
     for value in values:
-        previous = (float(value) * alpha) + (previous * (1 - alpha))
-        output.append(previous)
+        previous = (value * alpha) + (previous * one_minus_alpha)
+        append(previous)
     return output
 
 
 def rsi(values: list[float], period: int = 14) -> list[float]:
     if period <= 0:
         raise ValueError("period must be positive")
-    if not values:
+    n = len(values)
+    if n == 0:
         return []
-    if len(values) == 1:
+    if n == 1:
         return [50.0]
 
-    output = [50.0] * len(values)
+    output = [50.0] * n
     gains = 0.0
     losses = 0.0
-    for index in range(1, min(period + 1, len(values))):
+    limit = period + 1 if period + 1 < n else n
+    for index in range(1, limit):
         change = values[index] - values[index - 1]
-        if change >= 0:
+        if change >= 0.0:
             gains += change
         else:
             losses -= change
 
-    if len(values) <= period:
+    if n <= period:
         return output
 
-    avg_gain = gains / period
-    avg_loss = losses / period
+    inv_period = 1.0 / period
+    prev_weight = period - 1
+    avg_gain = gains * inv_period
+    avg_loss = losses * inv_period
     output[period] = _rsi_from_averages(avg_gain, avg_loss)
 
-    for index in range(period + 1, len(values)):
+    for index in range(period + 1, n):
         change = values[index] - values[index - 1]
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+        if change > 0.0:
+            avg_gain = ((avg_gain * prev_weight) + change) * inv_period
+            avg_loss = (avg_loss * prev_weight) * inv_period
+        elif change < 0.0:
+            avg_gain = (avg_gain * prev_weight) * inv_period
+            avg_loss = ((avg_loss * prev_weight) - change) * inv_period
+        else:
+            avg_gain = (avg_gain * prev_weight) * inv_period
+            avg_loss = (avg_loss * prev_weight) * inv_period
         output[index] = _rsi_from_averages(avg_gain, avg_loss)
 
     return output
 
 
 def _rsi_from_averages(avg_gain: float, avg_loss: float) -> float:
-    if avg_loss == 0:
+    if avg_gain == 0.0 and avg_loss == 0.0:
+        return 50.0
+    if avg_loss == 0.0:
         return 100.0
     relative_strength = avg_gain / avg_loss
-    return 100 - (100 / (1 + relative_strength))
+    return 100.0 - (100.0 / (1.0 + relative_strength))
 
 
 def macd(

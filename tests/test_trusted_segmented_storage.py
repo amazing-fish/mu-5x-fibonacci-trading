@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from mu_strategy.experiments.release_candidate import HistoricalTrustedGenerationReader
+from mu_strategy.research.historical_data import HistoricalTrustedGenerationReader
 from mu_strategy.market_data.trusted_data.contracts import (
     HealthReason,
     ManifestSchemaError,
@@ -134,7 +134,7 @@ class UtcMonthPartitionTests(unittest.TestCase):
 
 
 class SegmentedRefreshBehaviorTests(unittest.TestCase):
-    def test_complete_window_starting_in_listing_month_uses_isolated_segment(self):
+    def test_complete_window_starting_in_listing_month_uses_canonical_segment(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus
 
         now_ms = FEB_START_MS + 10 * DAY_MS
@@ -155,8 +155,8 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertEqual("complete", health.coverage_state)
             self.assertEqual(1, health.requested_days)
             storage = run.storage_by_dataset[(SYMBOL, "5m")]
-            self.assertIn(f".partial-{listing_ms}.csv", str(storage.segments[0].source_file))
-            self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+            self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-02"), storage.segments[0].source_file)
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-02").exists())
             self.assertEqual(SYMBOL, provider.asserted_symbol)
             self.assertIn(f"verified_listing_start:listing_time_ms={listing_ms}", health.warnings)
 
@@ -187,10 +187,9 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             paths = {interval: store.data_dir / first.storage_by_dataset[(SYMBOL, interval)].segments[0].source_file
                      for interval in ("5m", "15m", "1h")}
             previous_bytes = {interval: path.read_bytes() for interval, path in paths.items()}
-            self.assertIn(f".partial-{listing_ms + 45 * 60_000}.csv", str(paths["1h"]))
-            for interval in paths:
+            for interval, path in paths.items():
                 self.assertEqual("complete", first.datasets[(SYMBOL, interval)].coverage_state)
-                self.assertFalse(store.segment_path(SYMBOL, interval, "2026-02").exists())
+                self.assertEqual(store.segment_path(SYMBOL, interval, "2026-02"), path)
 
             five = _window_candles(listing_ms, now_ms + 3_600_000 - STEP_MS)
             provider.rows_by_interval = {"5m": five, "15m": aggregate_candles(five, interval="15m"),
@@ -263,7 +262,10 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertEqual("complete", health.coverage_state)
             self.assertEqual(180 * 288 + 1, health.rows)
             self.assertEqual([212], provider.history_days)
-            self.assertIn(f".partial-{listing_ms}.csv", str(run.storage_by_dataset[(SYMBOL, "5m")].segments[0].source_file))
+            self.assertEqual(
+                store.segment_source_file(SYMBOL, "5m", "2026-03"),
+                run.storage_by_dataset[(SYMBOL, "5m")].segments[0].source_file,
+            )
 
         # When fewer than 180 days exist, retain the existing truthful coverage
         # state instead of inventing pre-listing rows or shortening the request.
@@ -294,327 +296,6 @@ class SegmentedRefreshBehaviorTests(unittest.TestCase):
             self.assertTrue(store.generation_manifest_path(RUN_A).is_file())
             self.assertTrue(any((configured_data_dir / "segments").rglob("*.csv")))
             self.assertFalse((repository / "data" / "live").exists())
-
-    def test_incremental_partial_history_that_becomes_complete_stays_out_of_canonical_month(self):
-        from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
-
-        partial_end_ms = JAN_START_MS + (12 * 60 * 60_000)
-        complete_end_ms = JAN_START_MS + DAY_MS + (12 * 60 * 60_000)
-        provider = MutableHistoryProvider(_window_candles(JAN_START_MS, partial_end_ms))
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            store = TrustedDataStore(data_dir=data_dir)
-            first_run = _refresh(
-                store,
-                provider,
-                RUN_A,
-                days=1,
-                now_ms=partial_end_ms + STEP_MS,
-            )
-            first_snapshot = store.read_generation_manifest(RUN_A).snapshot
-            first_reference = first_snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
-            partial_path = data_dir / first_reference.source_file
-
-            provider.rows = _window_candles(JAN_START_MS, complete_end_ms)
-            second_run = _refresh(
-                store,
-                provider,
-                RUN_B,
-                days=1,
-                now_ms=complete_end_ms + STEP_MS,
-            )
-            second_result = store.read_generation_manifest(RUN_B)
-            second_reference = second_result.snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
-
-            self.assertEqual("partial_available_history", first_run.datasets[(SYMBOL, "5m")].coverage_state)
-            self.assertEqual(RefreshAttemptStatus.SUCCESS, second_run.attempt_status)
-            self.assertEqual(SnapshotUsability.USABLE, second_run.snapshot_usability)
-            self.assertEqual("complete", second_run.datasets[(SYMBOL, "5m")].coverage_state)
-            self.assertTrue(second_result.ok)
-            self.assertEqual(first_reference.source_file, second_reference.source_file)
-            self.assertGreater(second_reference.start_row, 0)
-            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
-            self.assertEqual(second_run.datasets[(SYMBOL, "5m")].rows, len(_read_exact(store, RUN_B)))
-
-            complete_end_ms += STEP_MS
-            provider.rows = _window_candles(JAN_START_MS, complete_end_ms)
-            third_run = _refresh(
-                store,
-                provider,
-                RUN_C,
-                days=1,
-                now_ms=complete_end_ms + STEP_MS,
-            )
-            third_reference = store.read_generation_manifest(RUN_C).snapshot.storage_by_dataset[
-                (SYMBOL, "5m")
-            ].segments[0]
-
-            self.assertEqual(RefreshAttemptStatus.SUCCESS, third_run.attempt_status)
-            self.assertEqual("complete", third_run.datasets[(SYMBOL, "5m")].coverage_state)
-            self.assertEqual(first_reference.source_file, third_reference.source_file)
-            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
-
-            def failed_incremental(symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
-                raise TimeoutError("incremental unavailable")
-
-            provider.fetch_incremental = failed_incremental
-            failed_run_id = "d" * 32
-            failed_run = _refresh(
-                store,
-                provider,
-                failed_run_id,
-                days=1,
-                now_ms=complete_end_ms + STEP_MS,
-            )
-            failed_reference = store.read_generation_manifest(failed_run_id).snapshot.storage_by_dataset[
-                (SYMBOL, "5m")
-            ].segments[0]
-            partial_bytes = partial_path.read_bytes()
-
-            self.assertEqual(RefreshAttemptStatus.DEGRADED, failed_run.attempt_status)
-            self.assertEqual(SnapshotUsability.USABLE, failed_run.snapshot_usability)
-            self.assertEqual("complete", failed_run.datasets[(SYMBOL, "5m")].coverage_state)
-            self.assertEqual(first_reference.source_file, failed_reference.source_file)
-            self.assertFalse(store.segment_path(SYMBOL, "5m", first_reference.segment_id).exists())
-
-            january_open_ms = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
-            provider.rows = _window_candles(january_open_ms, complete_end_ms)
-            expanded_run_id = "e" * 32
-            expanded_run = _refresh(
-                store,
-                provider,
-                expanded_run_id,
-                days=3,
-                now_ms=complete_end_ms + STEP_MS,
-            )
-            expanded_reference = store.read_generation_manifest(expanded_run_id).snapshot.storage_by_dataset[
-                (SYMBOL, "5m")
-            ].segments[0]
-
-            self.assertEqual(RefreshAttemptStatus.SUCCESS, expanded_run.attempt_status)
-            self.assertEqual(SnapshotUsability.USABLE, expanded_run.snapshot_usability)
-            self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-01"), expanded_reference.source_file)
-            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
-            self.assertEqual(partial_bytes, partial_path.read_bytes())
-
-    def test_canonical_month_rejects_corrections_against_all_compatibility_sources(self):
-        compatibility_rows = _window_candles(JAN_START_MS, JAN_START_MS + STEP_MS)
-        for compatibility_kind in ("partial", "import"):
-            with self.subTest(compatibility_kind=compatibility_kind), TemporaryDirectory() as tmp:
-                store = TrustedDataStore(data_dir=Path(tmp))
-                kwargs = (
-                    {"isolate_partial_start_month": True}
-                    if compatibility_kind == "partial"
-                    else {"import_generation_id": RUN_A}
-                )
-                storage = store.write_segmented_dataset(
-                    compatibility_rows,
-                    symbol=SYMBOL,
-                    interval="5m",
-                    **kwargs,
-                )
-                compatibility_path = Path(tmp) / storage.segments[0].source_file
-                compatibility_bytes = compatibility_path.read_bytes()
-                canonical_rows = _window_candles(
-                    JAN_MONTH_START_MS,
-                    JAN_START_MS + STEP_MS,
-                )
-                changed_index = (JAN_START_MS - JAN_MONTH_START_MS) // STEP_MS
-                changed = canonical_rows[changed_index]
-                canonical_rows[changed_index] = Candle(
-                    changed.open_time_ms,
-                    changed.open,
-                    changed.high + 1.0,
-                    changed.low,
-                    changed.close + 0.5,
-                    changed.volume,
-                )
-
-                with self.assertRaisesRegex(
-                    SegmentCorrectionError,
-                    "historical correction.*segment representation",
-                ):
-                    store.write_segmented_dataset(
-                        canonical_rows,
-                        symbol=SYMBOL,
-                        interval="5m",
-                        require_complete_start_month=True,
-                    )
-
-                self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-01").exists())
-                self.assertEqual(compatibility_bytes, compatibility_path.read_bytes())
-
-    def test_partial_start_reuses_existing_canonical_month_instead_of_wedging_extension(self):
-        january_rows = _window_candles(JAN_MONTH_START_MS, FEB_START_MS - STEP_MS)
-        february_rows = _window_candles(FEB_START_MS, FEB_START_MS + STEP_MS)
-        canonical_rows = [*january_rows, *february_rows]
-        partial_rows = [*january_rows[-2:], *february_rows]
-
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
-            partial_path = Path(tmp) / store.partial_segment_source_file(
-                SYMBOL,
-                "5m",
-                "2026-01",
-                partial_rows[0].open_time_ms,
-            )
-
-            storage = store.write_segmented_dataset(
-                partial_rows,
-                symbol=SYMBOL,
-                interval="5m",
-                isolate_partial_start_month=True,
-            )
-
-            self.assertEqual(
-                store.segment_source_file(SYMBOL, "5m", "2026-01"),
-                storage.segments[0].source_file,
-            )
-            self.assertFalse(partial_path.exists())
-
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            prior_partial = store.write_segmented_dataset(
-                partial_rows[:1],
-                symbol=SYMBOL,
-                interval="5m",
-                isolate_partial_start_month=True,
-            )
-            prior_partial_source = prior_partial.segments[0].source_file
-            prior_partial_path = Path(tmp) / prior_partial_source
-            prior_partial_bytes = prior_partial_path.read_bytes()
-            store.write_segmented_dataset(canonical_rows, symbol=SYMBOL, interval="5m")
-
-            storage = store.write_segmented_dataset(
-                partial_rows,
-                symbol=SYMBOL,
-                interval="5m",
-                reuse_partial_start_source_file=prior_partial_source,
-            )
-
-            self.assertEqual(
-                store.segment_source_file(SYMBOL, "5m", "2026-01"),
-                storage.segments[0].source_file,
-            )
-            self.assertEqual(prior_partial_bytes, prior_partial_path.read_bytes())
-
-    def test_new_compatibility_source_rejects_corrections_against_existing_representations(self):
-        canonical_rows = _window_candles(
-            JAN_MONTH_START_MS,
-            JAN_START_MS + STEP_MS,
-        )
-        compatibility_rows = _window_candles(JAN_START_MS, JAN_START_MS + STEP_MS)
-        changed_rows = list(compatibility_rows)
-        changed = changed_rows[0]
-        changed_rows[0] = Candle(
-            changed.open_time_ms,
-            changed.open,
-            changed.high + 1.0,
-            changed.low,
-            changed.close + 0.5,
-            changed.volume,
-        )
-        cases = (
-            ("canonical", "partial"),
-            ("canonical", "import"),
-            ("partial", "import"),
-            ("import", "partial"),
-        )
-        for existing_kind, new_kind in cases:
-            with self.subTest(existing_kind=existing_kind, new_kind=new_kind), TemporaryDirectory() as tmp:
-                store = TrustedDataStore(data_dir=Path(tmp))
-                if existing_kind == "canonical":
-                    existing_storage = store.write_segmented_dataset(
-                        canonical_rows,
-                        symbol=SYMBOL,
-                        interval="5m",
-                    )
-                elif existing_kind == "partial":
-                    existing_storage = store.write_segmented_dataset(
-                        compatibility_rows,
-                        symbol=SYMBOL,
-                        interval="5m",
-                        isolate_partial_start_month=True,
-                    )
-                else:
-                    existing_storage = store.write_segmented_dataset(
-                        compatibility_rows,
-                        symbol=SYMBOL,
-                        interval="5m",
-                        import_generation_id=RUN_A,
-                    )
-                existing_path = Path(tmp) / existing_storage.segments[0].source_file
-                existing_bytes = existing_path.read_bytes()
-                if new_kind == "partial":
-                    new_path = Path(tmp) / store.partial_segment_source_file(
-                        SYMBOL,
-                        "5m",
-                        "2026-01",
-                        JAN_START_MS,
-                    )
-                    kwargs = {"isolate_partial_start_month": True}
-                else:
-                    new_path = Path(tmp) / store.imported_segment_source_file(
-                        SYMBOL,
-                        "5m",
-                        "2026-01",
-                        RUN_B,
-                    )
-                    kwargs = {"import_generation_id": RUN_B}
-
-                with self.assertRaisesRegex(
-                    SegmentCorrectionError,
-                    "historical correction.*trusted segment",
-                ):
-                    store.write_segmented_dataset(
-                        changed_rows,
-                        symbol=SYMBOL,
-                        interval="5m",
-                        **kwargs,
-                    )
-
-                self.assertFalse(new_path.exists())
-                self.assertEqual(existing_bytes, existing_path.read_bytes())
-
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            partial_storage = store.write_segmented_dataset(
-                compatibility_rows[:1],
-                symbol=SYMBOL,
-                interval="5m",
-                isolate_partial_start_month=True,
-            )
-            partial_path = Path(tmp) / partial_storage.segments[0].source_file
-            partial_bytes = partial_path.read_bytes()
-            store.write_segmented_dataset(
-                canonical_rows,
-                symbol=SYMBOL,
-                interval="5m",
-            )
-            changed_extension = list(compatibility_rows)
-            changed = changed_extension[-1]
-            changed_extension[-1] = Candle(
-                changed.open_time_ms,
-                changed.open,
-                changed.high + 1.0,
-                changed.low,
-                changed.close + 0.5,
-                changed.volume,
-            )
-
-            with self.assertRaisesRegex(
-                SegmentCorrectionError,
-                "historical correction.*trusted segment",
-            ):
-                store.write_segmented_dataset(
-                    changed_extension,
-                    symbol=SYMBOL,
-                    interval="5m",
-                    isolate_partial_start_month=True,
-                )
-
-            self.assertEqual(partial_bytes, partial_path.read_bytes())
 
     def test_invalid_physical_lookbehind_is_not_written_and_corrected_retry_succeeds(self):
         from mu_strategy.market_data.trusted_data.contracts import RefreshAttemptStatus, SnapshotUsability
@@ -1517,7 +1198,7 @@ class SegmentedFailureContractTests(unittest.TestCase):
                 self.assertEqual(HealthReason.MALFORMED_MANIFEST, result.reason)
 
 
-class FlatGenerationImportTests(unittest.TestCase):
+class FlatGenerationCompatTests(unittest.TestCase):
     def test_refresh_from_v3_current_forces_month_lookbehind_before_incremental_reuse(self):
         now_ms = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
         source_rows = _window_candles(now_ms - DAY_MS, now_ms - STEP_MS)
@@ -1538,135 +1219,6 @@ class FlatGenerationImportTests(unittest.TestCase):
             self.assertEqual(source_rows, _read_exact(store, RUN_A))
             self.assertEqual(source_rows, _read_exact(store, RUN_B)[-len(source_rows) :])
             self.assertEqual(14 * 288 + 1, len(_read_exact(store, RUN_C)))
-
-    def test_partial_first_month_import_isolated_from_later_canonical_lookbehind(self):
-        source_run = "5" * 32
-        imported_run = "6" * 32
-        refreshed_run = "7" * 32
-        expanded_run = "8" * 32
-        now_ms = int(datetime(2026, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
-        source_rows = _window_candles(now_ms - DAY_MS, now_ms - STEP_MS)
-        provider = WindowedHistoryProvider(now_ms=now_ms)
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            _write_flat_v3_generation(store, source_run, source_rows)
-            imported = store.import_flat_generation(source_run, imported_run, publish=True)
-            import_reference = imported.snapshot.storage_by_dataset[(SYMBOL, "5m")].segments[0]
-            import_path = Path(tmp) / import_reference.source_file
-            import_bytes = import_path.read_bytes()
-
-            _refresh(store, provider, refreshed_run, days=1, now_ms=now_ms)
-            _refresh(store, provider, expanded_run, days=14, now_ms=now_ms)
-
-            self.assertEqual(
-                f"2026-01.import-{imported_run}.csv",
-                import_reference.source_file.name,
-            )
-            self.assertEqual([33, 46], provider.history_days)
-            self.assertEqual(0, provider.incremental_calls)
-            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-01").exists())
-            self.assertEqual(import_bytes, import_path.read_bytes())
-            self.assertEqual(source_rows, _read_exact(store, source_run))
-            self.assertEqual(source_rows, _read_exact(store, imported_run))
-            self.assertEqual(source_rows, _read_exact(store, refreshed_run)[-len(source_rows) :])
-            self.assertEqual(14 * 288 + 1, len(_read_exact(store, expanded_run)))
-
-            imported_manifest_path = store.generation_manifest_path(imported_run)
-            imported_manifest = json.loads(imported_manifest_path.read_text(encoding="utf-8"))
-            imported_manifest["symbols"][SYMBOL]["intervals"]["5m"]["storage"]["segments"][0][
-                "source_file"
-            ] = f"segments/okx/{SYMBOL}/5m/2026-01.import-{'9' * 32}.csv"
-            imported_manifest_path.write_text(json.dumps(imported_manifest, sort_keys=True), encoding="utf-8")
-            malformed = store.read_generation_manifest(imported_run)
-            self.assertFalse(malformed.ok)
-            self.assertEqual(HealthReason.MALFORMED_MANIFEST, malformed.reason)
-            self.assertEqual(import_bytes, import_path.read_bytes())
-
-    def test_explicit_v3_import_round_trips_candles_hashes_and_can_publish(self):
-        source_run = "d" * 32
-        target_run = "e" * 32
-        rows = _candles_through(FEB_START_MS)
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            store = TrustedDataStore(data_dir=data_dir)
-            source_path = _write_flat_v3_generation(store, source_run, rows)
-            source_bytes = source_path.read_bytes()
-
-            imported = store.import_flat_generation(source_run, target_run, publish=True)
-            source_result = store.read_generation_manifest(source_run)
-            source_rows = store.read_generation_dataset(
-                source_result.snapshot,
-                symbol=SYMBOL,
-                interval="5m",
-                generation_root=source_result.generation_root,
-                generation_id=source_run,
-            )
-            imported_rows = store.read_generation_dataset(
-                imported.snapshot,
-                symbol=SYMBOL,
-                interval="5m",
-                generation_root=imported.generation_root,
-                generation_id=target_run,
-            )
-
-            self.assertEqual(source_bytes, source_path.read_bytes())
-            self.assertEqual(4, imported.snapshot.schema_version)
-            self.assertEqual(source_run, imported.snapshot.imported_from_run_id)
-            self.assertEqual(source_rows, imported_rows)
-            self.assertEqual(candles_content_sha256(source_rows), candles_content_sha256(imported_rows))
-            self.assertEqual(target_run, json.loads(store.current_path.read_text(encoding="utf-8"))["generation_id"])
-
-    def test_v3_import_rejects_unusable_dataset_before_shared_or_target_writes(self):
-        rows = _candles_through(FEB_START_MS)
-        with TemporaryDirectory() as tmp:
-            store = TrustedDataStore(data_dir=Path(tmp))
-            _write_flat_v3_generation(store, RUN_A, rows)
-            manifest_path = store.generation_manifest_path(RUN_A)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            status = manifest["symbols"][SYMBOL]["intervals"]["5m"]
-            manifest["attempt_status"] = "failed"
-            manifest["snapshot_usability"] = "invalid"
-            status["integrity"] = "invalid"
-            status["freshness"] = "stale"
-            status["reasons"] = ["ohlcv_invalid"]
-            status["validation"] = {"ok": False, "reason": "ohlcv_invalid"}
-            store.write_generation_manifest(RUN_A, manifest)
-
-            with self.assertRaisesRegex(ManifestSchemaError, "source dataset is unusable"):
-                store.import_flat_generation(RUN_A, RUN_B)
-
-            self.assertFalse(store.generation_root(RUN_B).exists())
-            self.assertFalse(store.segments_dir.exists())
-
-    def test_import_command_is_explicit_and_does_not_publish_without_flag(self):
-        from mu_strategy.commands.import_trusted_generation import main
-
-        source_run = "1" * 32
-        target_run = "2" * 32
-        with TemporaryDirectory() as tmp:
-            data_dir = Path(tmp)
-            store = TrustedDataStore(data_dir=data_dir)
-            _write_flat_v3_generation(store, source_run, _candles_through(FEB_START_MS))
-            stdout = StringIO()
-
-            exit_code = main(
-                [
-                    "--data-dir",
-                    str(data_dir),
-                    "--source-run-id",
-                    source_run,
-                    "--target-run-id",
-                    target_run,
-                ],
-                stdout=stdout,
-            )
-            output = json.loads(stdout.getvalue())
-
-            self.assertEqual(0, exit_code)
-            self.assertEqual("ok", output["status"])
-            self.assertFalse(output["published"])
-            self.assertFalse(store.current_path.exists())
-            self.assertTrue(store.generation_manifest_path(target_run).exists())
 
     def test_current_and_historical_readers_are_cache_only(self):
         provider = MutableHistoryProvider(_candles_through(FEB_START_MS))

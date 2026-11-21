@@ -230,30 +230,33 @@ class Stage0ObservationContractTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     Stage0ScanResult.from_dict(malformed)
 
-    def test_fsync_failure_leaves_marker_that_prevents_consuming_visible_bytes(self):
+    def test_fsync_failure_rolls_back_uncommitted_bytes_without_poisoning_prior_cycles(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
             with patch("mu_strategy.observations.os.fsync", side_effect=OSError("disk failure")):
-                with self.assertRaises(ObservationWriteError):
-                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+                with self.assertRaisesRegex(ObservationWriteError, "disk failure"):
+                    repository.append_cycle(_cycle("cycle-b", "obs-b"))
 
-            self.assertTrue(repository.invalid_marker_path.exists())
-            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
-                JsonlObservationRepository(path).read_cycles()
+            self.assertFalse(repository.invalid_marker_path.exists())
+            self.assertEqual((first,), JsonlObservationRepository(path).read_cycles())
 
-    def test_append_fsyncs_parent_directory_for_marker_log_creation_and_marker_removal(self):
+    def test_append_fsyncs_parent_directory_only_on_initial_log_creation(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
             with patch.object(repository, "_fsync_parent_directory", create=True) as fsync_parent:
                 repository.append_cycle(_cycle("cycle-a", "obs-a"))
-                self.assertEqual(3, fsync_parent.call_count)
+                self.assertEqual(1, fsync_parent.call_count)
+                self.assertFalse(repository.invalid_marker_path.exists())
 
                 repository.append_cycle(_cycle("cycle-b", "obs-b"))
-                self.assertEqual(5, fsync_parent.call_count)
+                self.assertEqual(1, fsync_parent.call_count)
+                self.assertFalse(repository.invalid_marker_path.exists())
 
-    def test_first_append_fsyncs_each_new_directory_entry_bottom_up_and_restarts(self):
+    def test_first_append_fsyncs_each_new_directory_entry_and_new_log_without_marker(self):
         with TemporaryDirectory() as tmp:
             existing_root = Path(tmp)
             path = existing_root / "data" / "observations" / "stage0.jsonl"
@@ -265,17 +268,16 @@ class Stage0ObservationContractTests(unittest.TestCase):
             flushed_directories = [invocation.args[0] for invocation in fsync_directory.call_args_list]
             self.assertEqual(
                 [
-                    path.parent,
                     path.parent.parent,
                     existing_root,
-                    path.parent,
                     path.parent,
                 ],
                 flushed_directories,
             )
+            self.assertFalse(JsonlObservationRepository(path).invalid_marker_path.exists())
             self.assertEqual((cycle,), JsonlObservationRepository(path).read_cycles())
 
-    def test_new_parent_directory_fsync_failure_leaves_fail_closed_marker(self):
+    def test_new_parent_directory_fsync_failure_writes_no_log_and_allows_clean_retry(self):
         with TemporaryDirectory() as tmp:
             existing_root = Path(tmp)
             path = existing_root / "data" / "observations" / "stage0.jsonl"
@@ -291,33 +293,63 @@ class Stage0ObservationContractTests(unittest.TestCase):
                 with self.assertRaises(ObservationWriteError):
                     repository.append_cycle(_cycle("cycle-a", "obs-a"))
 
-            self.assertEqual([path.parent, path.parent.parent], flushed_directories)
-            self.assertTrue(repository.invalid_marker_path.exists())
+            self.assertEqual([path.parent.parent], flushed_directories)
+            self.assertFalse(repository.invalid_marker_path.exists())
             self.assertFalse(path.exists())
-            with self.assertRaises(ObservationWriteError):
-                repository.append_cycle(_cycle("cycle-b", "obs-b"))
-            self.assertTrue(repository.invalid_marker_path.exists())
-            self.assertFalse(path.exists())
-            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
-                JsonlObservationRepository(path).read_cycles()
+            cycle_b = _cycle("cycle-b", "obs-b")
+            repository.append_cycle(cycle_b)
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
 
-    def test_marker_removal_directory_fsync_failure_restores_failed_write_marker(self):
+    def test_read_tail_and_iter_tail_cycles_reverse_scan_across_chunk_boundaries(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
-            directory_fsyncs = (None, None, OSError("directory fsync failed"), None)
-            with patch.object(
-                repository,
-                "_fsync_parent_directory",
-                create=True,
-                side_effect=directory_fsyncs,
-            ):
-                with self.assertRaises(ObservationWriteError):
-                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            self.assertEqual((), repository.read_tail(limit=5))
+            cycles = tuple(
+                Stage0ObservationCycle(
+                    cycle_id=f"cycle-{idx}",
+                    created_at_ms=1_000 + idx * 100,
+                    observations=(_observation(cycle_id=f"cycle-{idx}", observation_id=f"obs-{idx}", created_at_ms=1_000 + idx * 100),),
+                )
+                for idx in range(6)
+            )
+            for item in cycles:
+                repository.append_cycle(item)
 
-            self.assertTrue(repository.invalid_marker_path.exists())
+            for chunk_size in (17, 64, 512, 65_536):
+                with self.subTest(chunk_size=chunk_size):
+                    self.assertEqual(cycles[-3:], repository.read_tail(limit=3, chunk_size=chunk_size))
+                    self.assertEqual(cycles, repository.read_tail(limit=10, chunk_size=chunk_size))
+                    self.assertEqual(
+                        cycles[3:],
+                        repository.read_tail(limit=10, min_created_at_ms=1_300, chunk_size=chunk_size),
+                    )
+                    self.assertEqual(
+                        tuple(reversed(cycles[-2:])),
+                        tuple(repository.iter_tail_cycles(max_cycles=2, chunk_size=chunk_size)),
+                    )
+
+    def test_read_tail_handles_empty_file_and_fails_closed_on_corruption_or_legacy_marker(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            path.write_bytes(b"")
+            self.assertEqual((), repository.read_tail(limit=5))
+
+            repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            repository.invalid_marker_path.write_text("legacy", encoding="utf-8")
             with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
-                repository.read_cycles()
+                repository.read_tail(limit=5)
+            repository.invalid_marker_path.unlink()
+
+            original = path.read_bytes()
+            path.write_bytes(original + b'{"incomplete":true')
+            with self.assertRaises(ObservationCorruptionError):
+                repository.read_tail(limit=5)
+
+            path.write_bytes(original.replace(b'"schema_version":2', b'"schema_version":2,"schema_version":2', 1))
+            with self.assertRaisesRegex(ObservationCorruptionError, "duplicate"):
+                repository.read_tail(limit=5)
 
     def test_reader_rejects_decision_metadata_that_disagrees_with_catalog(self):
         payload = _observation(result=_scan(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY)).to_dict()

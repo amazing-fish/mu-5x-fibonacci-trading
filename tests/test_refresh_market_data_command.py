@@ -13,6 +13,7 @@ from tests.factories.trusted_publication import manifest_path, range_candles
 class RefreshMarketDataCommandTests(unittest.TestCase):
     def test_success_ok_one_shot_returns_zero_with_structured_output(self):
         from mu_strategy.commands.refresh_market_data import main
+        from mu_strategy.market_data.trusted_data.refresh import DEFAULT_MAX_CONCURRENCY
 
         captured = {}
         run = _run("run-ok")
@@ -31,7 +32,7 @@ class RefreshMarketDataCommandTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(("5m",), captured["intervals"])
-        self.assertEqual(2, captured["args"].max_concurrency)
+        self.assertEqual(DEFAULT_MAX_CONCURRENCY, captured["args"].max_concurrency)
         self.assertEqual(
             {
                 "run_id": "run-ok",

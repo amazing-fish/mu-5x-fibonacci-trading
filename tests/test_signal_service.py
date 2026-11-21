@@ -144,19 +144,27 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(31000, self.time.now_ms())
 
     def test_refresh_failure_still_scans_previous_cache_but_service_remains_unhealthy(self):
-        for result, expected in [
-            (refresh_result(attempt="degraded", exit_code=2), StepStatus.DEGRADED),
-            (subprocess.CompletedProcess([], 1, '{"status":"error"}', "secret provider text"), StepStatus.FAILED),
-            (subprocess.TimeoutExpired("refresh", 240), StepStatus.TIMED_OUT),
-            (OSError("cannot spawn"), StepStatus.FAILED),
+        for result, expected, expected_detail in [
+            (refresh_result(attempt="degraded", exit_code=2), StepStatus.DEGRADED, None),
+            (
+                subprocess.CompletedProcess([], 1, '{"status":"error"}', "api_key=secret-token provider error"),
+                StepStatus.FAILED,
+                "provider error",
+            ),
+            (subprocess.TimeoutExpired("refresh", 240), StepStatus.TIMED_OUT, "TimeoutExpired"),
+            (OSError("cannot spawn"), StepStatus.FAILED, "OSError: cannot spawn"),
         ]:
             with self.subTest(expected=expected):
                 views = []
                 self.service([result, scan_result_process()]).run(cycles=1, on_cycle=views.append)
                 self.assertFalse(views[0]["healthy"])
                 self.assertEqual("allowed", views[0]["data_at_last_scan"]["status"])
-                self.assertIs(expected, self.store.read().last_cycle.refresh.status)
-                self.assertNotIn("secret provider text", self.store.path.read_text())
+                refresh = self.store.read().last_cycle.refresh
+                self.assertIs(expected, refresh.status)
+                self.assertNotIn("secret-token", self.store.path.read_text())
+                if expected_detail is not None:
+                    self.assertIsNotNone(refresh.error_detail)
+                    self.assertIn(expected_detail, refresh.error_detail)
 
     def test_malformed_or_contradictory_refresh_success_fails_closed(self):
         for result in [refresh_result(exit_code=1), refresh_result(attempt="degraded"), refresh_result(usable=False),
@@ -200,19 +208,22 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(before, self.store.path.read_bytes())
         self.assertFalse(self.store.is_running())
 
-    def test_interrupted_active_phase_requires_explicit_recovery_before_restart(self):
+    def test_interrupted_active_phase_recovers_automatically_on_restart(self):
         self.service([refresh_result(), scan_result_process()]).run(cycles=1)
         for phase in (Phase.REFRESH, Phase.SCAN):
             with self.subTest(phase=phase):
                 self.store.write(replace(self.store.read(), running=True, phase=phase))
-                before = self.store.path.read_bytes()
                 self.assertEqual("interrupted", health_view(self.store.read(), running=False, now_ms=1000)["runtime"])
-                with self.assertRaises(InterruptedCycleError):
-                    self.service([]).run(cycles=1)
-                self.assertEqual(before, self.store.path.read_bytes())
-                recover_interrupted(self.store, clock=self.time)
-                self.assertEqual("interruption_acknowledged", self.store.read().events[-1].kind)
-                self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+                views = []
+                self.service([refresh_result(), scan_result_process()]).run(cycles=1, on_cycle=views.append)
+                self.assertTrue(views[0]["healthy"])
+                state = self.store.read()
+                self.assertFalse(state.running)
+                kinds = [event.kind for event in state.events]
+                self.assertIn("interruption_recovered", kinds)
+                recovery_event = [event for event in state.events if event.kind == "interruption_recovered"][-1]
+                self.assertIn("runtime.interrupted", recovery_event.problems)
+                self.assertIn(f"interrupted.{phase.value}", recovery_event.problems)
 
     def test_interruption_during_idle_can_restart_and_busy_service_cannot_be_recovered(self):
         self.service([refresh_result(), scan_result_process()]).run(cycles=1)
@@ -378,12 +389,14 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(Path(__file__).resolve().parents[1], child.call_args.kwargs["cwd"])
 
     def test_scan_runner_failure_or_missing_result_does_not_attempt_persistence(self):
-        for runner, error in ((Mock(side_effect=RuntimeError("failed")), "scan_failed"),
-                              (Mock(return_value=None), "scan_result_missing")):
+        for runner, error, detail in (
+            (Mock(side_effect=RuntimeError("failed")), "scan_failed", "RuntimeError: failed"),
+            (Mock(return_value=None), "scan_result_missing", None),
+        ):
             with self.subTest(error=error):
                 repository = Mock()
                 result = scan_once(self.config, repository=repository, runner=runner)
-                self.assertEqual(ScanHealth(StepStatus.FAILED, error_code=error), result)
+                self.assertEqual(ScanHealth(StepStatus.FAILED, error_code=error, error_detail=detail), result)
                 repository.append_cycle.assert_not_called()
 
     def test_real_cache_worker_reports_missing_invalid_and_stale_data_without_network(self):
@@ -747,6 +760,29 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("starting", view["runtime"])
         self.assertFalse(view["healthy"])
         self.assertEqual("interrupted", health_view(state, running=False, now_ms=2001)["runtime"])
+
+    def test_health_store_prepare_skips_fsync_on_existing_root_and_decouples_lock(self):
+        from mu_strategy.file_locks import locked_file
+
+        self.store.prepare()
+        with patch("mu_strategy.service_health.fsync_directory") as sync:
+            self.store.prepare()
+        sync.assert_not_called()
+
+        self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        obs_lock = self.store.root / "observations.jsonl.lock"
+        self.assertNotEqual(obs_lock, self.store.health_lock_path)
+        state = self.store.read()
+        with locked_file(obs_lock):
+            self.store.write(replace(state, run_id="decoupled-run"))
+        self.assertEqual("decoupled-run", self.store.read().run_id)
+
+    def test_service_cycle_avoids_redundant_fsyncs_for_ephemeral_phases(self):
+        self.store.prepare()
+        with patch("mu_strategy.service_health.fsync_directory") as dir_sync:
+            self.service([refresh_result(), scan_result_process()]).run(cycles=1)
+        # Only durable start + stop writes call fsync_directory (2), not ephemeral phases or prepare().
+        self.assertEqual(2, dir_sync.call_count)
 
 
 if __name__ == "__main__":

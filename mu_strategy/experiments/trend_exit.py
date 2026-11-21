@@ -76,7 +76,7 @@ def retention_failures(row: dict, baseline: dict) -> list[str]:
     return failures
 
 
-def run_experiment(window: HistoricalResearchWindow) -> dict:
+def run_experiment(window: HistoricalResearchWindow, *, include_series: bool = True) -> dict:
     configs = candidate_configs(window.generation.reference.symbol)
     candles = list(window.candles_by_interval["15m"])
     context = build_hourly_context(candles, list(window.candles_by_interval["1h"]))
@@ -88,15 +88,19 @@ def run_experiment(window: HistoricalResearchWindow) -> dict:
             metrics(run_backtest([bar for bar in candles if start <= bar.open_time_ms < end], context, config=config))
             for start, end in periods
         ]
-        rows.append({
+        row = {
             "name": name,
             "configuration": asdict(config),
             "full": metrics(full),
             "periods": period_results,
             "double_fee": metrics(run_backtest(candles, context, config=replace(config, fee_rate=config.fee_rate * 2))),
-            "trades": [asdict(trade) for trade in full.trades],
-            "equity_curve": full.equity_curve,
-        })
+        }
+        if include_series:
+            row["trades"] = [asdict(trade) for trade in full.trades]
+            row["equity_curve"] = full.equity_curve
+        else:
+            row["equity_curve_points"] = len(full.equity_curve)
+        rows.append(row)
     for row in rows:
         row["retention_failures"] = retention_failures(row, rows[0]) if row["name"] != "baseline" else []
         row["retained_for_forward_observation"] = row["name"] != "baseline" and not row["retention_failures"]
@@ -109,6 +113,7 @@ def run_experiment(window: HistoricalResearchWindow) -> dict:
         "sample_status": "reused historical sample; not untouched out-of-sample or forward validation",
         "cost_model": "0.0005 per side; double-fee rerun 0.001; no funding, spread, queue or partial-fill model",
         "period_initialization": "10000 equity and no positions each period; fresh 15m indicators; continuous closed-hour context",
+        "series_included": include_series,
         "periods": [{"start_ms": start, "end_ms": end} for start, end in periods],
         "provenance": json.loads(window.provenance({name: asdict(config) for name, config in configs.items()})),
         "preferred_for_forward_observation": retained[0]["name"] if retained else None,
@@ -129,24 +134,45 @@ def render_markdown(report: dict) -> str:
         verdict = ", ".join(row["retention_failures"]) or ("对照" if row["name"] == "baseline" else "保留观察")
         lines.append(f"| {row['name']} | {full['return_pct']:.2%} | {full['max_drawdown_pct']:.2%} | {full['trade_count']} | "
                      + " | ".join(values) + f" | {row['double_fee']['return_pct']:.2%} | {verdict} |")
+    detail_note = (
+        "完整配置、每笔交易、权益路径、分段时间和数据身份见同目录 experiment.json。"
+        if report.get("series_included", True)
+        else "完整配置、分段指标、分段时间和数据身份见同目录 experiment.json（如需逐笔交易与逐根权益路径，请传入 --include-series）。"
+    )
     lines += ["", "条件：全期收益提升、回撤不恶化、中段及末段各不退步、至少 20 笔、双费率收益为正。保留后按末段收益、全期收益依次排序。",
-              "", "完整配置、每笔交易、权益路径、分段时间和数据身份见同目录 experiment.json。剔除前五盈利交易的净利润只用于衡量利润集中度，不是删除交易后的重新回测。", ""]
+              "", detail_note + "剔除前五盈利交易的净利润只用于衡量利润集中度，不是删除交易后的重新回测。", ""]
     return "\n".join(lines)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--generation-id", required=True)
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
-    parser.add_argument("--days", type=int, default=179)
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Complete historical days to load (defaults to available complete days up to 179).",
+    )
+    parser.add_argument(
+        "--include-series",
+        action="store_true",
+        help="Include full per-bar equity_curve and per-trade details in experiment.json (large output).",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     json_path, md_path = args.output_dir / "experiment.json", args.output_dir / "experiment.md"
     try:
         validate_replay_outputs(args.data_dir, json_path, md_path)
-        window = load_historical_window(data_dir=args.data_dir, generation_id=args.generation_id, symbol=args.symbol, days=args.days)
-        report = run_experiment(window)
+        window = load_historical_window(
+            data_dir=args.data_dir,
+            generation_id=args.generation_id,
+            symbol=args.symbol,
+            days=179 if args.days is None else args.days,
+            allow_partial=(args.days is None),
+        )
+        report = run_experiment(window, include_series=args.include_series)
     except (HistoricalGenerationError, ValueError) as exc:
         parser.error(str(exc))
     payload = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2)

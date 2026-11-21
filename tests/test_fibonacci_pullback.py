@@ -521,19 +521,10 @@ def _blocked_market_data_paths(module_name: str):
             )
         )
         for target in (
-            "mu_strategy.market_data.cache.fetch_okx_historical",
-            "mu_strategy.market_data.cache.fetch_okx_incremental",
-            "mu_strategy.market_data.cache.fetch_historical",
             "mu_strategy.market_data.trusted_data.refresh.fetch_okx_historical",
             "mu_strategy.market_data.trusted_data.refresh.fetch_okx_incremental",
         ):
             stack.enter_context(patch(target, side_effect=AssertionError("network must not be used")))
-        stack.enter_context(
-            patch(
-                "mu_strategy.market_data.cache.write_csv",
-                side_effect=AssertionError("cache write must not be used"),
-            )
-        )
         stack.enter_context(
             patch(
                 "mu_strategy.market_data.trusted_data.store.TrustedDataStore.write_csv",

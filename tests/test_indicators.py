@@ -17,8 +17,17 @@ class IndicatorTests(unittest.TestCase):
         rising = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114]
         falling = list(reversed(rising))
 
-        self.assertGreater(rsi(rising, 14)[-1], 70)
-        self.assertLess(rsi(falling, 14)[-1], 30)
+        self.assertAlmostEqual(100.0, rsi(rising, 14)[-1])
+        self.assertAlmostEqual(0.0, rsi(falling, 14)[-1])
+
+    def test_rsi_flat_series_is_neutral_fifty(self):
+        flat = [100.0] * 30
+
+        values = rsi(flat, 14)
+
+        self.assertEqual(len(flat), len(values))
+        for value in values:
+            self.assertAlmostEqual(50.0, value)
 
     def test_macd_histogram_is_returned_for_each_bar(self):
         values = [100 + i for i in range(40)]

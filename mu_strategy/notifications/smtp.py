@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import smtplib
 import ssl
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -12,6 +13,23 @@ from typing import Callable, Mapping
 from mu_strategy.canonical import canonical_sha256
 from mu_strategy.market_data.trusted_data.contracts import Clock, SystemClock
 from mu_strategy.notifications.events import AlertEvent, AlertKind, DeliveryState, NotificationError
+
+
+_SSL_CONTEXT_LOCK = threading.Lock()
+_DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    """Cache the default TLS context once per process (avoids multi-second Windows cert-store reloads)."""
+    global _DEFAULT_SSL_CONTEXT
+    context = _DEFAULT_SSL_CONTEXT
+    if context is None:
+        with _SSL_CONTEXT_LOCK:
+            context = _DEFAULT_SSL_CONTEXT
+            if context is None:
+                context = ssl.create_default_context()
+                _DEFAULT_SSL_CONTEXT = context
+    return context
 
 
 @dataclass(frozen=True, repr=False)
@@ -58,11 +76,19 @@ class SendResult:
 
 
 class SmtpTransport:
-    def __init__(self, config: SmtpConfig, *, factory=smtplib.SMTP_SSL, clock: Clock | None = None):
+    def __init__(
+        self,
+        config: SmtpConfig,
+        *,
+        factory=smtplib.SMTP_SSL,
+        clock: Clock | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+    ):
         self.config = config
         self.factory = factory
         self.target_fingerprint = config.target_fingerprint
         self.clock = clock or SystemClock()
+        self.ssl_context = ssl_context
 
     def send(self, event: AlertEvent, *, source_is_current: Callable[[], bool] | None = None) -> SendResult:
         if event.kind is AlertKind.ENTRY_REVIEW and source_is_current is None:
@@ -75,7 +101,8 @@ class SmtpTransport:
         client = None
         sending = False
         try:
-            client = self.factory(self.config.host, 465, timeout=20, context=ssl.create_default_context())
+            context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
+            client = self.factory(self.config.host, 465, timeout=20, context=context)
             client.login(self.config.sender, self.config.authorization_code)
             code, response = client.mail(self.config.sender)
             if code != 250:

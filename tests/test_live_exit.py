@@ -57,9 +57,8 @@ class LiveExitTests(unittest.TestCase):
         self.assertEqual("stop", observation.exit_reason)
         self.assertEqual("candle_low_at_or_below_stop_before_candle", observation.trigger_basis)
 
-    def test_non_session_liquidation_risk_reason_matches_backtest_precedence(self):
+    def test_non_session_stop_beats_liquidation_unless_price_gaps_past_stop_to_liquidation(self):
         weekend_ms = int(datetime(2026, 8, 8, tzinfo=timezone.utc).timestamp() * 1000)
-        candles = [Candle(weekend_ms, 100, 101, 79, 90, 1000)]
         snapshot = stage_one_position()
         config = StrategyConfig()
         backtest_position = OpenPosition(
@@ -70,21 +69,23 @@ class LiveExitTests(unittest.TestCase):
             max_stage=1,
         )
 
-        observation = evaluate_exit(
-            snapshot,
-            candles[0],
-            index=0,
-            candles=candles,
-            regime="yellow",
-            config=config,
-        )
+        # Continuous drop from open=100 -> low=79 hits active stop 98 BEFORE liquidation 80.
+        continuous = [Candle(weekend_ms, 100, 101, 79, 90, 1000)]
+        obs_stop = evaluate_exit(snapshot, continuous[0], index=0, candles=continuous, regime="yellow", config=config)
+        self.assertFalse(_has_non_session_liquidation_risk(continuous[0], backtest_position, config))
+        self.assertTrue(obs_stop.exit_triggered)
+        self.assertEqual("stop", obs_stop.exit_reason)
+        self.assertEqual("candle_low_at_or_below_stop_before_candle", obs_stop.trigger_basis)
 
-        self.assertTrue(_has_non_session_liquidation_risk(candles[0], backtest_position, config))
-        self.assertTrue(observation.exit_triggered)
-        self.assertEqual("non_session_liquidation_risk", observation.exit_reason)
+        # Gap at bar open straight into liquidation territory (open=79 <= liq=80) triggers non_session_liquidation_risk.
+        gapped = [Candle(weekend_ms, 79, 85, 75, 82, 1000)]
+        obs_liq = evaluate_exit(snapshot, gapped[0], index=0, candles=gapped, regime="yellow", config=config)
+        self.assertTrue(_has_non_session_liquidation_risk(gapped[0], backtest_position, config))
+        self.assertTrue(obs_liq.exit_triggered)
+        self.assertEqual("non_session_liquidation_risk", obs_liq.exit_reason)
         self.assertEqual(
             "candle_low_at_or_below_non_session_liquidation_risk_price",
-            observation.trigger_basis,
+            obs_liq.trigger_basis,
         )
 
     def test_close_below_new_stop_is_diagnostic_not_current_candle_exit(self):
@@ -152,24 +153,34 @@ class LiveExitTests(unittest.TestCase):
         self.assertIsNone(observation.assumption_evaluation)
         self.assertEqual("missing_or_invalid_average_entry_price", observation.unavailable_reason)
 
-    def test_aggregate_okx_row_keeps_unknown_state_visible_in_degraded_evaluation(self):
-        candles = [candle(0, 100, 101, 97, 99)]
-
-        observation = observe_okx_position(
+    def test_aggregate_okx_row_reports_actionable_exit_or_hold_with_degraded_quality(self):
+        triggered_candles = [candle(0, 100, 101, 97, 99)]
+        exit_obs = observe_okx_position(
             {"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "100", "posSide": "long"},
-            candles=candles,
+            candles=triggered_candles,
             regime="yellow",
             config=StrategyConfig(),
         )
 
-        self.assertEqual("unknown", observation.decision_status)
-        self.assertEqual("degraded", observation.state_quality)
-        self.assertIn("fills", observation.unknown_fields)
-        self.assertIn("max_stage", observation.unknown_fields)
-        self.assertIn("max_stage=1", observation.assumptions)
-        self.assertIsNotNone(observation.assumption_evaluation)
-        self.assertEqual(98, observation.assumption_evaluation.stop_before_candle)
-        self.assertTrue(observation.assumption_evaluation.exit_triggered)
+        self.assertEqual("exit", exit_obs.decision_status)
+        self.assertEqual("degraded", exit_obs.state_quality)
+        self.assertIn("fills", exit_obs.unknown_fields)
+        self.assertIn("max_stage", exit_obs.unknown_fields)
+        self.assertIn("max_stage=1", exit_obs.assumptions)
+        self.assertIsNotNone(exit_obs.assumption_evaluation)
+        self.assertEqual(98, exit_obs.assumption_evaluation.stop_before_candle)
+        self.assertTrue(exit_obs.assumption_evaluation.exit_triggered)
+
+        safe_candles = [candle(0, 100, 101, 99, 100.5)]
+        hold_obs = observe_okx_position(
+            {"instId": "MU-USDT-SWAP", "pos": "2", "avgPx": "100", "posSide": "long"},
+            candles=safe_candles,
+            regime="yellow",
+            config=StrategyConfig(),
+        )
+        self.assertEqual("hold", hold_obs.decision_status)
+        self.assertEqual("degraded", hold_obs.state_quality)
+        self.assertFalse(hold_obs.assumption_evaluation.exit_triggered)
 
     def test_no_candles_returns_unknown_observation(self):
         observation = observe_okx_position(

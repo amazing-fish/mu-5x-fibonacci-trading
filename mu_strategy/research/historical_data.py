@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Mapping
 
 from mu_strategy.canonical import canonical_sha256
 from mu_strategy.market_data.trusted_data.contracts import (
@@ -22,11 +23,61 @@ from mu_strategy.market_data.trusted_data.store import (
 )
 from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import Candle
-from mu_strategy.research.strategy_releases import TrustedExperimentDatasetV1
+
+
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+$")
 
 
 class HistoricalGenerationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class TrustedExperimentDatasetV1:
+    run_id: str
+    symbol: str
+    manifest_schema_version: int
+    requested_intervals: tuple[str, ...]
+    effective_intervals: tuple[str, ...]
+    content_sha256_by_interval: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not _RUN_ID_PATTERN.fullmatch(self.run_id):
+            raise ValueError("dataset run_id must be lowercase 32-character hex")
+        if not _SYMBOL_PATTERN.fullmatch(self.symbol):
+            raise ValueError("dataset symbol is invalid")
+        if self.manifest_schema_version not in (3, 4):
+            raise ValueError("historical dataset requires manifest schema v3 or v4")
+        if not self.requested_intervals or not self.effective_intervals:
+            raise ValueError("dataset intervals must not be empty")
+        if len(set(self.requested_intervals)) != len(self.requested_intervals) or len(
+            set(self.effective_intervals)
+        ) != len(self.effective_intervals):
+            raise ValueError("dataset intervals must be unique")
+        if not set(self.requested_intervals).issubset(self.effective_intervals):
+            raise ValueError("requested intervals must be a subset of effective intervals")
+        effective = set(self.effective_intervals)
+        if any(interval in effective for interval in ("15m", "1h")) and "5m" not in effective:
+            raise ValueError("dataset effective_intervals must include 5m when native intervals are present")
+        if tuple(sorted(self.content_sha256_by_interval)) != self.content_sha256_by_interval:
+            raise ValueError("dataset content hashes must be sorted by interval")
+        hashes = dict(self.content_sha256_by_interval)
+        if len(hashes) != len(self.content_sha256_by_interval) or set(hashes) != effective:
+            raise ValueError("dataset requires exactly one content hash per effective interval")
+        if any(not interval or not _SHA256_PATTERN.fullmatch(digest) for interval, digest in hashes.items()):
+            raise ValueError("dataset content hashes must be lowercase SHA-256")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "symbol": self.symbol,
+            "manifest_schema_version": self.manifest_schema_version,
+            "requested_intervals": list(self.requested_intervals),
+            "effective_intervals": list(self.effective_intervals),
+            "content_sha256_by_interval": dict(self.content_sha256_by_interval),
+        }
 
 
 @dataclass(frozen=True)
@@ -96,7 +147,7 @@ class HistoricalTrustedGenerationReader:
                     generation_root=generation_root,
                     generation_id=run_id,
                 )
-            except Exception as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 raise HistoricalGenerationError(
                     f"historical dataset read failed for {symbol}/{interval}: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -136,6 +187,9 @@ class HistoricalResearchWindow:
     candles_by_interval: Mapping[str, tuple[Candle, ...]]
     start_ms: int
     end_ms: int
+    requested_days: int | None = None
+    effective_days: int | None = None
+    partial_coverage: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "candles_by_interval", MappingProxyType(dict(self.candles_by_interval)))
@@ -153,7 +207,7 @@ class HistoricalResearchWindow:
             ).hexdigest()
             for path in sorted(package_root.rglob("*.py"))
         }
-        payload = {
+        payload: dict[str, object] = {
             "time_contract": "historical_replay",
             "window_rule": "latest common closed hour in the selected generation; end exclusive",
             "wall_clock_freshness": "not evaluated; research only, not a live trading data decision",
@@ -171,6 +225,10 @@ class HistoricalResearchWindow:
             "configuration": configuration,
             "configuration_sha256": canonical_sha256(configuration),
         }
+        if self.partial_coverage:
+            payload["coverage_state"] = "partial_available_history"
+            payload["requested_days"] = self.requested_days
+            payload["effective_days"] = self.effective_days
         return json.dumps(payload, ensure_ascii=True, allow_nan=False, indent=2, sort_keys=True)
 
 
@@ -179,10 +237,13 @@ def load_historical_window(
     data_dir: Path,
     generation_id: str,
     symbol: str,
-    days: int,
+    days: int | None,
+    allow_partial: bool = False,
 ) -> HistoricalResearchWindow:
     """Select an exact research window, independent of current.json and the wall clock."""
-    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+    if days is not None and (isinstance(days, bool) or not isinstance(days, int) or days <= 0):
+        raise HistoricalGenerationError("historical window days must be a positive integer")
+    if days is None and not allow_partial:
         raise HistoricalGenerationError("historical window days must be a positive integer")
     generation = HistoricalTrustedGenerationReader(data_dir=data_dir).read(run_id=generation_id, symbol=symbol)
     required = {"15m": 900_000, "1h": 3_600_000}
@@ -193,7 +254,19 @@ def load_historical_window(
         for interval, bars in generation.candles_by_interval.items()
     )
     end_ms -= end_ms % 3_600_000
-    start_ms = end_ms - days * DAY_MS
+    earliest_common_ms = max(generation.candles_by_interval[interval][0].open_time_ms for interval in required)
+    max_complete_days = (end_ms - earliest_common_ms) // DAY_MS
+    if allow_partial:
+        if max_complete_days <= 0:
+            raise HistoricalGenerationError("historical window has insufficient_coverage:15m")
+        effective_days = max_complete_days if days is None else min(days, max_complete_days)
+        partial_coverage = days is not None and effective_days < days
+    else:
+        assert days is not None
+        effective_days = days
+        partial_coverage = False
+
+    start_ms = end_ms - effective_days * DAY_MS
     selected: dict[str, tuple[Candle, ...]] = {}
     for interval, step in required.items():
         bars = tuple(
@@ -201,14 +274,22 @@ def load_historical_window(
             if start_ms <= bar.open_time_ms < end_ms
         )
         if (
-            len(bars) != days * DAY_MS // step
+            len(bars) != effective_days * DAY_MS // step
             or not bars
             or bars[0].open_time_ms != start_ms
             or bars[-1].open_time_ms + step != end_ms
         ):
             raise HistoricalGenerationError(f"historical window has insufficient_coverage:{interval}")
         selected[interval] = bars
-    return HistoricalResearchWindow(generation, selected, start_ms, end_ms)
+    return HistoricalResearchWindow(
+        generation,
+        selected,
+        start_ms,
+        end_ms,
+        requested_days=days if days is not None else effective_days,
+        effective_days=effective_days,
+        partial_coverage=partial_coverage,
+    )
 
 
 def validate_replay_outputs(data_dir: Path, *paths: Path) -> None:

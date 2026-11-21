@@ -1,6 +1,7 @@
 """On-demand, read-only baseline review of explicitly confirmed manual inputs."""
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, replace
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -17,9 +18,27 @@ from mu_strategy.strategies.position_rules import PositionFillSnapshot, Position
 from mu_strategy.strategies.registry import baseline_strategy_group
 
 
+logger = logging.getLogger(__name__)
 BAR_MS = 900_000
+HOURLY_BAR_MS = 3_600_000
 DAY_MS = 86_400_000
 MAX_MAPPED_FILLS = 32
+WARMUP_BARS = 35
+MIN_REVIEW_DAYS = 3
+
+
+def _contiguous_suffix(rows: list, *, interval_ms: int, now_ms: int) -> list:
+    """Return the longest gap-free trailing suffix of closed, strictly ascending candles."""
+    if not rows or rows[-1].open_time_ms + interval_ms > now_ms:
+        raise ValueError("incomplete closed-candle sequence")
+    start = len(rows) - 1
+    for index in range(len(rows) - 1, 0, -1):
+        delta = rows[index].open_time_ms - rows[index - 1].open_time_ms
+        if delta <= 0:
+            raise ValueError("non-monotonic candle sequence")
+        if delta == interval_ms and start == index:
+            start = index - 1
+    return rows[start:]
 
 
 def baseline_configuration(symbol):
@@ -122,9 +141,10 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
     result.update(confirmed_at_ms=confirmed_at, first_eligible_open_ms=first_open)
     if now_ms < confirmed_at:
         return {**result, "status": "data_blocked", "messages": ["查询时间早于人工确认时间，暂不能复核。"]}
-    # Include indicator context before the entire review interval. A bounded
-    # request must not silently drop the beginning of a long-lived confirmation.
-    days = max(7, (now_ms - first_open + DAY_MS - 1) // DAY_MS + 2)
+    # Load only the post-confirmation span plus 2 days of indicator warmup
+    # (>= 48 hourly bars > 35-bar warmup minimum) instead of over-fetching.
+    review_days = max(1, (max(0, now_ms - first_open) + DAY_MS - 1) // DAY_MS)
+    days = max(MIN_REVIEW_DAYS, review_days + 2)
     if days > 180:
         return {**result, "status": "data_blocked", "messages": ["本次确认后的区间超过复核上限，请核对历史记录后重新确认状态。"]}
     loader = loader or LoadTrustedBundle(TrustedDataStore(data_dir=Path(data_dir)))
@@ -138,17 +158,25 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
                     "data_reason": bundle.trust_decision.reason.value}
         if bundle.load_context != context or not bundle.run_id or bundle.run_id != context.manifest.run_id:
             raise ValueError("unpinned management input")
-        candles = bundle.candles_by_interval["15m"]
-        hourly = bundle.candles_by_interval["1h"]
-        # The loader owns integrity validation. These checks enforce this
-        # review's complete post-confirmation range and causal indicator input.
-        for rows, interval_ms in ((candles, BAR_MS), (hourly, 3_600_000)):
-            if not rows or rows[-1].open_time_ms + interval_ms > now_ms or any(
-                    right.open_time_ms - left.open_time_ms != interval_ms for left, right in zip(rows, rows[1:])):
-                raise ValueError("incomplete closed-candle sequence")
+        raw_candles = bundle.candles_by_interval.get("15m")
+        raw_hourly = bundle.candles_by_interval.get("1h")
+        if not raw_candles or not raw_hourly:
+            raise ValueError("incomplete closed-candle sequence")
+        # Require a gap-free contiguous suffix covering warmup + post-confirmation range,
+        # while tolerating isolated ancient exchange-maintenance gaps before that suffix.
+        candles = _contiguous_suffix(raw_candles, interval_ms=BAR_MS, now_ms=now_ms)
+        hourly = _contiguous_suffix(raw_hourly, interval_ms=HOURLY_BAR_MS, now_ms=now_ms)
         first_index = next((index for index, candle in enumerate(candles) if candle.open_time_ms >= first_open), None)
-        hashes = {interval: bundle.health_by_interval[interval].content_sha256 for interval in ("5m", "15m", "1h")}
-        if not all(hashes.values()):
+        required_hash_intervals = tuple(
+            interval for interval in ("5m", "15m", "1h")
+            if interval in bundle.health_by_interval or interval in ("15m", "1h")
+        )
+        hashes = {
+            interval: bundle.health_by_interval[interval].content_sha256
+            for interval in required_hash_intervals
+            if interval in bundle.health_by_interval
+        }
+        if len(hashes) != len(required_hash_intervals) or not all(hashes.values()):
             raise ValueError("missing canonical content hashes")
         provenance = {"generation_id": context.generation_id, "run_id": bundle.run_id,
                       "content_sha256": hashes, "configuration_sha256": inputs["configuration_sha256"],
@@ -159,9 +187,11 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
                       "evaluated_at_ms": now_ms, "leverage_source": "manual_confirmation"}
         result["provenance"] = provenance
         if first_index is None:
+            if len(candles) < min(WARMUP_BARS, len(raw_candles)) or len(hourly) < min(WARMUP_BARS, len(raw_hourly)):
+                raise ValueError("incomplete closed-candle sequence")
             return {**result, "status": "waiting", "messages": ["等待确认后的第一根完整 15m K 线；不会把当前止损回投到确认前的行情。"]}
-        if candles[first_index].open_time_ms != first_open or first_index < 35 or sum(
-                candle.open_time_ms + 3_600_000 <= first_open for candle in hourly) < 35:
+        if candles[first_index].open_time_ms != first_open or first_index < WARMUP_BARS or sum(
+                candle.open_time_ms + HOURLY_BAR_MS <= first_open for candle in hourly) < WARMUP_BARS:
             raise ValueError("review range or indicator history is incomplete")
         config_payload = parse_strategy_config_payload(inputs["configuration"])
         # Keep the selected complete baseline immutable. Only this risk input
@@ -179,8 +209,6 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
             stop_transition_fill_count=0, stop_transition_start=0.0,
         )
         hourly_context = build_hourly_context(candles, hourly)
-        closes = [candle.close for candle in candles]
-        rsi_values, hist = rsi(closes), macd(closes)[2]
         earliest_exit = None
         latest = None
         calendar_error = None
@@ -196,6 +224,8 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
             if calendar_error:
                 return {**result, "status": "data_blocked", "calendar_error": calendar_error,
                         "messages": ["已检查确认止损；参考日历不可用，无法完成退出与加仓条件复核。"]}
+            closes = [candle.close for candle in candles]
+            rsi_values, hist = rsi(closes), macd(closes)[2]
             addition = asdict(decide_pyramid_add(
                 snapshot, last, rsi_value=rsi_values[-1], macd_hist=hist[-1], previous_macd_hist=hist[-2],
                 regime=hourly_context[last.open_time_ms], config=config,
@@ -218,5 +248,6 @@ def review_position(position, data_dir: Path, *, now_ms: int, loader=None):
         })
         messages = ["参考日历不可用；已确认触及退出条件，日历相关风险条件仍未知，加仓未评估。"] if calendar_error else []
         return {**result, "status": "partial" if calendar_error else "evaluated", "messages": messages, "evaluation": evaluation}
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Position review blocked for %s: %s", position.get("position_id"), exc)
         return {**result, "status": "data_blocked", "messages": ["行情或规则输入不足以完整复核本次确认后的区间，请检查来源与覆盖范围。"]}

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import html
-from collections.abc import Mapping
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 from pathlib import Path
+from typing import Any
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.execution.instruments import OKXInstrumentSpec
@@ -17,23 +20,6 @@ from mu_strategy.market_data.utils import DAY_MS, infer_candle_interval_ms
 from mu_strategy.market_data.trusted_data.compat import trusted_bundle_error
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
-from mu_strategy.research.candidate_conclusions import (
-    CandidateConclusion,
-    CandidateConclusionError,
-    CandidateConclusionIndex,
-    CandidateRobustness,
-    CandidateStatus,
-    FeeAssumption,
-    StressCellReturn,
-    STRATEGY_LADDER_DEFAULT_FEE_BPS,
-    STRATEGY_LADDER_FEE_GRID_BPS,
-    STRATEGY_LADDER_PROTOCOL_VERSION,
-    STRATEGY_LADDER_SLIPPAGE_GRID_TICKS,
-    STRATEGY_LADDER_TOP_N,
-    format_candidate_metric,
-    validate_candidate_artifact_path,
-    write_candidate_conclusion_index,
-)
 from mu_strategy.research.robustness import trade_concentration
 from mu_strategy.research.historical_data import load_historical_window, replay_html, replay_markdown
 from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2
@@ -42,14 +28,15 @@ from mu_strategy.strategies.registry import baseline_strategy_group
 
 
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
-FEE_GRID_BPS = STRATEGY_LADDER_FEE_GRID_BPS
-SLIPPAGE_GRID_TICKS = STRATEGY_LADDER_SLIPPAGE_GRID_TICKS
+FEE_GRID_BPS = (0, 5, 10)
+SLIPPAGE_GRID_TICKS = (0, 1, 2)
 MOMENTUM_LOOKBACK_HOURS = (24, 96, 168)
 MOMENTUM_HISTORY_HOURS = max(MOMENTUM_LOOKBACK_HOURS) + 1
 MOMENTUM_HISTORY_DAYS = (MOMENTUM_HISTORY_HOURS + 23) // 24
-DEFAULT_FEE_BPS = STRATEGY_LADDER_DEFAULT_FEE_BPS
-TOP_N_TRADES = STRATEGY_LADDER_TOP_N
-PROTOCOL_VERSION = STRATEGY_LADDER_PROTOCOL_VERSION
+DEFAULT_FEE_BPS = 5
+TOP_N_TRADES = 5
+PROTOCOL_VERSION = "strategy-ladder-v1"
+_METRIC_QUANTUM = Decimal("0.00000001")
 LOCAL_CANDIDATE_LEVERAGE = 1.0
 ACCOUNT_RETURN_BASIS = (
     "Account return = sum(window ending equity) / sum(window starting equity) - 1. "
@@ -150,7 +137,7 @@ class StrategyLadderResult:
     data_files: tuple[Path, ...]
     instrument: OKXInstrumentSpec
     evaluations: tuple[CandidateEvaluation, ...]
-    conclusion_index: CandidateConclusionIndex
+    conclusion_index: dict[str, Any]
     replay_provenance: str | None = None
 
 
@@ -178,24 +165,36 @@ def candidate_definitions() -> tuple[CandidateDefinition, ...]:
     )
 
 
-def overnight_target_long(closed_candles: list[Candle], next_bar_open_time_ms: int) -> bool:
+def overnight_target_long(
+    closed_candles: Sequence[Candle],
+    next_bar_open_time_ms: int,
+    *,
+    end_index: int | None = None,
+) -> bool:
     """Return the scheduled long state without inspecting the bar to trade."""
 
-    if closed_candles and closed_candles[-1].open_time_ms + HOUR_MS > next_bar_open_time_ms:
+    count = len(closed_candles) if end_index is None else end_index
+    if count > 0 and closed_candles[count - 1].open_time_ms + HOUR_MS > next_bar_open_time_ms:
         raise ValueError("closed_candles contains a candle not closed before the trade bar")
     hour = datetime.fromtimestamp(next_bar_open_time_ms / 1000, tz=timezone.utc).hour
     return hour >= 22
 
 
-def momentum_target_long(closed_candles: list[Candle], lookback_hours: int) -> bool:
+def momentum_target_long(
+    closed_candles: Sequence[Candle],
+    lookback_hours: int,
+    *,
+    end_index: int | None = None,
+) -> bool:
     """Use only closed hourly candles to decide the next bar's long/flat state."""
 
     if lookback_hours <= 0:
         raise ValueError("lookback_hours must be positive")
-    if len(closed_candles) <= lookback_hours:
+    count = len(closed_candles) if end_index is None else end_index
+    if count <= lookback_hours:
         return False
-    current_close = closed_candles[-1].close
-    trailing_close = closed_candles[-1 - lookback_hours].close
+    current_close = closed_candles[count - 1].close
+    trailing_close = closed_candles[count - 1 - lookback_hours].close
     return trailing_close > 0 and current_close > trailing_close
 
 
@@ -249,11 +248,11 @@ def run_long_only_candidate(
         if target_long_by_open_time is not None:
             target_long = target_long_by_open_time[trade_bar.open_time_ms]
         elif definition.family == "overnight_seasonality":
-            target_long = overnight_target_long(ordered[:index], trade_bar.open_time_ms)
+            target_long = overnight_target_long(ordered, trade_bar.open_time_ms, end_index=index)
         elif definition.family == "time_series_momentum":
             if definition.lookback_hours is None:
                 raise ValueError("momentum candidate requires lookback_hours")
-            target_long = momentum_target_long(ordered[:index], definition.lookback_hours)
+            target_long = momentum_target_long(ordered, definition.lookback_hours, end_index=index)
         else:
             raise ValueError(f"unsupported local candidate family: {definition.family}")
 
@@ -426,8 +425,9 @@ def apply_adverse_tick_slippage(
         )
         adjusted_trades.append(adjusted_trade)
         equity += adjusted_pnl
+    slippage_events = _build_slippage_schedule(result.trades, slip)
     equity_curve = [
-        (time_ms, marked_equity - _slippage_cost_at(result.trades, time_ms, slip))
+        (time_ms, marked_equity - _lookup_slippage_cost(slippage_events, time_ms))
         for time_ms, marked_equity in result.equity_curve
     ]
     return BacktestResult(result.starting_equity, equity, adjusted_trades, equity_curve)
@@ -451,36 +451,38 @@ def build_conclusion_index(
     trusted_generation: str,
     window_days: int,
     windows: int,
-) -> CandidateConclusionIndex:
-    fee_assumption = FeeAssumption(
-        default_fee_bps_per_side=DEFAULT_FEE_BPS,
-        fee_grid_bps_per_side=FEE_GRID_BPS,
-        slippage_grid_ticks=SLIPPAGE_GRID_TICKS,
-        tick_size=format(instrument.tick_size, "f"),
-    )
-    entries: list[CandidateConclusion] = []
+) -> dict[str, Any]:
+    fee_assumption = {
+        "default_fee_bps_per_side": DEFAULT_FEE_BPS,
+        "fee_grid_bps_per_side": list(FEE_GRID_BPS),
+        "slippage_grid_ticks": list(SLIPPAGE_GRID_TICKS),
+        "tick_size": format(instrument.tick_size, "f"),
+    }
+    entries: list[dict[str, Any]] = []
     for family in ("overnight_seasonality", "time_series_momentum", "baseline"):
         family_evaluations = tuple(item for item in evaluations if item.definition.family == family)
-        metrics = tuple(_candidate_robustness(item) for item in family_evaluations)
-        entries.append(CandidateConclusion(
-            family=family,
-            source=family_evaluations[0].definition.source,
-            protocol_version=PROTOCOL_VERSION,
-            fee_assumption=fee_assumption,
-            robustness_metrics=metrics,
-            status=(
-                CandidateStatus.CANDIDATE
-                if any(item.survives_stress_grid for item in family_evaluations)
-                else CandidateStatus.STRESS_FAILED
-            ),
-        ))
-    return CandidateConclusionIndex(
-        tuple(entries),
-        instrument_id=instrument.inst_id,
-        trusted_generation=trusted_generation,
-        window_days=window_days,
-        windows=windows,
-    )
+        entries.append(
+            {
+                "family": family,
+                "source": family_evaluations[0].definition.source,
+                "protocol_version": PROTOCOL_VERSION,
+                "fee_assumption": fee_assumption,
+                "robustness_metrics": [_candidate_robustness(item) for item in family_evaluations],
+                "status": (
+                    "candidate"
+                    if any(item.survives_stress_grid for item in family_evaluations)
+                    else "stress_failed"
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "instrument_id": instrument.inst_id,
+        "trusted_generation": trusted_generation,
+        "window_days": window_days,
+        "windows": windows,
+        "entries": entries,
+    }
 
 
 def render_strategy_ladder_report(result: StrategyLadderResult) -> str:
@@ -682,7 +684,11 @@ def run_strategy_ladder(
         path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report, encoding="utf-8", newline="\n")
     html_report_path.write_text(dashboard, encoding="utf-8", newline="\n")
-    write_candidate_conclusion_index(conclusion_path, conclusion_index)
+    conclusion_path.write_text(
+        json.dumps(conclusion_index, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     return result
 
 
@@ -787,42 +793,75 @@ def build_cli_output_paths(
     )
 
 
-def _slippage_cost_at(trades: list[Trade], time_ms: int, slip: float) -> float:
-    cost = 0.0
+def _build_slippage_schedule(trades: Sequence[Trade], slip: float) -> tuple[list[int], list[float]]:
+    deltas: list[tuple[int, float]] = []
     for trade in trades:
-        if time_ms >= trade.exit_time_ms:
-            cost += 2 * slip * sum(fill.units for fill in trade.fills)
-            continue
-        cost += slip * sum(fill.units for fill in trade.fills if fill.time_ms <= time_ms)
-    return cost
+        total_units = 0.0
+        for fill in trade.fills:
+            total_units += fill.units
+            deltas.append((fill.time_ms, slip * fill.units))
+        deltas.append((trade.exit_time_ms, slip * total_units))
+    deltas.sort(key=lambda item: item[0])
+    times: list[int] = []
+    cumulative: list[float] = []
+    running = 0.0
+    for time_ms, delta in deltas:
+        running += delta
+        if times and times[-1] == time_ms:
+            cumulative[-1] = running
+        else:
+            times.append(time_ms)
+            cumulative.append(running)
+    return times, cumulative
 
 
-def _candidate_robustness(evaluation: CandidateEvaluation) -> CandidateRobustness:
+def _lookup_slippage_cost(schedule: tuple[list[int], list[float]], time_ms: int) -> float:
+    times, cumulative = schedule
+    pos = bisect_right(times, time_ms)
+    return cumulative[pos - 1] if pos > 0 else 0.0
+
+
+def format_candidate_metric(value: Decimal | float | str) -> str:
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("metric must be a finite decimal") from exc
+    if not parsed.is_finite():
+        raise ValueError("metric must be a finite decimal")
+    integer_digits = max(1, parsed.adjusted() + 1)
+    with localcontext() as context:
+        context.prec = max(28, integer_digits + 10, len(parsed.as_tuple().digits) + 10)
+        context.rounding = ROUND_HALF_EVEN
+        quantized = parsed.quantize(_METRIC_QUANTUM)
+    return format(quantized, "f")
+
+
+def _candidate_robustness(evaluation: CandidateEvaluation) -> dict[str, Any]:
     summary = evaluation.default_cell.summary
     concentration = trade_concentration(summary.trades, top_n=TOP_N_TRADES)
-    total_return_pct = _decimal_metric(summary.total_return_pct)
-    return CandidateRobustness(
-        candidate_id=evaluation.definition.candidate_id,
-        total_return_pct=total_return_pct,
-        max_drawdown_pct=_decimal_metric(summary.max_drawdown_pct),
-        trade_count=summary.trade_count,
-        win_rate=_decimal_metric(summary.win_rate),
-        top_n=TOP_N_TRADES,
-        top_n_trade_concentration=(
-            _decimal_metric(concentration.top_n_share_of_net_pnl)
+    total_return_pct = format_candidate_metric(summary.total_return_pct)
+    return {
+        "candidate_id": evaluation.definition.candidate_id,
+        "total_return_pct": total_return_pct,
+        "max_drawdown_pct": format_candidate_metric(summary.max_drawdown_pct),
+        "trade_count": summary.trade_count,
+        "win_rate": format_candidate_metric(summary.win_rate),
+        "top_n": TOP_N_TRADES,
+        "top_n_trade_concentration": (
+            format_candidate_metric(concentration.top_n_share_of_net_pnl)
             if Decimal(total_return_pct) > 0 and concentration.top_n_share_of_net_pnl is not None
             else None
         ),
-        stress_grid_returns=tuple(
-            StressCellReturn(
-                fee_bps_per_side=cell.fee_bps_per_side,
-                slippage_ticks=cell.slippage_ticks,
-                total_return_pct=_decimal_metric(cell.summary.total_return_pct),
-            )
+        "stress_grid_returns": [
+            {
+                "fee_bps_per_side": cell.fee_bps_per_side,
+                "slippage_ticks": cell.slippage_ticks,
+                "total_return_pct": format_candidate_metric(cell.summary.total_return_pct),
+            }
             for cell in evaluation.stress_grid
-        ),
-        survives_stress_grid=evaluation.survives_stress_grid,
-    )
+        ],
+        "survives_stress_grid": evaluation.survives_stress_grid,
+    }
 
 
 def _candidate_report_lines(evaluation: CandidateEvaluation) -> list[str]:
@@ -917,10 +956,6 @@ def _format_optional_pct(value: float | None) -> str:
     return "-" if value is None else f"{value:.4%}"
 
 
-def _decimal_metric(value: float) -> str:
-    return format_candidate_metric(value)
-
-
 def _validate_output_paths(
     *,
     data_dir: Path,
@@ -929,13 +964,7 @@ def _validate_output_paths(
     conclusion_path: Path,
 ) -> tuple[Path, Path, Path]:
     data_root = Path(data_dir).resolve()
-    try:
-        outputs = tuple(
-            validate_candidate_artifact_path(path)
-            for path in (report_path, html_report_path, conclusion_path)
-        )
-    except CandidateConclusionError as exc:
-        raise StrategyLadderOutputError(str(exc)) from exc
+    outputs = tuple(Path(path).resolve() for path in (report_path, html_report_path, conclusion_path))
     if len(set(outputs)) != len(outputs):
         raise StrategyLadderOutputError("strategy ladder output paths must be distinct")
     if any(path == data_root or path.is_relative_to(data_root) for path in outputs):

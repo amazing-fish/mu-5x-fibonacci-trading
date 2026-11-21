@@ -744,6 +744,22 @@ class EntryDashboardTests(unittest.TestCase):
             self.assertIn("ODLATEST", html)
             self.assertIn(str(output_path), stdout.getvalue())
 
+    def test_dashboard_displays_actual_decision_status_and_reads_jsonl_from_tail(self):
+        from mu_strategy.viz.entry_dashboard import latest_payload_from_jsonl, render_entry_dashboard
+
+        obs = _degraded_exit_observation(triggered=True, exit_reason="stop")
+        obs["decision_status"] = "exit"
+        html = render_entry_dashboard({"mode": "dry_run", "exit_observations": [obs]})
+        self.assertIn("decision_status=exit", html)
+
+        with TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "large.jsonl"
+            lines = [json.dumps({"mode": "dry_run", "seq": i, "pad": "x" * 120}) for i in range(60)]
+            lines.append("not-json-tail")
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            latest = latest_payload_from_jsonl(log_path, chunk_size=256)
+            self.assertEqual(59, latest["seq"])
+
 
 if __name__ == "__main__":
     unittest.main()

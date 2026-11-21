@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -244,15 +245,17 @@ def _blocking_hint(reasons: dict[str, list[str]]) -> str | None:
 
 
 def _format_days(value: Any) -> str:
+    if value is None:
+        return "-"
     try:
-        if value is None:
-            return "-"
         number = float(value)
-        if number.is_integer():
-            return f"{int(number)}d"
-        return f"{number:.2f}d"
-    except Exception:
+    except (TypeError, ValueError):
         return str(value)
+    if not math.isfinite(number):
+        return str(value)
+    if number.is_integer():
+        return f"{int(number)}d"
+    return f"{number:.2f}d"
 
 
 def _reasons_text(status: dict[str, Any]) -> str:
@@ -274,11 +277,11 @@ def _metric(label: str, value: Any) -> str:
 
 
 def _format_time_ms(value: Any) -> str:
+    if value is None:
+        return "-"
     try:
-        if value is None:
-            return "-"
         return datetime.fromtimestamp(int(value) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
+    except (TypeError, ValueError, OverflowError, OSError):
         return str(value)
 
 

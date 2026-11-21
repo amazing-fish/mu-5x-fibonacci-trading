@@ -304,12 +304,14 @@ def render_html(report: dict) -> str:
                      f"{item['validation']['return_pct']:.2%}",f"{item['validation']['daily_max_drawdown_pct']:.2%}",
                      f"{item['final']['return_pct']:.2%}",f"{item['final']['daily_max_drawdown_pct']:.2%}",f"{item['stress_final']['return_pct']:.2%}"] for item in report["frontier"]]
     weights = " + ".join(f"{html.escape(name)} <strong>{weight:.1%}</strong>" for name,weight in portfolio["weights"].items())
+    total_days = (report["periods"][2]["end_ms"] - report["periods"][0]["start_ms"]) // DAY_MS + 8
+    final_days = (report["periods"][2]["end_ms"] - report["periods"][2]["start_ms"]) // DAY_MS
     payload = json.dumps(traces,ensure_ascii=False,allow_nan=False).replace("<","\\u003c")
     return """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MU 跨机制策略与组合</title><script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>body{margin:0;background:#f3f4f6;color:#142335;font:15px system-ui}main{max-width:1400px;margin:auto;padding:32px}h1{font-size:32px}h2{margin-top:36px}.lead{font-size:20px;padding:22px;background:#e6f0ed;border-left:5px solid #087d69}p{line-height:1.8;color:#48576a}table{border-collapse:collapse;background:white;min-width:100%;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:12px;border-bottom:1px solid #dde3eb;white-space:nowrap}th{background:#e9eef4}td:first-child,th:first-child{text-align:left}.scroll{overflow:auto}#equity{height:470px}a{color:#087d69}</style><main>
-<h1>MU 跨机制策略与资金组合</h1>"""+f"<div class='lead'>{weights}</div>"+f"<p>{len(report['strategies'])} 个候选 · {len(report['selection']['allocations'])} 个资金分配 · 统一 1x 配置重跑 · 同一份 179 天行情</p>"+"""
-<p>先用 8 天预热，再用 60 天选每类参数、60 天选资金权重，最后 51 天只检验。以下主图只显示最终检验段。行情曾用于此前研究，不能称为完全未见样本。现金收益设为零；按初始本金分仓，不再平衡。</p>
+<h1>MU 跨机制策略与资金组合</h1>"""+f"<div class='lead'>{weights}</div>"+f"<p>{len(report['strategies'])} 个候选 · {len(report['selection']['allocations'])} 个资金分配 · 统一 1x 配置重跑 · 同一份 {total_days} 天行情</p>"+f"""
+<p>先用 8 天预热，再用 60 天选每类参数、60 天选资金权重，最后 {final_days} 天只检验。以下主图只显示最终检验段。行情曾用于此前研究，不能称为完全未见样本。现金收益设为零；按初始本金分仓，不再平衡。</p>
 <h2>最终检验段：固定参数与资金权重</h2><div id="equity"></div>"""+table(["配置","扣费收益","日末回撤","压力成本收益"],summary_rows)+"""
 <p>回撤采用 UTC 日末净权益采样，可能漏掉日内低点。基础每侧 5bps；压力每侧 10bps，小时策略额外每侧 1tick 滑点，Fibonacci 只提高费率。未模拟 funding、盘口队列和部分成交。</p>
 <h2>更高资金使用率：收益与回撤的取舍</h2><p>仅从同一批第二段资金分配选出非劣点，没有新增参数或权重搜索。最后段不参与选择。</p>"""+table(["资金分配","第二段收益","第二段回撤","最终段收益","最终段回撤","最终段压力收益"],frontier_rows)+"""
@@ -320,17 +322,30 @@ def render_html(report: dict) -> str:
 </main><script>Plotly.newPlot('equity',"""+payload+""",{margin:{t:20},yaxis:{title:'起始本金 10,000'},xaxis:{title:'UTC'},legend:{orientation:'h'}},{responsive:true});</script></html>"""
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir",type=Path,required=True)
     parser.add_argument("--generation-id",required=True)
+    parser.add_argument("--symbol",default="MU-USDT-SWAP")
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Complete historical days to load (defaults to available complete days up to 179; requires > 128 days).",
+    )
     parser.add_argument("--output-dir",type=Path,required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     paths = [args.output_dir/f"portfolio.{ext}" for ext in ("json","md","html")]
     selected_path = args.output_dir/"selected-portfolio.json"
     try:
         validate_replay_outputs(args.data_dir,*paths,selected_path)
-        window = load_historical_window(data_dir=args.data_dir,generation_id=args.generation_id,symbol="MU-USDT-SWAP",days=179)
+        window = load_historical_window(
+            data_dir=args.data_dir,
+            generation_id=args.generation_id,
+            symbol=args.symbol,
+            days=179 if args.days is None else args.days,
+            allow_partial=(args.days is None),
+        )
         report = run_research(window,progress=lambda line:print(line,flush=True))
     except ValueError as exc:
         parser.error(str(exc))

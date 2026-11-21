@@ -24,6 +24,10 @@ def bar(index, open_=100, high=101, low=99, close=100):
     return Candle(START + index * STEP, open_, high, low, close, 1000)
 
 
+def sig(index, open_=100, high=101, low=98, close=100):
+    return Candle(START + index * STEP, open_, high, low, close, 1000)
+
+
 class NetEquityTests(unittest.TestCase):
     def replay(self, bars, *, name="baseline", signals=(1,), regimes=None, **overrides):
         config = replace(selected_strategy_groups("MU-USDT-SWAP", [name])[0].config, **overrides)
@@ -44,7 +48,7 @@ class NetEquityTests(unittest.TestCase):
             self.assertAlmostEqual(target, value, delta=1e-9)
 
     def test_flat_price_entry_and_exit_charge_five_each(self):
-        result = self.replay([bar(i) for i in range(4)])
+        result = self.replay([bar(0), sig(1), bar(2), bar(3)])
         self.assert_values(self.values(result, 1), [10000])  # candidate only
         self.assert_values(self.values(result, 2), [9995, 9995])  # fill, close
         self.assert_values(self.values(result, 3), [9995, 9990])  # close, settlement
@@ -55,7 +59,7 @@ class NetEquityTests(unittest.TestCase):
         self.assertAlmostEqual(-.001, result.max_drawdown_pct)
 
     def test_profit_is_net_once_and_margin_is_not_a_cost(self):
-        result = self.replay([bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102)])
+        result = self.replay([bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102)])
         trade = result.trades[0]
         self.assert_values(self.values(result, 3), [10195, 10189.9])
         self.assertAlmostEqual(10.1, trade.fees)
@@ -66,7 +70,7 @@ class NetEquityTests(unittest.TestCase):
     def test_next_candle_fees_never_leak_into_signal_bar(self):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             with self.subTest(name=name):
-                bars = [bar(0), bar(1, 100, 100, 99, 100), bar(2), bar(3)]
+                bars = [bar(0), sig(1, 100, 100, 98, 100), bar(2), bar(3)]
                 result = self.replay(bars, name=name)
                 self.assert_values(self.values(result, 1), [10000])
                 self.assert_values(self.values(result, 2), [9995, 9995])
@@ -77,7 +81,7 @@ class NetEquityTests(unittest.TestCase):
     def test_same_bar_entry_stop_keeps_both_events_and_flat_close(self):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             with self.subTest(name=name):
-                result = self.replay([bar(0), bar(1, 100, 100, 99, 100),
+                result = self.replay([bar(0), sig(1, 100, 100, 98, 100),
                                       bar(2, 100, 101, 97, 100), bar(3)], name=name)
                 self.assert_values(self.values(result, 1), [10000])
                 self.assert_values(self.values(result, 2), [9995, 9790.1, 9790.1])
@@ -87,7 +91,7 @@ class NetEquityTests(unittest.TestCase):
     def test_terminal_entry_has_close_before_settlement_in_all_modes(self):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             with self.subTest(name=name):
-                result = self.replay([bar(0), bar(1), bar(2, 100, 100, 99, 100),
+                result = self.replay([bar(0), bar(1), sig(2, 100, 100, 98, 100),
                                       bar(3, 100, 101, 99, 101)], name=name, signals=(2,))
                 self.assert_values(self.values(result, 2), [10000])
                 self.assert_values(self.values(result, 3), [9995, 10095, 10089.95])
@@ -97,21 +101,21 @@ class NetEquityTests(unittest.TestCase):
         for final, exit_price, ending in ((bar(3, 95, 100, 94, 99), 95, 9490.25),
                                            (bar(3, 100, 101, 97, 100), 98, 9790.1)):
             with self.subTest(exit_price=exit_price):
-                result = self.replay([bar(0), bar(1), bar(2), final, bar(4)])
+                result = self.replay([bar(0), sig(1), bar(2), final, bar(4)])
                 self.assert_values(self.values(result, 3), [ending, ending])
                 self.assert_values(self.values(result, 4), [ending])
                 self.assertEqual(exit_price, result.trades[0].exit_price)
                 self.assertEqual("stop", result.trades[0].exit_reason)
 
     def test_hand_calculated_peak_trough_and_drawdown(self):
-        result = self.replay([bar(0), bar(1), bar(2, 100, 101, 99, 101),
+        result = self.replay([bar(0), sig(1), bar(2, 100, 101, 99, 101),
                               bar(3), bar(4, 101, 103, 100, 102)])
         self.assert_values(self.values(result, 2), [9995, 10095])
         self.assert_values(self.values(result, 3), [9995])
         self.assertAlmostEqual(9995 / 10095 - 1, result.max_drawdown_pct, delta=1e-12)
 
     def test_add_fees_accumulate_without_reducing_sizing_budget(self):
-        bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102),
+        bars = [bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102),
                 bar(4, 103, 105, 102, 104), bar(5, 105, 106, 104, 105)]
         result = self.replay(bars)
         trade = result.trades[0]
@@ -128,14 +132,14 @@ class NetEquityTests(unittest.TestCase):
     def test_missed_or_invalid_add_plan_has_no_fee(self):
         for execution in (bar(4), bar(8, 105, 106, 104, 105)):
             with self.subTest(execution=execution):
-                bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102), execution]
+                bars = [bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102), execution]
                 result = self.replay(bars)
                 self.assertEqual(1, len(result.trades[0].fills))
                 self.assertAlmostEqual(10000 + (execution.close - 100) * 100 - 5,
                                        result.equity_curve[-2][1])
 
     def test_fourth_stage_uses_original_forty_percent_budget(self):
-        bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102),
+        bars = [bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102),
                 bar(4, 103, 105, 102, 104), bar(5, 105, 107, 104, 106),
                 bar(6, 107, 108, 106, 107)]
         result = self.replay(bars)
@@ -146,7 +150,7 @@ class NetEquityTests(unittest.TestCase):
         self.assert_values(self.values(result, 6), [marked, marked, result.ending_equity])
 
     def test_new_regime_invalidates_add_without_charging_candidate_fee(self):
-        bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102),
+        bars = [bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102),
                 bar(4, 103, 105, 102, 104), bar(5, 105, 106, 104, 105)]
         regimes = {b.open_time_ms: "green" for b in bars}
         regimes[bars[5].open_time_ms] = "yellow"
@@ -155,13 +159,17 @@ class NetEquityTests(unittest.TestCase):
         marked = 10000 + 500 + 2 * 10000 / 103 - 10
         self.assert_values(self.values(result, 5), [marked, result.ending_equity])
 
-    def test_non_session_risk_precedes_stop_and_samples_net_exit(self):
-        result = self.replay([bar(0), bar(1), bar(2), bar(27, 100, 105, 70, 104)])
-        self.assertEqual("non_session_liquidation_risk", result.trades[0].exit_reason)
-        self.assert_values(self.values(result, 27), [7991, 7991])
+    def test_non_session_gap_liquidation_samples_net_exit_while_non_gap_hits_stop(self):
+        gapped = self.replay([bar(0), sig(1), bar(2), bar(27, 80, 105, 70, 104)])
+        self.assertEqual("non_session_liquidation_risk", gapped.trades[0].exit_reason)
+        self.assert_values(self.values(gapped, 27), [7991, 7991])
+
+        continuous = self.replay([bar(0), sig(1), bar(2), bar(27, 100, 105, 70, 104)])
+        self.assertEqual("stop", continuous.trades[0].exit_reason)
+        self.assert_values(self.values(continuous, 27), [9790.1, 9790.1])
 
     def test_untouched_next_bar_break_high_candidate_has_no_fee(self):
-        bars = [bar(0), bar(1), bar(2), bar(3)]
+        bars = [bar(0), sig(1), bar(2), bar(3)]
         result = self.replay(bars, name="legacy_break_high")
         self.assertEqual([], result.trades)
         self.assertEqual([(b.open_time_ms, 10000) for b in bars], result.equity_curve)
@@ -169,7 +177,7 @@ class NetEquityTests(unittest.TestCase):
     def test_unfilled_expired_or_closed_session_entry_is_free(self):
         for terminal in (bar(4), bar(27)):
             with self.subTest(terminal=terminal):
-                bars = [bar(0), bar(1), bar(2, 101, 102, 100.5, 101),
+                bars = [bar(0), sig(1), bar(2, 101, 102, 100.5, 101),
                         bar(3, 101, 102, 100.5, 101), terminal]
                 result = self.replay(bars, second_pullback_wait_bars=2)
                 self.assertEqual([], result.trades)
@@ -188,7 +196,7 @@ class NetEquityTests(unittest.TestCase):
                 self.assertEqual(0, result.max_drawdown_pct)
 
     def test_zero_fee_measurement_and_next_trade_compounding(self):
-        bars = [bar(0), bar(1), bar(2), bar(3, 100, 101, 97, 100), bar(4), bar(5), bar(6)]
+        bars = [bar(0), sig(1), bar(2), bar(3, 100, 101, 97, 100), sig(4), bar(5), bar(6)]
         zero = self.replay(bars, signals=(1, 4), fee_rate=0)
         paid = self.replay(bars, signals=(1, 4))
         self.assert_values(self.values(zero, 2), [10000, 10000])

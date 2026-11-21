@@ -26,14 +26,6 @@ python -B -m mu_strategy.commands.refresh_market_data --symbol MU-USDT-SWAP --da
 
 上市月边界实现已随 [PR #108](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/108) 合并；[#107](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/107) 仍开放，不能据此认定代码缺失，也不能仅凭合并认定实际运维验收完成。
 
-## 显式迁移
-
-schema-v3 flat generation 可通过离线迁移进入 v4；替换下列占位符后执行。`--publish` 会发布新 pointer，不能作为普通读取的隐式动作。
-
-```powershell
-python -B -m mu_strategy.commands.import_trusted_generation --data-dir data/live --source-run-id <v3_run_id> --target-run-id <new_v4_run_id> --publish
-```
-
 ## 文件与产物
 
 - `current.json`、对应 manifest 及其引用的 segment 共同构成可信快照；单独复制 pointer 不等于保留数据。
@@ -49,7 +41,7 @@ Module: `mu_strategy.fs_durability`
 
 `fsync_directory()` is the single owner of the POSIX directory-fsync and Windows directory-handle `FlushFileBuffers` implementation. Open, flush, close, and unsupported-platform failures raise `OSError`; callers may wrap that failure in their own domain error, but they may not silently claim durability.
 
-This low-level module does not define a publication commit point or recovery protocol. Trusted-generation publication, Stage 0 observation append logs, and immutable strategy-release publication still decide independently which file and directory entries must be durable, in what order, and how a failed or ambiguous write is recovered.
+This low-level module does not define a publication commit point or recovery protocol. Trusted-generation publication and Stage 0 observation append logs still decide independently which file and directory entries must be durable, in what order, and how a failed or ambiguous write is recovered.
 
 Trusted-generation publication keeps atomic replacement of `current.json` as its commit point. File and directory-sync failures before that replacement still fail publication. If the replacement succeeds but syncing its parent directory fails, the new complete pointer is already visible, so the writer reports `current_pointer_directory_sync_failed` as an explicit publication warning instead of returning a false rollback/failure result. A restart after that warning may observe either the previous complete pointer or the new complete pointer; trusted readers continue to validate whichever generation the pointer names.
 
@@ -59,7 +51,7 @@ Package: `mu_strategy.market_data`
 
 - `providers/okx.py`: OKX public candle fetching for `MU-USDT-SWAP`.
 - `providers/binance.py`: Binance futures candle fetching for explicit comparison runs.
-- `cache.py`: CSV cache paths, reads/writes, incremental merge, and lookback pruning.
+- `http_pool.py`: per-thread HTTP(S) keep-alive connection pool with process-cached default `SSLContext`.
 - `symbols.py`: OKX swap symbol normalization and aliases.
 - `universe.py`: dynamic OKX Top USDT-SWAP universe selection.
 - `utils.py`: shared candle time helpers, including `infer_candle_interval_ms`, used by reports and experiment windows.
@@ -67,10 +59,9 @@ Package: `mu_strategy.market_data`
 - `trusted_data/evaluate.py`: shared publication health classification plus refresh/load candle evaluation for windowing, normalization, freshness, built/native validation, and requested-days coverage.
 - `trusted_data/policy.py`: interval dependency planning, freshness policy, and trading/research/observe trust policies.
 - `trusted_data/validation.py`: in-memory candle normalization plus `5m -> 15m/1h` built/native validation.
-- `trusted_data/store.py`: strict flat-v3/segmented-v4 storage contracts, UTC-month CSV slices, JSON manifests, explicit flat import, and JSONL run-log repository with atomic per-file writes.
+- `trusted_data/store.py`: strict flat-v3/segmented-v4 storage contracts, UTC-month CSV slices, JSON manifests, and JSONL run-log repository with atomic per-file writes.
 - `trusted_data/refresh.py`: the canonical trusted refresh use case; it owns OKX provider calls, ticker universe fetch, shared segment writes, manifest writes, and run-log appends.
 - `trusted_data/load.py`: the only trusted cache-only load use case; it never accesses the network and never writes CSV, manifest, or run-log files.
-- `trusted.py`: compatibility facade for old public imports; implementation delegates to `trusted_data`.
 - `service.py`: thin application facade that adapts legacy `CandleBundle` callers to `trusted_data` refresh/load use cases.
 
 Rules:
@@ -81,10 +72,10 @@ Rules:
 - Adjacent candle continuity is gated by `previous close -> next open`; gaps above 2% raise `DataQualityError`.
 - A failed refresh does not remove prior published evidence. Current consumers must still pass the current trust policy; an explicitly selected historical generation must pass the historical reader contract. Failure does not grant a cache fallback.
 - `data/live/current.json` is the atomic pointer to the current trusted generation. A schema-v4 generation is metadata-only under `data/live/generations/<run_id>/manifest.json` and pins ordered slices of canonical UTC-month CSV files under `data/live/segments/okx/<symbol>/<interval>/<YYYY-MM>.csv`. The global refresh command/use case is the only normal runtime writer for the current pointer, segments, and generation manifests.
-- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, walk-forward, Fibonacci experiments, and demo are cache-only consumers. `python -m mu_strategy.commands.import_trusted_generation` is an explicit offline migration writer, never an implicit consumer fallback.
+- Trusted refresh and trusted consumer load are separate processes. `python -m mu_strategy.commands.refresh_market_data` is the only trusted refresh entry point; backtest, visualization, walk-forward, Fibonacci experiments, and demo are cache-only consumers.
 - Trusted refresh can be scoped with repeatable `--symbol` values such as `MU` or `MU-USDT-SWAP`. Explicit-symbol mode normalizes and de-dupes OKX swap symbols, skips the Top universe ticker list, and publishes only the requested subset into the same schema-v4 generation contract.
 - Trusted refresh may fetch up to `--max-concurrency` symbol/interval segments concurrently (CLI default `2`). Programmatic requests default to serial execution (`1`) so existing compatibility-facade callers with custom fetchers remain thread-safe unless they explicitly opt into concurrency. Complete local and built/native cross-interval validation covers both the exact logical window and the full pre-prune physical lookbehind before any candidate in that symbol bundle can mutate a shared segment; an invalid physical `5m` base also blocks dependent native intervals because their physical equality cannot be established, and parent-interval logical health/hash plus physical storage exclude rows outside the completely covered comparison range. Segment writes, manifest construction, and the single atomic `current.json` publication then remain on the caller thread. Each dataset's shared-tail read/compare/replace is serialized by its stable `.write.lock`, so a stale concurrent refresh re-reads the physical tail after acquiring the lock and cannot truncate a longer prefix. The storage boundary also requires exact interval continuity across every candidate month, including the old-tail/new-suffix join. This narrow writer lock does not cover consumers, the current pointer, unrelated datasets, or store lifecycle.
-- Trusted consumers never perform provider/network refresh, CSV writes, segment writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest, visualization, walk-forward, and Fibonacci experiment entry points default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, `python -m mu_strategy.walk_forward`, `python -m mu_strategy.experiments.fibonacci_pullback`, or `python -m mu_strategy.commands.okx_demo_loop`.
+- Trusted consumers never perform provider/network refresh, CSV writes, segment writes, manifest writes, run-log appends, universe mutation, or canonical `run_id` publication. Backtest, visualization, walk-forward, and Fibonacci experiment entry points default to trusted cache-only loading and no longer accept the old data-path flags `--refresh`, `--source`, or `--trusted-data`; run `python -m mu_strategy.commands.refresh_market_data` first, then run `python -m mu_strategy.cli`, `python -m mu_strategy.visualize`, `python -m mu_strategy.experiments.walk_forward`, `python -m mu_strategy.experiments.fibonacci_pullback`, or `python -m mu_strategy.commands.okx_demo_loop`.
 - The old in-process per-symbol consumer refresh APIs remain removed. Canonical subset refresh is only available through the standalone trusted refresh command and still writes the shared generation publication.
 - Trusted storage is canonical CSV + `current.json` + versioned generation manifests + JSONL run log. It does not use DB, Parquet, or a local web service. UTC calendar month is the pure segment identity. Closed month files are immutable; the trailing month may only append canonical rows while preserving its existing byte prefix. A newly created canonical month must begin exactly one interval after the latest existing canonical predecessor, so it cannot durably close an incomplete prior month. A full-history provider request adds 32 physical lookbehind days while health and manifest coverage retain the exact requested logical `days`; physical rows before the logical start month are discarded. When that fetch fully covers the requested logical window, a missing canonical start month is created only when its first row is the UTC month open; explicitly partial available history does not claim this proof. A verified mid-month listing start uses the partial compatibility path described above, not the canonical month path. The request size alone is never treated as proof that the provider returned complete lookbehind. Newly created `segments/okx/<symbol>/<interval>` directory entries are fsync'd ancestor by ancestor before a referenced file can be published.
 - Generated backtest, visualization, data-health, and scanner reports are local artifacts. Write them under ignored paths such as `reports/live/`; do not treat tracked report files as the authoritative baseline.
@@ -95,7 +86,7 @@ Rules:
 - Interval dependencies are planned once: `15m` and `1h` consumers automatically include `5m` because built/native validation depends on the base interval.
 - Freshness is calculated from clock time, interval length, max staleness bars, and the last confirmed candle timestamp.
 - Current and historical readers use the same store contract. A current load reads `current.json` once, pins that generation, and never mixes a later publication; an exact-generation experiment reader never reads `current.json`. A later tail append does not change an older generation because each manifest freezes its selected `[start_row, start_row + rows)` and hashes.
-- Schema-v3 generation-local flat CSV remains a strict known read-only layout for exact-ID compatibility. `python -m mu_strategy.commands.import_trusted_generation` is the only v3-to-v4 conversion path. Before any target/shared write it rejects every unusable source dataset and runs the same local and built/native bundle validation; after writing, it verifies candle/hash round trips before optional publication. A normal refresh never incrementally reuses v3 or an imported-v4 snapshot: its first upgrade fetches full month lookbehind. If an import's first month starts after UTC month-open, only that first reference uses a target-run-bound `YYYY-MM.import-<run_id>.csv` compatibility path; later canonical refreshes use `YYYY-MM.csv`, while the old import remains exact-readable. Unknown version/layout/import-path combinations never fall back.
+- Schema-v3 generation-local flat CSV remains a strict known read-only layout for exact-ID compatibility; new refreshes write schema-v4 segmented storage directly. A normal refresh never incrementally reuses a v3 snapshot: its first upgrade fetches full month lookbehind. Unknown version/layout combinations never fall back.
 - Missing or malformed manifests/segments, invalid paths, malformed CSV, count/hash/range mismatch, partial claimed data, and historical value corrections fail closed. A correction cannot rewrite stored evidence or replace `current.json`. Retention, pinning policy, GC, and deletion are deferred; this storage layer deletes nothing.
 
 ### Storage layout

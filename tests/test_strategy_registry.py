@@ -4,7 +4,6 @@ from dataclasses import replace
 from pathlib import Path
 
 from mu_strategy.strategies import registry
-from mu_strategy.strategies.presets.mu import DEFAULT_MU_STRATEGY_NAMES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,23 +38,6 @@ DEFAULT_NAMES = (
     "optimized_v2",
 )
 
-PUBLIC_FACTORIES = {
-    "legacy_break_high": "legacy_break_high_strategy_group",
-    "baseline": "baseline_strategy_group",
-    "direct_next_open": "direct_next_open_strategy_group",
-    "baseline_half_protect": "baseline_half_protect_strategy_group",
-    "baseline_green_wide": "baseline_green_wide_strategy_group",
-    "baseline_green_only_wide": "baseline_green_only_wide_strategy_group",
-    "baseline_yellow_wide": "baseline_yellow_wide_strategy_group",
-    "baseline_yellow_green_wide": "baseline_yellow_green_wide_strategy_group",
-    "baseline_half_green_wide": "baseline_half_green_wide_strategy_group",
-    "baseline_delayed_tighten": "baseline_delayed_tighten_strategy_group",
-    "baseline_delayed_tighten_slow_start": "baseline_delayed_tighten_slow_start_strategy_group",
-    "baseline_delayed_tighten_fast_start": "baseline_delayed_tighten_fast_start_strategy_group",
-    "baseline_delayed_tighten_smooth": "baseline_delayed_tighten_smooth_strategy_group",
-    "optimized_v2": "optimized_strategy_group",
-}
-
 
 class StrategyGroupRegistryTests(unittest.TestCase):
     def test_green_only_wide_is_opt_in_and_matches_the_measured_configuration(self):
@@ -63,19 +45,21 @@ class StrategyGroupRegistryTests(unittest.TestCase):
         from mu_strategy.strategy import should_enter_long
 
         group = registry.selected_strategy_groups("MU-USDT-SWAP", ["baseline_green_only_wide"])[0]
-        reference = registry.baseline_green_wide_strategy_group("MU-USDT-SWAP")
+        reference = registry.strategy_group("baseline_green_wide", "MU-USDT-SWAP")
         self.assertEqual(replace(reference.config, allowed_regimes=("green",)), group.config)
         self.assertNotIn(group.name, registry.default_strategy_names())
         candle = Candle(1, 101, 103, 98.8, 100.8, 1000)
-        self.assertTrue(should_enter_long(candle, 100, "green", 51, .2, .1, group.config).allowed)
-        self.assertEqual(EntryDecisionCode.REGIME_BLOCKED, should_enter_long(candle, 100, "yellow", 51, .2, .1, group.config).decision_code)
+        self.assertTrue(should_enter_long(candle, 100, "green", 51, 0.2, 0.1, group.config).allowed)
+        self.assertEqual(
+            EntryDecisionCode.REGIME_BLOCKED,
+            should_enter_long(candle, 100, "yellow", 51, 0.2, 0.1, group.config).decision_code,
+        )
 
     def test_registration_catalog_owns_names_rules_construction_selection_and_defaults(self):
         registrations = registry.strategy_group_registrations()
 
         self.assertEqual(REGISTERED_NAMES, tuple(registration.name for registration in registrations))
         self.assertEqual(DEFAULT_NAMES, registry.default_strategy_names())
-        self.assertEqual(DEFAULT_NAMES, DEFAULT_MU_STRATEGY_NAMES)
         self.assertEqual(
             DEFAULT_NAMES,
             tuple(group.name for group in registry.default_strategy_groups("MU-USDT-SWAP")),
@@ -88,13 +72,29 @@ class StrategyGroupRegistryTests(unittest.TestCase):
                     "MU-USDT-SWAP",
                     [registration.name],
                 )
-                public_factory = getattr(registry, PUBLIC_FACTORIES[registration.name])
+                built = registry.strategy_group(registration.name, "MU-USDT-SWAP")
 
                 self.assertTrue(registration.selectable)
                 self.assertEqual(registration.name, group.name)
                 self.assertEqual(registration.descriptor, group.rule)
-                self.assertEqual(group, public_factory("MU-USDT-SWAP"))
+                self.assertEqual(group, built)
                 self.assertEqual([group], selected)
+
+        self.assertEqual(
+            registry.strategy_group("baseline", "MU-USDT-SWAP"),
+            registry.baseline_strategy_group("MU-USDT-SWAP"),
+        )
+
+    def test_rule_descriptors_report_honest_order_types_and_validate_values(self):
+        self.assertEqual("limit", registry.strategy_rule_descriptor("baseline").order_type)
+        self.assertEqual("stop", registry.strategy_rule_descriptor("legacy_break_high").order_type)
+        self.assertEqual("stop", registry.strategy_rule_descriptor("optimized_v2").order_type)
+        self.assertEqual("market", registry.strategy_rule_descriptor("direct_next_open").order_type)
+
+        with self.assertRaises(ValueError):
+            registry.StrategyRuleDescriptor("mu.bad.long.v1", "bad", 1, "buy", "post_only")
+        with self.assertRaises(ValueError):
+            registry.StrategyRuleDescriptor("mu.bad.short.v1", "bad", 1, "sell", "limit")
 
     def test_non_default_delayed_variants_are_intentionally_selectable(self):
         names = (
@@ -136,21 +136,25 @@ class StrategyGroupRegistryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "second_pullback_limit_8",
-            registry.second_pullback_strategy_group("MU-USDT-SWAP").name,
+            registry.baseline_strategy_group("MU-USDT-SWAP"),
+            registry.strategy_group("second_pullback_limit_8", "MU-USDT-SWAP"),
         )
         with self.assertRaisesRegex(ValueError, r"unknown strategy group\(s\): missing, also_missing"):
             registry.selected_strategy_groups(
                 "MU-USDT-SWAP",
                 ["missing,also_missing"],
             )
+        with self.assertRaisesRegex(ValueError, r"unknown strategy group: missing"):
+            registry.strategy_group("missing", "MU-USDT-SWAP")
 
-    def test_strategy_module_remains_a_shallow_compatibility_reexport(self):
-        from mu_strategy import strategy
-
-        self.assertIs(registry.StrategyGroup, strategy.StrategyGroup)
-        self.assertIs(registry.default_strategy_groups, strategy.default_strategy_groups)
-        self.assertIs(registry.selected_strategy_groups, strategy.selected_strategy_groups)
+    def test_strategy_module_has_no_circular_import_of_registry(self):
+        source = (REPO_ROOT / "mu_strategy" / "strategy.py").read_text(encoding="utf-8")
+        imported_modules = {
+            node.module
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        self.assertNotIn("mu_strategy.strategies.registry", imported_modules)
 
     def test_cli_imports_strategy_selection_from_the_owning_registry(self):
         source = (REPO_ROOT / "mu_strategy" / "cli.py").read_text(encoding="utf-8")

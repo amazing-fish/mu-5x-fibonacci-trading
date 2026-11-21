@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,9 +21,19 @@ from mu_strategy.viz.signal_review import REVIEW_STYLE, render_signal_review, re
 from mu_strategy.viz.position_ledger import render_position_editor, render_position_management_editor, render_position_state_editor
 
 
+logger = logging.getLogger(__name__)
+
+
+class _ReviewHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        logger.exception("Unhandled error serving signal review request from %s", client_address)
+
+
 def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                        from_date: str | None = None, to_date: str | None = None,
-                       clock=None) -> HTTPServer:
+                       clock=None) -> ThreadingHTTPServer:
     clock = clock or SystemClock()
     options = {"days": days, "from_date": from_date, "to_date": to_date}
     review_window(now_ms=clock.now_ms(), **options)
@@ -33,8 +44,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             super().setup()
             self.connection.settimeout(10)
 
-        def log_message(self, *_args):
-            pass
+        def log_message(self, format: str, *args) -> None:
+            logger.debug("%s - %s", self.address_string(), format % args)
 
         def respond(self, status: int, content: str, content_type="text/html; charset=utf-8", *, location=None):
             encoded = content.encode("utf-8")
@@ -67,7 +78,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                     record = read_scan_evidence(data_dir, query["cycle_id"][0], query["observation_id"][0], clock=clock)
                 except (ValueError, UnicodeError):
                     self.respond(400, "原始记录查询参数无效。")
-                except (OSError, ObservationCorruptionError):
+                except (OSError, ObservationCorruptionError) as exc:
+                    logger.warning("Scan evidence unavailable for %s: %s", self.path, exc)
                     self.respond(503, "原始记录来源暂不可用，无法核实。")
                 else:
                     self.respond(200, render_scan_evidence(record)) if record else self.respond(404, "原始记录不存在。")
@@ -83,8 +95,13 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                 window = review_window(now_ms=clock.now_ms(), **options)
                 report = read_signal_review(data_dir, window, clock=clock)
                 content = render_signal_review(report, live=True)
-            except Exception:
+            except (OSError, sqlite3.Error, NotificationError, ObservationCorruptionError, ValueError) as exc:
+                logger.warning("Signal review report temporarily unavailable for %s: %s", self.path, exc, exc_info=True)
                 self.respond(503, "Report is temporarily unavailable")
+                return
+            except Exception:
+                logger.exception("Unexpected error rendering signal review report for %s", self.path)
+                self.respond(500, "Internal server error")
                 return
             self.respond(200, content)
 
@@ -118,7 +135,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             except (ValueError, UnicodeError):
                 self.respond(400, "Invalid feedback")
                 return
-            except (OSError, sqlite3.Error, NotificationError):
+            except (OSError, sqlite3.Error, NotificationError) as exc:
+                logger.warning("Signal feedback save failed: %s", exc)
                 self.respond(503, "Feedback could not be saved")
                 return
             self.respond(200, json.dumps(saved, ensure_ascii=False), "application/json; charset=utf-8")
@@ -165,7 +183,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
             except (ValueError, UnicodeError):
                 self.respond(400, "录入入口无效，请从复盘页重新打开。")
                 return
-            except (OSError, sqlite3.Error, NotificationError):
+            except (OSError, sqlite3.Error, NotificationError) as exc:
+                logger.warning("Position editor unavailable for %s: %s", self.path, exc)
                 self.respond(503, "关联来源暂不可用，请稍后重试。")
                 return
             self.respond(200 if view["available"] else 503, content)
@@ -187,7 +206,8 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
                 position_id = save(payload, now_ms=clock.now_ms())
             except (ValueError, UnicodeError) as exc:
                 status, error = 400, str(exc)
-            except (OSError, sqlite3.Error, NotificationError):
+            except (OSError, sqlite3.Error, NotificationError) as exc:
+                logger.warning("Position save failed for %s: %s", self.path, exc)
                 status, error = 503, "管理输入暂时无法保存，请稍后重试。" if management_editor else "持仓状态暂时无法保存，请稍后重试。" if state_editor else "成交记录暂时无法保存，请稍后重试。"
             else:
                 location = (f"/position-management?position_id={position_id}&saved=1#position-review" if management_editor else
@@ -210,7 +230,7 @@ def make_review_server(data_dir: Path, *, port: int = 8769, days: int = 7,
 
         do_DELETE = do_PATCH = do_PUT
 
-    return HTTPServer(("127.0.0.1", port), Handler)
+    return _ReviewHTTPServer(("127.0.0.1", port), Handler)
 
 
 def serve_signal_review(data_dir: Path, *, stdout, **options) -> int:

@@ -145,16 +145,25 @@ def _run_demo_order(args: argparse.Namespace) -> dict:
 def _response_warnings(output: dict, components: tuple[str, ...]) -> list[dict[str, str]]:
     warnings = []
     for component in components:
+        if component not in output:
+            continue
         response = output.get(component)
         if not isinstance(response, dict):
+            warnings.append(
+                {
+                    "component": component,
+                    "code": "",
+                    "msg": "Invalid OKX response payload.",
+                }
+            )
             continue
-        code = str(response.get("code", ""))
-        if code in {"", "0"}:
+        code = response.get("code")
+        if code is not None and str(code) == "0":
             continue
         warnings.append(
             {
                 "component": component,
-                "code": code,
+                "code": "" if code is None else str(code),
                 "msg": str(response.get("msg", "")),
             }
         )

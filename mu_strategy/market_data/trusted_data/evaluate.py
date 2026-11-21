@@ -19,11 +19,20 @@ from mu_strategy.market_data.trusted_data.contracts import (
 from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy
 from mu_strategy.market_data.trusted_data.validation import (
     aggregate_candles,
+    clip_parent_candles_to_bounds,
     clip_parent_candles_to_complete_base_window,
+    complete_parent_window,
+    complete_parent_window_from_bounds,
     normalize_and_validate_candles,
     validate_built_native_candles,
 )
-from mu_strategy.market_data.trusted_data.windowing import CandleWindowPlan, assess_requested_coverage, prune_candle_bundle, resolve_shared_window
+from mu_strategy.market_data.trusted_data.windowing import (
+    CandleWindowPlan,
+    assess_requested_coverage,
+    prune_candle_bundle,
+    resolve_shared_window,
+)
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -100,17 +109,30 @@ def evaluate_candle_bundle(
     allow_timestamp_gap_built_native_inputs: bool = False,
     raise_os_errors: bool = False,
     raise_exceptions: tuple[type[Exception], ...] = (),
+    validate_physical: bool = True,
+    window_anchor_bounds_ms: tuple[int, int] | None = None,
 ) -> DatasetEvaluationResult:
     raw_candles_by_interval = {
         interval: seeds_by_interval[interval].candles
         for interval in intervals
     }
-    physical_candles_by_interval, physical_validation_by_interval = validate_physical_candle_bundle(
-        intervals,
-        raw_candles_by_interval,
-    )
-    window_plan = resolve_shared_window(raw_candles_by_interval, days=days)
-    pruned_candles_by_interval = prune_candle_bundle(raw_candles_by_interval, plan=window_plan)
+    physical_candles_by_interval: dict[str, list[Candle]]
+    physical_validation_by_interval: dict[str, ValidationReport]
+    if validate_physical:
+        physical_candles_by_interval, physical_validation_by_interval = validate_physical_candle_bundle(
+            intervals,
+            raw_candles_by_interval,
+        )
+        pruning_source = physical_candles_by_interval
+    else:
+        physical_candles_by_interval = raw_candles_by_interval
+        physical_validation_by_interval = {}
+        pruning_source = raw_candles_by_interval
+
+    anchor_end_ms = window_anchor_bounds_ms[1] if window_anchor_bounds_ms is not None else None
+    window_plan = resolve_shared_window(pruning_source, days=days, anchor_end_time_ms=anchor_end_ms)
+    pruned_candles_by_interval = prune_candle_bundle(pruning_source, plan=window_plan)
+
     logical_five = pruned_candles_by_interval.get("5m") or []
     if logical_five:
         for interval in ("15m", "1h"):
@@ -121,6 +143,30 @@ def evaluate_candle_bundle(
                 base_candles=logical_five,
                 interval=interval,
             )
+    elif window_anchor_bounds_ms is not None:
+        base_first_ms, base_last_ms = window_anchor_bounds_ms
+        base_step = interval_to_ms("5m")
+        window_start_ms = base_last_ms - (days * DAY_MS)
+        rem = window_start_ms % base_step
+        pruned_five_start = window_start_ms if rem == 0 else window_start_ms + (base_step - rem)
+        effective_five_start = max(base_first_ms, pruned_five_start)
+        for interval in ("15m", "1h"):
+            if interval not in pruned_candles_by_interval:
+                continue
+            parent_window = complete_parent_window_from_bounds(
+                effective_five_start,
+                base_last_ms,
+                interval=interval,
+            )
+            if parent_window is None:
+                pruned_candles_by_interval[interval] = []
+            else:
+                pruned_candles_by_interval[interval] = clip_parent_candles_to_bounds(
+                    pruned_candles_by_interval[interval],
+                    start_ms=parent_window[0],
+                    end_ms=parent_window[1],
+                )
+
     health_by_key: dict[tuple[str, str], DatasetHealth] = {}
     candles_by_key: dict[tuple[str, str], list[Candle]] = {}
 
@@ -150,7 +196,14 @@ def evaluate_candle_bundle(
             continue
 
         try:
-            normalized, validation = normalize_and_validate_candles(candles, interval=interval)
+            # Avoid redundant second normalization/validation when the physical superset
+            # already passed validation and the pruned slice is non-empty.
+            physical_report = physical_validation_by_interval.get(interval)
+            if physical_report is not None and physical_report.ok and candles:
+                normalized = candles
+                validation = ValidationReport(True, HealthReason.OK)
+            else:
+                normalized, validation = normalize_and_validate_candles(candles, interval=interval)
             if not validation.ok:
                 reason = seed.empty_validation_reason if not normalized and seed.empty_validation_reason is not None else validation.reason
                 health = make_dataset_health(
@@ -226,6 +279,7 @@ def evaluate_candle_bundle(
         health_by_key,
         candles_by_key,
         allow_timestamp_gap_inputs=allow_timestamp_gap_built_native_inputs,
+        physical_validation_by_interval=physical_validation_by_interval if validate_physical else None,
     )
     apply_requested_coverage_gate(
         symbol,
@@ -235,13 +289,14 @@ def evaluate_candle_bundle(
         days=days,
         window_end_time_ms=window_plan.end_time_ms,
     )
-    apply_physical_validation_gate(
-        symbol,
-        intervals,
-        health_by_key,
-        candles_by_key,
-        physical_validation_by_interval,
-    )
+    if validate_physical:
+        apply_physical_validation_gate(
+            symbol,
+            intervals,
+            health_by_key,
+            candles_by_key,
+            physical_validation_by_interval,
+        )
     if on_validated_candles is not None:
         for interval in intervals:
             seed = seeds_by_interval[interval]
@@ -411,23 +466,51 @@ def apply_built_native_validation(
     candles_by_key: dict[tuple[str, str], list[Candle]],
     *,
     allow_timestamp_gap_inputs: bool = False,
+    physical_validation_by_interval: dict[str, ValidationReport] | None = None,
 ) -> None:
     base_health = health_by_key.get((symbol, "5m"))
     if base_health is None or not _has_validation_inputs(base_health, allow_timestamp_gap_inputs=allow_timestamp_gap_inputs):
         return
     five = candles_by_key.get((symbol, "5m")) or []
+    physical_base_ok = (
+        physical_validation_by_interval is not None
+        and (base_rep := physical_validation_by_interval.get("5m")) is not None
+        and base_rep.ok
+    )
     for interval in ("15m", "1h"):
         key = (symbol, interval)
         native_health = health_by_key.get(key)
         if native_health is None or not _has_validation_inputs(native_health, allow_timestamp_gap_inputs=allow_timestamp_gap_inputs):
             continue
+        native_rows = candles_by_key.get(key) or []
+        # Skip redundant second aggregation/comparison when the full physical superset already
+        # passed built/native validation and the clipped logical slice covers the complete window.
+        if (
+            physical_base_ok
+            and physical_validation_by_interval is not None
+            and (native_rep := physical_validation_by_interval.get(interval)) is not None
+            and native_rep.ok
+            and base_health.integrity == IntegrityState.VALID
+            and native_health.integrity == IntegrityState.VALID
+            and five
+            and native_rows
+        ):
+            parent_window = complete_parent_window(five, interval=interval)
+            if (
+                parent_window is not None
+                and native_rows[0].open_time_ms == parent_window[0]
+                and native_rows[-1].open_time_ms == parent_window[1]
+                and len(native_rows) == ((parent_window[1] - parent_window[0]) // interval_to_ms(interval)) + 1
+            ):
+                continue
+
         try:
             built = aggregate_candles(five, interval=interval, ohlc_policy="okx_native")
         except ValueError as exc:
             report = ValidationReport(False, HealthReason.OHLCV_INVALID, warnings=(str(exc),))
         else:
             built = clip_parent_candles_to_complete_base_window(built, base_candles=five, interval=interval)
-            native = clip_parent_candles_to_complete_base_window(candles_by_key.get(key) or [], base_candles=five, interval=interval)
+            native = clip_parent_candles_to_complete_base_window(native_rows, base_candles=five, interval=interval)
             report = validate_built_native_candles(
                 built,
                 native,
@@ -469,7 +552,7 @@ def apply_requested_coverage_gate(
             requested_days=days,
             window_end_time_ms=window_end_time_ms,
         )
-        warning = _coverage_warning(coverage)
+        warning = coverage_warning(coverage)
         health_by_key[key] = replace(
             health,
             requested_days=coverage.requested_days,
@@ -515,7 +598,7 @@ def make_dataset_health(
     )
 
 
-def _coverage_warning(coverage) -> str | None:
+def coverage_warning(coverage) -> str | None:
     if coverage.coverage_state != "partial_available_history" or coverage.effective_days is None:
         return None
     return f"partial_available_history:requested_days={coverage.requested_days}:effective_days={coverage.effective_days:.2f}"

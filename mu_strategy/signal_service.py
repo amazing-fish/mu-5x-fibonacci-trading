@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ from typing import Callable
 
 from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
 from mu_strategy.market_data.trusted_data.contracts import Clock, RefreshAttemptStatus, SnapshotUsability, SystemClock
-from mu_strategy.observations import JsonlObservationRepository, ObservationCycleInvalidError
+from mu_strategy.observations import JsonlObservationRepository, ObservationCycleInvalidError, sanitize_observation_text
 from mu_strategy.readonly_scan import scan_watchlist
 from mu_strategy.stage0 import persist_observation_cycle
 from mu_strategy.service_health import (
@@ -21,6 +22,7 @@ from mu_strategy.service_health import (
 
 
 DEADLINE_GRACE_MS = 30_000
+_LOGGER = logging.getLogger(__name__)
 
 
 class InterruptedCycleError(RuntimeError):
@@ -81,8 +83,14 @@ class SignalService:
             raise ValueError("cycles must be positive")
         with self.store.exclusive(), ExitStack() as liveness:
             previous = self.store.read()
+            interrupted_phase: Phase | None = None
             if previous is not None and previous.running and previous.phase is not Phase.IDLE:
-                raise InterruptedCycleError("interrupted child phase; confirm all prior workers stopped before recovery")
+                interrupted_phase = previous.phase
+                _LOGGER.warning(
+                    "recovering stale interrupted %s phase from prior run_id=%s",
+                    interrupted_phase.value,
+                    previous.run_id,
+                )
             now = self.clock.now_ms()
             same_symbols = previous is not None and previous.symbols == self.config.symbols
             self.state = ServiceState(
@@ -91,6 +99,8 @@ class SignalService:
                 previous.last_cycle if same_symbols else None, previous.consecutive_failures if same_symbols else 0,
                 previous.events if previous else (), previous.event_sequence if previous else 0,
             )
+            if interrupted_phase is not None:
+                self._event("interruption_recovered", ("runtime.interrupted", f"interrupted.{interrupted_phase.value}"))
             self._event("restarted" if previous else "started", ())
             self.store.write(self.state)
             # Publish the new run identity before acquiring liveness. A query
@@ -112,7 +122,10 @@ class SignalService:
                     now = self.clock.now_ms()
                     self.state = replace(self.state, phase=Phase.IDLE, updated_at_ms=now,
                                          deadline_ms=now + int(max(0, next_tick - current_tick) * 1000) + DEADLINE_GRACE_MS)
-                    self.store.write(self.state)
+                    if cycles is not None and completed >= cycles:
+                        self.store.write_ephemeral(self.state)
+                    else:
+                        self.store.write(self.state)
                     on_cycle(health_view(self.state, running=True, now_ms=now))
             finally:
                 now = self.clock.now_ms()
@@ -123,9 +136,8 @@ class SignalService:
     def _phase(self, phase: Phase, timeout: int) -> None:
         now = self.clock.now_ms()
         self.state = replace(self.state, phase=phase, updated_at_ms=now, deadline_ms=now + timeout * 1000 + DEADLINE_GRACE_MS)
-        # Publish the active phase before spawning. A hard crash cannot leave an
-        # unrecorded writer that a new supervisor silently runs beside.
-        self.store.write(self.state)
+        # Publish transient active phase atomically without extra disk fsyncs.
+        self.store.write_ephemeral(self.state)
 
     def _cycle(self) -> None:
         started = self.clock.now_ms()
@@ -157,10 +169,14 @@ class SignalService:
     def _refresh(self, argv: list[str]) -> RefreshHealth:
         try:
             result = self.processes.run(argv, timeout=self.config.refresh_timeout_seconds)
-        except subprocess.TimeoutExpired:
-            return RefreshHealth(StepStatus.TIMED_OUT, error_code="refresh_timeout")
-        except Exception:
-            return RefreshHealth(StepStatus.FAILED, error_code="refresh_process_failed")
+        except subprocess.TimeoutExpired as exc:
+            detail = _format_error(exc)
+            _LOGGER.warning("refresh subprocess timed out: %s", detail)
+            return RefreshHealth(StepStatus.TIMED_OUT, error_code="refresh_timeout", error_detail=detail)
+        except Exception as exc:
+            detail = _format_error(exc)
+            _LOGGER.error("refresh subprocess execution error: %s", detail)
+            return RefreshHealth(StepStatus.FAILED, error_code="refresh_process_failed", error_detail=detail)
         try:
             payload = _result_json(result.stdout)
             attempt = RefreshAttemptStatus(payload["attempt_status"])
@@ -177,18 +193,24 @@ class SignalService:
                 raise ValueError("refresh exit contradicts payload")
             health = RefreshHealth(status, payload["run_id"], attempt, usability, result.returncode,
                                    None if status is StepStatus.SUCCEEDED else "publication_not_fully_healthy")
-            return RefreshHealth.from_dict(health.to_dict())
-        except (KeyError, TypeError, ValueError):
+            return health.validate()
+        except (KeyError, TypeError, ValueError) as exc:
             error = "refresh_process_failed" if result.returncode != 0 else "refresh_result_invalid"
-            return RefreshHealth(StepStatus.FAILED, exit_code=result.returncode, error_code=error)
+            detail = _format_process_error(exc, result.stderr)
+            _LOGGER.error("refresh step failed (%s, rc=%s): %s", error, result.returncode, detail)
+            return RefreshHealth(StepStatus.FAILED, exit_code=result.returncode, error_code=error, error_detail=detail)
 
     def _scan(self, argv: list[str]) -> ScanHealth:
         try:
             result = self.processes.run(argv, timeout=self.config.scan_timeout_seconds)
-        except subprocess.TimeoutExpired:
-            return ScanHealth(StepStatus.TIMED_OUT, error_code="scan_timeout")
-        except Exception:
-            return ScanHealth(StepStatus.FAILED, error_code="scan_process_failed")
+        except subprocess.TimeoutExpired as exc:
+            detail = _format_error(exc)
+            _LOGGER.warning("scan subprocess timed out: %s", detail)
+            return ScanHealth(StepStatus.TIMED_OUT, error_code="scan_timeout", error_detail=detail)
+        except Exception as exc:
+            detail = _format_error(exc)
+            _LOGGER.error("scan subprocess execution error: %s", detail)
+            return ScanHealth(StepStatus.FAILED, error_code="scan_process_failed", error_detail=detail)
         try:
             payload = _result_json(result.stdout)
             if set(payload) != {"schema_version", "scan"} or type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
@@ -200,8 +222,10 @@ class SignalService:
             if scan.cycle is not None and sorted(item.symbol for item in scan.cycle.observations) != sorted(self.config.symbols):
                 raise ValueError("scan did not cover configured watchlist exactly once")
             return scan
-        except (KeyError, TypeError, ValueError):
-            return ScanHealth(StepStatus.FAILED, error_code="scan_result_invalid")
+        except (KeyError, TypeError, ValueError) as exc:
+            detail = _format_process_error(exc, result.stderr)
+            _LOGGER.error("scan step failed (rc=%s): %s", result.returncode, detail)
+            return ScanHealth(StepStatus.FAILED, error_code="scan_result_invalid", error_detail=detail)
 
     def _event(self, kind: str, problems: tuple[str, ...]) -> None:
         sequence = self.state.event_sequence + 1
@@ -232,15 +256,37 @@ def scan_once(config: ServiceConfig, *, repository=None, runner=scan_watchlist) 
     repository = repository if repository is not None else JsonlObservationRepository(store.root / "observations.jsonl")
     try:
         cycle = runner(data_dir=config.data_dir, days=config.scan_days, symbols=config.symbols)
-    except Exception:
-        return ScanHealth(StepStatus.FAILED, error_code="scan_failed")
+    except Exception as exc:
+        detail = _format_error(exc)
+        _LOGGER.error("scan_once failed: %s", detail)
+        return ScanHealth(StepStatus.FAILED, error_code="scan_failed", error_detail=detail)
     if cycle is None:
         return ScanHealth(StepStatus.FAILED, error_code="scan_result_missing")
     try:
         persist_observation_cycle(repository, cycle)
-    except ObservationCycleInvalidError:
+    except ObservationCycleInvalidError as exc:
+        _LOGGER.error("observation persistence failed: %s", _format_error(exc))
         return ScanHealth(StepStatus.SUCCEEDED, cycle, StepStatus.FAILED, "observation_write_failed")
     return ScanHealth(StepStatus.SUCCEEDED, cycle, StepStatus.SUCCEEDED)
+
+
+def _sanitize_detail(text: str) -> str:
+    sanitized = sanitize_observation_text(text)
+    cleaned = "".join(char if ord(char) >= 32 else " " for char in sanitized).strip()
+    return cleaned or "unknown error"
+
+
+def _format_error(exc: BaseException) -> str:
+    message = str(exc)
+    detail = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    return _sanitize_detail(detail)
+
+
+def _format_process_error(exc: BaseException, stderr: str | None) -> str:
+    parts = [_format_error(exc)]
+    if stderr and stderr.strip():
+        parts.append(f"stderr={stderr.strip()}")
+    return _sanitize_detail(" | ".join(parts))
 
 
 def _result_json(value: str) -> dict:

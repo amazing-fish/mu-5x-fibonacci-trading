@@ -38,12 +38,12 @@ class EntryScannerTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, result.fib_level)
         self.assertAlmostEqual(0.008, result.fib_distance_pct)
         self.assertAlmostEqual(100.0, result.trigger_price)
-        self.assertAlmostEqual(98.0, result.initial_stop)
+        self.assertAlmostEqual(99.8, result.initial_stop)
         self.assertIs(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, result.decision_code)
         self.assertIs(EntryDisposition.READY, result.disposition)
         self.assertIs(EntryDecisionStage.PENDING_ENTRY, result.stage)
 
-    def test_scan_entry_second_pullback_does_not_reapply_current_filters_to_pending_fill(self):
+    def test_scan_entry_second_pullback_enforces_current_bar_blocks_before_entering(self):
         from mu_strategy.entry.scanner import scan_entry
 
         candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
@@ -78,14 +78,13 @@ class EntryScannerTests(unittest.TestCase):
                             lookback_bars=4,
                         )
 
-        self.assertEqual("enter", result.action)
-        self.assertEqual("recent retest confirmed; resting second-pullback fib limit", result.reason)
+        self.assertEqual("skip", result.action)
+        self.assertEqual("1h regime is red", result.reason)
         self.assertEqual("red", result.regime_1h)
-        self.assertEqual(candles[signal_index].open_time_ms, result.signal_time_ms)
-        self.assertAlmostEqual(100.0, result.trigger_price)
-        self.assertIs(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, result.decision_code)
-        self.assertIs(EntryDisposition.READY, result.disposition)
-        self.assertIs(EntryDecisionStage.PENDING_ENTRY, result.stage)
+        self.assertIsNone(result.trigger_price)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, result.decision_code)
+        self.assertIs(EntryDisposition.BLOCK, result.disposition)
+        self.assertIs(EntryDecisionStage.SIGNAL, result.stage)
 
     def test_scan_entry_second_pullback_ignores_signal_filled_by_latest_confirmed_candle(self):
         from mu_strategy.entry.scanner import scan_entry
@@ -157,7 +156,8 @@ class EntryScannerTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, result.trigger_price)
         self.assertIs(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY, result.decision_code)
 
-    def test_scan_entry_second_pullback_preserves_older_active_pending_signal(self):
+    def test_scan_entry_second_pullback_picks_latest_unfilled_signal_without_duplicate_scan(self):
+        import mu_strategy.entry.scanner as scanner_mod
         from mu_strategy.entry.scanner import scan_entry
 
         candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 15))
@@ -165,38 +165,143 @@ class EntryScannerTests(unittest.TestCase):
         later_signal_index = len(candles) - 2
         candles[first_signal_index] = Candle(candles[first_signal_index].open_time_ms, 100, 101, 99.8, 100.5, 1000)
         candles[later_signal_index] = Candle(candles[later_signal_index].open_time_ms, 105, 106, 104.8, 105.2, 1000)
-        candles[-1] = Candle(candles[-1].open_time_ms, 100.5, 101, 100.4, 100.5, 1000)
+        candles[-1] = Candle(candles[-1].open_time_ms, 105.5, 106, 105.4, 105.5, 1000)
         config = replace(
             baseline_strategy_group("BTC-USDT-SWAP").config,
             entry_execution="second_pullback",
             second_pullback_wait_bars=8,
         )
 
-        with patch("mu_strategy.entry.scanner.build_hourly_context") as build_context:
-            build_context.return_value = {bar.open_time_ms: "green" for bar in candles}
-            with patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)):
-                with patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))):
-                    with patch("mu_strategy.entry.scanner.nearest_fib_retest_level") as nearest_fib:
-                        nearest_fib.side_effect = (
-                            lambda _candles, index, _config: 100.0
-                            if index == first_signal_index
-                            else 105.0
-                            if index == later_signal_index
-                            else None
-                        )
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level") as nearest_fib,
+            patch.object(scanner_mod, "_latest_recent_signal", wraps=scanner_mod._latest_recent_signal) as latest_spy,
+        ):
+            nearest_fib.side_effect = (
+                lambda _candles, index, _config: 100.0
+                if index == first_signal_index
+                else 105.0
+                if index == later_signal_index
+                else None
+            )
 
-                        result = scan_entry(
-                            "BTC-USDT-SWAP",
-                            candles,
-                            candles,
-                            config=config,
-                            lookback_bars=4,
-                        )
+            result = scan_entry(
+                "BTC-USDT-SWAP",
+                candles,
+                candles,
+                config=config,
+                lookback_bars=4,
+            )
 
+        self.assertEqual(1, latest_spy.call_count)
         self.assertEqual("enter", result.action)
-        self.assertEqual(candles[first_signal_index].open_time_ms, result.signal_time_ms)
-        self.assertAlmostEqual(100.0, result.trigger_price)
-        self.assertAlmostEqual(0.005, result.fib_distance_pct)
+        self.assertEqual(candles[later_signal_index].open_time_ms, result.signal_time_ms)
+        self.assertAlmostEqual(105.0, result.trigger_price)
+        self.assertAlmostEqual((105.5 / 105.0) - 1, result.fib_distance_pct)
+
+    def test_scan_entry_honors_config_allowed_regimes_for_green_only(self):
+        from mu_strategy.entry.scanner import scan_entry
+        from mu_strategy.strategies.registry import strategy_group
+
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
+        config = strategy_group("baseline_green_only_wide", "BTC-USDT-SWAP").config
+
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "yellow" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+        ):
+            result = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+        self.assertEqual("skip", result.action)
+        self.assertEqual("yellow", result.regime_1h)
+        self.assertIs(EntryDecisionCode.REGIME_BLOCKED, result.decision_code)
+
+    def test_scan_entry_enforces_should_execute_entry_for_break_high_and_optimized_v2(self):
+        from mu_strategy.entry.scanner import scan_entry
+        from mu_strategy.strategies.registry import strategy_group
+
+        candles = _candles_ending_at(_utc_ms(2026, 6, 18, 14, 0))
+        signal_index = len(candles) - 2
+        # Case 1: next candle does not break signal high -> wait with NEXT_CANDLE_DID_NOT_BREAK_SIGNAL_HIGH.
+        candles[signal_index] = Candle(candles[signal_index].open_time_ms, 100.0, 101.0, 99.8, 100.5, 1000)
+        candles[-1] = Candle(candles[-1].open_time_ms, 100.4, 100.9, 100.2, 100.6, 1000)
+        config = strategy_group("optimized_v2", "BTC-USDT-SWAP").config
+
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == signal_index else None),
+        ):
+            no_break = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+        self.assertEqual("wait", no_break.action)
+        self.assertIs(EntryDecisionCode.NEXT_CANDLE_DID_NOT_BREAK_SIGNAL_HIGH, no_break.decision_code)
+
+        # Case 2: next candle breaks high, but signal candle range exceeds max_signal_range_pct (0.015) -> skip.
+        candles[signal_index] = Candle(candles[signal_index].open_time_ms, 100.0, 101.0, 98.8, 100.2, 1000)
+        candles[-1] = Candle(candles[-1].open_time_ms, 100.2, 101.2, 100.0, 100.8, 1000)
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == signal_index else None),
+        ):
+            wide_bar = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+        self.assertEqual("skip", wide_bar.action)
+        self.assertIs(EntryDecisionCode.SIGNAL_CANDLE_TOO_WIDE, wide_bar.decision_code)
+
+        # Case 3: valid signal on latest bar for break_high waits for NEXT_CANDLE_REQUIRED.
+        candles[-1] = Candle(candles[-1].open_time_ms, 100.0, 100.6, 99.8, 100.3, 1000)
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == len(candles) - 1 else None),
+        ):
+            needs_next = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+        self.assertEqual("wait", needs_next.action)
+        self.assertIs(EntryDecisionCode.NEXT_CANDLE_REQUIRED, needs_next.decision_code)
+        self.assertAlmostEqual(100.6, needs_next.trigger_price)
+
+    def test_scan_entry_waits_when_next_execution_candle_is_outside_trading_window(self):
+        from mu_strategy.entry.scanner import scan_entry
+
+        # 2026-06-18 (EDT = UTC-4): morning window 09:45-11:30 ET = 13:45-15:30 UTC; afternoon 14:30-15:45 ET = 18:30-19:45 UTC.
+        # Signal forms at 15:30 UTC (in window), next_candle is at 15:45 UTC (outside window!), latest bar is 18:30 UTC (in window).
+        signal_ms = _utc_ms(2026, 6, 18, 15, 30)
+        outside_next_ms = _utc_ms(2026, 6, 18, 15, 45)
+        latest_in_window_ms = _utc_ms(2026, 6, 18, 18, 30)
+        candles = [
+            Candle(signal_ms - 1_800_000, 99.0, 100.0, 98.5, 99.5, 1000),
+            Candle(signal_ms - 900_000, 99.5, 101.0, 99.2, 100.5, 1000),
+            Candle(signal_ms, 100.0, 101.0, 99.8, 100.5, 1000),
+            Candle(outside_next_ms, 100.5, 101.5, 100.3, 100.8, 1000),
+            Candle(latest_in_window_ms, 100.6, 101.0, 100.4, 100.7, 1000),
+        ]
+        for execution in ("break_high", "direct_next_open"):
+            with self.subTest(execution=execution):
+                config = replace(
+                    baseline_strategy_group("BTC-USDT-SWAP").config,
+                    entry_execution=execution,
+                )
+                with (
+                    patch("mu_strategy.entry.scanner.build_hourly_context", return_value={bar.open_time_ms: "green" for bar in candles}),
+                    patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(candles)),
+                    patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(candles), [0.0] * len(candles), [0.2] * len(candles))),
+                    patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 100.0 if idx == 2 else None),
+                ):
+                    result = scan_entry("BTC-USDT-SWAP", candles, candles, config=config, lookback_bars=4)
+
+                self.assertEqual("wait", result.action)
+                self.assertIs(EntryDecisionCode.NEXT_FILL_OUTSIDE_TRADING_WINDOW, result.decision_code)
+                self.assertIs(EntryDisposition.WAIT, result.disposition)
+                self.assertIs(EntryDecisionStage.EXECUTION, result.stage)
 
     def test_scan_entry_second_pullback_places_limit_when_current_close_moved_away_from_fib(self):
         from mu_strategy.entry.scanner import scan_entry

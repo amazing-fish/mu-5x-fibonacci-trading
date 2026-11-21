@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import asdict, dataclass, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.entry.scanner import EntryScanResult, scan_entry
 from mu_strategy.live_exit import observe_okx_position
-from mu_strategy.live.okx import OKXInstrumentSpec
+from mu_strategy.live.okx import OKXInstrumentSpec, OKXRestClient
 from mu_strategy.market_data.trusted_data.compat import CandleBundle
 from mu_strategy.market_data.trusted_data.contracts import Clock, TrustedConsumerRefreshError, TrustedLoadContext, UniverseSnapshot
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
@@ -40,6 +41,7 @@ class DemoTradingConfig:
     max_open_positions: int = 3
     leverage: int = 5
     dry_run: bool = True
+    fetch_instrument_specs: bool = False
     max_candle_staleness_bars: int = 3
     watchlist_symbols: tuple[str, ...] = DEFAULT_WATCHLIST_SYMBOLS
     observation_log_path: Path | None = None
@@ -277,6 +279,7 @@ def run_once(
         if observation_repository is not None:
             persist_observation_cycle(observation_repository, cycle)
 
+    instrument_cache: dict[str, OKXInstrumentSpec | None] = {}
     for result in scan_results:
         if result.symbol not in entry_eligible_inst_ids:
             continue
@@ -285,7 +288,8 @@ def run_once(
 
         plan = _build_order_plan(result, config)
         if config.dry_run:
-            _attach_order_sizing(plan, broker, result)
+            if _should_attach_dry_run_sizing(broker, config):
+                _attach_order_sizing(plan, broker, result, instrument_cache=instrument_cache)
             orders.append(plan)
             continue
 
@@ -310,8 +314,8 @@ def run_once(
             orders.append(plan)
             continue
 
-        _attach_order_sizing(plan, broker, result)
-        if Decimal(str(plan.get("size") or "0")) <= 0:
+        _attach_order_sizing(plan, broker, result, instrument_cache=instrument_cache)
+        if _decimal(plan.get("size"), allow_empty=True) <= 0:
             plan["status"] = "blocked"
             plan["reason"] = "order_size_below_lot"
             orders.append(plan)
@@ -481,11 +485,44 @@ def _build_order_plan(result: EntryScanResult, config: DemoTradingConfig) -> dic
     }
 
 
-def _attach_order_sizing(plan: dict[str, Any], broker: Any | None, result: EntryScanResult) -> None:
+def _should_attach_dry_run_sizing(broker: Any | None, config: DemoTradingConfig) -> bool:
+    if broker is None:
+        return False
+    if config.fetch_instrument_specs:
+        return True
+    if isinstance(broker, OKXRestClient) and getattr(broker, "_owned_transport", None) is not None:
+        return False
+    return True
+
+
+def _attach_order_sizing(
+    plan: dict[str, Any],
+    broker: Any | None,
+    result: EntryScanResult,
+    *,
+    instrument_cache: dict[str, OKXInstrumentSpec | None] | None = None,
+) -> None:
     if broker is None or result.trigger_price is None:
         return
-    instrument = broker.get_instruments(inst_type="SWAP", inst_id=result.symbol)
-    spec = _instrument_spec(instrument)
+    if instrument_cache is not None and result.symbol in instrument_cache:
+        spec = instrument_cache[result.symbol]
+    else:
+        instrument = broker.get_instruments(inst_type="SWAP", inst_id=result.symbol)
+        spec = None
+        if not _okx_response_failed(instrument):
+            data = instrument.get("data")
+            if isinstance(data, list) and data:
+                for row in data:
+                    if isinstance(row, dict) and row.get("instId"):
+                        parsed = OKXInstrumentSpec.from_row(row)
+                        if instrument_cache is not None:
+                            instrument_cache[str(row["instId"])] = parsed
+                        if str(row["instId"]) == result.symbol and spec is None:
+                            spec = parsed
+                if spec is None and isinstance(data[0], dict):
+                    spec = OKXInstrumentSpec.from_row(data[0])
+        if instrument_cache is not None:
+            instrument_cache.setdefault(result.symbol, spec)
     if spec is None:
         plan["reason"] = "instrument_spec_unavailable"
         return
@@ -607,7 +644,7 @@ def _latest_close(candles: list) -> float | None:
 def _count_open_exposure(positions: dict[str, Any], open_orders: dict[str, Any]) -> int:
     count = 0
     for row in positions.get("data") or []:
-        if _decimal(row.get("pos")) != 0:
+        if _decimal(row.get("pos"), allow_empty=True) != 0:
             count += 1
     count += len(open_orders.get("data") or [])
     return count
@@ -617,14 +654,14 @@ def _open_position_inst_ids(positions: dict[str, Any]) -> set[str]:
     return {
         str(row.get("instId"))
         for row in positions.get("data") or []
-        if row.get("instId") and _decimal(row.get("pos")) != 0
+        if row.get("instId") and _decimal(row.get("pos"), allow_empty=True) != 0
     }
 
 
 def _open_position_rows_by_inst_id(positions: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     rows_by_inst_id: dict[str, list[dict[str, Any]]] = {}
     for row in positions.get("data") or []:
-        if not isinstance(row, dict) or not row.get("instId") or _decimal(row.get("pos")) == 0:
+        if not isinstance(row, dict) or not row.get("instId") or _decimal(row.get("pos"), allow_empty=True) == 0:
             continue
         rows_by_inst_id.setdefault(str(row["instId"]), []).append(row)
     return rows_by_inst_id
@@ -728,34 +765,54 @@ def _text_or_none(value: Any) -> str | None:
 
 def _account_context_error(account_context: dict[str, Any]) -> dict[str, str] | None:
     for component, response in account_context.items():
-        code = str(response.get("code", "")) if isinstance(response, dict) else ""
-        if code not in {"", "0"}:
+        if not isinstance(response, dict):
             return {
                 "component": component,
-                "code": code,
-                "msg": str(response.get("msg", "")) if isinstance(response, dict) else "",
+                "code": "",
+                "msg": "invalid OKX response payload",
+            }
+        code = response.get("code")
+        if code is None or str(code) != "0":
+            return {
+                "component": component,
+                "code": "" if code is None else str(code),
+                "msg": str(response.get("msg", "")) or "missing or non-zero OKX response code",
             }
     return None
 
 
-def _okx_response_failed(response: dict[str, Any]) -> bool:
-    if str(response.get("code", "")) not in {"", "0"}:
+def _okx_response_failed(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return True
+    code = response.get("code")
+    if code is None or str(code) != "0":
         return True
 
     data = response.get("data")
     if not isinstance(data, list):
         return False
     for row in data:
-        if isinstance(row, dict) and "sCode" in row and str(row.get("sCode", "")) not in {"", "0"}:
-            return True
+        if isinstance(row, dict) and "sCode" in row:
+            s_code = row.get("sCode")
+            if s_code is None or str(s_code) != "0":
+                return True
     return False
 
 
-def _decimal(value: Any) -> Decimal:
+def _decimal(value: Any, *, allow_empty: bool = False) -> Decimal:
+    if value is None or value == "":
+        if allow_empty:
+            return Decimal("0")
+        raise ValueError(f"missing decimal value: {value!r}")
+    if isinstance(value, bool):
+        raise ValueError(f"invalid decimal value: {value!r}")
     try:
-        return Decimal(str(value or "0"))
-    except Exception:
-        return Decimal("0")
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"invalid decimal value: {value!r}") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"non-finite decimal value: {value!r}")
+    return parsed
 
 
 def _float_to_price_text(value: float) -> str:
@@ -763,7 +820,14 @@ def _float_to_price_text(value: float) -> str:
 
 
 def _float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
+    if value is None or value == "":
         return 0.0
+    if isinstance(value, bool):
+        raise ValueError(f"invalid float value: {value!r}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite float value: {value!r}")
+    return parsed

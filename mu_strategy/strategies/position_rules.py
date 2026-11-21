@@ -278,7 +278,7 @@ def _stop_transition_progress(
 ) -> float:
     if config.stop_transition_bars <= 0:
         return 1.0
-    fill_index = _fill_index(candles, position.fills[-1].time_ms)
+    fill_index = _fill_index(candles, position.fills[-1].time_ms, hint_index=index)
     elapsed = max(0, index - fill_index)
     return min(1.0, elapsed / config.stop_transition_bars)
 
@@ -327,10 +327,23 @@ def _interpolate(start: float, target: float, progress: float) -> float:
     return start + ((target - start) * progress)
 
 
-def _fill_index(candles: Sequence[Candle], fill_time_ms: int) -> int:
-    for index, candle in enumerate(candles):
-        if candle.open_time_ms == fill_time_ms:
-            return index
+def _fill_index(candles: Sequence[Candle], fill_time_ms: int, *, hint_index: int | None = None) -> int:
+    n = len(candles)
+    if not n:
+        raise ValueError(f"fill timestamp {fill_time_ms} is not present in candles")
+    if hint_index is not None and 0 <= hint_index < n and candles[hint_index].open_time_ms == fill_time_ms:
+        return hint_index
+    lo = 0
+    hi = n - 1
+    while lo <= hi:
+        mid = (lo + hi) >> 1
+        mid_time = candles[mid].open_time_ms
+        if mid_time == fill_time_ms:
+            return mid
+        if mid_time < fill_time_ms:
+            lo = mid + 1
+        else:
+            hi = mid - 1
     raise ValueError(f"fill timestamp {fill_time_ms} is not present in candles")
 
 

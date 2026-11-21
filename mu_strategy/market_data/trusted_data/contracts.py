@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from mu_strategy.market_data.utils import interval_to_ms
+from mu_strategy.market_data.utils import day_utc_month_id
 from mu_strategy.models import Candle
 
 
@@ -243,7 +242,7 @@ class DatasetHealth:
             "availability": self.availability.value,
             "integrity": self.integrity.value,
             "freshness": self.freshness.value,
-            "reasons": [reason.value for reason in self.reasons],
+            "reasons": [r.value for r in self.reasons],
             "rows": self.rows,
             "first_timestamp_ms": self.first_timestamp_ms,
             "last_timestamp_ms": self.last_timestamp_ms,
@@ -335,7 +334,6 @@ class TrustedManifestSnapshot:
     provider_failures: tuple[dict[str, str], ...] = ()
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
-    imported_from_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -437,7 +435,6 @@ class RefreshRun:
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
     refresh_segments: tuple[RefreshSegmentDiagnostics, ...] = ()
-    imported_from_run_id: str | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -476,8 +473,6 @@ class RefreshRun:
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
-        if self.imported_from_run_id is not None:
-            payload["imported_from_run_id"] = self.imported_from_run_id
         diagnostics = refresh_run_diagnostics_payload(self)
         if diagnostics:
             payload["diagnostics"] = diagnostics
@@ -618,17 +613,11 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
             )
             for key, health in datasets.items()
         }
-        imported_from_run_id = None
     else:
         layout = _required_str(payload, "storage_layout")
         if layout != TrustedStorageLayout.SEGMENTED_CSV_V1.value:
             raise ManifestSchemaError(f"unsupported manifest storage_layout: {layout}")
-        imported_from_run_id = _optional_non_empty_str(payload, "imported_from_run_id")
-        datasets, storage_by_dataset = _segmented_datasets_from_symbols(
-            symbols,
-            run_id=run_id,
-            imported_from_run_id=imported_from_run_id,
-        )
+        datasets, storage_by_dataset = _segmented_datasets_from_symbols(symbols)
 
     snapshot = TrustedManifestSnapshot(
         schema_version=schema_version,
@@ -645,7 +634,6 @@ def trusted_manifest_snapshot_from_dict(payload: dict[str, Any]) -> TrustedManif
         provider_failures=_provider_failures(payload.get("provider_failures") or ()),
         warnings=_optional_str_tuple(payload, "warnings"),
         cycle_error=_optional_str_dict(payload.get("cycle_error")),
-        imported_from_run_id=imported_from_run_id,
     )
     _validate_manifest_snapshot(snapshot)
     return snapshot
@@ -656,7 +644,7 @@ def health_reason(value: Any, *, strict: bool = False) -> HealthReason:
         return value
     try:
         return HealthReason(str(value))
-    except Exception:
+    except ValueError:
         if strict:
             raise ManifestSchemaError(f"unknown health reason: {value}") from None
         return HealthReason.REFRESH_FAILED
@@ -710,7 +698,6 @@ def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> d
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UTC_MONTH_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
-_UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _SEGMENT_REFERENCE_FIELDS = frozenset(
     {
         "segment_id",
@@ -729,19 +716,16 @@ _DATASET_STORAGE_FIELDS = frozenset({"layout", "source_root", "segments"})
 def utc_month_segment_id(open_time_ms: int) -> str:
     if not _is_int(open_time_ms):
         raise ValueError("open_time_ms must be an integer")
-    seconds, milliseconds = divmod(open_time_ms, 1000)
+    seconds = open_time_ms // 1000
+    utc_day = seconds // 86_400
     try:
-        instant = _UTC_EPOCH + timedelta(seconds=seconds, milliseconds=milliseconds)
+        return day_utc_month_id(utc_day)
     except (OverflowError, ValueError) as exc:
         raise ValueError("open_time_ms is outside the supported UTC datetime range") from exc
-    return f"{instant.year:04d}-{instant.month:02d}"
 
 
 def _segmented_datasets_from_symbols(
     symbols: dict[str, Any],
-    *,
-    run_id: str,
-    imported_from_run_id: str | None,
 ) -> tuple[dict[tuple[str, str], DatasetHealth], dict[tuple[str, str], DatasetStorage]]:
     datasets: dict[tuple[str, str], DatasetHealth] = {}
     storage_by_dataset: dict[tuple[str, str], DatasetStorage] = {}
@@ -756,13 +740,7 @@ def _segmented_datasets_from_symbols(
                 raise ManifestSchemaError("manifest dataset health entries must be objects")
             if "source_file" in payload:
                 raise ManifestSchemaError("schema-v4 dataset must use storage instead of source_file")
-            storage = _dataset_storage_from_dict(
-                str(symbol),
-                str(interval),
-                payload.get("storage"),
-                run_id=run_id,
-                imported_from_run_id=imported_from_run_id,
-            )
+            storage = _dataset_storage_from_dict(str(symbol), str(interval), payload.get("storage"))
             health_payload = dict(payload)
             health_payload.pop("storage", None)
             health_payload["source_file"] = storage.source_root.as_posix()
@@ -777,9 +755,6 @@ def _dataset_storage_from_dict(
     symbol: str,
     interval: str,
     payload: Any,
-    *,
-    run_id: str,
-    imported_from_run_id: str | None,
 ) -> DatasetStorage:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 dataset storage must be object")
@@ -799,15 +774,8 @@ def _dataset_storage_from_dict(
     if not isinstance(segment_payloads, list):
         raise ManifestSchemaError("schema-v4 dataset segments must be array")
     segments = tuple(
-        _segment_reference_from_dict(
-            symbol,
-            interval,
-            item,
-            run_id=run_id,
-            imported_from_run_id=imported_from_run_id,
-            first_reference=index == 0,
-        )
-        for index, item in enumerate(segment_payloads)
+        _segment_reference_from_dict(symbol, interval, item)
+        for item in segment_payloads
     )
     return DatasetStorage(
         layout=TrustedStorageLayout.SEGMENTED_CSV_V1,
@@ -820,10 +788,6 @@ def _segment_reference_from_dict(
     symbol: str,
     interval: str,
     payload: Any,
-    *,
-    run_id: str,
-    imported_from_run_id: str | None,
-    first_reference: bool,
 ) -> SegmentReference:
     if not isinstance(payload, dict):
         raise ManifestSchemaError("schema-v4 segment reference must be object")
@@ -854,30 +818,9 @@ def _segment_reference_from_dict(
     if first_segment_id != segment_id or last_segment_id != segment_id:
         raise ManifestSchemaError("schema-v4 segment timestamp bounds must belong to segment_id")
     expected_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.csv"
-    imported_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.import-{run_id}.csv"
-    try:
-        partial_start_ms = int(first_timestamp_ms) - (int(start_row) * interval_to_ms(interval))
-        partial_segment_id = utc_month_segment_id(partial_start_ms)
-    except (IndexError, TypeError, ValueError) as exc:
-        raise ManifestSchemaError(f"schema-v4 segment interval is invalid: {interval}") from exc
-    partial_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.partial-{partial_start_ms}.csv"
     source_file_value = payload.get("source_file")
-    if not isinstance(source_file_value, str) or not (
-        source_file_value == expected_source_value
-        or (
-            imported_from_run_id is not None
-            and first_reference
-            and source_file_value == imported_source_value
-        )
-        or (
-            first_reference
-            and partial_segment_id == segment_id
-            and source_file_value == partial_source_value
-        )
-    ):
-        raise ManifestSchemaError(
-            "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"
-        )
+    if not isinstance(source_file_value, str) or source_file_value != expected_source_value:
+        raise ManifestSchemaError("schema-v4 segment source_file must equal the canonical month path")
     source_file = Path(source_file_value)
     if not isinstance(content_sha256, str) or not _SHA256_RE.fullmatch(content_sha256):
         raise ManifestSchemaError("schema-v4 segment content_sha256 must be lowercase SHA-256")
@@ -1031,15 +974,6 @@ def _optional_str_tuple(payload: dict[str, Any], key: str) -> tuple[str, ...]:
     if any(not isinstance(item, str) for item in value):
         raise ManifestSchemaError(f"manifest {key} entries must be strings")
     return tuple(value)
-
-
-def _optional_non_empty_str(payload: dict[str, Any], key: str) -> str | None:
-    value = payload.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        raise ManifestSchemaError(f"manifest {key} must be non-empty string when present")
-    return value
 
 
 def _required_enum(payload: dict[str, Any], key: str, enum_type):

@@ -103,7 +103,7 @@ def _windows_os_error(api: _WindowsDirectoryApi, directory: Path) -> OSError:
     return OSError(error, api.format_error(error), str(directory))
 
 
-def _load_windows_directory_api() -> _WindowsDirectoryApi:
+def _build_windows_directory_api() -> _WindowsDirectoryApi:
     import ctypes
     from ctypes import wintypes
 
@@ -133,6 +133,18 @@ def _load_windows_directory_api() -> _WindowsDirectoryApi:
         get_last_error=ctypes.get_last_error,
         format_error=ctypes.FormatError,
     )
+
+
+_WINDOWS_DIRECTORY_API: _WindowsDirectoryApi | None = (
+    _build_windows_directory_api() if os.name == "nt" else None
+)
+
+
+def _load_windows_directory_api() -> _WindowsDirectoryApi:
+    global _WINDOWS_DIRECTORY_API
+    if _WINDOWS_DIRECTORY_API is None:
+        _WINDOWS_DIRECTORY_API = _build_windows_directory_api()
+    return _WINDOWS_DIRECTORY_API
 
 
 __all__ = ["fsync_directory"]

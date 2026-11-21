@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import time
 import urllib.parse
-import urllib.request
 
+from mu_strategy.market_data.http_pool import get_json
 from mu_strategy.market_data.utils import DAY_MS, dedupe_candles, interval_to_ms
 from mu_strategy.models import Candle
 
@@ -30,8 +29,7 @@ def fetch_klines(
     if end_time_ms is not None:
         params["endTime"] = end_time_ms
     url = f"{BASE_URL}?{urllib.parse.urlencode(params)}"
-    with urllib.request.urlopen(url, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = get_json(url, timeout=20.0, retries=1)
     return [Candle.from_binance_row(row) for row in payload]
 
 

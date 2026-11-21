@@ -11,7 +11,7 @@ from mu_strategy.market_data.trusted_data.store import TrustedDataStore
 
 class TrustedMarketDataUniverseTests(unittest.TestCase):
     def test_selects_crypto_top10_excluding_stock_token_candidates(self):
-        from mu_strategy.market_data.trusted import select_top_okx_crypto_swaps, select_top_okx_stock_tokens
+        from mu_strategy.market_data.trusted_data.refresh import select_top_okx_crypto_swaps, select_top_okx_stock_tokens
 
         rows = [
             {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "10"},
@@ -30,7 +30,7 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
         self.assertEqual(["stock_token", "stock_token"], [item.source for item in stocks])
 
     def test_selectors_honor_zero_and_reject_negative_limits(self):
-        from mu_strategy.market_data.trusted import select_top_okx_crypto_swaps, select_top_okx_stock_tokens
+        from mu_strategy.market_data.trusted_data.refresh import select_top_okx_crypto_swaps, select_top_okx_stock_tokens
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
 
         rows = [
@@ -60,17 +60,17 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "symbol"):
             RefreshTrustedMarketDataRequest(symbols=("!!!",))
 
-    def test_request_defaults_to_serial_compatibility_and_accepts_concurrency(self):
+    def test_request_defaults_to_parallel_concurrency_and_accepts_override(self):
         from mu_strategy.market_data.trusted_data.refresh import (
             DEFAULT_MAX_CONCURRENCY,
             DEFAULT_REQUEST_MAX_CONCURRENCY,
             RefreshTrustedMarketDataRequest,
         )
 
-        self.assertEqual(2, DEFAULT_MAX_CONCURRENCY)
-        self.assertEqual(1, DEFAULT_REQUEST_MAX_CONCURRENCY)
+        self.assertEqual(4, DEFAULT_MAX_CONCURRENCY)
+        self.assertEqual(4, DEFAULT_REQUEST_MAX_CONCURRENCY)
         self.assertEqual(DEFAULT_REQUEST_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest().max_concurrency)
-        self.assertEqual(DEFAULT_MAX_CONCURRENCY, RefreshTrustedMarketDataRequest(max_concurrency=2).max_concurrency)
+        self.assertEqual(1, RefreshTrustedMarketDataRequest(max_concurrency=1).max_concurrency)
 
     def test_request_rejects_non_positive_concurrency(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketDataRequest
@@ -94,7 +94,7 @@ class TrustedMarketDataUniverseTests(unittest.TestCase):
 
 class TrustedCandleValidationTests(unittest.TestCase):
     def test_validate_built_native_rejects_empty_built(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([], [_candle(0, 100)], interval="15m")
 
@@ -102,7 +102,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual("built_empty", result.reason)
 
     def test_validate_built_native_rejects_empty_native(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([_candle(0, 100)], [], interval="15m")
 
@@ -110,7 +110,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual("native_empty", result.reason)
 
     def test_validate_built_native_reports_native_timestamp_missing_from_built(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([_candle(0, 100)], [_candle(0, 100), _candle(900_000, 101)], interval="15m")
 
@@ -119,7 +119,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual([900_000], result.missing_in_built)
 
     def test_validate_built_native_reports_built_timestamp_missing_from_native(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([_candle(0, 100), _candle(900_000, 101)], [_candle(0, 100)], interval="15m")
 
@@ -128,7 +128,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual([900_000], result.missing_in_native)
 
     def test_validate_built_native_rejects_misaligned_timestamp(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([_candle(60_000, 100)], [_candle(60_000, 100)], interval="15m")
 
@@ -137,7 +137,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual([60_000], result.misaligned_timestamps)
 
     def test_validate_built_native_accepts_matching_coverage(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         result = validate_built_native_candles([_candle(0, 100), _candle(900_000, 101)], [_candle(0, 100), _candle(900_000, 101)], interval="15m")
 
@@ -145,7 +145,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual("ok", result.reason)
 
     def test_validate_built_native_rejects_ohlcv_mismatch(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         built = [Candle(0, 100, 110, 90, 105, 123)]
         native = [Candle(0, 100, 111, 90, 105, 123)]
@@ -157,7 +157,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
         self.assertEqual([{"timestamp_ms": 0, "field": "high", "built": 110, "native": 111}], result.value_mismatches)
 
     def test_validate_built_native_accepts_price_and_volume_within_tolerance(self):
-        from mu_strategy.market_data.trusted import validate_built_native_candles
+        validate_built_native_candles = _validate_built_native_candles
 
         built = [Candle(0, 100.0, 110.0, 90.0, 105.0, 123.0)]
         native = [Candle(0, 100.0001, 110.0001, 90.0001, 105.0001, 123.0001)]
@@ -272,7 +272,7 @@ class TrustedCandleValidationTests(unittest.TestCase):
 
 class TrustedRefreshStoreTests(unittest.TestCase):
     def test_refresh_once_writes_manifest_run_log_and_health_dashboard(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
         from mu_strategy.viz.data_health import render_data_health_dashboard
 
         rows = [
@@ -317,14 +317,8 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertIn("MU-USDT-SWAP", html)
         self.assertIn("stock_token_top", html)
 
-    def test_per_symbol_refresh_facades_are_removed(self):
-        import mu_strategy.market_data.trusted as trusted
-
-        self.assertFalse(hasattr(trusted, "refresh_trusted_interval"))
-        self.assertFalse(hasattr(trusted, "refresh_trusted_symbol_statuses"))
-
     def test_refresh_once_marks_manifest_invalid_when_any_interval_fails(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
 
         rows = [
             {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "10"},
@@ -363,7 +357,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("refresh_failed", manifest["symbols"]["BTC-USDT-SWAP"]["intervals"]["15m"]["reason"])
 
     def test_refresh_once_marks_empty_universe_invalid(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
 
         def fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
             raise AssertionError("empty universe must not fetch symbol candles")
@@ -394,7 +388,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertIn("empty_universe", manifest["warnings"])
 
     def test_refresh_once_rebuilds_bad_cache_without_aborting_other_symbols(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
 
         rows = [
             {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "20"},
@@ -429,7 +423,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertTrue(eth_status["is_valid"])
 
     def test_refresh_once_rebuilds_invalid_native_cache_during_validation(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
 
         rows = [
             {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "20"},
@@ -470,7 +464,7 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("ok", status["reason"])
 
     def test_refresh_once_marks_native_ohlcv_mismatch_invalid(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+        refresh_market_data_once = _refresh_market_data_once
 
         rows = [
             {"instId": "BTC-USDT-SWAP", "last": "65000", "volCcy24h": "20"},
@@ -554,8 +548,8 @@ class TrustedRefreshStoreTests(unittest.TestCase):
         self.assertEqual("explicit", manifest["symbols"]["MU-USDT-SWAP"]["source"])
         self.assertEqual("explicit", manifest["universes"]["crypto_top"][0]["source"])
 
-    def test_compatibility_refresh_custom_fetcher_remains_serial_by_default(self):
-        from mu_strategy.market_data.trusted import refresh_market_data_once
+    def test_refresh_honors_explicit_serial_and_default_parallel_concurrency(self):
+        refresh_market_data_once = _refresh_market_data_once
 
         lock = threading.Lock()
         first_started = threading.Event()
@@ -587,12 +581,30 @@ class TrustedRefreshStoreTests(unittest.TestCase):
                 days=1,
                 fetcher=stateful_fetcher,
                 now_ms=86_400_000,
+                max_concurrency=1,
             )
 
         self.assertTrue(first_started.is_set())
         self.assertTrue(second_started.is_set())
         self.assertEqual(1, max_active)
         self.assertEqual("success", manifest["attempt_status"])
+
+        first_started.clear()
+        second_started.clear()
+        active = 0
+        max_active = 0
+        with TemporaryDirectory() as tmp:
+            parallel_manifest = refresh_market_data_once(
+                data_dir=Path(tmp),
+                symbols=("BTC", "ETH"),
+                intervals=("5m",),
+                days=1,
+                fetcher=stateful_fetcher,
+                now_ms=86_400_000,
+            )
+
+        self.assertGreaterEqual(max_active, 2)
+        self.assertEqual("success", parallel_manifest["attempt_status"])
 
     def test_explicit_symbol_refresh_reuses_current_generation_incrementally(self):
         from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
@@ -776,7 +788,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
             self.assertFalse((data_dir / "refresh_runs.jsonl").exists())
 
     def test_refresh_trusted_candle_bundle_honors_refresh_false(self):
-        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.data import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
         from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 
@@ -789,7 +801,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
                 if interval == "5m":
                     candles = five_minute
                 else:
-                    from mu_strategy.market_data.trusted import aggregate_candles
+                    from mu_strategy.market_data.trusted_data.validation import aggregate_candles
 
                     candles = aggregate_candles(five_minute, interval=interval)
                 write_csv(candles, path)
@@ -832,9 +844,9 @@ class TrustedCandleBundleTests(unittest.TestCase):
         self.assertTrue(bundle.statuses_by_interval["15m"].validation.ok)
 
     def test_refresh_trusted_candle_bundle_prunes_cached_window_and_statuses_to_days(self):
-        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.data import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
-        from mu_strategy.market_data.trusted import aggregate_candles
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
         from mu_strategy.market_data.trusted_data.store import candles_content_sha256
         from mu_strategy.market_data.utils import DAY_MS
 
@@ -898,7 +910,7 @@ class TrustedCandleBundleTests(unittest.TestCase):
             self.assertTrue(status.validation.ok)
 
     def test_refresh_trusted_candle_bundle_preserves_manifest_failure_status(self):
-        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.data import write_csv
         from mu_strategy.market_data.service import refresh_trusted_candle_bundle
 
         with TemporaryDirectory() as tmp:
@@ -1047,6 +1059,72 @@ def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
 
 
+def _validate_built_native_candles(
+    built: list[Candle],
+    native: list[Candle],
+    *,
+    interval: str,
+    min_samples: int = 1,
+    value_rel_tol: float = 1e-8,
+    value_abs_tol: float = 1e-8,
+    max_value_mismatches: int = 20,
+):
+    from mu_strategy.market_data.trusted_data.compat import validation_result_from_report
+    from mu_strategy.market_data.trusted_data.validation import validate_built_native_candles
+
+    return validation_result_from_report(
+        validate_built_native_candles(
+            built,
+            native,
+            interval=interval,
+            min_samples=min_samples,
+            value_rel_tol=value_rel_tol,
+            value_abs_tol=value_abs_tol,
+            max_value_mismatches=max_value_mismatches,
+        )
+    )
+
+
+def _refresh_market_data_once(
+    *,
+    data_dir: Path,
+    stock_token_inst_ids: set[str] | None = None,
+    ticker_rows: list[dict] | None = None,
+    limit: int = 10,
+    symbols: tuple[str, ...] = (),
+    days: int = 180,
+    intervals: tuple[str, ...] = ("5m", "15m", "1h"),
+    fetcher=None,
+    incremental_fetcher=None,
+    now_ms: int | None = None,
+    max_concurrency: int | None = None,
+) -> dict:
+    from mu_strategy.market_data.trusted_data.refresh import (
+        DEFAULT_REQUEST_MAX_CONCURRENCY,
+        RefreshTrustedMarketDataRequest,
+        refresh_with_okx_provider,
+    )
+    from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+
+    run = refresh_with_okx_provider(
+        TrustedDataStore(data_dir=Path(data_dir)),
+        RefreshTrustedMarketDataRequest(
+            requested_intervals=intervals,
+            days=days,
+            limit=limit,
+            symbols=symbols,
+            stock_token_inst_ids=stock_token_inst_ids,
+            now_ms=now_ms,
+            max_concurrency=max_concurrency if max_concurrency is not None else DEFAULT_REQUEST_MAX_CONCURRENCY,
+        ),
+        ticker_rows=ticker_rows,
+        history_fetcher=fetcher,
+        incremental_fetcher=incremental_fetcher,
+        history_days_fallback=days,
+    )
+    return run.to_manifest()
+
+
 def _ohlcv_candle(
     *,
     open: float = 100.0,
@@ -1073,7 +1151,7 @@ def _fake_fetcher(symbol: str, interval: str, *, days: int) -> list[Candle]:
     five_minute = _five_minute_candles(days=logical_days)
     if interval == "5m":
         return five_minute
-    from mu_strategy.market_data.trusted import aggregate_candles
+    from mu_strategy.market_data.trusted_data.validation import aggregate_candles
 
     return aggregate_candles(five_minute, interval=interval)
 
