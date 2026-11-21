@@ -298,6 +298,19 @@ class TrustedDataStore:
                     last_segment_id,
                     last_candidate_rows[-1],
                 )
+        for segment_id, segment_candles in logical_partitions.items():
+            if segment_id == first_logical_segment_id:
+                continue
+            existing_path = self.segment_path(symbol, interval, segment_id)
+            if not existing_path.exists():
+                continue
+            existing_rows = self.read_csv(existing_path)
+            _validate_segment_candles(existing_rows, segment_id=segment_id)
+            if segment_candles[0].open_time_ms < existing_rows[0].open_time_ms:
+                raise SegmentCorrectionError(
+                    f"canonical trusted segment does not cover logical month start: "
+                    f"{symbol}/{interval}/{segment_id}"
+                )
         for segment_id, candidate_rows in physical_partitions.items():
             canonical_source = self.segment_source_file(symbol, interval, segment_id)
             path = self.segment_path(symbol, interval, segment_id)
@@ -357,6 +370,7 @@ class TrustedDataStore:
                     segment_id,
                     candidate_rows[0].open_time_ms,
                     candidate_rows[-1].open_time_ms,
+                    require_full_coverage=is_closed,
                 )
                 if segment_id == first_logical_segment_id
                 and (
@@ -458,6 +472,10 @@ class TrustedDataStore:
                     / f"{segment_id}.partial-{expanded[0].open_time_ms}.csv"
                 )
                 expanded_path = self._segment_path_from_source(expanded_source)
+                if expanded_path.exists():
+                    raise SegmentCorrectionError(
+                        f"closed trusted segment cannot grow: {symbol}/{interval}/{segment_id}"
+                    )
                 self.write_csv(expanded, expanded_path)
                 physical_rows_by_segment[segment_id] = expanded
                 source_files_by_segment[segment_id] = expanded_source
@@ -548,6 +566,8 @@ class TrustedDataStore:
         segment_id: str,
         first_timestamp_ms: int,
         last_timestamp_ms: int,
+        *,
+        require_full_coverage: bool = False,
     ) -> tuple[int, Path, Path] | None:
         segment_dir = self.data_dir / self.segment_source_root(symbol, interval)
         if not segment_dir.exists():
@@ -573,6 +593,8 @@ class TrustedDataStore:
             if rows[-1].open_time_ms + step_ms < first_timestamp_ms:
                 continue
             covers_end = rows[-1].open_time_ms >= last_timestamp_ms
+            if require_full_coverage and not covers_end:
+                continue
             candidates.append((not covers_end, partial_start_ms, source_file, path))
         if not candidates:
             return None

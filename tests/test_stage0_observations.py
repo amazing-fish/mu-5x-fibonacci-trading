@@ -358,6 +358,28 @@ class Stage0ObservationContractTests(unittest.TestCase):
             self.assertEqual(acknowledged_log, path.read_bytes())
             self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
 
+        # Also verify exact 160-byte truncation (losing slot 1 after seq=3) fails closed without truncating cycle 3!
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            repository.append_cycle(_cycle("cycle-1", "obs-1"))
+            repository.append_cycle(_cycle("cycle-2", "obs-2"))
+            repository.append_cycle(_cycle("cycle-3", "obs-3"))
+            self.assertEqual(320, repository.commit_path.stat().st_size)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            repository.commit_path.write_bytes(repository.commit_path.read_bytes()[:160])
+
+            slot0_state, has_unreadable = repository.inspect_commit_slots()
+            self.assertEqual(2, slot0_state.seq)
+            self.assertTrue(has_unreadable)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-4", "obs-4"))
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
         # Also verify a torn short write of slot 1 (between 160 and 320 bytes) fails closed without truncating.
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
@@ -452,23 +474,54 @@ class Stage0ObservationContractTests(unittest.TestCase):
             self.assertFalse(repository.commit_path.exists())
             self.assertTrue(Path(f"{path}.commit.staging").exists())
 
-            # Retry after fault clears completes migration and appends second cycle cleanly.
-            repository.append_cycle(second)
+            # Retry after fault clears completes migration, writes full 2-slot commit, and syncs marker removal.
+            staging_exists_at_dir_fsync: list[bool] = []
+            with patch(
+                "mu_strategy.observations._fsync_directory",
+                side_effect=lambda _d: staging_exists_at_dir_fsync.append(Path(f"{path}.commit.staging").exists()),
+            ):
+                repository.append_cycle(second)
             self.assertFalse(Path(f"{path}.commit.staging").exists())
+            self.assertEqual([True, True, False], staging_exists_at_dir_fsync)
             self.assertTrue(repository.commit_path.exists())
+            self.assertEqual(320, repository.commit_path.stat().st_size)
             self.assertEqual((first, second), repository.read_cycles())
 
-            # Symmetric partial state (commit exists, index missing, durable staging marker present) also retries cleanly.
+            # Symmetric partial state (commit exists, index missing, durable staging marker present) MUST
+            # rebuild .index strictly up to existing .commit WITHOUT committing uncommitted trailing bytes!
+            uncommitted_extra = _cycle("cycle-uncommitted", "obs-uncommitted")
+            with path.open("ab") as handle:
+                handle.write((uncommitted_extra.to_json() + "\n").encode("utf-8"))
             repository.index_path.unlink()
             Path(f"{path}.commit.staging").write_bytes(b"migrating\n")
-            repository.append_cycle(third)
+            rebuild_dir_fsync_marker_states: list[bool] = []
+            with patch(
+                "mu_strategy.observations._fsync_directory",
+                side_effect=lambda _d: rebuild_dir_fsync_marker_states.append(Path(f"{path}.commit.staging").exists()),
+            ):
+                repository.append_cycle(third)
             self.assertFalse(Path(f"{path}.commit.staging").exists())
+            self.assertEqual([True, False], rebuild_dir_fsync_marker_states)
+            # Uncommitted extra cycle was truncated by normal repair, never promoted into commit!
             self.assertEqual((first, second, third), repository.read_cycles())
+
+            # Retry cleanup path (both sidecars exist + surviving marker) must also sync marker removal.
+            Path(f"{path}.commit.staging").write_bytes(b"migrating\n")
+            cleanup_marker_states: list[bool] = []
+            fourth = _cycle("cycle-d", "obs-d")
+            with patch(
+                "mu_strategy.observations._fsync_directory",
+                side_effect=lambda _d: cleanup_marker_states.append(Path(f"{path}.commit.staging").exists()),
+            ):
+                repository.append_cycle(fourth)
+            self.assertFalse(Path(f"{path}.commit.staging").exists())
+            self.assertEqual([True, False], cleanup_marker_states)
+            self.assertEqual((first, second, third, fourth), repository.read_cycles())
 
             # Externally deleting .commit or .index on an already-migrated repo (no staging marker) still fails closed.
             repository.commit_path.unlink()
             with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
-                repository.append_cycle(_cycle("cycle-d", "obs-d"))
+                repository.append_cycle(_cycle("cycle-e", "obs-e"))
 
     def test_oversized_cycle_rejected_before_writing_and_limit_boundary_matches_readers(self):
         with TemporaryDirectory() as tmp:

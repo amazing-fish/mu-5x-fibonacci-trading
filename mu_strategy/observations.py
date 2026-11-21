@@ -624,14 +624,20 @@ class JsonlObservationRepository:
                 file_locks.unlock_file(stream)
 
     def inspect_commit_slots(self) -> tuple[ObservationCommitState | None, bool]:
-        """Inspect both ping-pong commit slots, returning ``(highest_valid_state, has_unreadable_slot)``."""
+        """Inspect both ping-pong commit slots, returning ``(highest_valid_state, has_unreadable_slot)``.
+
+        Every repository initialized or migrated by this code maintains a 2-slot (320-byte) commit file.
+        Any file length other than ``2 * _COMMIT_SLOT_BYTES`` (including exact 160-byte truncation of
+        slot 1) sets ``has_unreadable_slot=True`` so automatic tail repair will never truncate bytes that
+        a missing or damaged second slot could have acknowledged.
+        """
         try:
             raw = self.commit_path.read_bytes()
         except FileNotFoundError:
             return None, False
         if not raw or len(raw) > 2 * _COMMIT_SLOT_BYTES:
             raise ObservationCorruptionError("corrupted observation commit boundary")
-        has_unreadable_slot = len(raw) not in (_COMMIT_SLOT_BYTES, 2 * _COMMIT_SLOT_BYTES)
+        has_unreadable_slot = len(raw) != 2 * _COMMIT_SLOT_BYTES
         candidates: list[ObservationCommitState] = []
         slot_count = len(raw) // _COMMIT_SLOT_BYTES
         for slot_idx in range(slot_count):
@@ -1159,22 +1165,77 @@ class JsonlObservationRepository:
         except OSError:
             pass
 
+    def _open_sync_commit_handle(self):
+        """Open existing commit file with write-through I/O so slot writes hit stable storage before returning."""
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            import msvcrt
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            generic_read_write = 0x80000000 | 0x40000000
+            share_all = 0x00000001 | 0x00000002 | 0x00000004
+            open_existing = 3
+            file_flag_write_through = 0x80000000
+            invalid_handle = ctypes.c_void_p(-1).value
+            win_handle = kernel32.CreateFileW(
+                str(self.commit_path),
+                generic_read_write,
+                share_all,
+                None,
+                open_existing,
+                file_flag_write_through,
+                None,
+            )
+            if win_handle in (None, invalid_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                fd = msvcrt.open_osfhandle(win_handle, 0)
+            except BaseException:
+                kernel32.CloseHandle(win_handle)
+                raise
+            try:
+                return os.fdopen(fd, "r+b", buffering=0)
+            except BaseException:
+                os.close(fd)
+                raise
+        sync_flag = getattr(os, "O_SYNC", 0) or getattr(os, "O_DSYNC", 0)
+        fd = os.open(self.commit_path, os.O_RDWR | sync_flag)
+        try:
+            return os.fdopen(fd, "r+b", buffering=0)
+        except BaseException:
+            os.close(fd)
+            raise
+
     def _write_commit_slot(self, state: ObservationCommitState) -> None:
+        """Update the target ping-pong slot via synchronous write-through I/O + fsync."""
         slot_bytes = _encode_commit_slot(state)
         slot_offset = (state.seq % 2) * _COMMIT_SLOT_BYTES
-        mode = "r+b" if self.commit_path.exists() else "w+b"
-        with self.commit_path.open(mode, buffering=0) as commit_handle:
+        with self._open_sync_commit_handle() as commit_handle:
             commit_handle.seek(slot_offset)
             _write_all(commit_handle, slot_bytes)
             os.fsync(commit_handle.fileno())
 
     def _write_commit_slot_atomic(self, state: ObservationCommitState) -> None:
-        """Publish an initial commit slot atomically so partial writes never poison retryable init."""
+        """Publish an initial 2-slot (320-byte) commit file atomically so partial init never poisons retries."""
         slot_bytes = _encode_commit_slot(state)
         tmp_path = self.path.parent / f".{self.commit_path.name}.init-{uuid.uuid4().hex}"
         try:
             with tmp_path.open("wb", buffering=0) as tmp_handle:
-                _write_all(tmp_handle, slot_bytes)
+                # Populate both ping-pong slots so every repository starts with a full 2-slot commit file.
+                _write_all(tmp_handle, slot_bytes + slot_bytes)
                 os.fsync(tmp_handle.fileno())
             os.replace(tmp_path, self.commit_path)
         except BaseException:
@@ -1216,27 +1277,100 @@ class JsonlObservationRepository:
             self._fsync_parent_directory()
             return initial, False
 
-        if (not commit_exists and not index_exists) or (
-            commit_staging.exists() and (not commit_exists or not index_exists)
-        ):
+        if not commit_exists and (not index_exists or commit_staging.exists()):
             return self._bootstrap_legacy_storage(commit_staging=commit_staging), False
+
+        if commit_exists and not index_exists and commit_staging.exists():
+            commit, has_unreadable_slot = self.inspect_commit_slots()
+            if commit is None:
+                raise OSError("observation commit boundary is unreadable")
+            self._rebuild_index_to_commit_boundary(commit, commit_staging=commit_staging)
+            return commit, has_unreadable_slot
 
         if not commit_exists or not index_exists:
             raise OSError("observation commit boundary or index is missing for non-empty log")
 
         if commit_staging.exists():
-            # Prior legacy migration published both files; ensure their directory entries are durable,
-            # then remove the marker.
+            # Prior migration published both sidecars; sync their directory entries, remove the
+            # marker, and sync marker removal before allowing another append.
             self._fsync_parent_directory()
             commit_staging.unlink()
+            self._fsync_parent_directory()
 
         commit, has_unreadable_slot = self.inspect_commit_slots()
         if commit is None:
             raise OSError("observation commit boundary is unreadable")
         return commit, has_unreadable_slot
 
+    def _rebuild_index_to_commit_boundary(
+        self,
+        commit: ObservationCommitState,
+        *,
+        commit_staging: Path,
+    ) -> None:
+        """Rebuild a missing index strictly up to ``commit.offset``, leaving any trailing bytes for normal repair."""
+        if self.path.stat().st_size < commit.offset:
+            raise OSError("observation log truncated before durable commit boundary")
+        seq = 0
+        offset = 0
+        prefix_max = -1
+        chain = _ZERO_CHAIN_SHA256
+        index_chunks: list[bytes] = []
+        with self.path.open("rb") as handle:
+            while offset < commit.offset:
+                start = offset
+                remaining = commit.offset - offset
+                raw = handle.readline(min(_MAX_RECORD_BYTES + 1, remaining))
+                if not raw:
+                    raise OSError("observation log ended before durable commit boundary")
+                if len(raw) > _MAX_RECORD_BYTES or not raw.endswith(b"\n"):
+                    raise OSError("committed observation record incomplete or oversized")
+                cycle = _decode_cycle_bytes(raw)
+                prefix_max = cycle.created_at_ms if seq == 0 else max(prefix_max, cycle.created_at_ms)
+                cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
+                content_hash16 = bytes.fromhex(canonical_sha256(cycle.to_dict()))[:16]
+                symbols_hash16 = _symbols_hash16(cycle)
+                entry = _pack_index_entry(
+                    offset=start,
+                    length=len(raw),
+                    created_at_ms=cycle.created_at_ms,
+                    prefix_max_created_at_ms=prefix_max,
+                    cycle_id_hash16=cycle_id_hash16,
+                    content_hash16=content_hash16,
+                    symbols_hash16=symbols_hash16,
+                )
+                index_chunks.append(entry)
+                chain = hashlib.sha256(bytes.fromhex(chain) + raw + entry).hexdigest()
+                seq += 1
+                offset += len(raw)
+        if (
+            seq != commit.seq
+            or offset != commit.offset
+            or seq * _INDEX_ENTRY_BYTES != commit.index_offset
+            or prefix_max != commit.prefix_max_created_at_ms
+            or chain != commit.chain_sha256
+        ):
+            raise OSError("rebuilt observation index disagrees with durable commit boundary")
+
+        tmp_index = self.path.parent / f".{self.index_path.name}.rebuild-{uuid.uuid4().hex}"
+        try:
+            with tmp_index.open("wb", buffering=0) as idx_handle:
+                if index_chunks:
+                    _write_all(idx_handle, b"".join(index_chunks))
+                os.fsync(idx_handle.fileno())
+            os.replace(tmp_index, self.index_path)
+            self._fsync_parent_directory()
+            commit_staging.unlink()
+            self._fsync_parent_directory()
+        except BaseException:
+            try:
+                tmp_index.unlink()
+            except OSError:
+                pass
+            raise
+
     def _bootstrap_legacy_storage(self, *, commit_staging: Path) -> ObservationCommitState:
-        """Stage and atomically publish durable commit + index sidecars for a legacy JSONL log."""
+        """Stage and atomically publish durable 2-slot commit + index sidecars for a legacy JSONL log."""
         seq = 0
         offset = 0
         index_offset = 0
@@ -1286,11 +1420,8 @@ class JsonlObservationRepository:
                     _write_all(idx_handle, b"".join(index_chunks))
                 os.fsync(idx_handle.fileno())
             with tmp_commit.open("wb", buffering=0) as commit_handle:
-                if state.seq % 2 == 1:
-                    # Populate both slots with the valid odd-seq state so .commit has zero invalid slots
-                    # while keeping slot 0 ready to accept the next even sequence number (state.seq + 1).
-                    _write_all(commit_handle, slot_bytes)
-                _write_all(commit_handle, slot_bytes)
+                # Always initialize both ping-pong slots (320 bytes) for every migrated repository.
+                _write_all(commit_handle, slot_bytes + slot_bytes)
                 os.fsync(commit_handle.fileno())
             # Persist and directory-sync the migration marker BEFORE exposing either final sidecar so
             # a power loss after the first os.replace() always leaves the marker durable for retry.
@@ -1302,6 +1433,7 @@ class JsonlObservationRepository:
             os.replace(tmp_commit, self.commit_path)
             self._fsync_parent_directory()
             commit_staging.unlink()
+            self._fsync_parent_directory()
             return state
         except BaseException:
             for leftover in (tmp_index, tmp_commit):
