@@ -445,7 +445,8 @@ def _decode_cycle_bytes(raw: bytes, *, strict_unique: bool = True) -> Stage0Obse
 
 
 _COMMIT_SLOT_BYTES = 160
-_INDEX_ENTRY_STRUCT = struct.Struct("<QQQq16s16s")
+_COMMIT_SLOT_VERSION = "v2"
+_INDEX_ENTRY_STRUCT = struct.Struct("<QQQq16s16s16s")
 _INDEX_ENTRY_BYTES = _INDEX_ENTRY_STRUCT.size
 _ZERO_CHAIN_SHA256 = "0" * 64
 
@@ -467,6 +468,12 @@ class ObservationIndexEntry:
     prefix_max_created_at_ms: int
     cycle_id_hash16: bytes
     content_hash16: bytes
+    symbols_hash16: bytes
+
+
+def _symbols_hash16(cycle: Stage0ObservationCycle) -> bytes:
+    symbols = sorted({observation.symbol for observation in cycle.observations})
+    return hashlib.sha256(canonical_json(symbols).encode("utf-8")).digest()[:16]
 
 
 def _write_all(handle, payload: bytes) -> None:
@@ -481,7 +488,7 @@ def _write_all(handle, payload: bytes) -> None:
 
 def _encode_commit_slot(state: ObservationCommitState) -> bytes:
     payload = (
-        f"v1 {state.seq} {state.offset} {state.index_offset} "
+        f"{_COMMIT_SLOT_VERSION} {state.seq} {state.offset} {state.index_offset} "
         f"{state.prefix_max_created_at_ms} {state.chain_sha256}"
     )
     tag = hashlib.sha256(payload.encode("ascii")).hexdigest()[:16]
@@ -498,7 +505,7 @@ def _decode_commit_slot(raw: bytes) -> ObservationCommitState | None:
         parts = raw.decode("ascii").strip().split()
     except UnicodeDecodeError:
         return None
-    if len(parts) != 7 or parts[0] != "v1":
+    if len(parts) != 7 or parts[0] != _COMMIT_SLOT_VERSION:
         return None
     try:
         seq = int(parts[1])
@@ -519,7 +526,7 @@ def _decode_commit_slot(raw: bytes) -> ObservationCommitState | None:
         or not _SHA256_PATTERN.fullmatch(chain_sha256)
     ):
         return None
-    payload = f"v1 {seq} {offset} {index_offset} {prefix_max} {chain_sha256}"
+    payload = f"{_COMMIT_SLOT_VERSION} {seq} {offset} {index_offset} {prefix_max} {chain_sha256}"
     expected_tag = hashlib.sha256(payload.encode("ascii")).hexdigest()[:16]
     if tag != expected_tag:
         return None
@@ -540,6 +547,7 @@ def _pack_index_entry(
     prefix_max_created_at_ms: int,
     cycle_id_hash16: bytes,
     content_hash16: bytes,
+    symbols_hash16: bytes,
 ) -> bytes:
     return _INDEX_ENTRY_STRUCT.pack(
         offset,
@@ -548,13 +556,16 @@ def _pack_index_entry(
         prefix_max_created_at_ms,
         cycle_id_hash16,
         content_hash16,
+        symbols_hash16,
     )
 
 
 def _unpack_index_entry(raw: bytes) -> ObservationIndexEntry:
     if len(raw) != _INDEX_ENTRY_BYTES:
         raise ObservationCorruptionError("truncated observation index entry")
-    offset, length, created_at_ms, prefix_max, cycle_id_hash16, content_hash16 = _INDEX_ENTRY_STRUCT.unpack(raw)
+    offset, length, created_at_ms, prefix_max, cycle_id_hash16, content_hash16, symbols_hash16 = (
+        _INDEX_ENTRY_STRUCT.unpack(raw)
+    )
     return ObservationIndexEntry(
         offset=offset,
         length=length,
@@ -562,6 +573,7 @@ def _unpack_index_entry(raw: bytes) -> ObservationIndexEntry:
         prefix_max_created_at_ms=prefix_max,
         cycle_id_hash16=cycle_id_hash16,
         content_hash16=content_hash16,
+        symbols_hash16=symbols_hash16,
     )
 
 
@@ -717,6 +729,66 @@ class JsonlObservationRepository:
             except OSError as exc:
                 raise ObservationCorruptionError(f"observation repository read failed: {type(exc).__name__}") from exc
 
+    def repair_uncommitted_tail(self) -> bool:
+        """Truncate and fsync any uncommitted trailing log/index bytes past the durable commit boundary."""
+        try:
+            if not self.path.parent.exists():
+                return False
+            with self.publication_fence():
+                if self.invalid_marker_path.exists():
+                    raise OSError("observation repository has an unresolved invalid marker")
+                commit = self.read_commit_state()
+                if commit is None:
+                    return False
+                if not self.path.exists() or not self.index_path.exists():
+                    raise OSError("observation log or index missing for committed repository")
+                return self._repair_uncommitted_tail_locked(commit)
+        except (OSError, ObservationCorruptionError) as exc:
+            raise ObservationWriteError(f"observation commit-boundary repair failed: {type(exc).__name__}: {exc}") from exc
+
+    def _repair_uncommitted_tail_locked(self, commit: ObservationCommitState) -> bool:
+        """Must be called under publication_fence(). Truncates verified uncommitted trailing bytes only."""
+        log_size = self.path.stat().st_size
+        index_size = self.index_path.stat().st_size
+        if log_size < commit.offset or index_size < commit.index_offset:
+            raise OSError("observation log or index truncated before durable commit boundary")
+        if log_size == commit.offset and index_size == commit.index_offset:
+            return False
+
+        # Verify the committed boundary is intact before discarding uncommitted trailing bytes.
+        if commit.seq > 0:
+            with self.index_path.open("rb") as idx_handle, self.path.open("rb") as log_handle:
+                last_entry = self.read_index_entry(idx_handle, commit.seq - 1)
+                if (
+                    last_entry.offset + last_entry.length != commit.offset
+                    or last_entry.prefix_max_created_at_ms != commit.prefix_max_created_at_ms
+                ):
+                    raise OSError("committed index boundary disagrees with durable commit state")
+                last_cycle, last_digest = self.read_cycle_at(
+                    log_handle, offset=last_entry.offset, length=last_entry.length
+                )
+                if (
+                    last_cycle.created_at_ms != last_entry.created_at_ms
+                    or hashlib.sha256(last_cycle.cycle_id.encode("utf-8")).digest()[:16] != last_entry.cycle_id_hash16
+                    or bytes.fromhex(last_digest)[:16] != last_entry.content_hash16
+                    or _symbols_hash16(last_cycle) != last_entry.symbols_hash16
+                ):
+                    raise OSError("committed log boundary disagrees with durable index state")
+
+        try:
+            if log_size > commit.offset:
+                with self.path.open("r+b", buffering=0) as log_handle:
+                    log_handle.truncate(commit.offset)
+                    os.fsync(log_handle.fileno())
+            if index_size > commit.index_offset:
+                with self.index_path.open("r+b", buffering=0) as index_handle:
+                    index_handle.truncate(commit.index_offset)
+                    os.fsync(index_handle.fileno())
+        except BaseException:
+            self._quarantine_invalid_marker("commit-boundary-repair")
+            raise
+        return True
+
     def append_cycle(self, cycle: Stage0ObservationCycle) -> None:
         encoded = (cycle.to_json() + "\n").encode("utf-8")
         if len(encoded) > _MAX_RECORD_BYTES:
@@ -730,8 +802,10 @@ class JsonlObservationRepository:
                     raise OSError("observation repository has an unresolved invalid marker")
                 self._flush_dirsync_marker()
                 commit = self._ensure_storage_initialized()
+                self._repair_uncommitted_tail_locked(commit)
                 cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
                 content_hash16 = hashlib.sha256(encoded[:-1]).digest()[:16]
+                symbols_hash16 = _symbols_hash16(cycle)
                 new_prefix_max = (
                     cycle.created_at_ms
                     if commit.seq == 0
@@ -749,6 +823,7 @@ class JsonlObservationRepository:
                         prefix_max_created_at_ms=new_prefix_max,
                         cycle_id_hash16=cycle_id_hash16,
                         content_hash16=content_hash16,
+                        symbols_hash16=symbols_hash16,
                     )
                     new_chain = hashlib.sha256(
                         bytes.fromhex(commit.chain_sha256) + encoded + index_entry
@@ -1063,12 +1138,29 @@ class JsonlObservationRepository:
             _write_all(commit_handle, slot_bytes)
             os.fsync(commit_handle.fileno())
 
+    def _write_commit_slot_atomic(self, state: ObservationCommitState) -> None:
+        """Publish an initial commit slot atomically so partial writes never poison retryable init."""
+        slot_bytes = _encode_commit_slot(state)
+        tmp_path = self.path.parent / f".{self.commit_path.name}.init-{uuid.uuid4().hex}"
+        try:
+            with tmp_path.open("wb", buffering=0) as tmp_handle:
+                _write_all(tmp_handle, slot_bytes)
+                os.fsync(tmp_handle.fileno())
+            os.replace(tmp_path, self.commit_path)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+
     def _ensure_storage_initialized(self) -> ObservationCommitState:
         """Initialize durable commit + coverage index on initial log creation or legacy bootstrap."""
         log_exists = self.path.exists()
         log_size = self.path.stat().st_size if log_exists else 0
         commit_exists = self.commit_path.exists()
         index_exists = self.index_path.exists()
+        commit_staging = Path(f"{self.path}.commit.staging")
 
         if log_size == 0:
             if commit_exists:
@@ -1082,7 +1174,8 @@ class JsonlObservationRepository:
                 prefix_max_created_at_ms=-1,
                 chain_sha256=_ZERO_CHAIN_SHA256,
             )
-            self._write_commit_slot(initial)
+            if not commit_exists:
+                self._write_commit_slot_atomic(initial)
             if not log_exists:
                 self.path.open("ab").close()
             if not index_exists or self.index_path.stat().st_size != 0:
@@ -1091,19 +1184,24 @@ class JsonlObservationRepository:
             self._fsync_parent_directory()
             return initial
 
-        if not commit_exists and not index_exists:
-            return self._bootstrap_legacy_storage()
+        if not commit_exists and (not index_exists or commit_staging.exists()):
+            return self._bootstrap_legacy_storage(commit_staging=commit_staging)
 
         if not commit_exists or not index_exists:
             raise OSError("observation commit boundary or index is missing for non-empty log")
+
+        if commit_staging.exists():
+            # Prior legacy migration published both files but failed before parent directory fsync completed.
+            self._fsync_parent_directory()
+            commit_staging.unlink()
 
         commit = self.read_commit_state()
         if commit is None:
             raise OSError("observation commit boundary is unreadable")
         return commit
 
-    def _bootstrap_legacy_storage(self) -> ObservationCommitState:
-        """Build durable commit and index files for a pre-existing legacy JSONL log."""
+    def _bootstrap_legacy_storage(self, *, commit_staging: Path) -> ObservationCommitState:
+        """Stage and atomically publish durable commit + index sidecars for a legacy JSONL log."""
         seq = 0
         offset = 0
         index_offset = 0
@@ -1122,6 +1220,7 @@ class JsonlObservationRepository:
                 prefix_max = cycle.created_at_ms if seq == 0 else max(prefix_max, cycle.created_at_ms)
                 cycle_id_hash16 = hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16]
                 content_hash16 = bytes.fromhex(canonical_sha256(cycle.to_dict()))[:16]
+                symbols_hash16 = _symbols_hash16(cycle)
                 entry = _pack_index_entry(
                     offset=start,
                     length=len(raw),
@@ -1129,16 +1228,13 @@ class JsonlObservationRepository:
                     prefix_max_created_at_ms=prefix_max,
                     cycle_id_hash16=cycle_id_hash16,
                     content_hash16=content_hash16,
+                    symbols_hash16=symbols_hash16,
                 )
                 index_chunks.append(entry)
                 chain = hashlib.sha256(bytes.fromhex(chain) + raw + entry).hexdigest()
                 seq += 1
                 offset = handle.tell()
                 index_offset += _INDEX_ENTRY_BYTES
-        with self.index_path.open("wb", buffering=0) as idx_handle:
-            if index_chunks:
-                _write_all(idx_handle, b"".join(index_chunks))
-            os.fsync(idx_handle.fileno())
         state = ObservationCommitState(
             seq=seq,
             offset=offset,
@@ -1146,9 +1242,42 @@ class JsonlObservationRepository:
             prefix_max_created_at_ms=prefix_max,
             chain_sha256=chain,
         )
-        self._write_commit_slot(state)
-        self._fsync_parent_directory()
-        return state
+        slot_bytes = _encode_commit_slot(state)
+        tmp_index = self.path.parent / f".{self.index_path.name}.migrate-{uuid.uuid4().hex}"
+        tmp_commit = self.path.parent / f".{self.commit_path.name}.migrate-{uuid.uuid4().hex}"
+        try:
+            with tmp_index.open("wb", buffering=0) as idx_handle:
+                if index_chunks:
+                    _write_all(idx_handle, b"".join(index_chunks))
+                os.fsync(idx_handle.fileno())
+            with tmp_commit.open("wb", buffering=0) as commit_handle:
+                if state.seq % 2 == 1:
+                    _write_all(commit_handle, b"\x00" * _COMMIT_SLOT_BYTES)
+                _write_all(commit_handle, slot_bytes)
+                os.fsync(commit_handle.fileno())
+            # Record migration in progress before exposing index_path, and keep marker until
+            # parent directory fsync succeeds so any interruption remains recognizable and retryable.
+            with commit_staging.open("wb", buffering=0) as staging_handle:
+                _write_all(staging_handle, b"migrating\n")
+                os.fsync(staging_handle.fileno())
+            os.replace(tmp_index, self.index_path)
+            os.replace(tmp_commit, self.commit_path)
+            self._fsync_parent_directory()
+            commit_staging.unlink()
+            return state
+        except BaseException:
+            for leftover in (tmp_index, tmp_commit):
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
+            # Only remove commit_staging if neither final sidecar was exposed yet.
+            if not self.index_path.exists() and not self.commit_path.exists():
+                try:
+                    commit_staging.unlink()
+                except OSError:
+                    pass
+            raise
 
     def _ensure_parent_directories_staged(self) -> None:
         """Create missing parent directories atomically with a durable .dirsync list before visibility."""

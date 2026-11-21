@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -404,6 +405,158 @@ class SignalReviewTests(unittest.TestCase):
             res2 = read_signal_review(data_dir2, self.window, clock=self.clock, scan_limit=4)["sources"]["observations"]
             self.assertEqual("incomplete", res2["state"])
             self.assertFalse(res2["complete"])
+
+    def test_damaged_evidence_index_returns_unavailable_instead_of_missing_above_scan_limit(self):
+        from mu_strategy.observations import _INDEX_ENTRY_BYTES
+        from mu_strategy.signal_review import _read_observations
+
+        cycles = [cycle(i, "wait", at=NOW - (15 - i) * 86_400_000) for i in range(10)]
+        self.initialize(cycles)
+        target = cycles[1]
+
+        # Validated index locates target above scan_limit.
+        valid = _read_observations(
+            self.log.path,
+            {"start_ms": 0, "end_ms": 2**63},
+            clock=self.clock,
+            display_limit=1,
+            scan_limit=4,
+            evidence_key=(target.cycle_id, target.observations[0].observation_id),
+        )
+        self.assertEqual("ok", valid["state"])
+        self.assertEqual(target.observations[0].observation_id, valid["evidence"]["observation_id"])
+
+        # Corrupt only cycle_id_hash16 of entry #1 (offsets & timestamps remain intact!).
+        raw_index = bytearray(self.log.index_path.read_bytes())
+        hash_offset = 1 * _INDEX_ENTRY_BYTES + 32  # after <QQQq (32 bytes)
+        raw_index[hash_offset] ^= 0xFF
+        self.log.index_path.write_bytes(bytes(raw_index))
+
+        damaged = _read_observations(
+            self.log.path,
+            {"start_ms": 0, "end_ms": 2**63},
+            clock=self.clock,
+            display_limit=1,
+            scan_limit=4,
+            evidence_key=(target.cycle_id, target.observations[0].observation_id),
+        )
+        self.assertEqual("unavailable", damaged["state"])
+        self.assertIsNone(damaged.get("evidence"))
+
+    def test_stale_index_after_same_length_prefix_repair_does_not_claim_complete_coverage(self):
+        ancient = [cycle(i, "wait", at=NOW - (25 - i) * 86_400_000, reason="reason-alpha") for i in range(8)]
+        recent = [cycle(100, "ready", at=NOW - 600_000), cycle(101, "wait", at=NOW)]
+        self.initialize([*ancient, *recent])
+
+        warm = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("ok", warm["state"])
+        self.assertTrue(warm["complete"])
+
+        # Same-length in-place edit in prefix (leaving .index and .commit untouched with stale timestamps/chain).
+        stat = self.log.path.stat()
+        raw = self.log.path.read_bytes()
+        updated = raw.replace(b"reason-alpha", b"reason-bravo", 1)
+        self.assertEqual(len(raw), len(updated))
+        self.log.path.write_bytes(updated)
+        os.utime(self.log.path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        # Must NOT trust the stale index to claim complete coverage; falls back to bounded scan -> incomplete.
+        after = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("incomplete", after["state"])
+        self.assertFalse(after["complete"])
+
+    def test_indexed_window_preserves_latest_all_for_prefix_only_symbols_independent_of_completeness(self):
+        btc_old_1 = cycle(1, "wait", at=NOW - 20 * 86_400_000, symbol="BTC-USDT-SWAP")
+        btc_old_2 = cycle(2, "ready", at=NOW - 19 * 86_400_000, symbol="BTC-USDT-SWAP")
+        eth_old = cycle(3, "wait", at=NOW - 18 * 86_400_000, symbol="ETH-USDT-SWAP")
+        more_ancient = [cycle(i, "wait", at=NOW - (17 - i) * 86_400_000, symbol=SYMBOL) for i in range(4, 10)]
+        recent_mu_1 = cycle(100, "ready", at=NOW - 600_000, symbol=SYMBOL)
+        recent_mu_2 = cycle(101, "wait", at=NOW, symbol=SYMBOL)
+        self.initialize([btc_old_1, btc_old_2, eth_old, *more_ancient, recent_mu_1, recent_mu_2])
+
+        # Complete indexed window (total=11 > scan_limit=4, suffix=2 <= 4).
+        source = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("ok", source["state"])
+        self.assertTrue(source["complete"])
+        latest_all_by_symbol = {row["symbol"]: row["observation_id"] for row in source["latest_all"]}
+        self.assertEqual(len(source["latest_all"]), len(latest_all_by_symbol), "latest_all must not duplicate symbols")
+        self.assertEqual(
+            {
+                "BTC-USDT-SWAP": btc_old_2.observations[0].observation_id,
+                "ETH-USDT-SWAP": eth_old.observations[0].observation_id,
+                SYMBOL: recent_mu_2.observations[0].observation_id,
+            },
+            latest_all_by_symbol,
+        )
+
+        # Incomplete indexed window (5 recent MU cycles > scan_limit=4) must STILL preserve BTC and ETH in latest_all.
+        for extra in range(102, 106):
+            self.log.append_cycle(cycle(extra, "wait", at=NOW + extra * 1000, symbol=SYMBOL))
+        inc = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("incomplete", inc["state"])
+        self.assertFalse(inc["complete"])
+        inc_by_symbol = {row["symbol"]: row["observation_id"] for row in inc["latest_all"]}
+        self.assertEqual(len(inc["latest_all"]), len(inc_by_symbol))
+        self.assertEqual(btc_old_2.observations[0].observation_id, inc_by_symbol["BTC-USDT-SWAP"])
+        self.assertEqual(eth_old.observations[0].observation_id, inc_by_symbol["ETH-USDT-SWAP"])
+        self.assertEqual("observation-105", inc_by_symbol[SYMBOL])
+
+    def test_refresh_verification_does_not_hold_publication_fence_during_full_log_digest(self):
+        from mu_strategy import signal_review as sr
+
+        self.initialize([cycle(1, "wait", at=NOW - 600_000), cycle(2, "ready", at=NOW)])
+        # Prime cache first so we also test a cache-hit refresh.
+        self.assertEqual("ok", self.read()["sources"]["observations"]["state"])
+
+        in_verify = threading.Event()
+        release_verify = threading.Event()
+        real_verify = sr._verify_snapshot_unlocked
+        reader_result = {}
+
+        def paused_verify(*args, **kwargs):
+            in_verify.set()
+            release_verify.wait()
+            return real_verify(*args, **kwargs)
+
+        def run_reader():
+            with patch.object(sr, "_verify_snapshot_unlocked", side_effect=paused_verify):
+                reader_result["obs"] = self.read()["sources"]["observations"]
+
+        reader = threading.Thread(target=run_reader)
+        reader.start()
+        try:
+            self.assertTrue(in_verify.wait(timeout=5), "reader did not reach unlocked verification")
+            # Exclusive writer publication_fence MUST acquire without blocking while full-log verification runs!
+            with self.log.publication_fence(wait=False):
+                pass
+            release_verify.set()
+            reader.join(timeout=5)
+        finally:
+            release_verify.set()
+            reader.join(timeout=5)
+
+        self.assertEqual("ok", reader_result["obs"]["state"])
+
+    def test_warm_cache_invalidates_and_rejects_when_index_offset_is_damaged(self):
+        from mu_strategy.observations import _INDEX_ENTRY_BYTES
+
+        ancient = [cycle(i, "wait", at=NOW - (20 - i) * 86_400_000) for i in range(8)]
+        recent = [cycle(100, "ready", at=NOW - 600_000), cycle(101, "wait", at=NOW)]
+        self.initialize([*ancient, *recent])
+
+        warm = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("ok", warm["state"])
+        self.assertTrue(warm["complete"])
+
+        # Damage entry #1 offset in .index while preserving exact file size and mtime, without touching .jsonl/.commit.
+        idx_stat = self.log.index_path.stat()
+        raw_index = bytearray(self.log.index_path.read_bytes())
+        raw_index[_INDEX_ENTRY_BYTES] ^= 0x01
+        self.log.index_path.write_bytes(bytes(raw_index))
+        os.utime(self.log.index_path, ns=(idx_stat.st_atime_ns, idx_stat.st_mtime_ns))
+
+        after = self.read(scan_limit=4)["sources"]["observations"]
+        self.assertEqual("unavailable", after["state"])
 
 
 if __name__ == "__main__":

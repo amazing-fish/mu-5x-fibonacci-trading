@@ -396,6 +396,115 @@ class EntryScannerTests(unittest.TestCase):
         self.assertEqual(candles[idx_c].open_time_ms, after_expiry.signal_time_ms)
         self.assertAlmostEqual(110.0, after_expiry.trigger_price)
 
+    def test_scan_entry_excludes_pre_coverage_history_from_order_replay_without_discarding_indicators(self):
+        from mu_strategy.core.trading_calendar import CalendarUnavailable, US_EQUITIES_CALENDAR
+        from mu_strategy.entry.scanner import scan_entry
+        from mu_strategy.indicators import macd, rsi
+        from mu_strategy.models import closes
+
+        # Build continuous 15m candles starting Dec 31, 2024 09:00 ET (14:00 UTC) — before
+        # us_equities_2025_2028_v1 lower coverage — through Jan 10, 2025 10:00 ET (15:00 UTC).
+        # Also test right after the lower boundary (Jan 2, 2025 10:15 ET) so RSI/MACD depend on Dec 2024 bars.
+        config = replace(
+            baseline_strategy_group("MU-USDT-SWAP").config,
+            trading_calendar_id=US_EQUITIES_CALENDAR,
+            trading_calendar_sha256=None,
+            entry_execution="second_pullback",
+            second_pullback_wait_bars=8,
+            trading_windows_et=(("09:45", "11:30"),),
+        )
+
+        # Part 1: Tight boundary crossing (Dec 31, 2024 -> Jan 2, 2025 10:15 ET) with REAL indicators (unmocked).
+        # 2025-01-01 is a holiday; 2025-01-02 09:45 ET (14:45 UTC) is the first open window in coverage.
+        dec_bars = [
+            Candle(_utc_ms(2024, 12, 31, 14, 0) + i * 900_000, 100.0 + i * 0.4, 101.0 + i * 0.4, 99.5 + i * 0.4, 100.3 + i * 0.4, 1000)
+            for i in range(30)
+        ]
+        jan2_bars = [
+            Candle(_utc_ms(2025, 1, 2, 14, 30), 112.0, 113.0, 111.5, 112.5, 1000),  # 09:30 ET (outside 09:45 window)
+            Candle(_utc_ms(2025, 1, 2, 14, 45), 112.5, 114.0, 111.9, 113.2, 1000),  # 09:45 ET (in window, signal)
+            Candle(_utc_ms(2025, 1, 2, 15, 0), 113.2, 114.5, 113.0, 114.0, 1000),   # 10:00 ET (in window)
+            Candle(_utc_ms(2025, 1, 2, 15, 15), 114.0, 115.0, 113.8, 114.6, 1000),  # 10:15 ET (in window, current)
+        ]
+        boundary_candles = dec_bars + jan2_bars
+        expected_rsi = rsi(closes(boundary_candles), 14)[-1]
+        expected_hist = macd(closes(boundary_candles))[2][-1]
+        jan_only_rsi = rsi(closes(jan2_bars), 14)[-1]
+        self.assertNotAlmostEqual(expected_rsi, jan_only_rsi)
+
+        dec_idx = len(dec_bars) - 2
+        jan2_sig_idx = len(dec_bars) + 1
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={b.open_time_ms: "green" for b in boundary_candles}),
+            patch(
+                "mu_strategy.entry.scanner.nearest_fib_retest_level",
+                side_effect=lambda _c, idx, _cfg: 110.0 if idx == dec_idx else (112.0 if idx == jan2_sig_idx else None),
+            ),
+        ):
+            boundary_res = scan_entry("MU-USDT-SWAP", boundary_candles, boundary_candles, config=config, lookback_bars=8)
+
+        # Dec 2024 bar is excluded from order replay (never raises CalendarUnavailable, never suppresses Jan 2 signal),
+        # while full Dec 2024 + Jan 2025 indicator history is preserved.
+        self.assertEqual("enter", boundary_res.action)
+        self.assertEqual(boundary_candles[jan2_sig_idx].open_time_ms, boundary_res.signal_time_ms)
+        self.assertAlmostEqual(112.0, boundary_res.trigger_price)
+        self.assertAlmostEqual(expected_rsi, boundary_res.rsi14)
+        self.assertAlmostEqual(expected_hist, boundary_res.macd_hist)
+
+        # Non-second_pullback lookback reaching across the lower coverage boundary also skips unsupported dates.
+        direct_cfg = replace(config, entry_execution="direct_next_open")
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={b.open_time_ms: "green" for b in boundary_candles}),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: 110.0 if idx == dec_idx else None),
+        ):
+            direct_res = scan_entry("MU-USDT-SWAP", boundary_candles, boundary_candles, config=direct_cfg, lookback_bars=16)
+        self.assertEqual("wait", direct_res.action)
+        self.assertIs(EntryDecisionCode.NO_RECENT_CONFIRMED_FIB_RETEST, direct_res.decision_code)
+
+        # Part 2: History starting in Dec 2024 ending Jan 10, 2025 10:00 ET (15:00 UTC), verifying chronological
+        # suppression within the supported 2025 range (A at Jan 8 suppresses B, then C on Jan 10 becomes active).
+        jan_seq_start = _utc_ms(2025, 1, 10, 14, 45)  # 09:45 ET on Jan 10, 2025
+        # Construct 12 supported 15m bars across Jan 8 & Jan 10 (Jan 9, 2025 is Carter National Day of Mourning holiday!)
+        jan8_bars = [
+            Candle(_utc_ms(2025, 1, 8, 14, 45) + i * 900_000, 106.0, 107.0, 105.5, 106.5, 1000)
+            for i in range(9)
+        ]
+        jan10_bars = [
+            Candle(jan_seq_start, 110.0, 111.0, 109.8, 110.5, 1000),               # 09:45 ET (C)
+            Candle(jan_seq_start + 900_000, 110.6, 111.5, 110.4, 111.0, 1000),     # 10:00 ET (current bar)
+        ]
+        jan8_bars[0] = Candle(jan8_bars[0].open_time_ms, 100.0, 101.0, 99.8, 100.5, 1000)   # A
+        jan8_bars[2] = Candle(jan8_bars[2].open_time_ms, 105.0, 106.0, 104.8, 105.2, 1000)  # B (suppressed by A)
+        full_candles = dec_bars + jan8_bars + jan10_bars
+        idx_a = len(dec_bars)
+        idx_b = len(dec_bars) + 2
+        idx_c = len(dec_bars) + len(jan8_bars)
+        fib_map = {dec_idx: 99.0, idx_a: 100.0, idx_b: 105.0, idx_c: 110.0}
+
+        with (
+            patch("mu_strategy.entry.scanner.build_hourly_context", return_value={b.open_time_ms: "green" for b in full_candles}),
+            patch("mu_strategy.entry.scanner.rsi", return_value=[55.0] * len(full_candles)),
+            patch("mu_strategy.entry.scanner.macd", return_value=([0.0] * len(full_candles), [0.0] * len(full_candles), [0.2] * len(full_candles))),
+            patch("mu_strategy.entry.scanner.nearest_fib_retest_level", side_effect=lambda _c, idx, _cfg: fib_map.get(idx)),
+        ):
+            jan10_res = scan_entry("MU-USDT-SWAP", full_candles, full_candles, config=config, lookback_bars=8)
+            # Without C, suppressed B must still NOT be revived once A expires.
+            fib_map.pop(idx_c)
+            jan10_no_c = scan_entry("MU-USDT-SWAP", full_candles, full_candles, config=config, lookback_bars=8)
+
+        self.assertEqual("enter", jan10_res.action)
+        self.assertEqual(full_candles[idx_c].open_time_ms, jan10_res.signal_time_ms)
+        self.assertAlmostEqual(110.0, jan10_res.trigger_price)
+        self.assertEqual("wait", jan10_no_c.action)
+        self.assertIs(EntryDecisionCode.NO_RECENT_CONFIRMED_FIB_RETEST, jan10_no_c.decision_code)
+
+        # Part 3: Current candle outside calendar coverage or non-coverage calendar failures still fail closed.
+        with self.assertRaises(CalendarUnavailable):
+            scan_entry("MU-USDT-SWAP", dec_bars, dec_bars, config=config, lookback_bars=8)
+        with patch("mu_strategy.core.trading_calendar.ZoneInfo", side_effect=RuntimeError("tz missing")):
+            with self.assertRaises(CalendarUnavailable):
+                scan_entry("MU-USDT-SWAP", boundary_candles, boundary_candles, config=config, lookback_bars=8)
+
     def test_scan_entry_second_pullback_places_limit_when_current_close_moved_away_from_fib(self):
         from mu_strategy.entry.scanner import scan_entry
 

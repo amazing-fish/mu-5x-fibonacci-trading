@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 
 from mu_strategy.core.market_context import build_hourly_context
 from mu_strategy.core.risk import resolve_initial_stop
-from mu_strategy.core.trading_calendar import evaluate_trading_window
+from mu_strategy.core.trading_calendar import CalendarCoverageError, evaluate_trading_window
 from mu_strategy.indicators import macd, rsi
 from mu_strategy.models import (
     Candle,
@@ -514,7 +514,7 @@ def _latest_recent_signal(
         )
     for index in range(len(candles) - 1, start - 1, -1):
         candle = candles[index]
-        if not is_preferred_us_cash_window(candle.open_time_ms, config):
+        if not _is_historical_trading_window(candle.open_time_ms, config):
             continue
         fib_level = nearest_fib_retest_level(candles, index, config)
         if fib_level is None:
@@ -558,11 +558,11 @@ def _active_second_pullback_signal(
             if index > expires_index:
                 pending = None
             else:
-                if candle.low <= pending_fib and is_preferred_us_cash_window(candle.open_time_ms, config):
+                if candle.low <= pending_fib and _is_historical_trading_window(candle.open_time_ms, config):
                     pending = None
                 continue
 
-        if not is_preferred_us_cash_window(candle.open_time_ms, config):
+        if not _is_historical_trading_window(candle.open_time_ms, config):
             continue
         regime = hourly_context.get(candle.open_time_ms, "yellow")
         if regime not in allowed_regimes:
@@ -598,6 +598,14 @@ def _active_second_pullback_signal(
     if len(candles) > expires_index or sig_idx < min_signal_index:
         return None
     return (sig_idx, sig_candle, fib_level, sig_stop)
+
+
+def _is_historical_trading_window(open_time_ms: int, config: StrategyConfig) -> bool:
+    """Evaluate trading-window eligibility for a historical bar, excluding dates outside calendar coverage."""
+    try:
+        return is_preferred_us_cash_window(open_time_ms, config)
+    except CalendarCoverageError:
+        return False
 
 
 def _effective_lookback_bars(config: StrategyConfig, requested_lookback_bars: int) -> int:

@@ -19,6 +19,9 @@ from mu_strategy.observations import (
     JsonlObservationRepository,
     ObservationCorruptionError,
     _INDEX_ENTRY_BYTES,
+    _MAX_RECORD_BYTES,
+    _ZERO_CHAIN_SHA256,
+    _symbols_hash16,
     _unpack_index_entry,
     canonical_payload_sha256,
 )
@@ -56,9 +59,107 @@ def _source(state: str, at_ms: int, message: str, **extra) -> dict:
     return {"state": state, "read_at_ms": at_ms, "message": message, **extra}
 
 
-def _file_content_digest(path: Path) -> bytes:
+class _SnapshotChanged(Exception):
+    pass
+
+
+def _hash_file_prefix(path: Path, *, limit: int) -> bytes:
+    """Compute BLAKE2b digest of the exact first ``limit`` bytes without holding locks."""
+    hasher = hashlib.blake2b()
+    remaining = limit
     with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "blake2b").digest()
+        while remaining > 0:
+            chunk = handle.read(min(65_536, remaining))
+            if not chunk:
+                raise _SnapshotChanged()
+            hasher.update(chunk)
+            remaining -= len(chunk)
+    return hasher.digest()
+
+
+def _verify_snapshot_unlocked(
+    repository: JsonlObservationRepository,
+    *,
+    log_size: int,
+    commit,
+    index_size: int | None,
+) -> tuple[bytes, bytes | None, str]:
+    """Compute bounded content digests and verify commit-chain binding outside read_fence().
+
+    Returns ``(log_digest, index_digest, index_status)`` where ``index_status`` is one of:
+    - ``"none"``: no commit+index pair for this snapshot
+    - ``"verified"``: index offsets, prefix_max monotonicity, and SHA-256 chain all match commit
+    - ``"structural_corrupt"``: index sidecar size, offsets, lengths, or prefix_max are corrupted
+    - ``"chain_mismatch"``: index structure is intact but log/index bytes disagree with commit.chain_sha256
+    """
+    if commit is None or commit.seq == 0 or index_size is None:
+        return _hash_file_prefix(repository.path, limit=log_size), None, "none"
+
+    if index_size != commit.index_offset or commit.index_offset != commit.seq * _INDEX_ENTRY_BYTES:
+        return (
+            _hash_file_prefix(repository.path, limit=log_size),
+            _hash_file_prefix(repository.index_path, limit=index_size),
+            "structural_corrupt",
+        )
+
+    log_hasher = hashlib.blake2b()
+    index_hasher = hashlib.blake2b()
+    chain = bytes.fromhex(_ZERO_CHAIN_SHA256)
+    expected_offset = 0
+    expected_prefix_max: int | None = None
+    structural_corrupt = False
+    chunk_entries = 1024
+
+    with repository.index_path.open("rb") as index_handle, repository.path.open("rb") as log_handle:
+        remaining = commit.seq
+        while remaining > 0:
+            take = min(remaining, chunk_entries)
+            raw_index = index_handle.read(take * _INDEX_ENTRY_BYTES)
+            if len(raw_index) != take * _INDEX_ENTRY_BYTES:
+                raise _SnapshotChanged()
+            index_hasher.update(raw_index)
+            if not structural_corrupt:
+                mv = memoryview(raw_index)
+                for idx in range(take):
+                    entry_bytes = mv[idx * _INDEX_ENTRY_BYTES : (idx + 1) * _INDEX_ENTRY_BYTES].tobytes()
+                    entry = _unpack_index_entry(entry_bytes)
+                    if (
+                        entry.offset != expected_offset
+                        or entry.length <= 0
+                        or entry.length > _MAX_RECORD_BYTES
+                        or expected_offset + entry.length > log_size
+                    ):
+                        structural_corrupt = True
+                        break
+                    expected_prefix_max = (
+                        entry.created_at_ms
+                        if expected_prefix_max is None
+                        else max(expected_prefix_max, entry.created_at_ms)
+                    )
+                    if entry.prefix_max_created_at_ms != expected_prefix_max:
+                        structural_corrupt = True
+                        break
+                    raw_record = log_handle.read(entry.length)
+                    if len(raw_record) != entry.length:
+                        raise _SnapshotChanged()
+                    log_hasher.update(raw_record)
+                    chain = hashlib.sha256(chain + raw_record + entry_bytes).digest()
+                    expected_offset += entry.length
+            remaining -= take
+
+        if structural_corrupt or expected_offset != log_size:
+            leftover = log_size - expected_offset
+            while leftover > 0:
+                chunk = log_handle.read(min(65_536, leftover))
+                if not chunk:
+                    raise _SnapshotChanged()
+                log_hasher.update(chunk)
+                leftover -= len(chunk)
+            return log_hasher.digest(), index_hasher.digest(), "structural_corrupt"
+
+    if chain.hex() != commit.chain_sha256:
+        return log_hasher.digest(), index_hasher.digest(), "chain_mismatch"
+    return log_hasher.digest(), index_hasher.digest(), "verified"
 
 
 def _scan_indexed_evidence(
@@ -136,7 +237,7 @@ def _scan_indexed_window(
     display_limit: int,
     scan_limit: int,
 ) -> tuple[bool, deque, dict, dict, Counter, int, int, int, int, int | None, int | None]:
-    """Use monotonic prefix_max_created_at_ms coverage index when total_count exceeds scan_limit."""
+    """Use verified monotonic prefix_max_created_at_ms coverage index when total_count exceeds scan_limit."""
     with repository.index_path.open("rb") as index_handle, repository.path.open("rb") as log_handle:
         first_in_window = repository.find_first_index_with_prefix_max_ge(index_handle, total_count, window["start_ms"])
         start_idx = min(first_in_window, total_count - 1) if total_count > 0 else 0
@@ -158,13 +259,14 @@ def _scan_indexed_window(
         suffix_id_hashes = {entry.cycle_id_hash16 for entry in suffix_entries}
         prefix_matches: dict[bytes, list[tuple[int, int, bytes]]] = {}
         prefix_first_by_id: dict[bytes, tuple[bytes, int, int]] = {}
-        last_distinct_prefix_entry = None
+        last_distinct_by_symbols: dict[bytes, tuple[int, object]] = {}
         expected_offset = 0
         expected_prefix_max: int | None = None
         if start_idx > 0:
             index_handle.seek(0)
             chunk_entries = 1024
             remaining = start_idx
+            global_idx = 0
             while remaining > 0:
                 take = min(remaining, chunk_entries)
                 raw = index_handle.read(take * _INDEX_ENTRY_BYTES)
@@ -186,16 +288,19 @@ def _scan_indexed_window(
                     first = prefix_first_by_id.get(entry.cycle_id_hash16)
                     if first is None:
                         prefix_first_by_id[entry.cycle_id_hash16] = (entry.content_hash16, entry.offset, entry.length)
-                        last_distinct_prefix_entry = entry
+                        last_distinct_by_symbols[entry.symbols_hash16] = (global_idx, entry)
                     elif first[0] != entry.content_hash16:
                         c1, d1 = repository.read_cycle_at(log_handle, offset=first[1], length=first[2])
                         c2, d2 = repository.read_cycle_at(log_handle, offset=entry.offset, length=entry.length)
                         if c1.cycle_id == c2.cycle_id and d1 != d2:
                             raise ObservationCorruptionError("cycle identity conflicts")
+                        if c1.cycle_id != c2.cycle_id:
+                            last_distinct_by_symbols[entry.symbols_hash16] = (global_idx, entry)
                     if entry.cycle_id_hash16 in suffix_id_hashes:
                         prefix_matches.setdefault(entry.cycle_id_hash16, []).append(
                             (entry.offset, entry.length, entry.content_hash16)
                         )
+                    global_idx += 1
                 remaining -= take
 
         counts = Counter()
@@ -203,6 +308,7 @@ def _scan_indexed_window(
         latest_obs: dict = {}
         latest_all_obs: dict = {}
         seen: dict[str, str] = {}
+        suffix_distinct_symbols_hashes: set[bytes] = set()
         total_cycles = total_observations = duplicates = read_cycles = 0
         first_at = last_at = None
 
@@ -224,6 +330,7 @@ def _scan_indexed_window(
                 cycle.created_at_ms != entry.created_at_ms
                 or hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16] != entry.cycle_id_hash16
                 or bytes.fromhex(digest)[:16] != entry.content_hash16
+                or _symbols_hash16(cycle) != entry.symbols_hash16
             ):
                 raise ObservationCorruptionError("observation index disagrees with log")
 
@@ -248,6 +355,7 @@ def _scan_indexed_window(
                 duplicates += 1
                 continue
             seen[cycle.cycle_id] = digest
+            suffix_distinct_symbols_hashes.add(entry.symbols_hash16)
 
             for observation in cycle.observations:
                 latest_all_obs[observation.symbol] = observation
@@ -267,22 +375,32 @@ def _scan_indexed_window(
         if expected_offset != commit_offset:
             raise ObservationCorruptionError("observation index end disagrees with commit boundary")
 
-        # If every suffix entry was an exact replay of a prefix cycle, resolve the latest distinct
-        # cycle from the prefix so current_conclusions stays anchored on the newest distinct cycle.
-        if not latest_all_obs and last_distinct_prefix_entry is not None:
-            cycle, digest = repository.read_cycle_at(
-                log_handle,
-                offset=last_distinct_prefix_entry.offset,
-                length=last_distinct_prefix_entry.length,
-            )
-            if (
-                cycle.created_at_ms != last_distinct_prefix_entry.created_at_ms
-                or hashlib.sha256(cycle.cycle_id.encode("utf-8")).digest()[:16] != last_distinct_prefix_entry.cycle_id_hash16
-                or bytes.fromhex(digest)[:16] != last_distinct_prefix_entry.content_hash16
-            ):
-                raise ObservationCorruptionError("observation index disagrees with log")
-            for observation in cycle.observations:
-                latest_all_obs[observation.symbol] = observation
+        # Preserve the latest distinct observation for every symbol represented only in the prefix,
+        # independent of window completeness, while letting suffix observations win without duplicates.
+        if last_distinct_by_symbols:
+            prefix_candidates = [
+                (g_idx, p_entry)
+                for sym_hash, (g_idx, p_entry) in last_distinct_by_symbols.items()
+                if sym_hash not in suffix_distinct_symbols_hashes
+            ]
+            if prefix_candidates:
+                prefix_candidates.sort(key=lambda item: item[0])
+                prefix_latest_all: dict = {}
+                for _, p_entry in prefix_candidates:
+                    p_cycle, p_digest = repository.read_cycle_at(
+                        log_handle, offset=p_entry.offset, length=p_entry.length
+                    )
+                    if (
+                        p_cycle.created_at_ms != p_entry.created_at_ms
+                        or hashlib.sha256(p_cycle.cycle_id.encode("utf-8")).digest()[:16] != p_entry.cycle_id_hash16
+                        or bytes.fromhex(p_digest)[:16] != p_entry.content_hash16
+                        or _symbols_hash16(p_cycle) != p_entry.symbols_hash16
+                    ):
+                        raise ObservationCorruptionError("observation index disagrees with log")
+                    for observation in p_cycle.observations:
+                        prefix_latest_all[observation.symbol] = observation
+                for symbol, observation in prefix_latest_all.items():
+                    latest_all_obs.setdefault(symbol, observation)
 
         return (
             complete,
@@ -299,9 +417,33 @@ def _scan_indexed_window(
         )
 
 
+def _snapshot_meta_locked(repository: JsonlObservationRepository, path: Path):
+    """Capture tiny repository metadata snapshot while holding read_fence()."""
+    if repository.invalid_marker_path.exists():
+        raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
+    commit = repository.read_commit_state()
+    try:
+        log_stat = path.stat()
+    except FileNotFoundError:
+        return None, commit, None
+    if commit is not None and log_stat.st_size != commit.offset:
+        raise ObservationCorruptionError("observation log size disagrees with durable commit boundary")
+    try:
+        idx_stat = repository.index_path.stat()
+    except FileNotFoundError:
+        idx_stat = None
+    return (
+        (log_stat.st_size, log_stat.st_mtime_ns, getattr(log_stat, "st_ino", 0)),
+        commit,
+        (idx_stat.st_size, idx_stat.st_mtime_ns, getattr(idx_stat, "st_ino", 0)) if idx_stat is not None else None,
+    )
+
+
 def _read_observations(path: Path, window: dict, *, clock, display_limit: int, scan_limit: int, evidence_key=None) -> dict:
     repository = JsonlObservationRepository(path)
+    resolved_path = str(path.resolve())
     try:
+        unlocked_attempts = 0
         while True:
             locked = False
             counts = Counter()
@@ -311,14 +453,12 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
             total_cycles = total_observations = duplicates = read_cycles = 0
             first_at = last_at = None
             complete = True
+
+            # Step 1: Capture lightweight metadata under read_fence(), then release before hashing.
             try:
                 with repository.read_fence() as locked:
-                    if repository.invalid_marker_path.exists():
-                        raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
-                    commit = repository.read_commit_state()
-                    try:
-                        stat = path.stat()
-                    except FileNotFoundError:
+                    log_meta, commit, index_meta = _snapshot_meta_locked(repository, path)
+                    if log_meta is None:
                         if repository.invalid_marker_path.exists():
                             raise ObservationCorruptionError("observation repository has an unresolved failed-write marker")
                         if not locked and repository.lock_path.exists():
@@ -326,14 +466,69 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                         if commit is not None and commit.offset > 0:
                             raise ObservationCorruptionError("observation log missing before durable commit boundary")
                         return _source("missing", clock.now_ms(), "尚无扫描日志。")
-                    initial_bytes = stat.st_size
-                    if commit is not None and initial_bytes != commit.offset:
-                        raise ObservationCorruptionError("observation log size disagrees with durable commit boundary")
-                    content_digest = _file_content_digest(path)
+                    if not locked and repository.lock_path.exists():
+                        continue
+            except _SnapshotChanged:
+                continue
+            except ObservationCorruptionError:
+                if not locked and repository.lock_path.exists():
+                    continue
+                raise
+
+            initial_bytes = log_meta[0]
+            index_size = index_meta[0] if index_meta is not None else None
+
+            # Step 2: Verify full log/index digests and commit-chain binding OUTSIDE read_fence()
+            # so cache hits and refresh verification never block writers on publication_fence().
+            if unlocked_attempts < 8:
+                try:
+                    log_digest, index_digest, index_status = _verify_snapshot_unlocked(
+                        repository,
+                        log_size=initial_bytes,
+                        commit=commit,
+                        index_size=index_size,
+                    )
+                except (FileNotFoundError, _SnapshotChanged):
+                    unlocked_attempts += 1
+                    continue
+            else:
+                log_digest = index_digest = None
+                index_status = "none"
+
+            # Step 3: Re-acquire read_fence(), recheck snapshot, serve cache hit or run read.
+            try:
+                with repository.read_fence() as locked:
+                    recheck_log, recheck_commit, recheck_index = _snapshot_meta_locked(repository, path)
+                    if recheck_log is None:
+                        if not locked and repository.lock_path.exists():
+                            continue
+                        if recheck_commit is not None and recheck_commit.offset > 0:
+                            raise ObservationCorruptionError("observation log missing before durable commit boundary")
+                        return _source("missing", clock.now_ms(), "尚无扫描日志。")
+                    if unlocked_attempts < 8:
+                        if (recheck_log, recheck_commit, recheck_index) != (log_meta, commit, index_meta):
+                            unlocked_attempts += 1
+                            continue
+                    else:
+                        log_meta, commit, index_meta = recheck_log, recheck_commit, recheck_index
+                        initial_bytes = log_meta[0]
+                        index_size = index_meta[0] if index_meta is not None else None
+                        log_digest, index_digest, index_status = _verify_snapshot_unlocked(
+                            repository,
+                            log_size=initial_bytes,
+                            commit=commit,
+                            index_size=index_size,
+                        )
+
+                    if index_status == "structural_corrupt":
+                        raise ObservationCorruptionError("observation index is structurally corrupted")
+
                     cache_key = (
-                        str(path.resolve()),
+                        resolved_path,
                         initial_bytes,
-                        content_digest,
+                        log_digest,
+                        index_digest,
+                        index_status,
                         commit.chain_sha256 if commit is not None else None,
                         window["start_ms"],
                         window["end_ms"],
@@ -341,6 +536,8 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                         scan_limit,
                         evidence_key,
                     )
+                    if not locked and repository.lock_path.exists():
+                        continue
                     with _OBSERVATION_CACHE_LOCK:
                         cached = _OBSERVATION_CACHE.get(cache_key)
                         if cached is not None:
@@ -350,15 +547,17 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                                 result["read_at_ms"] = clock.now_ms()
                                 return result
 
-                    index_available = (
-                        commit is not None
+                    index_verified = (
+                        index_status == "verified"
+                        and commit is not None
                         and commit.seq > 0
-                        and repository.index_path.exists()
-                        and repository.index_path.stat().st_size == commit.index_offset
-                        and commit.index_offset == commit.seq * _INDEX_ENTRY_BYTES
                     )
 
-                    if evidence_key is not None and index_available and commit.seq > scan_limit:
+                    if evidence_key is not None and commit is not None and commit.seq > scan_limit:
+                        if not index_verified:
+                            raise ObservationCorruptionError(
+                                "observation index cannot be verified against durable commit boundary"
+                            )
                         evidence_obs, read_cycles = _scan_indexed_evidence(
                             repository,
                             total_count=commit.seq,
@@ -366,7 +565,7 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                             evidence_key=evidence_key,
                         )
                         complete = True
-                    elif evidence_key is None and index_available and commit.seq > scan_limit:
+                    elif evidence_key is None and index_verified and commit.seq > scan_limit:
                         (
                             complete,
                             rows,
@@ -437,6 +636,8 @@ def _read_observations(path: Path, window: dict, *, clock, display_limit: int, s
                         raise ObservationCorruptionError("observation log was truncated during review")
                     if not locked and repository.lock_path.exists():
                         continue
+            except _SnapshotChanged:
+                continue
             except ObservationCorruptionError:
                 if not locked and repository.lock_path.exists():
                     continue

@@ -1390,13 +1390,14 @@ class FlatGenerationCompatTests(unittest.TestCase):
             self.assertEqual(store.segment_source_file(SYMBOL, "5m", "2026-01"), storage.segments[0].source_file)
             self.assertEqual(full_jan, store.read_csv(store.segment_path(SYMBOL, "5m", "2026-01")))
 
-        # 2. A mid-month 2026-01.csv remains expandable when earlier Jan 1 rows arrive without shifting old offsets.
+        # 2. A mid-month 2026-01.csv remains expandable across the Feb 1 month boundary without shifting old offsets.
         with TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             store = TrustedDataStore(data_dir=data_dir)
             short_rows = _window_candles(JAN_START_MS, JAN_START_MS + DAY_MS)
-            full_rows = _window_candles(JAN_MONTH_START_MS, JAN_START_MS + DAY_MS)
-            extended_rows = _window_candles(JAN_MONTH_START_MS, JAN_START_MS + DAY_MS + 3 * STEP_MS)
+            full_through_feb1 = _window_candles(JAN_MONTH_START_MS, FEB_START_MS + 3 * STEP_MS)
+            extended_feb1 = _window_candles(JAN_MONTH_START_MS, FEB_START_MS + 6 * STEP_MS)
+            later_feb_rows = _window_candles(JAN_MONTH_START_MS, FEB_START_MS + 12 * DAY_MS)
 
             run_short = _refresh(
                 store,
@@ -1410,30 +1411,82 @@ class FlatGenerationCompatTests(unittest.TestCase):
             canonical_jan = store.segment_path(SYMBOL, "5m", "2026-01")
             canonical_bytes_before = canonical_jan.read_bytes()
 
+            # Continuous Jan 1 -> Feb 1 creates expanded Jan partial AND creates Feb 2026-02.csv seamlessly.
             run_full = _refresh(
                 store,
-                MutableHistoryProvider(full_rows),
+                MutableHistoryProvider(full_through_feb1),
                 RUN_B,
-                days=22,
-                now_ms=full_rows[-1].open_time_ms + STEP_MS,
+                days=32,
+                now_ms=full_through_feb1[-1].open_time_ms + STEP_MS,
             )
             self.assertEqual("success", run_full.attempt_status.value)
+            self.assertTrue(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+            jan_partial_path = data_dir / f"segments/okx/{SYMBOL}/5m/2026-01.partial-{JAN_MONTH_START_MS}.csv"
+            self.assertTrue(jan_partial_path.exists())
+            jan_partial_bytes_before = jan_partial_path.read_bytes()
             # Original 2026-01.csv stays byte-identical so RUN_A remains exact-readable.
             self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
             self.assertEqual(short_rows, _read_exact(store, RUN_A))
-            self.assertEqual(full_rows, _read_exact(store, RUN_B))
+            self.assertEqual(full_through_feb1, _read_exact(store, RUN_B))
 
-            # Subsequent refresh extending the tail reuses and grows the expanded representation cleanly.
+            # Incremental refresh extending Feb 1 with logical start mid-Jan (< Jan 22) reuses expanded partial cleanly.
             run_ext = _refresh(
                 store,
-                MutableHistoryProvider(extended_rows),
+                MutableHistoryProvider(extended_feb1),
                 RUN_C,
-                days=22,
-                now_ms=extended_rows[-1].open_time_ms + STEP_MS,
+                days=20,
+                now_ms=extended_feb1[-1].open_time_ms + STEP_MS,
             )
             self.assertEqual("success", run_ext.attempt_status.value)
-            self.assertEqual(extended_rows[-run_ext.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_C))
-            self.assertEqual(full_rows, _read_exact(store, RUN_B))
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+            self.assertEqual(jan_partial_bytes_before, jan_partial_path.read_bytes())
+            # No redundant partial file should be spawned when existing expanded partial already covers the window.
+            self.assertEqual(
+                [jan_partial_path.name],
+                sorted(p.name for p in canonical_jan.parent.glob("2026-01.partial-*.csv")),
+            )
+            self.assertEqual(extended_feb1[-run_ext.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_C))
+            self.assertEqual(full_through_feb1, _read_exact(store, RUN_B))
+
+            # Later incremental refresh (Feb 13, days=20 -> logical start Jan 24 > Jan 22) still reuses expanded partial
+            # instead of failing closed-segment growth against the frozen Jan 22-23 canonical file.
+            run_later = _refresh(
+                store,
+                MutableHistoryProvider(later_feb_rows),
+                RUN_D,
+                days=20,
+                now_ms=later_feb_rows[-1].open_time_ms + STEP_MS,
+            )
+            self.assertEqual("success", run_later.attempt_status.value)
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+            self.assertEqual(later_feb_rows[-run_later.datasets[(SYMBOL, "5m")].rows :], _read_exact(store, RUN_D))
+            self.assertEqual(short_rows, _read_exact(store, RUN_A))
+            self.assertEqual(full_through_feb1, _read_exact(store, RUN_B))
+
+        # 3. Two-step expansion: Jan 1..Jan 31 23:55 expanded first, then a standalone Feb 1 write validates adjacency
+        # against the expanded Jan partial (while gapped Feb 1 00:05 still fails closed).
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            store = TrustedDataStore(data_dir=data_dir)
+            short_rows = _window_candles(JAN_START_MS, JAN_START_MS + DAY_MS)
+            full_jan_only = _window_candles(JAN_MONTH_START_MS, FEB_START_MS - STEP_MS)
+            feb_rows = _window_candles(FEB_START_MS, FEB_START_MS + 2 * STEP_MS)
+            gapped_feb_rows = _window_candles(FEB_START_MS + STEP_MS, FEB_START_MS + 3 * STEP_MS)
+
+            store.write_segmented_dataset(short_rows, symbol=SYMBOL, interval="5m")
+            canonical_jan = store.segment_path(SYMBOL, "5m", "2026-01")
+            canonical_bytes_before = canonical_jan.read_bytes()
+            store.write_segmented_dataset(full_jan_only, symbol=SYMBOL, interval="5m")
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+
+            with self.assertRaisesRegex(SegmentCorrectionError, "not adjacent"):
+                store.write_segmented_dataset(gapped_feb_rows, symbol=SYMBOL, interval="5m")
+            self.assertFalse(store.segment_path(SYMBOL, "5m", "2026-02").exists())
+
+            feb_storage = store.write_segmented_dataset(feb_rows, symbol=SYMBOL, interval="5m")
+            self.assertEqual(("2026-02",), tuple(ref.segment_id for ref in feb_storage.segments))
+            self.assertEqual(canonical_bytes_before, canonical_jan.read_bytes())
+            self.assertEqual(feb_rows, store.read_csv(store.segment_path(SYMBOL, "5m", "2026-02")))
 
 
 def _candles_through(end_ms: int) -> list[Candle]:

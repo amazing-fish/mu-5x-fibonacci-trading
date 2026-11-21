@@ -62,6 +62,10 @@ class CalendarUnavailable(ValueError):
     pass
 
 
+class CalendarCoverageError(CalendarUnavailable):
+    """Raised when a timestamp falls outside a reference calendar's supported year range."""
+
+
 def _easter_sunday(year: int) -> date:
     """Anonymous Gregorian algorithm (Meeus/Jones/Butcher) for Easter Sunday."""
     a = year % 19
@@ -269,9 +273,9 @@ def _session(day: date, calendar_id: str) -> tuple[str, int, int]:
     if calendar_id == US_EQUITIES_CALENDAR and not (
         _US_EQUITIES_V1_YEARS[0] <= day.year <= _US_EQUITIES_V1_YEARS[-1]
     ):
-        raise CalendarUnavailable("reference calendar covers 2025 through 2028 only")
+        raise CalendarCoverageError("reference calendar covers 2025 through 2028 only")
     if calendar_id == US_EQUITIES_ALGORITHMIC_CALENDAR and day.year < _ALGORITHMIC_MIN_YEAR:
-        raise CalendarUnavailable(f"reference calendar covers {_ALGORITHMIC_MIN_YEAR} onward only")
+        raise CalendarCoverageError(f"reference calendar covers {_ALGORITHMIC_MIN_YEAR} onward only")
     if calendar_id != CONTINUOUS_CALENDAR and day.weekday() >= 5:
         return "weekend", 0, 0
     if calendar_id not in (US_EQUITIES_CALENDAR, US_EQUITIES_ALGORITHMIC_CALENDAR):
