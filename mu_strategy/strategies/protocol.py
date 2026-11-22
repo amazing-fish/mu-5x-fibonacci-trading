@@ -28,11 +28,13 @@ __all__ = [
     "OrderType",
     "QtyMode",
     "TimeInForce",
+    "PriceSource",
     "SideMode",
     "SUPPORTED_ORDER_SIDES",
     "SUPPORTED_ORDER_TYPES",
     "SUPPORTED_QTY_MODES",
     "SUPPORTED_TIME_IN_FORCE",
+    "SUPPORTED_PRICE_SOURCES",
     "SUPPORTED_SIDE_MODES",
     "PriceExclusionBand",
     "SessionGate",
@@ -56,6 +58,7 @@ OrderSide = Literal["buy", "sell"]
 OrderType = Literal["market", "limit", "stop_market", "stop_limit"]
 QtyMode = Literal["target_weight", "equity_fraction", "contracts", "close_all"]
 TimeInForce = Literal["gtc", "open_only"]
+PriceSource = Literal["fill", "open"]
 SideMode = Literal["buy", "sell", "long_short"]
 ParamKind = Literal["int", "float", "bool", "categorical"]
 
@@ -63,6 +66,7 @@ SUPPORTED_ORDER_SIDES: frozenset[str] = frozenset({"buy", "sell"})
 SUPPORTED_ORDER_TYPES: frozenset[str] = frozenset({"market", "limit", "stop_market", "stop_limit"})
 SUPPORTED_QTY_MODES: frozenset[str] = frozenset({"target_weight", "equity_fraction", "contracts", "close_all"})
 SUPPORTED_TIME_IN_FORCE: frozenset[str] = frozenset({"gtc", "open_only"})
+SUPPORTED_PRICE_SOURCES: frozenset[str] = frozenset({"fill", "open"})
 SUPPORTED_SIDE_MODES: frozenset[str] = frozenset({"buy", "sell", "long_short"})
 _SUPPORTED_PARAM_KINDS: frozenset[str] = frozenset({"int", "float", "bool", "categorical"})
 MAX_PARAM_GRID_SIZE: int = 100_000
@@ -187,12 +191,20 @@ def _parse_hhmm_minute(value: Any) -> int:
 class PriceExclusionBand:
     """Fill-time price exclusion band around ``center`` within ``tolerance_pct``.
 
-    Excludes candidate fill price ``price`` when
+    Excludes candidate price ``price`` when
     ``abs(price - center) <= price * tolerance_pct``.
+
+    ``price_source`` selects which price the execution engine tests against this band:
+      - ``"fill"`` (default): final execution price after spread/slippage
+        (``quote.exec_price``), preserving generic order-fill protection.
+      - ``"open"``: raw fill-bar opening price (``bar_open``) before spread/slippage,
+        for strategies (such as legacy-parity ``direct_next_open``) whose entry gate
+        is defined on the candle open.
     """
 
     center: float
     tolerance_pct: float
+    price_source: PriceSource = "fill"
 
     def __post_init__(self) -> None:
         center = _normalize_positive_float(self.center, "center")
@@ -203,6 +215,8 @@ class PriceExclusionBand:
             raise ValueError("tolerance_pct must be in [0, 1)")
         if _needs_float_set(self.tolerance_pct, tol):
             object.__setattr__(self, "tolerance_pct", tol)
+        if self.price_source not in SUPPORTED_PRICE_SOURCES:
+            raise ValueError(f"unsupported price_source: {self.price_source!r}")
 
     def excludes(self, price: float) -> bool:
         return abs(price - self.center) <= price * self.tolerance_pct

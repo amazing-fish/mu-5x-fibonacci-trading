@@ -1066,6 +1066,87 @@ class RiskOverlayTests(unittest.TestCase):
         self.assertEqual(1, len(res_clean.intents))
         self.assertAlmostEqual(1.0, res_clean.intents[0].qty_value, places=9)
 
+    def test_exposure_cap_reserves_all_surviving_targets_and_documents_decision_time_scope_cr4_01_cr4_02(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu}, now_ms=t0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+
+        # CR4-02: Overlay contract explicitly scopes caps to decision time and preserves 1.0x at unchanged open.
+        self.assertEqual("decision_time", ov.cap_scope)
+        self.assertIn("decision-time", (ExposureCapOverlay.__doc__ or "").lower())
+        pf_flat = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_flat = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_flat, instrument=inst)
+        c100 = OrderIntent("c100", sym, "buy", "market", "contracts", 100.0)
+        res_c100 = ov.filter(ctx_flat, StrategyOutput(intents=(c100,)))
+        self.assertEqual(1, len(res_c100.intents))
+        self.assertAlmostEqual(100.0, res_c100.intents[0].qty_value, places=9)
+
+        # CR4-01: With 1x cap and existing 0.1x long, emitting targets (0.6x, 0.1x) + 0.9x buy MUST
+        # reserve the min/max across EVERY surviving target (0.6x), clamping the buy to 0.4x (not 0.9x!).
+        pos_01 = {sym: PositionView(sym, qty=10.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=1_000.0, leverage=0.1)}
+        pf_01 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_01,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_01 = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_01, instrument=inst)
+        buy_09 = OrderIntent("b90", sym, "buy", "market", "equity_fraction", 0.9)
+        res_multi = ov.filter(
+            ctx_01,
+            StrategyOutput(
+                targets=(TargetPosition(sym, 0.6), TargetPosition(sym, 0.1)),
+                intents=(buy_09,),
+            ),
+        )
+        self.assertEqual(1, len(res_multi.intents))
+        self.assertAlmostEqual(0.4, res_multi.intents[0].qty_value, places=9)
+
+        # A lone 0.1x target with existing 0.1x long MUST still leave exact 0.9x headroom!
+        res_single = ov.filter(
+            ctx_01,
+            StrategyOutput(
+                targets=(TargetPosition(sym, 0.1),),
+                intents=(buy_09,),
+            ),
+        )
+        self.assertEqual(1, len(res_single.intents))
+        self.assertAlmostEqual(0.9, res_single.intents[0].qty_value, places=9)
+
+        # Short mirror: existing -0.1x short, targets (-0.6x, -0.1x) + 0.9x sell clamps sell to 0.4x.
+        pos_m01 = {sym: PositionView(sym, qty=-10.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=1_000.0, leverage=0.1)}
+        pf_m01 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_m01,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_m01 = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_m01, instrument=inst)
+        sell_09 = OrderIntent("s90", sym, "sell", "market", "equity_fraction", 0.9)
+        res_short = ov.filter(
+            ctx_m01,
+            StrategyOutput(
+                targets=(TargetPosition(sym, -0.6), TargetPosition(sym, -0.1)),
+                intents=(sell_09,),
+            ),
+        )
+        self.assertEqual(1, len(res_short.intents))
+        self.assertAlmostEqual(0.4, res_short.intents[0].qty_value, places=9)
+
 
 if __name__ == "__main__":
     unittest.main()

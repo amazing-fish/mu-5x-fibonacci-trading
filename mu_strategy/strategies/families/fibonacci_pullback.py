@@ -38,6 +38,7 @@ from mu_strategy.strategies.protocol import (
     ParamSpace,
     ParamSpec,
     PriceExclusionBand,
+    PriceSource,
     SessionGate,
     StrategyOutput,
 )
@@ -296,12 +297,15 @@ def _reverse_fib_exclusion_bands_from_arrays(
     curr_abs_idx: int,
     lookback: int,
     tolerance_pct: float,
+    *,
+    price_source: PriceSource = "fill",
 ) -> tuple[PriceExclusionBand, ...]:
     """Compute causal reverse-Fibonacci resistance bands known at ``curr_abs_idx``.
 
-    Evaluated at fill time against the actual fill price (e.g. ``next_bar.open`` for
-    ``direct_next_open`` or ``max(next_bar.open, curr_high)`` for ``break_high``) so
-    resistance checks match legacy ``should_execute_entry`` without look-ahead.
+    Evaluated at fill time against ``next_bar.open`` (``price_source="open"``) for
+    ``direct_next_open`` so resistance checks match legacy ``should_execute_entry``
+    even under nonzero spread/slippage, or against execution price (``price_source="fill"``)
+    for ``break_high`` stop triggers.
     """
     rel_idx = curr_abs_idx - start
     if rel_idx <= 0 or lookback <= 0:
@@ -329,7 +333,11 @@ def _reverse_fib_exclusion_bands_from_arrays(
 
     span = high_val - low_val
     return tuple(
-        PriceExclusionBand(center=low_val + span * ratio, tolerance_pct=tolerance_pct)
+        PriceExclusionBand(
+            center=low_val + span * ratio,
+            tolerance_pct=tolerance_pct,
+            price_source=price_source,
+        )
         for ratio in (0.382, 0.5, 0.618)
     )
 
@@ -1042,6 +1050,7 @@ class FibonacciPullbackStrategy:
             max_entry_price = cap_close if max_entry_price is None else min(max_entry_price, cap_close)
 
         entry_qty_fraction = cfg.margin_steps[0] * cfg.leverage
+        band_price_source: PriceSource = "open" if cfg.entry_execution == "direct_next_open" else "fill"
         excluded_bands: tuple[PriceExclusionBand, ...] = (
             _reverse_fib_exclusion_bands_from_arrays(
                 base.highs,
@@ -1050,6 +1059,7 @@ class FibonacciPullbackStrategy:
                 curr_abs_idx,
                 cfg.reverse_fib_lookback,
                 cfg.reverse_fib_tolerance_pct,
+                price_source=band_price_source,
             )
             if cfg.block_reverse_fib_resistance
             else ()

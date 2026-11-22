@@ -2749,6 +2749,521 @@ class SimulatorCoreTests(unittest.TestCase):
         self.assertAlmostEqual(100.0, res_existed.trades[0].exit_price, places=6)
         _assert_accounting_invariants(self, res_existed)
 
+    def test_exposure_cap_multi_target_on_change_e2e_never_exceeds_cap_cr4_01(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        bars = _make_series([(100.0, 100.0, 100.0, 100.0, 1000.0)] * 4, symbol="MUUSDT")
+        sim = Simulator(
+            inst,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=10_000.0, target_rebalance_mode="on_change"),
+        )
+        observed_leverages: list[float] = []
+
+        class _MultiTargetStrategy(_ScriptedStrategy):
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                pos = ctx.portfolio.positions.get(ctx.symbol)
+                observed_leverages.append(pos.leverage if pos is not None else 0.0)
+                return super().on_bar(ctx)
+
+        strat = _MultiTargetStrategy(
+            {
+                0: StrategyOutput(targets=(TargetPosition("MUUSDT", 0.1),)),
+                1: StrategyOutput(
+                    targets=(TargetPosition("MUUSDT", 0.6), TargetPosition("MUUSDT", 0.1)),
+                    intents=(OrderIntent("b90", "MUUSDT", "buy", "market", "equity_fraction", 0.9),),
+                ),
+            },
+            warmup=0,
+        )
+        res = sim.run(strat, bars, overlays=(ExposureCapOverlay(1.0, 1.0),))
+        self.assertLessEqual(max(observed_leverages), 1.0 + 1e-9)
+        self.assertAlmostEqual(1.0, observed_leverages[2], places=6)
+        _assert_accounting_invariants(self, res)
+
+    def test_band_rejected_opening_stop_limit_does_not_fill_from_bar_high_cr4_03(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        sim = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
+
+        # Case 1 (CR4-03): Long position has sell close_all stop-limit (stop=105, limit=90) with
+        # exclusion band blocking 100. Bar 2 is flat at 100 -> activates at open, opening quote is
+        # rejected by band, MUST NOT fall through to bar_high >= 90 to fabricate a fill at 90!
+        # Stays activated and fills on bar 3 at open=102 (outside the band).
+        bars_band = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),  # enter long 10 @ 100
+                (100.0, 100.0, 100.0, 100.0, 1000.0),  # triggers @ open=100, band blocks 100
+                (102.0, 102.0, 102.0, 102.0, 1000.0),  # activated limit fills @ 102
+            ],
+            symbol="MUUSDT",
+        )
+        res_band = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e1", "MUUSDT", "buy", "market", "contracts", 10.0),)),
+                    1: StrategyOutput(
+                        intents=(
+                            OrderIntent(
+                                "sl_band",
+                                "MUUSDT",
+                                "sell",
+                                "stop_limit",
+                                "close_all",
+                                0.0,
+                                stop_price=105.0,
+                                limit_price=90.0,
+                                reduce_only=False,
+                                excluded_price_bands=(PriceExclusionBand(center=100.0, tolerance_pct=0.01),),
+                                tag="sl_band_exit",
+                            ),
+                        )
+                    ),
+                },
+                warmup=0,
+            ),
+            bars_band,
+        )
+        self.assertEqual(1, res_band.trade_count)
+        self.assertEqual("sl_band_exit", res_band.trades[0].reason)
+        self.assertEqual(int(bars_band.open_times[3]), res_band.trades[0].exit_time_ms)
+        self.assertAlmostEqual(102.0, res_band.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_band)
+
+        # Case 2: Genuine gap past limit (bar 2 opens at 85 < 90, rallies to high=92) MUST STILL
+        # fill on bar 2 at limit_price=90.0!
+        bars_gap = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),  # enter long 10 @ 100
+                (85.0, 92.0, 84.0, 88.0, 1000.0),      # gaps past 90, returns to 90 -> fills @ 90!
+                (88.0, 88.0, 88.0, 88.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        res_gap = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e1", "MUUSDT", "buy", "market", "contracts", 10.0),)),
+                    1: StrategyOutput(
+                        intents=(
+                            OrderIntent(
+                                "sl_gap",
+                                "MUUSDT",
+                                "sell",
+                                "stop_limit",
+                                "close_all",
+                                0.0,
+                                stop_price=105.0,
+                                limit_price=90.0,
+                                reduce_only=False,
+                                excluded_price_bands=(PriceExclusionBand(center=100.0, tolerance_pct=0.01),),
+                                tag="sl_gap_exit",
+                            ),
+                        )
+                    ),
+                },
+                warmup=0,
+            ),
+            bars_gap,
+        )
+        self.assertEqual(1, res_gap.trade_count)
+        self.assertEqual("sl_gap_exit", res_gap.trades[0].reason)
+        self.assertEqual(int(bars_gap.open_times[2]), res_gap.trades[0].exit_time_ms)
+        self.assertAlmostEqual(90.0, res_gap.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_gap)
+
+    def test_open_only_reduction_matches_open_entry_but_expires_before_intrabar_cr4_04(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        sim = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
+
+        # Case 1 (CR4-04): Flat account queues market buy + open_only reduce_only sell limit @ 95.
+        # Bar 1 opens at 100 -> market buy fills at 100 AND open_only sell fills at 100 in post-entry pass!
+        bars_open = _make_series(
+            [
+                (100.0, 101.0, 99.0, 100.0, 1000.0),
+                (100.0, 102.0, 98.0, 101.0, 1000.0),
+                (101.0, 102.0, 100.0, 101.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        res_open = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(
+                        intents=(
+                            OrderIntent("mbuy", "MUUSDT", "buy", "market", "contracts", 10.0),
+                            OrderIntent(
+                                "oo_sell95",
+                                "MUUSDT",
+                                "sell",
+                                "limit",
+                                "close_all",
+                                0.0,
+                                limit_price=95.0,
+                                reduce_only=True,
+                                time_in_force="open_only",
+                                tag="open_entry_exit",
+                            ),
+                        )
+                    )
+                },
+                warmup=0,
+            ),
+            bars_open,
+        )
+        self.assertEqual(1, res_open.trade_count)
+        self.assertEqual("open_entry_exit", res_open.trades[0].reason)
+        self.assertEqual(int(bars_open.open_times[1]), res_open.trades[0].exit_time_ms)
+        self.assertAlmostEqual(100.0, res_open.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_open)
+
+        # Case 2 (Both Phase 0 open entry AND Phase 1 intrabar entry on same bar):
+        # Market buy fills at open=100 and is closed at open=100 by open_only sell @ 95;
+        # then open_only sell expires before buy limit @ 90 fills intrabar, leaving the 90 fill open!
+        bars_both = _make_series(
+            [
+                (100.0, 101.0, 99.0, 100.0, 1000.0),
+                (100.0, 100.0, 89.0, 92.0, 1000.0),
+                (92.0, 93.0, 91.0, 92.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        res_both = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(
+                        intents=(
+                            OrderIntent("mbuy", "MUUSDT", "buy", "market", "contracts", 10.0),
+                            OrderIntent("lbuy90", "MUUSDT", "buy", "limit", "contracts", 10.0, limit_price=90.0),
+                            OrderIntent(
+                                "oo_sell95",
+                                "MUUSDT",
+                                "sell",
+                                "limit",
+                                "close_all",
+                                0.0,
+                                limit_price=95.0,
+                                reduce_only=True,
+                                time_in_force="open_only",
+                                tag="open_entry_exit",
+                            ),
+                        )
+                    )
+                },
+                warmup=0,
+            ),
+            bars_both,
+        )
+        self.assertEqual(2, res_both.trade_count)
+        self.assertEqual("open_entry_exit", res_both.trades[0].reason)
+        self.assertAlmostEqual(100.0, res_both.trades[0].entry_price, places=6)
+        self.assertAlmostEqual(100.0, res_both.trades[0].exit_price, places=6)
+        self.assertEqual("end_of_data", res_both.trades[1].reason)
+        self.assertAlmostEqual(90.0, res_both.trades[1].entry_price, places=6)
+        self.assertAlmostEqual(92.0, res_both.trades[1].exit_price, places=6)
+        _assert_accounting_invariants(self, res_both)
+
+        # Case 3 (session_gate deferral preserved on open_only close_all after open entry):
+        gate = SessionGate(
+            trading_calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+            trading_windows_et=(("09:45", "11:30"),),
+        )
+        t_out0 = int(datetime(2026, 6, 11, 19, 45, tzinfo=timezone.utc).timestamp() * 1000)  # 15:45 ET (out)
+        t_out1 = int(datetime(2026, 6, 11, 20, 0, tzinfo=timezone.utc).timestamp() * 1000)   # 16:00 ET (out)
+        t_in2 = int(datetime(2026, 6, 12, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)    # 10:00 ET (in)
+        bars_gated = BarSeries.from_candles(
+            "MUUSDT",
+            "15m",
+            [
+                Candle(t_out0, 100.0, 101.0, 99.0, 100.0, 1000.0),
+                Candle(t_out1, 100.0, 101.0, 99.0, 100.0, 1000.0),
+                Candle(t_in2, 106.0, 107.0, 105.0, 106.0, 1000.0),
+            ],
+        )
+        res_gated = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(
+                        intents=(
+                            OrderIntent("mbuy", "MUUSDT", "buy", "market", "contracts", 10.0),
+                            OrderIntent(
+                                "oo_gated",
+                                "MUUSDT",
+                                "sell",
+                                "limit",
+                                "close_all",
+                                0.0,
+                                limit_price=95.0,
+                                reduce_only=False,
+                                time_in_force="open_only",
+                                session_gate=gate,
+                                tag="gated_oo_exit",
+                            ),
+                        )
+                    )
+                },
+                interval="15m",
+                warmup=0,
+            ),
+            bars_gated,
+        )
+        self.assertEqual(1, res_gated.trade_count)
+        self.assertEqual("gated_oo_exit", res_gated.trades[0].reason)
+        self.assertEqual(t_in2, res_gated.trades[0].exit_time_ms)
+        self.assertAlmostEqual(106.0, res_gated.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_gated)
+
+    def test_simulator_rejects_overlapping_primary_bars_and_accepts_contiguous_cr4_05(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        sim = Simulator(
+            inst,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+        t0 = 1_735_689_600_000
+        # Overlapping 1h bars: bar 0 spans 00:00-01:00, bar 1 opens at 00:30 (< 01:00)!
+        overlap_bars = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 105.0, 99.0, 104.0, 1000.0),
+                Candle(t0 + 1_800_000, 101.0, 106.0, 100.0, 105.0, 1000.0),
+            ],
+        )
+        strat = _ScriptedStrategy({0: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0),))}, warmup=0)
+        with self.assertRaisesRegex(ValueError, "overlapping bars"):
+            sim.run(strat, overlap_bars)
+        with self.assertRaisesRegex(ValueError, "overlapping bars"):
+            sim.run_with_funding_sensitivity(strat, overlap_bars)
+
+        # Contiguous bars (next open == previous close) and gapped bars (next open > previous close) MUST pass!
+        contig_bars = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 101.0, 99.0, 100.0, 1000.0),
+                Candle(t0 + 3_600_000, 100.0, 105.0, 99.0, 104.0, 1000.0),
+                Candle(t0 + 10_800_000, 104.0, 106.0, 103.0, 105.0, 1000.0),
+            ],
+        )
+        res = sim.run(strat, contig_bars)
+        self.assertEqual(1, res.trade_count)
+        self.assertAlmostEqual(100.0, res.trades[0].entry_price, places=6)
+        _assert_accounting_invariants(self, res)
+
+    def test_zero_weight_target_intent_closes_exact_residual_under_nonzero_spread_cr4_06(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        cost = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=50.0,
+            slippage_model=FixedTicks(0.0),
+            stop_slippage_multiplier=1.0,
+            maintenance_margin_rate=0.0,
+            liquidation_fee_bps=0.0,
+        )
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 77.0, 78.0, 1000.0),
+                (78.0, 79.0, 77.0, 78.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        sim = Simulator(
+            inst,
+            cost,
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+        # Requote after partial stop with 50 bps half-spread: sell stop @ 78 executes @ 77.61.
+        # target_weight=0.0 MUST close the exact residual long without overselling into a short!
+        strat_flat = _ScriptedStrategy(
+            {
+                0: StrategyOutput(
+                    intents=(
+                        OrderIntent("open5x", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 5.0),
+                        OrderIntent(
+                            "part_prot",
+                            "MU-USDT-SWAP",
+                            "sell",
+                            "stop_market",
+                            "contracts",
+                            250.0,
+                            stop_price=85.0,
+                            reduce_only=True,
+                            tag="partial_stop",
+                        ),
+                        OrderIntent(
+                            "flat_tw",
+                            "MU-USDT-SWAP",
+                            "sell",
+                            "stop_market",
+                            "target_weight",
+                            0.0,
+                            stop_price=78.0,
+                            reduce_only=False,
+                            tag="flatten_tw",
+                        ),
+                    )
+                )
+            },
+            warmup=0,
+        )
+        res_flat = sim.run(strat_flat, bars)
+        self.assertEqual(0, res_flat.liquidations)
+        self.assertEqual(2, res_flat.trade_count)
+        self.assertEqual(["long", "long"], [t.side for t in res_flat.trades])
+        self.assertAlmostEqual(78.0 * 0.995, res_flat.trades[1].exit_price, places=6)
+        _assert_accounting_invariants(self, res_flat)
+
+        # Nonzero reversal target_weight=-0.5 MUST still be able to cross flat into a short!
+        strat_rev = _ScriptedStrategy(
+            {
+                0: StrategyOutput(
+                    intents=(
+                        OrderIntent("open1x", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 1.0),
+                        OrderIntent(
+                            "rev_tw",
+                            "MU-USDT-SWAP",
+                            "sell",
+                            "stop_market",
+                            "target_weight",
+                            -0.5,
+                            stop_price=85.0,
+                            reduce_only=False,
+                            tag="reverse_tw",
+                        ),
+                    )
+                )
+            },
+            warmup=0,
+        )
+        res_rev = sim.run(strat_rev, bars)
+        self.assertEqual(2, res_rev.trade_count)
+        self.assertEqual(["long", "short"], [t.side for t in res_rev.trades])
+        _assert_accounting_invariants(self, res_rev)
+
+    def test_benchmark_overlapping_bars_processes_funding_in_timestamp_order_cr4_07(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        t0 = 1_735_689_600_000
+        # 5x long @ 100 with zero costs -> initial liq = 80.0.
+        # Bar 0: 00:00..01:00; Bar 1: 01:00..02:00; Bar 2: 01:30..02:30 (overlaps Bar 1, opens at 81.0!).
+        overlap_bars = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 3_600_000, 100.0, 100.0, 95.0, 100.0, 1000.0),
+                Candle(t0 + 5_400_000, 81.0, 85.0, 81.0, 85.0, 1000.0),
+            ],
+        )
+
+        # Case A: +2% funding event at 01:45 (AFTER Bar 2's 01:30 open) MUST NOT debit cash before 01:30
+        # or cause a false liquidation at 81.0!
+        f_after = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 6_300_000, rate=0.02)],  # 01:45
+        )
+        res_after = compute_buy_and_hold_benchmark(
+            overlap_bars,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_after,
+            close_on_end=True,
+        )
+        self.assertEqual(0, res_after.liquidations)
+        self.assertEqual(1, res_after.trade_count)
+        self.assertEqual("end_of_data", res_after.trades[0].reason)
+        self.assertLess(res_after.attribution.funding_pnl, 0.0)
+        _assert_accounting_invariants(self, res_after)
+
+        # Case B: +2% funding event at 01:15 (BEFORE Bar 2's 01:30 open) MUST settle before 01:30,
+        # raising liq_price from 80.0 to 82.0 and liquidating at Bar 2's 01:30 open of 81.0!
+        f_before = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 4_500_000, rate=0.02)],  # 01:15
+        )
+        res_before = compute_buy_and_hold_benchmark(
+            overlap_bars,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_before,
+            close_on_end=True,
+        )
+        self.assertEqual(1, res_before.liquidations)
+        self.assertEqual(1, res_before.trade_count)
+        self.assertEqual("liquidation", res_before.trades[0].reason)
+        self.assertAlmostEqual(81.0, res_before.trades[0].exit_price, places=6)
+        self.assertAlmostEqual(-1_000.0, res_before.attribution.funding_pnl, places=6)
+        _assert_accounting_invariants(self, res_before)
+
+    def test_price_exclusion_band_open_vs_fill_price_source_under_nonzero_costs_cr4_08(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        # +50 bps half-spread (+0.50) + 50 ticks (+0.50) = +1.00 above open=100.0 -> exec_price=101.00!
+        cost = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=50.0,
+            slippage_model=FixedTicks(50.0),
+            stop_slippage_multiplier=1.0,
+            maintenance_margin_rate=0.0,
+            liquidation_fee_bps=0.0,
+        )
+        sim = Simulator(inst, cost, SimulatorConfig(starting_equity=10_000.0))
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 102.0, 99.0, 102.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+
+        # Direction 1: open=100.0 INSIDE band(100.0, 0.2%), exec=101.0 OUTSIDE band.
+        band_open_in = (PriceExclusionBand(100.0, 0.002, price_source="open"),)
+        band_fill_out = (PriceExclusionBand(100.0, 0.002, price_source="fill"),)
+        res_open_rej = sim.run(
+            _ScriptedStrategy(
+                {0: StrategyOutput(intents=(OrderIntent("b1", "MUUSDT", "buy", "market", "contracts", 10.0, excluded_price_bands=band_open_in),))},
+                warmup=0,
+            ),
+            bars,
+        )
+        res_fill_acc = sim.run(
+            _ScriptedStrategy(
+                {0: StrategyOutput(intents=(OrderIntent("b1", "MUUSDT", "buy", "market", "contracts", 10.0, excluded_price_bands=band_fill_out),))},
+                warmup=0,
+            ),
+            bars,
+        )
+        self.assertEqual(0, res_open_rej.trade_count)
+        self.assertEqual(1, res_fill_acc.trade_count)
+        self.assertAlmostEqual(101.0, res_fill_acc.trades[0].entry_price, places=6)
+
+        # Direction 2: open=100.0 OUTSIDE band(101.0, 0.2%), exec=101.0 INSIDE band.
+        band_open_out = (PriceExclusionBand(101.0, 0.002, price_source="open"),)
+        band_fill_in = (PriceExclusionBand(101.0, 0.002, price_source="fill"),)
+        res_open_acc = sim.run(
+            _ScriptedStrategy(
+                {0: StrategyOutput(intents=(OrderIntent("b2", "MUUSDT", "buy", "market", "contracts", 10.0, excluded_price_bands=band_open_out),))},
+                warmup=0,
+            ),
+            bars,
+        )
+        res_fill_rej = sim.run(
+            _ScriptedStrategy(
+                {0: StrategyOutput(intents=(OrderIntent("b2", "MUUSDT", "buy", "market", "contracts", 10.0, excluded_price_bands=band_fill_in),))},
+                warmup=0,
+            ),
+            bars,
+        )
+        self.assertEqual(1, res_open_acc.trade_count)
+        self.assertAlmostEqual(101.0, res_open_acc.trades[0].entry_price, places=6)
+        self.assertEqual(0, res_fill_rej.trade_count)
+
 
 if __name__ == "__main__":
     unittest.main()

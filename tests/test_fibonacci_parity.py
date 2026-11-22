@@ -275,6 +275,98 @@ class FibonacciParityTests(unittest.TestCase):
         self.assertGreater(strat.params.atr_stop_multiplier, 0.0)
         self.assertFalse(strat.params.legacy_parity)
 
+    def test_direct_next_open_reverse_fib_parity_with_nonzero_spread_and_slippage_cr4_08(self) -> None:
+        # Down-swing in [0, 5): high=140.0 (idx 0) -> low=100.0 (idx 2) => 0.382 reverse-Fib resistance = 115.28.
+        # Up-swing in [2, 5): low=100.0 (idx 2) -> high=120.0 (idx 4) => 0.382 Fib retest = 112.36 (confirmed on idx 5).
+        # With half_spread_bps=100 (+1%) and FixedTicks(20) (+0.20), buy exec_price is ~+1.35 above bar_open!
+        base_candles = [
+            _candle(0, 130.0, 140.0, 120.0, 125.0),
+            _candle(1, 125.0, 125.0, 110.0, 112.0),
+            _candle(2, 112.0, 112.0, 100.0, 104.0),
+            _candle(3, 104.0, 115.0, 104.0, 113.0),
+            _candle(4, 113.0, 120.0, 112.0, 119.0),
+            _candle(5, 118.0, 119.0, 112.0, 113.0),
+        ]
+        config = StrategyConfig(
+            symbol="MU-USDT-SWAP",
+            fee_rate=0.0005,
+            trading_windows_et=(("00:00", "23:59"),),
+            entry_execution="direct_next_open",
+            fib_lookback=3,
+            reverse_fib_lookback=5,
+            reverse_fib_tolerance_pct=0.003,
+            block_reverse_fib_resistance=True,
+            max_entry_above_fib_pct=None,
+            max_entry_above_signal_close_pct=None,
+            max_signal_range_pct=None,
+            rsi_floor=0.0,
+        )
+        nonzero_cost = CostModel(
+            maker_fee_bps=5.0,
+            taker_fee_bps=5.0,
+            half_spread_bps=100.0,
+            slippage_model=FixedTicks(20.0),
+            stop_slippage_multiplier=1.0,
+            maintenance_margin_rate=0.0,
+            liquidation_fee_bps=0.0,
+        )
+        inst = okx_swap_spec(config.symbol, tick_size=Decimal("0.01"), max_leverage=10.0)
+        sim = Simulator(
+            instrument=inst,
+            cost_model=nonzero_cost,
+            config=SimulatorConfig(
+                starting_equity=10_000.0,
+                primary_interval="15m",
+                warmup_bars=1,
+                close_on_end=True,
+                sizing_basis="settled_equity",
+                allow_missing_funding_for_perp=True,
+                enforce_instrument_max_leverage=False,
+            ),
+        )
+
+        # Direction 1: bar 6 opens at 115.30 (INSIDE 115.28 +/- 0.3% band), while buy exec_price ~ 116.653
+        # is OUTSIDE the band. Both legacy run_backtest and unified Simulator MUST REJECT the entry!
+        candles_open_inside = base_candles + [
+            _candle(6, 115.30, 118.0, 115.0, 117.5),
+            _candle(7, 117.5, 119.0, 117.0, 118.0),
+        ]
+        legacy_rej = run_backtest(
+            candles_open_inside,
+            build_hourly_context(candles_open_inside, []),
+            config=config,
+            starting_equity=10_000.0,
+        )
+        unified_rej = sim.run(
+            FibonacciPullbackStrategy.from_legacy_config(config, legacy_parity=True),
+            {(config.symbol, "15m"): BarSeries.from_candles(config.symbol, "15m", candles_open_inside)},
+            feature_cache=FeatureCache(),
+        )
+        self.assertEqual(0, legacy_rej.trade_count)
+        self.assertEqual(0, unified_rej.trade_count)
+
+        # Direction 2: bar 6 opens at 113.90 (OUTSIDE 115.28 +/- 0.3% band), while buy exec_price = 115.239
+        # lands INSIDE the band. Both legacy run_backtest and unified Simulator MUST ACCEPT at bar 6!
+        candles_open_outside = base_candles + [
+            _candle(6, 113.90, 114.5, 113.8, 114.2),
+            _candle(7, 114.2, 114.6, 114.0, 114.4),
+        ]
+        legacy_acc = run_backtest(
+            candles_open_outside,
+            build_hourly_context(candles_open_outside, []),
+            config=config,
+            starting_equity=10_000.0,
+        )
+        unified_acc = sim.run(
+            FibonacciPullbackStrategy.from_legacy_config(config, legacy_parity=True),
+            {(config.symbol, "15m"): BarSeries.from_candles(config.symbol, "15m", candles_open_outside)},
+            feature_cache=FeatureCache(),
+        )
+        self.assertEqual(1, legacy_acc.trade_count)
+        self.assertEqual(1, unified_acc.trade_count)
+        self.assertEqual(legacy_acc.trades[0].entry_time_ms, unified_acc.trades[0].entry_time_ms)
+        self.assertAlmostEqual(113.90 * 1.01 + 0.20, unified_acc.trades[0].entry_price, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

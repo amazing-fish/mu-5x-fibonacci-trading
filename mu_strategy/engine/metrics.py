@@ -1014,8 +1014,7 @@ def compute_buy_and_hold_benchmark(
     bars_in_market = 0
     liquidations = 0
     is_open = True
-    prev_close_ms = entry_open_ms
-    prev_close_px = float(closes[entry_prior_idx]) if entry_prior_idx is not None else ref_entry
+    settled_until_ms = entry_open_ms
 
     def _compute_bench_liq_price(curr_cash: float) -> float | None:
         if asset_class in ("spot", "equity") and side == "long":
@@ -1041,17 +1040,22 @@ def compute_buy_and_hold_benchmark(
         bar_vol = float(volumes[i])
         bar_atr = float(atr_arr[i]) if atr_arr is not None else None
 
-        # 1. Settle any gap funding in (prev_close_ms, bar_open_ms] BEFORE bar open / intrabar liquidation.
-        if is_open and effective_funding is not None and bar_open_ms > prev_close_ms:
-            gap_events = effective_funding.between(prev_close_ms, bar_open_ms)
+        # 1. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar open / liquidation
+        #    using strictly causal prior-closed mark prices (CR4-07).
+        if is_open and effective_funding is not None and bar_open_ms > settled_until_ms:
+            gap_events = effective_funding.between(settled_until_ms, bar_open_ms)
             if gap_events:
-                gap_mark = prev_close_px if prev_close_px > 0.0 else bar_open
+                prior_idx = _prior_closed_index(i, bar_open_ms)
+                gap_mark = float(closes[prior_idx]) if prior_idx is not None else bar_open
+                if gap_mark <= 0.0:
+                    gap_mark = bar_open
                 for ev in gap_events:
                     rate = ev.rate if hasattr(ev, "rate") else ev[1]
                     delta = -signed_qty * gap_mark * float(rate)
                     cash += delta
                     accrued_funding += delta
                 liq_price = _compute_bench_liq_price(cash)
+            settled_until_ms = bar_open_ms
 
         # 2. Intrabar / gap-at-open OHLC MMR liquidation check matching Simulator rules (CR1-52, CR2-31).
         if is_open and liq_price is not None:
@@ -1144,10 +1148,13 @@ def compute_buy_and_hold_benchmark(
                 liq_price = None
                 liquidations += 1
 
-        # 3. Settle bar-period funding in (max(prev_close_ms, bar_open_ms), bar_close_ms] at bar close.
-        bar_fund_start = bar_open_ms if bar_open_ms > prev_close_ms else prev_close_ms
-        if is_open and effective_funding is not None and bar_close_ms > bar_fund_start:
-            events = effective_funding.between(bar_fund_start, bar_close_ms)
+        # 3. Settle bar-period funding at bar close ONLY when bar_close_ms <= next bar's open (CR4-07).
+        #    When overlapping bar i+1 opens before bar i closes, defer settlement so Step 1 of bar i+1
+        #    settles events <= open_times[i+1] causally before bar i+1's open check and never debits
+        #    future funding (> open_times[i+1]) before bar i+1 opens.
+        next_open_ms = int(open_times[i + 1]) if (i + 1 < n) else bar_close_ms
+        if is_open and effective_funding is not None and bar_close_ms <= next_open_ms and bar_close_ms > settled_until_ms:
+            events = effective_funding.between(settled_until_ms, bar_close_ms)
             if events:
                 mark_px = bar_close if bar_close > 0.0 else bar_open
                 for ev in events:
@@ -1156,6 +1163,7 @@ def compute_buy_and_hold_benchmark(
                     cash += delta
                     accrued_funding += delta
                 liq_price = _compute_bench_liq_price(cash)
+            settled_until_ms = bar_close_ms
 
         # 4. Close valuation & bankruptcy guard.
         if is_open:
@@ -1222,9 +1230,6 @@ def compute_buy_and_hold_benchmark(
                 equity_curve.append((bar_close_ms, _clean_zero(marked_equity)))
         else:
             equity_curve.append((bar_close_ms, _clean_zero(cash)))
-
-        prev_close_ms = bar_close_ms
-        prev_close_px = bar_close
 
     if is_open:
         final_close = float(closes[-1])

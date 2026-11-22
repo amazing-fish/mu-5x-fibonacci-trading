@@ -405,8 +405,11 @@ class ProtocolContractsTests(unittest.TestCase):
         self.assertFalse(empty_constrained.is_valid({}))
         self.assertEqual([], list(empty_constrained.iter_valid_grid()))
 
-        # CR2-15 & CR2-44 protocol contracts: PriceExclusionBand & BarContext.require_touch_through.
+        # CR2-15, CR2-44 & CR4-08 protocol contracts: PriceExclusionBand (price_source) & BarContext.require_touch_through.
         band = PriceExclusionBand(center=101.0, tolerance_pct=0.003)
+        self.assertEqual("fill", band.price_source)
+        open_band = PriceExclusionBand(center=101.0, tolerance_pct=0.003, price_source="open")
+        self.assertEqual("open", open_band.price_source)
         self.assertTrue(band.excludes(101.0))
         self.assertTrue(band.excludes(101.2))
         self.assertFalse(band.excludes(100.0))
@@ -414,6 +417,8 @@ class ProtocolContractsTests(unittest.TestCase):
             PriceExclusionBand(center=0.0, tolerance_pct=0.003)
         with self.assertRaises(ValueError):
             PriceExclusionBand(center=100.0, tolerance_pct=1.0)
+        with self.assertRaises(ValueError):
+            PriceExclusionBand(center=100.0, tolerance_pct=0.003, price_source="close")  # type: ignore[arg-type]
         entry_with_band = OrderIntent(
             "eb1", "MU", "buy", "market", "equity_fraction", 1.0, time_in_force="open_only", excluded_price_bands=(band,)
         )

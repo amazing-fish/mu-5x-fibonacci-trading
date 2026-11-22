@@ -1316,6 +1316,8 @@ class FibonacciPullbackStrategyTests(unittest.TestCase):
             )
             self.assertEqual(2, len(out_r.intents))
             self.assertEqual(3, len(out_r.intents[0].excluded_price_bands))
+            # CR4-08: direct_next_open reverse-Fib bands evaluate fill-bar open (price_source="open").
+            self.assertTrue(all(b.price_source == "open" for b in out_r.intents[0].excluded_price_bands))
             self.assertTrue(any(b.excludes(res_level) for b in out_r.intents[0].excluded_price_bands))
 
             # E2E Simulator check: next bar open inside resistance -> REJECTED (0 trades); clean open -> FILLS!
@@ -1330,6 +1332,24 @@ class FibonacciPullbackStrategyTests(unittest.TestCase):
             self.assertEqual(0, len(res_blocked.trades), f"resistance open should be rejected (cap={cap_pct})")
             self.assertEqual(1, len(res_allowed.trades), f"clean open should fill (cap={cap_pct})")
             self.assertAlmostEqual(bar_open_clean.open, res_allowed.trades[0].entry_price, places=8)
+
+        # CR4-08: break_high reverse-Fib bands keep price_source="fill" so stop-trigger fill prices remain checked.
+        cfg_bh_rev = StrategyConfig(
+            symbol="MU-USDT-SWAP",
+            entry_execution="break_high",
+            fib_lookback=24,
+            block_reverse_fib_resistance=True,
+            reverse_fib_lookback=64,
+            reverse_fib_tolerance_pct=0.003,
+        )
+        s_bh_rev = BarSeries.from_candles("MU-USDT-SWAP", "15m", rev_bars)
+        mv_bh = MarketView({("MU-USDT-SWAP", "15m"): s_bh_rev, ("MU-USDT-SWAP", "1h"): s1h_rev}, now_ms=s_bh_rev.close_times[45], features=fc)
+        out_bh_rev = FibonacciPullbackStrategy.from_legacy_config(cfg_bh_rev).on_bar(
+            BarContext(s_bh_rev.close_times[45], "MU-USDT-SWAP", mv_bh, _portfolio("MU-USDT-SWAP"), spec)
+        )
+        self.assertEqual(2, len(out_bh_rev.intents))
+        self.assertEqual(3, len(out_bh_rev.intents[0].excluded_price_bands))
+        self.assertTrue(all(b.price_source == "fill" for b in out_bh_rev.intents[0].excluded_price_bands))
 
     def test_break_high_and_direct_next_open_modes(self) -> None:
         s15, s1h, sig_idx = self._build_fib_retest_fixture()

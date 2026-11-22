@@ -751,8 +751,24 @@ class DailyLossLimitOverlay:
 
 
 class ExposureCapOverlay:
-    """Clamps signed target weights and risk-increasing order sizes to hard exposure limits."""
+    """Clamps signed target weights and risk-increasing order sizes to decision-time exposure limits.
 
+    Scope & contract:
+      - Caps (`max_gross_leverage`, `max_single_weight`) apply pre-trade at
+        bar-close decision time inside ``filter(ctx, output)`` against the causal
+        decision-time portfolio equity and reference prices.
+      - Weight-based outputs (``TargetPosition``, ``OrderIntent(qty_mode="target_weight")``,
+        ``OrderIntent(qty_mode="equity_fraction")``) express exposure relative to fill-time
+        equity/price when subsequently executed by the simulator.
+      - Fixed-quantity ``OrderIntent(qty_mode="contracts")`` orders are clamped at
+        decision time using the order's limit/stop price or causal decision-time
+        reference price (``qty * contract_value * ref_px / equity``); they are not
+        re-clamped at fill time if the next bar opens at a gapped price. For strict
+        fill-time leverage capping across opening gaps, use weight-based sizing or
+        configure ``SimulatorConfig(max_leverage=...)``.
+    """
+
+    cap_scope: Literal["decision_time"] = "decision_time"
     supports_ephemeral_context: bool = True
 
     def __init__(self, max_gross_leverage: float, max_single_weight: float) -> None:
@@ -812,10 +828,20 @@ class ExposureCapOverlay:
                     else:
                         rest_sell[osym] = rest_sell.get(osym, 0.0) + w
 
-        def _post_target_envelope(sym: str, w_t: float | None) -> tuple[float, float]:
+        def _post_target_envelope(
+            sym: str,
+            w_lo: float | None,
+            w_hi: float | None = None,
+        ) -> tuple[float, float]:
             ew = existing_weights.get(sym, 0.0)
-            b_lo = ew if w_t is None else (w_t if w_t < ew else ew)
-            b_hi = ew if w_t is None else (w_t if w_t > ew else ew)
+            b_lo = ew
+            b_hi = ew
+            if w_lo is not None:
+                hi_val = w_lo if w_hi is None else w_hi
+                if w_lo < b_lo:
+                    b_lo = w_lo
+                if hi_val > b_hi:
+                    b_hi = hi_val
             if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
                 b_lo = rest_tw_lo[sym]
             if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
@@ -840,7 +866,8 @@ class ExposureCapOverlay:
             targeted_symbols.add(tsym)
             all_known_syms.add(tsym)
 
-        # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols.
+        # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols,
+        #    aggregating the min/max envelope across EVERY surviving target per symbol (CR4-01).
         if clamped_targets:
             untouched_gross = 0.0
             for usym in all_known_syms:
@@ -848,29 +875,35 @@ class ExposureCapOverlay:
                     u_lo, u_hi = _post_target_envelope(usym, None)
                     untouched_gross += max(abs(u_lo), abs(u_hi))
             allowed_targeted_gross = max(0.0, self.max_gross_leverage - untouched_gross)
-            # Compute worst-case gross contribution of each target (including resting add cushions).
-            target_worst = [
-                max(abs(_post_target_envelope(t.symbol, t.target_weight)[0]), abs(_post_target_envelope(t.symbol, t.target_weight)[1]))
-                for t in clamped_targets
-            ]
-            total_target_worst = math.fsum(target_worst)
+            sym_t_lo: dict[str, float] = {}
+            sym_t_hi: dict[str, float] = {}
+            for t in clamped_targets:
+                tsym = t.symbol
+                tw = t.target_weight
+                sym_t_lo[tsym] = tw if tsym not in sym_t_lo else min(sym_t_lo[tsym], tw)
+                sym_t_hi[tsym] = tw if tsym not in sym_t_hi else max(sym_t_hi[tsym], tw)
+            sym_worst: dict[str, float] = {}
+            for tsym in targeted_symbols:
+                e_lo, e_hi = _post_target_envelope(tsym, sym_t_lo[tsym], sym_t_hi[tsym])
+                sym_worst[tsym] = max(abs(e_lo), abs(e_hi))
+            total_target_worst = math.fsum(sym_worst.values())
             if total_target_worst > allowed_targeted_gross + 1e-12:
                 # Reserve the unavoidable floor gross from existing positions + resting orders on targeted symbols,
                 # then proportionally scale the incremental target weights within remaining headroom.
-                base_floors = []
-                inc_contribs = []
-                for t, tw in zip(clamped_targets, target_worst):
-                    f_lo, f_hi = _post_target_envelope(t.symbol, 0.0)
+                base_floors: dict[str, float] = {}
+                inc_contribs: dict[str, float] = {}
+                for tsym in targeted_symbols:
+                    f_lo, f_hi = _post_target_envelope(tsym, 0.0, 0.0)
                     fl = max(abs(f_lo), abs(f_hi))
-                    base_floors.append(fl)
-                    inc_contribs.append(max(0.0, tw - fl))
-                inc_sum = math.fsum(inc_contribs)
-                rem_for_inc = max(0.0, allowed_targeted_gross - math.fsum(base_floors))
+                    base_floors[tsym] = fl
+                    inc_contribs[tsym] = max(0.0, sym_worst[tsym] - fl)
+                inc_sum = math.fsum(inc_contribs.values())
+                rem_for_inc = max(0.0, allowed_targeted_gross - math.fsum(base_floors.values()))
                 if inc_sum > 1e-12:
                     ratio = min(1.0, rem_for_inc / inc_sum)
                     new_targets: list[TargetPosition] = []
-                    for t, inc in zip(clamped_targets, inc_contribs):
-                        if inc > 0.0:
+                    for t in clamped_targets:
+                        if inc_contribs.get(t.symbol, 0.0) > 0.0:
                             # Scale the incremental part of target weight beyond 0.
                             w_scaled = t.target_weight * ratio
                             if w_scaled == 0.0:
@@ -886,6 +919,7 @@ class ExposureCapOverlay:
         #    bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
         #    Reachable exposure is [base_lo - add_sell, base_hi + add_buy].
         #    This guarantees:
+        #      - CR4-01: reserve min/max across every surviving target per symbol (so on_change cannot bypass cap).
         #      - CR3-22: pending buy/sell increments are reserved AFTER any new target_weight fill.
         #      - CR2-29: resting orders reserved before targets and carried into intent budget.
         #      - CR1-32: single shared exposure budget across targets + intents in the same output.
@@ -897,12 +931,21 @@ class ExposureCapOverlay:
         add_buy: dict[str, float] = {}
         add_sell: dict[str, float] = {}
         tracked_syms: set[str] = set(all_known_syms)
-        target_w_by_sym: dict[str, float] = {t.symbol: t.target_weight for t in clamped_targets}
+        target_lo_by_sym: dict[str, float] = {}
+        target_hi_by_sym: dict[str, float] = {}
+        for t in clamped_targets:
+            tsym = t.symbol
+            tw = t.target_weight
+            target_lo_by_sym[tsym] = tw if tsym not in target_lo_by_sym else min(target_lo_by_sym[tsym], tw)
+            target_hi_by_sym[tsym] = tw if tsym not in target_hi_by_sym else max(target_hi_by_sym[tsym], tw)
         for sym in all_known_syms:
             ew = existing_weights.get(sym, 0.0)
-            w_t = target_w_by_sym.get(sym)
-            b_lo = ew if w_t is None else (w_t if w_t < ew else ew)
-            b_hi = ew if w_t is None else (w_t if w_t > ew else ew)
+            b_lo = ew
+            b_hi = ew
+            if sym in target_lo_by_sym and target_lo_by_sym[sym] < b_lo:
+                b_lo = target_lo_by_sym[sym]
+            if sym in target_hi_by_sym and target_hi_by_sym[sym] > b_hi:
+                b_hi = target_hi_by_sym[sym]
             if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
                 b_lo = rest_tw_lo[sym]
             if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
@@ -1007,7 +1050,7 @@ class ExposureCapOverlay:
             if intent.qty_mode == "contracts":
                 ref_px = intent.limit_price or intent.stop_price or self._reference_price(ctx, sym)
                 if equity <= 0.0 or ref_px is None or ref_px <= 0.0:
-                    # Fail closed (CR1-33): do not pass an unpriceable contracts order through a hard cap.
+                    # Fail closed (CR1-33): do not pass an unpriceable contracts order through the decision-time cap.
                     continue
                 mult = _contract_multiplier(ctx, sym)
                 order_weight = (intent.qty_value * mult * ref_px) / equity
