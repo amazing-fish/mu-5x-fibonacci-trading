@@ -1318,19 +1318,32 @@ def compute_buy_and_hold_benchmark(
                 if eff_intrabar_liq is not None:
                     intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
                     if intrabar_hit:
-                        non_gap_open = (
-                            (p_open if p_open >= eff_intrabar_liq else eff_intrabar_liq)
-                            if side == "long"
-                            else (p_open if p_open <= eff_intrabar_liq else eff_intrabar_liq)
+                        # CR10-01: Reserve threshold fills strictly for actual price crossings inside
+                        # [p_low, p_high]. If a funding-induced jump moves eff_intrabar_liq beyond the
+                        # bar's observed range (> p_high for long; < p_low for short), fill at the
+                        # observed close price p_close (gapped_open=True), never synthesizing an
+                        # unobserved price outside [p_low, p_high].
+                        jumped_beyond_bar = (
+                            (eff_intrabar_liq > p_high) if side == "long" else (eff_intrabar_liq < p_low)
                         )
+                        if jumped_beyond_bar:
+                            fill_open = p_close
+                            fill_gapped = True
+                        else:
+                            fill_open = (
+                                (p_open if p_open >= eff_intrabar_liq else eff_intrabar_liq)
+                                if side == "long"
+                                else (p_open if p_open <= eff_intrabar_liq else eff_intrabar_liq)
+                            )
+                            fill_gapped = False
                         _liquidate_bench(
                             exit_bar_idx=p_idx,
                             exit_time_ms=p_close_ms,
                             liq_threshold=eff_intrabar_liq,
-                            gapped_open=False,
+                            gapped_open=fill_gapped,
                             use_prior_open_slip=False,
                             include_exit_bar=False,
-                            b_open=non_gap_open,
+                            b_open=fill_open,
                             b_high=p_high,
                             b_low=p_low,
                             b_close=p_close,
