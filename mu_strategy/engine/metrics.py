@@ -5,6 +5,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from heapq import heappop, heappush
 from math import expm1, fsum, isfinite, log, sqrt
 from types import MappingProxyType
 from typing import Any, Literal
@@ -1010,7 +1011,8 @@ def compute_buy_and_hold_benchmark(
     cash = starting_equity - entry_fee
     accrued_funding = 0.0
     total_traded_notional = entry_notional
-    equity_curve: list[tuple[int, float]] = []
+    equity_curve_slots: list[tuple[int, float] | None] = [None] * (n - start_idx)
+    pending_closes: list[tuple[int, int]] = []
     trades: list[TradeRecord] = []
     bars_in_market = 0
     liquidations = 0
@@ -1029,18 +1031,21 @@ def compute_buy_and_hold_benchmark(
             liquidation_fee_bps=liq_fee_bps_eff,
         )
 
-    def _causal_event_mark(ev_ts_ms: int, max_idx: int) -> float:
-        """Select the latest causally observable mark at or before ``ev_ts_ms`` (CR5-01).
+    def _causal_event_mark(ev_ts_ms: int) -> float:
+        """Select the unique causally observable mark at or before ``ev_ts_ms`` (CR5-01 / CR6-01).
 
-        Checks bars ``0..max_idx``: prefers the latest bar close with
-        ``close_time_ms <= ev_ts_ms`` (breaking exact timestamp ties in favor of close),
-        or a strictly newer bar open with ``open_time_ms <= ev_ts_ms``, falling back to
-        ``ref_entry`` when no bar mark exists at or before ``ev_ts_ms``. Never reads a
-        later bar's open or close (``> ev_ts_ms``).
+        Because ``open_times`` is strictly increasing and ``open_times[j] <= close_times[j]``,
+        only bars with ``j <= open_pos`` can have an open or close timestamp ``<= ev_ts_ms``.
+        Prefers the latest bar close with ``close_time_ms <= ev_ts_ms`` (breaking exact ties in
+        favor of close), or a strictly newer bar open with ``open_time_ms <= ev_ts_ms``, falling
+        back to ``ref_entry``. Applied uniformly across non-overlapping and overlapping bars.
         """
+        open_pos = bisect_right(open_times, ev_ts_ms) - 1
+        if open_pos < 0:
+            return ref_entry
         best_close_ts: int | None = None
         best_close_px = 0.0
-        for j in range(max_idx, -1, -1):
+        for j in range(open_pos, -1, -1):
             c_ts = int(close_times[j])
             if c_ts <= ev_ts_ms:
                 if best_close_ts is None or c_ts > best_close_ts:
@@ -1050,49 +1055,134 @@ def compute_buy_and_hold_benchmark(
                         best_close_px = c_px
                 elif c_ts < best_close_ts:
                     break
-        # open_times is strictly increasing in BarSeries.
-        open_pos = bisect_right(open_times, ev_ts_ms, 0, max_idx + 1) - 1
         best_open_ts: int | None = None
         best_open_px = 0.0
-        while open_pos >= 0:
-            o_px = float(opens[open_pos])
+        k = open_pos
+        while k >= 0:
+            o_px = float(opens[k])
             if o_px > 0.0:
-                best_open_ts = int(open_times[open_pos])
+                best_open_ts = int(open_times[k])
                 best_open_px = o_px
                 break
-            open_pos -= 1
-        if best_close_ts is not None and (best_open_ts is None or best_close_ts >= best_open_ts):
+            k -= 1
+        if best_close_ts is not None and best_close_ts == ev_ts_ms:
             return best_close_px
-        if best_open_ts is not None:
+        if best_open_ts is not None and (best_close_ts is None or best_open_ts >= best_close_ts):
             return best_open_px
+        if best_close_ts is not None:
+            return best_close_px
         return ref_entry
+
+    def _settle_funding_up_to(end_ms: int) -> None:
+        nonlocal cash, accrued_funding, liq_price, settled_until_ms
+        if is_open and effective_funding is not None and end_ms > settled_until_ms:
+            events = effective_funding.between(settled_until_ms, end_ms)
+            if events:
+                for ev in events:
+                    ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
+                    rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                    ev_mark = _causal_event_mark(ev_ts)
+                    delta = -signed_qty * ev_mark * float(rate)
+                    cash += delta
+                    accrued_funding += delta
+                liq_price = _compute_bench_liq_price(cash)
+            settled_until_ms = end_ms
+
+    def _flush_pending_close(p_close_ms: int, p_idx: int) -> None:
+        nonlocal cash, total_traded_notional, bars_in_market, is_open, liq_price, liquidations
+        # Settle all funding up to this bar's close timestamp strictly causally (CR6-01 / CR6-02).
+        _settle_funding_up_to(p_close_ms)
+        if is_open:
+            bars_in_market += 1
+            p_close = float(closes[p_idx])
+            p_vol = float(volumes[p_idx])
+            p_atr = float(atr_arr[p_idx]) if atr_arr is not None else None
+            unrealized = signed_qty * (p_close - exec_entry)
+            marked_equity = cash + unrealized
+            if marked_equity <= 0.0:
+                if execution is not None:
+                    b_quote = execution.fill_market(
+                        close_side,
+                        qty_abs,
+                        bar_open=p_close,
+                        bar_high=p_close,
+                        bar_low=p_close,
+                        bar_close=p_close,
+                        bar_volume=p_vol,
+                        bar_atr=p_atr,
+                        reason="bankrupt",
+                    )
+                    ref_exit = b_quote.ref_price
+                    exec_exit = b_quote.exec_price
+                    exit_notional = b_quote.notional
+                    exit_fee = b_quote.fee
+                    exit_slippage = b_quote.slippage_cost
+                else:
+                    ref_exit = p_close
+                    exec_exit = p_close * (1.0 - side_sign * spread_rate)
+                    if exec_exit <= 0.0:
+                        exec_exit = p_close
+                    exit_notional = exec_exit * qty_abs
+                    exit_fee = exit_notional * fee_rate
+                    exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+                gross_pnl = signed_qty * (ref_exit - ref_entry)
+                total_fees = entry_fee + exit_fee
+                total_slip = entry_slippage + exit_slippage
+                net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
+                cash = starting_equity + net_pnl
+                total_traded_notional += exit_notional
+                trades.append(
+                    TradeRecord(
+                        entry_time_ms=int(open_times[start_idx]),
+                        exit_time_ms=p_close_ms,
+                        side=side,
+                        entry_price=exec_entry,
+                        exit_price=exec_exit,
+                        qty=qty_abs,
+                        gross_pnl=gross_pnl,
+                        fees=total_fees,
+                        slippage=total_slip,
+                        funding_pnl=accrued_funding,
+                        net_pnl=net_pnl,
+                        return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
+                        reason="bankrupt",
+                        symbol=resolved_symbol,
+                        ref_entry_price=ref_entry,
+                        ref_exit_price=ref_exit,
+                    )
+                )
+                is_open = False
+                liq_price = None
+                liquidations += 1
+                equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(cash))
+            else:
+                equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(marked_equity))
+        else:
+            equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(cash))
 
     liq_price = _compute_bench_liq_price(cash)
 
+    # Monotonic timestamp-ordered timeline over bar opens and closes (CR4-07 / CR5-01 / CR5-02 / CR6-01 / CR6-02).
+    # On contiguous/gapped bars, pending_closes flushes bar i-1 immediately before bar i opens (zero drift).
+    # On overlapping bars, earlier opens/liquidations run before later closes are flushed, using one live cash state.
     for i in range(start_idx, n):
         bar_open_ms = int(open_times[i])
         bar_close_ms = int(close_times[i])
+
+        # 1a. Flush every prior bar close completing at or before this bar's open in ascending close_time_ms order.
+        while pending_closes and pending_closes[0][0] <= bar_open_ms:
+            p_close_ms, p_idx = heappop(pending_closes)
+            _flush_pending_close(p_close_ms, p_idx)
+
+        # 1b. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar i's open/liquidation check.
+        _settle_funding_up_to(bar_open_ms)
+
         bar_open = float(opens[i])
         bar_high = float(highs[i])
         bar_low = float(lows[i])
         bar_close = float(closes[i])
         bar_vol = float(volumes[i])
         bar_atr = float(atr_arr[i]) if atr_arr is not None else None
-
-        # 1. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar open / liquidation,
-        #    pricing each event strictly from marks available at or before ev.ts_ms (CR4-07 / CR5-01).
-        if is_open and effective_funding is not None and bar_open_ms > settled_until_ms:
-            gap_events = effective_funding.between(settled_until_ms, bar_open_ms)
-            if gap_events:
-                for ev in gap_events:
-                    ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
-                    rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                    ev_mark = _causal_event_mark(ev_ts, i)
-                    delta = -signed_qty * ev_mark * float(rate)
-                    cash += delta
-                    accrued_funding += delta
-                liq_price = _compute_bench_liq_price(cash)
-            settled_until_ms = bar_open_ms
 
         # 2. Intrabar / gap-at-open OHLC MMR liquidation check matching Simulator rules (CR1-52, CR2-31).
         if is_open and liq_price is not None:
@@ -1185,118 +1275,15 @@ def compute_buy_and_hold_benchmark(
                 liq_price = None
                 liquidations += 1
 
-        # 3. Settle bar-period funding in strict timestamp order (CR4-07 / CR5-01 / CR5-02):
-        #    - Non-overlapping bar (bar_close_ms <= next_open_ms): settle (settled_until_ms, bar_close_ms]
-        #      into live cash at bar close.
-        #    - Overlapping bar (next_open_ms < bar_close_ms):
-        #      (a) settle events strictly before next_open_ms into live cash right now using strictly
-        #          causal per-event marks (<= ev.ts_ms), advancing settled_until_ms to next_open_ms - 1;
-        #      (b) keep events in [next_open_ms, bar_close_ms] OUT of live cash / liq_price so bar i+1's
-        #          opening check at next_open_ms never sees future funding, while adding a non-mutating
-        #          deferred_close_funding_delta to bar i's recorded close-time equity_curve point!
-        next_open_ms = int(open_times[i + 1]) if (i + 1 < n) else bar_close_ms
-        deferred_close_funding_delta = 0.0
-        if is_open and effective_funding is not None and bar_close_ms > settled_until_ms:
-            if bar_close_ms <= next_open_ms:
-                events = effective_funding.between(settled_until_ms, bar_close_ms)
-                if events:
-                    for ev in events:
-                        ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
-                        rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                        mark_px = bar_close if bar_close > 0.0 else _causal_event_mark(ev_ts, i)
-                        delta = -signed_qty * mark_px * float(rate)
-                        cash += delta
-                        accrued_funding += delta
-                    liq_price = _compute_bench_liq_price(cash)
-                settled_until_ms = bar_close_ms
-            else:
-                # Overlapping bar i+1 opens at next_open_ms < bar_close_ms.
-                early_cap_ms = next_open_ms - 1
-                if early_cap_ms > settled_until_ms:
-                    early_events = effective_funding.between(settled_until_ms, early_cap_ms)
-                    if early_events:
-                        for ev in early_events:
-                            ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
-                            rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                            ev_mark = _causal_event_mark(ev_ts, i)
-                            delta = -signed_qty * ev_mark * float(rate)
-                            cash += delta
-                            accrued_funding += delta
-                        liq_price = _compute_bench_liq_price(cash)
-                    settled_until_ms = early_cap_ms
-                deferred_events = effective_funding.between(settled_until_ms, bar_close_ms)
-                if deferred_events:
-                    for ev in deferred_events:
-                        ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
-                        rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                        mark_px = bar_close if bar_close > 0.0 else _causal_event_mark(ev_ts, i)
-                        deferred_close_funding_delta += -signed_qty * mark_px * float(rate)
+        # 3. Enqueue bar i's close timestamp for chronological funding, bankruptcy, and equity curve recording.
+        heappush(pending_closes, (bar_close_ms, i))
 
-        # 4. Close valuation & bankruptcy guard.
-        if is_open:
-            bars_in_market += 1
-            unrealized = signed_qty * (bar_close - exec_entry)
-            marked_equity = cash + unrealized
-            if marked_equity <= 0.0:
-                if execution is not None:
-                    b_quote = execution.fill_market(
-                        close_side,
-                        qty_abs,
-                        bar_open=bar_close,
-                        bar_high=bar_close,
-                        bar_low=bar_close,
-                        bar_close=bar_close,
-                        bar_volume=bar_vol,
-                        bar_atr=bar_atr,
-                        reason="bankrupt",
-                    )
-                    ref_exit = b_quote.ref_price
-                    exec_exit = b_quote.exec_price
-                    exit_notional = b_quote.notional
-                    exit_fee = b_quote.fee
-                    exit_slippage = b_quote.slippage_cost
-                else:
-                    ref_exit = bar_close
-                    exec_exit = bar_close * (1.0 - side_sign * spread_rate)
-                    if exec_exit <= 0.0:
-                        exec_exit = bar_close
-                    exit_notional = exec_exit * qty_abs
-                    exit_fee = exit_notional * fee_rate
-                    exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
-                gross_pnl = signed_qty * (ref_exit - ref_entry)
-                total_fees = entry_fee + exit_fee
-                total_slip = entry_slippage + exit_slippage
-                net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
-                cash = starting_equity + net_pnl
-                total_traded_notional += exit_notional
-                trades.append(
-                    TradeRecord(
-                        entry_time_ms=int(open_times[start_idx]),
-                        exit_time_ms=bar_close_ms,
-                        side=side,
-                        entry_price=exec_entry,
-                        exit_price=exec_exit,
-                        qty=qty_abs,
-                        gross_pnl=gross_pnl,
-                        fees=total_fees,
-                        slippage=total_slip,
-                        funding_pnl=accrued_funding,
-                        net_pnl=net_pnl,
-                        return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
-                        reason="bankrupt",
-                        symbol=resolved_symbol,
-                        ref_entry_price=ref_entry,
-                        ref_exit_price=ref_exit,
-                    )
-                )
-                is_open = False
-                liq_price = None
-                liquidations += 1
-                equity_curve.append((bar_close_ms, _clean_zero(cash)))
-            else:
-                equity_curve.append((bar_close_ms, _clean_zero(marked_equity + deferred_close_funding_delta)))
-        else:
-            equity_curve.append((bar_close_ms, _clean_zero(cash)))
+    # 4. Flush all remaining bar closes in ascending close_time_ms order.
+    while pending_closes:
+        p_close_ms, p_idx = heappop(pending_closes)
+        _flush_pending_close(p_close_ms, p_idx)
+
+    equity_curve: list[tuple[int, float]] = [pt for pt in equity_curve_slots if pt is not None]
 
     if is_open:
         final_close = float(closes[-1])

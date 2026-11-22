@@ -760,8 +760,10 @@ class ExposureCapOverlay:
       - Target-weight outputs (``TargetPosition`` and ``OrderIntent(qty_mode="target_weight")``)
         express exposure relative to fill-time equity/price. When
         ``SimulatorConfig(enforce_instrument_max_leverage=True)`` (the default) is enabled,
-        the simulator clamps each target weight to ``±InstrumentSpec.max_leverage`` at fill
-        time; this is a per-position fill-time cap, not a portfolio-level gross cap.
+        the simulator clamps each requested target weight to ``±InstrumentSpec.max_leverage``
+        before sizing at fill time; this is a clamp on the requested target weight (not a
+        portfolio-level gross cap, and marked post-fill exposure can still exceed that weight
+        under adverse spread/slippage).
       - Incremental ``OrderIntent(qty_mode="equity_fraction")`` orders only clamp the single
         order's notional to ``eq_basis * InstrumentSpec.max_leverage`` at fill time and do
         not bound held-plus-order exposure across opening gaps.
@@ -774,9 +776,28 @@ class ExposureCapOverlay:
     cap_scope: Literal["decision_time"] = "decision_time"
     supports_ephemeral_context: bool = True
 
-    def __init__(self, max_gross_leverage: float, max_single_weight: float) -> None:
+    def __init__(
+        self,
+        max_gross_leverage: float,
+        max_single_weight: float,
+        *,
+        sizing_basis: Literal["marked_equity", "settled_equity"] | None = None,
+        enforce_instrument_max_leverage: bool | None = None,
+    ) -> None:
         self.max_gross_leverage = _require_positive_finite("max_gross_leverage", max_gross_leverage)
         self.max_single_weight = _require_positive_finite("max_single_weight", max_single_weight)
+        if sizing_basis is not None and sizing_basis not in ("marked_equity", "settled_equity"):
+            raise ValueError(f"unsupported sizing_basis: {sizing_basis!r}")
+        if enforce_instrument_max_leverage is not None and not isinstance(enforce_instrument_max_leverage, bool):
+            raise ValueError(
+                f"enforce_instrument_max_leverage must be bool or None, got {enforce_instrument_max_leverage!r}"
+            )
+        self.sizing_basis = sizing_basis
+        self.enforce_instrument_max_leverage = enforce_instrument_max_leverage
+        # Run-scoped simulator policy bindings (set/restored by Simulator.run in try/finally).
+        self._runtime_sizing_basis: Literal["marked_equity", "settled_equity"] | None = None
+        self._runtime_enforce_instrument_max_leverage: bool | None = None
+        self._runtime_settled_equity_source: Any = None
 
     def reset(self) -> None:
         return None
@@ -790,6 +811,41 @@ class ExposureCapOverlay:
 
         single_cap = min(self.max_single_weight, self.max_gross_leverage)
         equity = ctx.portfolio.equity
+        eff_sizing_basis = (
+            self._runtime_sizing_basis
+            if self._runtime_sizing_basis is not None
+            else self.sizing_basis
+        )
+        eff_enforce_inst_lev = (
+            self._runtime_enforce_instrument_max_leverage
+            if self._runtime_enforce_instrument_max_leverage is not None
+            else self.enforce_instrument_max_leverage
+        )
+        settled_src = self._runtime_settled_equity_source
+        settled_equity = (
+            float(settled_src.settled_equity)
+            if settled_src is not None
+            else float(ctx.portfolio.cash)
+        )
+        # Convert simulator eq_basis-denominated fractions to marked-equity weights (CR6-04).
+        if equity > 0.0:
+            if eff_sizing_basis == "settled_equity":
+                ef_ratio = max(0.0, settled_equity / equity)
+                prot_ef_ratio = ef_ratio
+                prot_tw_ratio = min(1.0, ef_ratio) if settled_equity > 0.0 else 0.0
+            elif eff_sizing_basis == "marked_equity":
+                ef_ratio = 1.0
+                prot_ef_ratio = 1.0
+                prot_tw_ratio = 1.0
+            else:
+                settled_ratio = max(0.0, settled_equity / equity)
+                ef_ratio = max(1.0, settled_ratio)
+                prot_ef_ratio = max(1.0, settled_ratio)
+                prot_tw_ratio = min(1.0, settled_ratio) if settled_equity > 0.0 else 0.0
+        else:
+            ef_ratio = 1.0
+            prot_ef_ratio = 1.0
+            prot_tw_ratio = 0.0
 
         # Current signed weights by symbol.
         existing_weights: dict[str, float] = {}
@@ -800,7 +856,7 @@ class ExposureCapOverlay:
                     existing_weights[sym] = sign * (pos.notional / equity)
 
         # 1. Summarize already-resting open orders AND protective reductions BEFORE admitting targets
-        #    (CR2-29 / CR3-16 / CR5-05):
+        #    (CR2-29 / CR3-16 / CR5-05 / CR6-04 / CR6-05):
         #    - Non-reduce-only resting orders can still fill AFTER a queued TargetPosition fills.
         #    - Protective reduce_only / close_all orders (resting + same-output, deduplicated by intent_id)
         #      can shrink a positive long down toward 0.0 (never negative) or a negative short up toward 0.0
@@ -825,10 +881,11 @@ class ExposureCapOverlay:
                 else:
                     red_buy[osym] = math.inf
             elif qm == "equity_fraction":
+                w_red_ef = ord_obj.qty_value * prot_ef_ratio
                 if ord_obj.side == "sell":
-                    red_sell[osym] = red_sell.get(osym, 0.0) + ord_obj.qty_value
+                    red_sell[osym] = red_sell.get(osym, 0.0) + w_red_ef
                 else:
-                    red_buy[osym] = red_buy.get(osym, 0.0) + ord_obj.qty_value
+                    red_buy[osym] = red_buy.get(osym, 0.0) + w_red_ef
             elif qm == "contracts":
                 ord_px = ord_obj.limit_price or ord_obj.stop_price
                 dec_px = self._reference_price(ctx, osym)
@@ -843,11 +900,33 @@ class ExposureCapOverlay:
                 else:
                     red_buy[osym] = red_buy.get(osym, 0.0) + w_red
             elif qm == "target_weight":
+                # CR6-05: Reserve against the effective protective target AFTER instrument leverage
+                # clamping when known; reserve conservatively down to flat (0.0) when policy is unknown;
+                # preserve the unclamped target when leverage enforcement is explicitly off.
+                inst_ml: float | None = None
+                inst = ctx.instrument
+                if inst is not None and osym == inst.symbol:
+                    raw_ml = getattr(inst, "max_leverage", None)
+                    if raw_ml is not None and math.isfinite(raw_ml) and raw_ml > 0.0:
+                        inst_ml = float(raw_ml)
+                raw_tw = ord_obj.qty_value
                 if ord_obj.side == "sell":
-                    fl = max(0.0, ord_obj.qty_value)
+                    if eff_enforce_inst_lev is True:
+                        eff_tw = min(raw_tw, inst_ml) if inst_ml is not None else 0.0
+                        fl = max(0.0, eff_tw) * prot_tw_ratio
+                    elif eff_enforce_inst_lev is False:
+                        fl = max(0.0, raw_tw) * prot_tw_ratio
+                    else:
+                        fl = 0.0
                     red_sell_floor[osym] = fl if osym not in red_sell_floor else min(red_sell_floor[osym], fl)
                 else:
-                    cl = min(0.0, ord_obj.qty_value)
+                    if eff_enforce_inst_lev is True:
+                        eff_tw = max(raw_tw, -inst_ml) if inst_ml is not None else 0.0
+                        cl = min(0.0, eff_tw) * prot_tw_ratio
+                    elif eff_enforce_inst_lev is False:
+                        cl = min(0.0, raw_tw) * prot_tw_ratio
+                    else:
+                        cl = 0.0
                     red_buy_ceil[osym] = cl if osym not in red_buy_ceil else max(red_buy_ceil[osym], cl)
 
         same_output_reduce_ids = {
@@ -868,10 +947,11 @@ class ExposureCapOverlay:
                 rest_tw_lo[osym] = w if osym not in rest_tw_lo else min(rest_tw_lo[osym], w)
                 rest_tw_hi[osym] = w if osym not in rest_tw_hi else max(rest_tw_hi[osym], w)
             elif open_ord.qty_mode == "equity_fraction":
+                w_ef = open_ord.qty_value * ef_ratio
                 if open_ord.side == "buy":
-                    rest_buy[osym] = rest_buy.get(osym, 0.0) + open_ord.qty_value
+                    rest_buy[osym] = rest_buy.get(osym, 0.0) + w_ef
                 else:
-                    rest_sell[osym] = rest_sell.get(osym, 0.0) + open_ord.qty_value
+                    rest_sell[osym] = rest_sell.get(osym, 0.0) + w_ef
             elif open_ord.qty_mode == "contracts":
                 ref_px = open_ord.limit_price or open_ord.stop_price or self._reference_price(ctx, osym)
                 if equity > 0.0 and ref_px is not None and ref_px > 0.0:
@@ -1098,7 +1178,18 @@ class ExposureCapOverlay:
                     desired = 0.0
                 clamped_intents.append(replace(intent, qty_value=desired))
                 tracked_syms.add(sym)
-                d_lo, d_hi = _apply_protective_reductions(sym, desired, desired)
+                eff_d = desired
+                if eff_enforce_inst_lev is True:
+                    inst_c = ctx.instrument
+                    if inst_c is not None and sym == inst_c.symbol:
+                        raw_ml_c = getattr(inst_c, "max_leverage", None)
+                        if raw_ml_c is not None and math.isfinite(raw_ml_c) and raw_ml_c > 0.0:
+                            ml_c = float(raw_ml_c)
+                            if eff_d > ml_c:
+                                eff_d = ml_c
+                            elif eff_d < -ml_c:
+                                eff_d = -ml_c
+                d_lo, d_hi = _apply_protective_reductions(sym, eff_d, eff_d)
                 base_lo[sym] = d_lo if d_lo < b_lo else b_lo
                 base_hi[sym] = d_hi if d_hi > b_hi else b_hi
                 add_buy.setdefault(sym, ab)
@@ -1106,7 +1197,7 @@ class ExposureCapOverlay:
                 continue
 
             if intent.qty_mode == "equity_fraction":
-                w = intent.qty_value
+                w = intent.qty_value * ef_ratio
                 if intent.side == "buy":
                     if hi + w <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
@@ -1117,8 +1208,8 @@ class ExposureCapOverlay:
                         add_sell.setdefault(sym, as_)
                     else:
                         allowed_w = max_abs_sym - hi
-                        if allowed_w > 1e-12:
-                            clamped_intents.append(replace(intent, qty_value=allowed_w))
+                        if allowed_w > 1e-12 and ef_ratio > 0.0:
+                            clamped_intents.append(replace(intent, qty_value=allowed_w / ef_ratio))
                             tracked_syms.add(sym)
                             add_buy[sym] = ab + allowed_w
                             base_lo.setdefault(sym, b_lo)
@@ -1134,8 +1225,8 @@ class ExposureCapOverlay:
                         add_buy.setdefault(sym, ab)
                     else:
                         allowed_w = max_abs_sym + lo
-                        if allowed_w > 1e-12:
-                            clamped_intents.append(replace(intent, qty_value=allowed_w))
+                        if allowed_w > 1e-12 and ef_ratio > 0.0:
+                            clamped_intents.append(replace(intent, qty_value=allowed_w / ef_ratio))
                             tracked_syms.add(sym)
                             add_sell[sym] = as_ + allowed_w
                             base_lo.setdefault(sym, b_lo)

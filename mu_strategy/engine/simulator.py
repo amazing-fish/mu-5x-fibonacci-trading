@@ -19,7 +19,7 @@ from mu_strategy.engine.metrics import (
     _finalize_curve_stats,
     compute_simulation_metrics,
 )
-from mu_strategy.engine.risk_overlay import RiskOverlay, apply_risk_overlays
+from mu_strategy.engine.risk_overlay import ExposureCapOverlay, RiskOverlay, apply_risk_overlays
 from mu_strategy.market_data.bar_series import BarSeries, BarSeriesSlice, MarketView
 from mu_strategy.market_data.funding import (
     FundingSeries,
@@ -594,6 +594,40 @@ def _bands_exclude_price(
         if band.excludes(target_px):
             return True
     return False
+
+
+def _apply_sim_overlays(
+    overlays: Sequence[RiskOverlay],
+    ctx: BarContext,
+    output: StrategyOutput,
+    sizing_basis: Literal["marked_equity", "settled_equity"],
+    enforce_instrument_max_leverage: bool,
+    acct: Any,
+) -> StrategyOutput:
+    """Apply overlays with transient run-scoped Simulator policy bindings (CR6-04 / CR6-05)."""
+    saved: list[tuple[ExposureCapOverlay, Any, Any, Any]] = []
+    for ov in overlays:
+        if isinstance(ov, ExposureCapOverlay):
+            saved.append(
+                (
+                    ov,
+                    ov._runtime_sizing_basis,
+                    ov._runtime_enforce_instrument_max_leverage,
+                    ov._runtime_settled_equity_source,
+                )
+            )
+            ov._runtime_sizing_basis = sizing_basis
+            ov._runtime_enforce_instrument_max_leverage = enforce_instrument_max_leverage
+            ov._runtime_settled_equity_source = acct
+    if not saved:
+        return apply_risk_overlays(overlays, ctx, output)
+    try:
+        return apply_risk_overlays(overlays, ctx, output)
+    finally:
+        for ov, prev_sb, prev_enf, prev_src in saved:
+            ov._runtime_sizing_basis = prev_sb
+            ov._runtime_enforce_instrument_max_leverage = prev_enf
+            ov._runtime_settled_equity_source = prev_src
 
 
 class _SimAccount:
@@ -2274,6 +2308,7 @@ class _SimAccount:
 
         # 1.5 Intrabar protective exits (MMR liquidation / stop-loss / take-profit under CONSERVATIVE).
         if self.pos_qty != 0.0:
+            liqs_before_p1_5 = self.liquidations
             if self.pending_reduce_orders:
                 if self.process_protective_exits_with_orders(
                     i,
@@ -2320,6 +2355,8 @@ class _SimAccount:
                             if exit_quote.order_type == "liquidation":
                                 self.liquidations += 1
                             exited_existing_this_bar = True
+            if self.liquidations > liqs_before_p1_5 and self.pending_entries:
+                self.pending_entries.clear()
 
         # 1.6 Resting entry / scale-in OrderIntents (CR1-38/39/40/42/46 + CR2-19/20 + CR3-06 + CR4-04).
         #     Keep eligible ``open_only`` protective reductions alive through Phase 0 (at-open entries)
@@ -2708,8 +2745,9 @@ class _SimAccount:
                 else:
                     self.pending_entries = suspended_entries + next_entries
 
-        # 1.7 Same-bar conservative protective stop & post-fill liquidation recheck (CR1-46).
+        # 1.7 Same-bar conservative protective stop & post-fill liquidation recheck (CR1-46 / CR6-06).
         if risk_increased_in_p1_6 and self.pos_qty != 0.0:
+            liqs_before_p1_7 = self.liquidations
             if fresh_entry_this_bar and (not new_target_bracket_set):
                 if self.pending_reduce_orders:
                     self.process_protective_exits_with_orders(
@@ -2732,6 +2770,7 @@ class _SimAccount:
                         liq_bar_high=p1_6_liq_high,
                         liq_bar_low=p1_6_liq_low,
                         skip_stops_at_or_beyond_entry=True,
+                        raw_bar_open=bar_open,
                     )
                 else:
                     liq_px = self.cached_liq_price
@@ -2810,6 +2849,10 @@ class _SimAccount:
                                 self.apply_fill(scale_exit, bar_open_ms, i)
                                 if scale_exit.order_type == "liquidation":
                                     self.liquidations += 1
+            # CR6-06: Cancel all surviving queued entries if Step 1.7 liquidated the position
+            # (leaving pending entries intact on ordinary non-liquidation exits).
+            if self.liquidations > liqs_before_p1_7 and self.pending_entries:
+                self.pending_entries.clear()
 
         # Decrement TTL and expire missed eligible open_only orders on surviving resting reduce_only orders (CR2-19, CR3-20).
         if self.pending_reduce_orders:
@@ -4308,7 +4351,14 @@ class Simulator:
                     acct.bar_idx = i
                     acct.callback_active = True
                     try:
-                        output = apply_risk_overlays(overlays, live_ctx, on_bar_fn(live_ctx))
+                        output = _apply_sim_overlays(
+                            overlays,
+                            live_ctx,
+                            on_bar_fn(live_ctx),
+                            self.config.sizing_basis,
+                            enforce_max_lev,
+                            acct,
+                        )
                     finally:
                         acct.callback_active = False
                 elif reuse_ctx:
@@ -4321,12 +4371,26 @@ class Simulator:
                     finally:
                         acct.callback_active = False
                     ov_ctx = acct.build_immutable_ctx(i, close_equity, peak_equity, daily_start_equity)
-                    output = apply_risk_overlays(overlays, ov_ctx, raw_output)
+                    output = _apply_sim_overlays(
+                        overlays,
+                        ov_ctx,
+                        raw_output,
+                        self.config.sizing_basis,
+                        enforce_max_lev,
+                        acct,
+                    )
                 else:
                     ctx = acct.build_immutable_ctx(i, close_equity, peak_equity, daily_start_equity)
                     output = on_bar_fn(ctx)
                     if has_overlays:
-                        output = apply_risk_overlays(overlays, ctx, output)
+                        output = _apply_sim_overlays(
+                            overlays,
+                            ctx,
+                            output,
+                            self.config.sizing_basis,
+                            enforce_max_lev,
+                            acct,
+                        )
 
                 # If a loss overlay halted trading, cancel all queued risk-increasing entries while preserving exits (CR1-38).
                 if has_overlays and acct.is_halted_by_overlay():
