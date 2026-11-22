@@ -1012,8 +1012,9 @@ def compute_buy_and_hold_benchmark(
     accrued_funding = 0.0
     total_traded_notional = entry_notional
     equity_curve_slots: list[tuple[int, float] | None] = [None] * (n - start_idx)
-    pending_closes: list[tuple[int, int]] = []
+    pending_closes: list[tuple[int, int, float | None]] = []
     trades: list[TradeRecord] = []
+    entry_bar_idx = start_idx
     bars_in_market = 0
     liquidations = 0
     is_open = True
@@ -1088,15 +1089,173 @@ def compute_buy_and_hold_benchmark(
                 liq_price = _compute_bench_liq_price(cash)
             settled_until_ms = end_ms
 
-    def _flush_pending_close(p_close_ms: int, p_idx: int) -> None:
+    def _liquidate_bench(
+        *,
+        exit_bar_idx: int,
+        exit_time_ms: int,
+        liq_threshold: float,
+        gapped_open: bool,
+        use_prior_open_slip: bool,
+        b_open: float,
+        b_high: float,
+        b_low: float,
+        b_close: float,
+        b_vol: float,
+        b_atr: float | None,
+    ) -> None:
         nonlocal cash, total_traded_notional, bars_in_market, is_open, liq_price, liquidations
-        # Settle all funding up to this bar's close timestamp strictly causally (CR6-01 / CR6-02).
+        if execution is not None:
+            if use_prior_open_slip:
+                gap_prior_idx = _prior_closed_index(exit_bar_idx, exit_time_ms)
+                p_high_l = float(highs[gap_prior_idx]) if gap_prior_idx is not None else b_open
+                p_low_l = float(lows[gap_prior_idx]) if gap_prior_idx is not None else b_open
+                p_close_l = float(closes[gap_prior_idx]) if gap_prior_idx is not None else b_open
+                p_vol_l = float(volumes[gap_prior_idx]) if gap_prior_idx is not None else 0.0
+                p_atr_l = (
+                    float(atr_arr[gap_prior_idx])
+                    if (atr_arr is not None and gap_prior_idx is not None)
+                    else None
+                )
+                slip_l = execution.compute_slippage_price(
+                    b_open,
+                    order_notional=b_open * qty_abs,
+                    bar_close=p_close_l,
+                    bar_volume=p_vol_l,
+                    bar_atr=p_atr_l,
+                    bar_high=p_high_l,
+                    bar_low=p_low_l,
+                    is_stop=True,
+                )
+                adv_l = (b_open * execution._half_spread_rate) + slip_l
+                exec_l = (
+                    (b_open + adv_l)
+                    if close_side == "buy"
+                    else max(execution.min_price, b_open - adv_l)
+                )
+                liq_quote = execution._make_quote(
+                    side=close_side,
+                    order_type="liquidation",
+                    ref_price=b_open,
+                    exec_price=exec_l,
+                    qty=qty_abs,
+                    fee_rate=execution._liq_total_fee_rate,
+                    liquidity="taker",
+                    reason="liquidation",
+                )
+            else:
+                liq_quote = execution.try_fill_liquidation(
+                    signed_qty,
+                    liq_threshold,
+                    bar_open=b_open,
+                    bar_high=b_high,
+                    bar_low=b_low,
+                    bar_close=b_close,
+                    bar_volume=b_vol,
+                    bar_atr=b_atr,
+                )
+                assert liq_quote is not None
+            ref_exit = liq_quote.ref_price
+            exec_exit = liq_quote.exec_price
+            exit_notional = liq_quote.notional
+            exit_fee = liq_quote.fee
+            exit_slippage = liq_quote.slippage_cost
+        else:
+            ref_exit = b_open if gapped_open else liq_threshold
+            exec_exit = ref_exit * (1.0 - side_sign * spread_rate)
+            if exec_exit <= 0.0:
+                exec_exit = ref_exit
+            exit_notional = exec_exit * qty_abs
+            exit_fee = exit_notional * liq_total_fee_rate
+            exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+
+        gross_pnl = signed_qty * (ref_exit - ref_entry)
+        total_fees = entry_fee + exit_fee
+        total_slip = entry_slippage + exit_slippage
+        net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
+        cash = starting_equity + net_pnl
+        total_traded_notional += exit_notional
+        bars_in_market += max(0, exit_bar_idx - entry_bar_idx)
+        trades.append(
+            TradeRecord(
+                entry_time_ms=int(open_times[start_idx]),
+                exit_time_ms=exit_time_ms,
+                side=side,
+                entry_price=exec_entry,
+                exit_price=exec_exit,
+                qty=qty_abs,
+                gross_pnl=gross_pnl,
+                fees=total_fees,
+                slippage=total_slip,
+                funding_pnl=accrued_funding,
+                net_pnl=net_pnl,
+                return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
+                reason="liquidation",
+                symbol=resolved_symbol,
+                ref_entry_price=ref_entry,
+                ref_exit_price=ref_exit,
+            )
+        )
+        is_open = False
+        liq_price = None
+        liquidations += 1
+
+    def _flush_pending_close(p_close_ms: int, p_idx: int, open_liq_price: float | None) -> None:
+        nonlocal cash, total_traded_notional, bars_in_market, is_open, liq_price, liquidations
+        p_open = float(opens[p_idx])
+        p_high = float(highs[p_idx])
+        p_low = float(lows[p_idx])
+        p_close = float(closes[p_idx])
+        p_vol = float(volumes[p_idx])
+        p_atr = float(atr_arr[p_idx]) if atr_arr is not None else None
+
+        # 1. Non-gap intrabar OHLC MMR liquidation check deferred to bar close so a later overlapping
+        #    bar's intrabar wick cannot preempt an earlier bar's close or funding (CR7-03), while
+        #    preserving pre-funding intrabar ordering on non-overlapping bars and avoiding false
+        #    retroactive liquidation when subsequent funding raises liq_price past an earlier open (CR4-07).
+        if is_open and open_liq_price is not None and liq_price is not None:
+            eff_intrabar_liq = (
+                min(open_liq_price, liq_price) if side == "long" else max(open_liq_price, liq_price)
+            )
+            intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
+            if intrabar_hit:
+                _liquidate_bench(
+                    exit_bar_idx=p_idx,
+                    exit_time_ms=p_close_ms,
+                    liq_threshold=liq_price,
+                    gapped_open=((p_open <= liq_price) if side == "long" else (p_open >= liq_price)),
+                    use_prior_open_slip=False,
+                    b_open=p_open,
+                    b_high=p_high,
+                    b_low=p_low,
+                    b_close=p_close,
+                    b_vol=p_vol,
+                    b_atr=p_atr,
+                )
+
+        # 2. Settle all funding up to this bar's close timestamp strictly causally (CR6-01 / CR6-02).
         _settle_funding_up_to(p_close_ms)
+
         if is_open:
-            bars_in_market += 1
-            p_close = float(closes[p_idx])
-            p_vol = float(volumes[p_idx])
-            p_atr = float(atr_arr[p_idx]) if atr_arr is not None else None
+            # 3. Post-close-funding maintenance-margin liquidation check before recording the close (CR7-02).
+            if liq_price is not None and (
+                (p_close <= liq_price) if side == "long" else (p_close >= liq_price)
+            ):
+                _liquidate_bench(
+                    exit_bar_idx=p_idx,
+                    exit_time_ms=p_close_ms,
+                    liq_threshold=liq_price,
+                    gapped_open=True,
+                    use_prior_open_slip=False,
+                    b_open=p_close,
+                    b_high=p_close,
+                    b_low=p_close,
+                    b_close=p_close,
+                    b_vol=p_vol,
+                    b_atr=p_atr,
+                )
+                equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(cash))
+                return
+
             unrealized = signed_qty * (p_close - exec_entry)
             marked_equity = cash + unrealized
             if marked_equity <= 0.0:
@@ -1131,6 +1290,7 @@ def compute_buy_and_hold_benchmark(
                 net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
                 cash = starting_equity + net_pnl
                 total_traded_notional += exit_notional
+                bars_in_market += max(0, p_idx - entry_bar_idx)
                 trades.append(
                     TradeRecord(
                         entry_time_ms=int(open_times[start_idx]),
@@ -1162,19 +1322,20 @@ def compute_buy_and_hold_benchmark(
 
     liq_price = _compute_bench_liq_price(cash)
 
-    # Monotonic timestamp-ordered timeline over bar opens and closes (CR4-07 / CR5-01 / CR5-02 / CR6-01 / CR6-02).
+    # Monotonic timestamp-ordered timeline over bar opens and closes (CR4-07 / CR5-01 / CR5-02 / CR6-01 / CR6-02 / CR7-01..03).
     # On contiguous/gapped bars, pending_closes flushes bar i-1 immediately before bar i opens (zero drift).
-    # On overlapping bars, earlier opens/liquidations run before later closes are flushed, using one live cash state.
+    # On overlapping bars, gap-at-open liquidations execute at bar_open_ms while non-gap intrabar breaches
+    # and close-time funding/MMR liquidation checks flush in ascending close_time_ms order on one live cash state.
     for i in range(start_idx, n):
         bar_open_ms = int(open_times[i])
         bar_close_ms = int(close_times[i])
 
         # 1a. Flush every prior bar close completing at or before this bar's open in ascending close_time_ms order.
         while pending_closes and pending_closes[0][0] <= bar_open_ms:
-            p_close_ms, p_idx = heappop(pending_closes)
-            _flush_pending_close(p_close_ms, p_idx)
+            p_close_ms, p_idx, p_open_liq = heappop(pending_closes)
+            _flush_pending_close(p_close_ms, p_idx, p_open_liq)
 
-        # 1b. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar i's open/liquidation check.
+        # 1b. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar i's open/gap-liquidation check.
         _settle_funding_up_to(bar_open_ms)
 
         bar_open = float(opens[i])
@@ -1184,108 +1345,38 @@ def compute_buy_and_hold_benchmark(
         bar_vol = float(volumes[i])
         bar_atr = float(atr_arr[i]) if atr_arr is not None else None
 
-        # 2. Intrabar / gap-at-open OHLC MMR liquidation check matching Simulator rules (CR1-52, CR2-31).
+        # 2. Gap-at-open MMR liquidation check ONLY (CR1-52 / CR2-31 / CR7-03); non-gap intrabar
+        #    liquidations are evaluated when bar i's close flushes so overlapping opens cannot preempt
+        #    earlier bar closes or funding events.
         if is_open and liq_price is not None:
-            liq_triggered = (bar_low <= liq_price) if side == "long" else (bar_high >= liq_price)
-            if liq_triggered:
-                gapped_liq = (bar_open <= liq_price) if side == "long" else (bar_open >= liq_price)
-                if execution is not None:
-                    if gapped_liq:
-                        gap_prior_idx = _prior_closed_index(i, bar_open_ms)
-                        p_high_l = float(highs[gap_prior_idx]) if gap_prior_idx is not None else bar_open
-                        p_low_l = float(lows[gap_prior_idx]) if gap_prior_idx is not None else bar_open
-                        p_close_l = float(closes[gap_prior_idx]) if gap_prior_idx is not None else bar_open
-                        p_vol_l = float(volumes[gap_prior_idx]) if gap_prior_idx is not None else 0.0
-                        p_atr_l = float(atr_arr[gap_prior_idx]) if (atr_arr is not None and gap_prior_idx is not None) else None
-                        slip_l = execution.compute_slippage_price(
-                            bar_open,
-                            order_notional=bar_open * qty_abs,
-                            bar_close=p_close_l,
-                            bar_volume=p_vol_l,
-                            bar_atr=p_atr_l,
-                            bar_high=p_high_l,
-                            bar_low=p_low_l,
-                            is_stop=True,
-                        )
-                        adv_l = (bar_open * execution._half_spread_rate) + slip_l
-                        exec_l = (bar_open + adv_l) if close_side == "buy" else max(execution.min_price, bar_open - adv_l)
-                        liq_quote = execution._make_quote(
-                            side=close_side,
-                            order_type="liquidation",
-                            ref_price=bar_open,
-                            exec_price=exec_l,
-                            qty=qty_abs,
-                            fee_rate=execution._liq_total_fee_rate,
-                            liquidity="taker",
-                            reason="liquidation",
-                        )
-                    else:
-                        liq_quote = execution.try_fill_liquidation(
-                            signed_qty,
-                            liq_price,
-                            bar_open=bar_open,
-                            bar_high=bar_high,
-                            bar_low=bar_low,
-                            bar_close=bar_close,
-                            bar_volume=bar_vol,
-                            bar_atr=bar_atr,
-                        )
-                        assert liq_quote is not None
-                    ref_exit = liq_quote.ref_price
-                    exec_exit = liq_quote.exec_price
-                    exit_notional = liq_quote.notional
-                    exit_fee = liq_quote.fee
-                    exit_slippage = liq_quote.slippage_cost
-                else:
-                    ref_exit = bar_open if gapped_liq else liq_price
-                    exec_exit = ref_exit * (1.0 - side_sign * spread_rate)
-                    if exec_exit <= 0.0:
-                        exec_exit = ref_exit
-                    exit_notional = exec_exit * qty_abs
-                    exit_fee = exit_notional * liq_total_fee_rate
-                    exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
-
-                gross_pnl = signed_qty * (ref_exit - ref_entry)
-                total_fees = entry_fee + exit_fee
-                total_slip = entry_slippage + exit_slippage
-                net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
-                cash = starting_equity + net_pnl
-                total_traded_notional += exit_notional
-                trades.append(
-                    TradeRecord(
-                        entry_time_ms=int(open_times[start_idx]),
-                        exit_time_ms=bar_open_ms,
-                        side=side,
-                        entry_price=exec_entry,
-                        exit_price=exec_exit,
-                        qty=qty_abs,
-                        gross_pnl=gross_pnl,
-                        fees=total_fees,
-                        slippage=total_slip,
-                        funding_pnl=accrued_funding,
-                        net_pnl=net_pnl,
-                        return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
-                        reason="liquidation",
-                        symbol=resolved_symbol,
-                        ref_entry_price=ref_entry,
-                        ref_exit_price=ref_exit,
-                    )
+            gapped_liq = (bar_open <= liq_price) if side == "long" else (bar_open >= liq_price)
+            if gapped_liq:
+                _liquidate_bench(
+                    exit_bar_idx=i,
+                    exit_time_ms=bar_open_ms,
+                    liq_threshold=liq_price,
+                    gapped_open=True,
+                    use_prior_open_slip=True,
+                    b_open=bar_open,
+                    b_high=bar_high,
+                    b_low=bar_low,
+                    b_close=bar_close,
+                    b_vol=bar_vol,
+                    b_atr=bar_atr,
                 )
-                is_open = False
-                liq_price = None
-                liquidations += 1
 
-        # 3. Enqueue bar i's close timestamp for chronological funding, bankruptcy, and equity curve recording.
-        heappush(pending_closes, (bar_close_ms, i))
+        # 3. Enqueue bar i's close timestamp & open-time liq threshold for chronological close processing.
+        heappush(pending_closes, (bar_close_ms, i, liq_price))
 
     # 4. Flush all remaining bar closes in ascending close_time_ms order.
     while pending_closes:
-        p_close_ms, p_idx = heappop(pending_closes)
-        _flush_pending_close(p_close_ms, p_idx)
+        p_close_ms, p_idx, p_open_liq = heappop(pending_closes)
+        _flush_pending_close(p_close_ms, p_idx, p_open_liq)
 
     equity_curve: list[tuple[int, float]] = [pt for pt in equity_curve_slots if pt is not None]
 
     if is_open:
+        bars_in_market += max(0, n - entry_bar_idx)
         final_close = float(closes[-1])
         final_close_ms = int(close_times[-1])
         if close_on_end:

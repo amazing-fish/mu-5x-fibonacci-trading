@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -827,36 +827,77 @@ class ExposureCapOverlay:
             if settled_src is not None
             else float(ctx.portfolio.cash)
         )
-        # Convert simulator eq_basis-denominated fractions to marked-equity weights (CR6-04).
-        if equity > 0.0:
-            if eff_sizing_basis == "settled_equity":
-                ef_ratio = max(0.0, settled_equity / equity)
-                prot_ef_ratio = ef_ratio
-                prot_tw_ratio = min(1.0, ef_ratio) if settled_equity > 0.0 else 0.0
-            elif eff_sizing_basis == "marked_equity":
-                ef_ratio = 1.0
-                prot_ef_ratio = 1.0
-                prot_tw_ratio = 1.0
-            else:
-                settled_ratio = max(0.0, settled_equity / equity)
-                ef_ratio = max(1.0, settled_ratio)
-                prot_ef_ratio = max(1.0, settled_ratio)
-                prot_tw_ratio = min(1.0, settled_ratio) if settled_equity > 0.0 else 0.0
-        else:
-            ef_ratio = 1.0
-            prot_ef_ratio = 1.0
-            prot_tw_ratio = 0.0
-
-        # Current signed weights by symbol.
+        # Current signed marked-equity weights and realizable net PnL by symbol.
         existing_weights: dict[str, float] = {}
+        pos_realizable_net: dict[str, float] = {}
         if equity > 0.0:
+            src_sym = getattr(settled_src, "symbol", None) if settled_src is not None else None
             for sym, pos in ctx.portfolio.positions.items():
                 if not pos.is_flat:
                     sign = 1.0 if pos.qty > 0.0 else -1.0
                     existing_weights[sym] = sign * (pos.notional / equity)
+                    r_net = float(pos.unrealized_pnl)
+                    if settled_src is not None and sym == src_sym:
+                        r_net += float(settled_src.open_funding_pnl) - float(settled_src.open_entry_fees)
+                    pos_realizable_net[sym] = r_net
+
+        def _inst_max_leverage(osym: str) -> float | None:
+            inst_obj = ctx.instrument
+            if inst_obj is not None and osym == inst_obj.symbol:
+                raw_ml = getattr(inst_obj, "max_leverage", None)
+                if raw_ml is not None and math.isfinite(raw_ml) and raw_ml > 0.0:
+                    return float(raw_ml)
+            return None
+
+        def _settled_ratios_for_bounds(
+            lo_fn: Callable[[str], float],
+            hi_fn: Callable[[str], float],
+        ) -> tuple[float, float]:
+            """Map simulator eq_basis units to marked-equity weights (upper, lower) (CR6-04 / CR7-05 / CR7-06 / CR7-10)."""
+            if equity <= 0.0:
+                return 1.0, 0.0
+            if eff_sizing_basis == "marked_equity":
+                return 1.0, 1.0
+            gain = 0.0
+            loss = 0.0
+            for osym, ew in existing_weights.items():
+                r_net = pos_realizable_net.get(osym, 0.0)
+                if r_net == 0.0 or ew == 0.0:
+                    continue
+                if ew > 0.0:
+                    lo_w = lo_fn(osym)
+                    rem_pos = lo_w if lo_w > 0.0 else 0.0
+                    closed_frac = (ew - rem_pos) / ew if rem_pos < ew else 0.0
+                else:
+                    hi_w = hi_fn(osym)
+                    rem_neg = -hi_w if hi_w < 0.0 else 0.0
+                    ew_abs = -ew
+                    closed_frac = (ew_abs - rem_neg) / ew_abs if rem_neg < ew_abs else 0.0
+                if closed_frac > 1.0:
+                    closed_frac = 1.0
+                if closed_frac > 0.0:
+                    if r_net > 0.0:
+                        gain += closed_frac * r_net
+                    else:
+                        loss += closed_frac * r_net
+            max_eq_r = max(0.0, (settled_equity + gain) / equity)
+            min_eq_r = max(0.0, (settled_equity + loss) / equity)
+            if eff_sizing_basis == "settled_equity":
+                return max_eq_r, min_eq_r
+            return max(1.0, max_eq_r), min(1.0, min_eq_r)
+
+        if equity > 0.0:
+            if eff_sizing_basis == "marked_equity":
+                prot_tw_ratio = 1.0
+            else:
+                loss_all = math.fsum(v for v in pos_realizable_net.values() if v < 0.0)
+                min_settled_r = max(0.0, (settled_equity + loss_all) / equity)
+                prot_tw_ratio = min(1.0, min_settled_r) if settled_equity > 0.0 else 0.0
+        else:
+            prot_tw_ratio = 0.0
 
         # 1. Summarize already-resting open orders AND protective reductions BEFORE admitting targets
-        #    (CR2-29 / CR3-16 / CR5-05 / CR6-04 / CR6-05):
+        #    (CR2-29 / CR3-16 / CR5-05 / CR6-04 / CR6-05 / CR7-04 / CR7-06):
         #    - Non-reduce-only resting orders can still fill AFTER a queued TargetPosition fills.
         #    - Protective reduce_only / close_all orders (resting + same-output, deduplicated by intent_id)
         #      can shrink a positive long down toward 0.0 (never negative) or a negative short up toward 0.0
@@ -871,6 +912,32 @@ class ExposureCapOverlay:
         red_buy_ceil: dict[str, float] = {}
         all_known_syms: set[str] = set(existing_weights.keys())
 
+        def _apply_protective_reductions(sym: str, lo_val: float, hi_val: float) -> tuple[float, float]:
+            # Shrink only the inner side toward 0.0 (never crossing 0.0, preserving CR3-16 & CR1-31).
+            if lo_val > 0.0:
+                if sym in red_sell_floor and red_sell_floor[sym] < lo_val:
+                    lo_val = red_sell_floor[sym]
+                rs_red = red_sell.get(sym, 0.0)
+                if rs_red > 0.0:
+                    lo_val = max(0.0, lo_val - rs_red)
+            if hi_val < 0.0:
+                if sym in red_buy_ceil and red_buy_ceil[sym] > hi_val:
+                    hi_val = red_buy_ceil[sym]
+                rb_red = red_buy.get(sym, 0.0)
+                if rb_red > 0.0:
+                    hi_val = min(0.0, hi_val + rb_red)
+            return lo_val, hi_val
+
+        def _prot_only_lo(sym: str) -> float:
+            ew = existing_weights.get(sym, 0.0)
+            lo_v, _ = _apply_protective_reductions(sym, ew, ew)
+            return lo_v
+
+        def _prot_only_hi(sym: str) -> float:
+            ew = existing_weights.get(sym, 0.0)
+            _, hi_v = _apply_protective_reductions(sym, ew, ew)
+            return hi_v
+
         def _record_protective_reduction(ord_obj: OrderIntent) -> None:
             osym = ord_obj.symbol
             all_known_syms.add(osym)
@@ -881,7 +948,15 @@ class ExposureCapOverlay:
                 else:
                     red_buy[osym] = math.inf
             elif qm == "equity_fraction":
-                w_red_ef = ord_obj.qty_value * prot_ef_ratio
+                # CR7-04: Clamp protective equity_fraction by known instrument max_leverage when enforced;
+                # size against current upper settled ratio (reflecting any prior profit-realizing reductions).
+                raw_ef = ord_obj.qty_value
+                if eff_enforce_inst_lev is True:
+                    inst_ml_ef = _inst_max_leverage(osym)
+                    if inst_ml_ef is not None and raw_ef > inst_ml_ef:
+                        raw_ef = inst_ml_ef
+                cur_prot_ef_ratio, _ = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
+                w_red_ef = raw_ef * cur_prot_ef_ratio
                 if ord_obj.side == "sell":
                     red_sell[osym] = red_sell.get(osym, 0.0) + w_red_ef
                 else:
@@ -903,12 +978,7 @@ class ExposureCapOverlay:
                 # CR6-05: Reserve against the effective protective target AFTER instrument leverage
                 # clamping when known; reserve conservatively down to flat (0.0) when policy is unknown;
                 # preserve the unclamped target when leverage enforcement is explicitly off.
-                inst_ml: float | None = None
-                inst = ctx.instrument
-                if inst is not None and osym == inst.symbol:
-                    raw_ml = getattr(inst, "max_leverage", None)
-                    if raw_ml is not None and math.isfinite(raw_ml) and raw_ml > 0.0:
-                        inst_ml = float(raw_ml)
+                inst_ml = _inst_max_leverage(osym)
                 raw_tw = ord_obj.qty_value
                 if ord_obj.side == "sell":
                     if eff_enforce_inst_lev is True:
@@ -935,19 +1005,51 @@ class ExposureCapOverlay:
             if it.reduce_only or it.qty_mode == "close_all"
         }
 
+        # Step 1a: Record all Step 1.3 protective orders BEFORE computing target conversion ratios.
         for open_ord in ctx.portfolio.open_orders:
             if open_ord.reduce_only or open_ord.qty_mode == "close_all":
                 if open_ord.intent_id not in same_output_reduce_ids:
                     _record_protective_reduction(open_ord)
+
+        for it_pre in output.intents:
+            if it_pre.reduce_only or it_pre.qty_mode == "close_all":
+                _record_protective_reduction(it_pre)
+
+        target_upper_ratio, target_lower_ratio = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
+
+        # Step 1b: Record target bracket protective exits (Step 1.5, after Step 1.4 targets).
+        for t_pre in output.targets:
+            if t_pre.stop_price is not None or t_pre.take_profit is not None:
+                if t_pre.target_weight > 0.0:
+                    red_sell[t_pre.symbol] = math.inf
+                elif t_pre.target_weight < 0.0:
+                    red_buy[t_pre.symbol] = math.inf
+
+        rest_upper_ratio, rest_lower_ratio = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
+
+        # Step 1c: Summarize non-reduce-only resting open orders in marked-equity units.
+        for open_ord in ctx.portfolio.open_orders:
+            if open_ord.reduce_only or open_ord.qty_mode == "close_all":
                 continue
             osym = open_ord.symbol
             all_known_syms.add(osym)
             if open_ord.qty_mode == "target_weight":
                 w = open_ord.qty_value
-                rest_tw_lo[osym] = w if osym not in rest_tw_lo else min(rest_tw_lo[osym], w)
-                rest_tw_hi[osym] = w if osym not in rest_tw_hi else max(rest_tw_hi[osym], w)
+                inst_ml_r = _inst_max_leverage(osym)
+                if eff_enforce_inst_lev is True and inst_ml_r is not None:
+                    r_vals: tuple[float, ...] = (max(-inst_ml_r, min(inst_ml_r, w)),)
+                elif eff_enforce_inst_lev is False or inst_ml_r is None:
+                    r_vals = (w,)
+                else:
+                    r_cl = max(-inst_ml_r, min(inst_ml_r, w))
+                    r_vals = (w, r_cl) if r_cl != w else (w,)
+                r_cands = [v * r for v in r_vals for r in (rest_lower_ratio, rest_upper_ratio)]
+                r_lo = min(r_cands)
+                r_hi = max(r_cands)
+                rest_tw_lo[osym] = r_lo if osym not in rest_tw_lo else min(rest_tw_lo[osym], r_lo)
+                rest_tw_hi[osym] = r_hi if osym not in rest_tw_hi else max(rest_tw_hi[osym], r_hi)
             elif open_ord.qty_mode == "equity_fraction":
-                w_ef = open_ord.qty_value * ef_ratio
+                w_ef = open_ord.qty_value * rest_upper_ratio
                 if open_ord.side == "buy":
                     rest_buy[osym] = rest_buy.get(osym, 0.0) + w_ef
                 else:
@@ -961,33 +1063,6 @@ class ExposureCapOverlay:
                         rest_buy[osym] = rest_buy.get(osym, 0.0) + w
                     else:
                         rest_sell[osym] = rest_sell.get(osym, 0.0) + w
-
-        for it_pre in output.intents:
-            if it_pre.reduce_only or it_pre.qty_mode == "close_all":
-                _record_protective_reduction(it_pre)
-
-        for t_pre in output.targets:
-            if t_pre.stop_price is not None or t_pre.take_profit is not None:
-                if t_pre.target_weight > 0.0:
-                    red_sell[t_pre.symbol] = math.inf
-                elif t_pre.target_weight < 0.0:
-                    red_buy[t_pre.symbol] = math.inf
-
-        def _apply_protective_reductions(sym: str, lo_val: float, hi_val: float) -> tuple[float, float]:
-            # Shrink only the inner side toward 0.0 (never crossing 0.0, preserving CR3-16 & CR1-31).
-            if lo_val > 0.0:
-                if sym in red_sell_floor and red_sell_floor[sym] < lo_val:
-                    lo_val = red_sell_floor[sym]
-                rs_red = red_sell.get(sym, 0.0)
-                if rs_red > 0.0:
-                    lo_val = max(0.0, lo_val - rs_red)
-            if hi_val < 0.0:
-                if sym in red_buy_ceil and red_buy_ceil[sym] > hi_val:
-                    hi_val = red_buy_ceil[sym]
-                rb_red = red_buy.get(sym, 0.0)
-                if rb_red > 0.0:
-                    hi_val = min(0.0, hi_val + rb_red)
-            return lo_val, hi_val
 
         def _post_target_envelope(
             sym: str,
@@ -1010,26 +1085,40 @@ class ExposureCapOverlay:
             b_lo, b_hi = _apply_protective_reductions(sym, b_lo, b_hi)
             return b_lo - rest_sell.get(sym, 0.0), b_hi + rest_buy.get(sym, 0.0)
 
-        # 2. Clamp individual TargetPositions against single_cap AND resting orders on that symbol (CR2-29).
+        # 2. Clamp individual TargetPositions in marked-equity units against single_cap AND resting orders
+        #    on that symbol, then convert capped results back to the simulator's sizing basis (CR2-29 / CR7-10).
         clamped_targets: list[TargetPosition] = []
+        target_marked: list[float] = []
         targeted_symbols: set[str] = set()
         for t in output.targets:
             tsym = t.symbol
             rb = rest_buy.get(tsym, 0.0)
             rs = rest_sell.get(tsym, 0.0)
-            w = t.target_weight
-            if w > 0.0:
-                w = min(w, max(0.0, single_cap - rb))
-            elif w < 0.0:
-                w = max(w, -max(0.0, single_cap - rs))
-            if w == 0.0:
-                w = 0.0
-            clamped_targets.append(replace(t, target_weight=w))
+            w_raw = t.target_weight
+            w_m = w_raw * target_upper_ratio
+            clamped_s = False
+            if w_m > 0.0:
+                lim_pos = max(0.0, single_cap - rb)
+                if w_m > lim_pos:
+                    w_m = lim_pos
+                    clamped_s = True
+            elif w_m < 0.0:
+                lim_neg = -max(0.0, single_cap - rs)
+                if w_m < lim_neg:
+                    w_m = lim_neg
+                    clamped_s = True
+            w_out = ((w_m / target_upper_ratio) if target_upper_ratio > 0.0 else 0.0) if clamped_s else w_raw
+            if w_out == 0.0:
+                w_out = 0.0
+            if w_m == 0.0:
+                w_m = 0.0
+            clamped_targets.append(replace(t, target_weight=w_out))
+            target_marked.append(w_m)
             targeted_symbols.add(tsym)
             all_known_syms.add(tsym)
 
-        # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols,
-        #    aggregating the min/max envelope across EVERY surviving target per symbol (CR4-01).
+        # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols
+        #    in marked-equity units, aggregating the min/max envelope across EVERY surviving target per symbol (CR4-01 / CR7-10).
         if clamped_targets:
             untouched_gross = 0.0
             for usym in all_known_syms:
@@ -1039,11 +1128,10 @@ class ExposureCapOverlay:
             allowed_targeted_gross = max(0.0, self.max_gross_leverage - untouched_gross)
             sym_t_lo: dict[str, float] = {}
             sym_t_hi: dict[str, float] = {}
-            for t in clamped_targets:
+            for t, tw_m in zip(clamped_targets, target_marked):
                 tsym = t.symbol
-                tw = t.target_weight
-                sym_t_lo[tsym] = tw if tsym not in sym_t_lo else min(sym_t_lo[tsym], tw)
-                sym_t_hi[tsym] = tw if tsym not in sym_t_hi else max(sym_t_hi[tsym], tw)
+                sym_t_lo[tsym] = tw_m if tsym not in sym_t_lo else min(sym_t_lo[tsym], tw_m)
+                sym_t_hi[tsym] = tw_m if tsym not in sym_t_hi else max(sym_t_hi[tsym], tw_m)
             sym_worst: dict[str, float] = {}
             for tsym in targeted_symbols:
                 e_lo, e_hi = _post_target_envelope(tsym, sym_t_lo[tsym], sym_t_hi[tsym])
@@ -1064,34 +1152,45 @@ class ExposureCapOverlay:
                 if inc_sum > 1e-12:
                     ratio = min(1.0, rem_for_inc / inc_sum)
                     new_targets: list[TargetPosition] = []
-                    for t in clamped_targets:
+                    new_marked: list[float] = []
+                    for t, w_cur_m in zip(clamped_targets, target_marked):
                         tsym = t.symbol
                         if inc_contribs.get(tsym, 0.0) > 0.0:
                             # CR5-04: Preserve each symbol's baseline (existing position / floor) and
                             # scale ONLY the requested increase above that baseline; flat books scale from 0.
                             fl_sym = base_floors[tsym]
-                            w_cur = t.target_weight
-                            if w_cur > 0.0:
+                            if w_cur_m > 0.0:
                                 base_pos = max(0.0, fl_sym - rest_buy.get(tsym, 0.0))
-                                w_scaled = (base_pos + (w_cur - base_pos) * ratio) if w_cur > base_pos else w_cur
-                            elif w_cur < 0.0:
+                                w_scaled_m = (base_pos + (w_cur_m - base_pos) * ratio) if w_cur_m > base_pos else w_cur_m
+                            elif w_cur_m < 0.0:
                                 base_neg = max(0.0, fl_sym - rest_sell.get(tsym, 0.0))
-                                w_scaled = -(base_neg + (-w_cur - base_neg) * ratio) if (-w_cur) > base_neg else w_cur
+                                w_scaled_m = -(base_neg + (-w_cur_m - base_neg) * ratio) if (-w_cur_m) > base_neg else w_cur_m
                             else:
-                                w_scaled = 0.0
-                            if w_scaled == 0.0:
-                                w_scaled = 0.0
-                            new_targets.append(replace(t, target_weight=w_scaled))
+                                w_scaled_m = 0.0
+                            if w_scaled_m == 0.0:
+                                w_scaled_m = 0.0
+                            if w_scaled_m != w_cur_m:
+                                w_scaled_out = (w_scaled_m / target_upper_ratio) if target_upper_ratio > 0.0 else 0.0
+                                if w_scaled_out == 0.0:
+                                    w_scaled_out = 0.0
+                                new_targets.append(replace(t, target_weight=w_scaled_out))
+                            else:
+                                new_targets.append(t)
+                            new_marked.append(w_scaled_m)
                         else:
                             new_targets.append(t)
+                            new_marked.append(w_cur_m)
                     clamped_targets = new_targets
+                    target_marked = new_marked
                 elif allowed_targeted_gross <= 1e-12:
                     clamped_targets = [replace(t, target_weight=0.0) for t in clamped_targets]
+                    target_marked = [0.0] * len(clamped_targets)
 
-        # 4. Seed conservative reachable weight state per symbol, separating absolute target
-        #    bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
+        # 4. Seed conservative reachable weight state per symbol (in marked-equity units), separating
+        #    absolute target bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
         #    Reachable exposure is [base_lo - add_sell, base_hi + add_buy].
         #    This guarantees:
+        #      - CR7-05 / CR7-06 / CR7-10: unified marked-equity accounting with dynamic settled_equity profit updates.
         #      - CR5-05: protective reductions adjust inner bound toward 0.0 for opposing orders.
         #      - CR4-01: reserve min/max across every surviving target per symbol (so on_change cannot bypass cap).
         #      - CR3-22: pending buy/sell increments are reserved AFTER any new target_weight fill.
@@ -1110,8 +1209,19 @@ class ExposureCapOverlay:
         for t in clamped_targets:
             tsym = t.symbol
             tw = t.target_weight
-            target_lo_by_sym[tsym] = tw if tsym not in target_lo_by_sym else min(target_lo_by_sym[tsym], tw)
-            target_hi_by_sym[tsym] = tw if tsym not in target_hi_by_sym else max(target_hi_by_sym[tsym], tw)
+            inst_ml_t = _inst_max_leverage(tsym)
+            if eff_enforce_inst_lev is True and inst_ml_t is not None:
+                t_vals: tuple[float, ...] = (max(-inst_ml_t, min(inst_ml_t, tw)),)
+            elif eff_enforce_inst_lev is False or inst_ml_t is None:
+                t_vals = (tw,)
+            else:
+                t_cl = max(-inst_ml_t, min(inst_ml_t, tw))
+                t_vals = (tw, t_cl) if t_cl != tw else (tw,)
+            t_cands = [v * r for v in t_vals for r in (target_lower_ratio, target_upper_ratio)]
+            t_lo_m = min(t_cands)
+            t_hi_m = max(t_cands)
+            target_lo_by_sym[tsym] = t_lo_m if tsym not in target_lo_by_sym else min(target_lo_by_sym[tsym], t_lo_m)
+            target_hi_by_sym[tsym] = t_hi_m if tsym not in target_hi_by_sym else max(target_hi_by_sym[tsym], t_hi_m)
         for sym in all_known_syms:
             ew = existing_weights.get(sym, 0.0)
             b_lo = ew
@@ -1137,6 +1247,12 @@ class ExposureCapOverlay:
             a_hi = -hi_s if hi_s < 0.0 else hi_s
             return a_hi if a_hi >= a_lo else a_lo
 
+        def _cur_intent_ratios() -> tuple[float, float]:
+            return _settled_ratios_for_bounds(
+                lambda s: base_lo.get(s, 0.0) - add_sell.get(s, 0.0),
+                lambda s: base_hi.get(s, 0.0) + add_buy.get(s, 0.0),
+            )
+
         clamped_intents: list[OrderIntent] = []
 
         for intent in output.intents:
@@ -1155,41 +1271,51 @@ class ExposureCapOverlay:
             max_abs_sym = min(single_cap, max(0.0, self.max_gross_leverage - other_gross))
 
             if intent.qty_mode == "target_weight":
+                cur_upper_ratio, cur_lower_ratio = _cur_intent_ratios()
                 raw_w = intent.qty_value
+                raw_w_m = raw_w * cur_upper_ratio
                 if raw_w == 0.0:
                     desired = 0.0
                 elif raw_w > 0.0:
                     max_pos_w = max_abs_sym - ab
-                    if raw_w <= b_hi and intent.side == "sell":
+                    if raw_w_m <= b_hi + 1e-12 and intent.side == "sell":
                         desired = raw_w
                     elif max_pos_w <= 1e-12:
                         continue
+                    elif raw_w_m <= max_pos_w + 1e-12:
+                        desired = raw_w
+                    elif cur_upper_ratio > 0.0:
+                        desired = max_pos_w / cur_upper_ratio
                     else:
-                        desired = raw_w if raw_w <= max_pos_w else max_pos_w
+                        desired = raw_w
                 else:
                     min_neg_w = -(max_abs_sym - as_)
-                    if raw_w >= b_lo and intent.side == "buy":
+                    if raw_w_m >= b_lo - 1e-12 and intent.side == "buy":
                         desired = raw_w
                     elif min_neg_w >= -1e-12:
                         continue
+                    elif raw_w_m >= min_neg_w - 1e-12:
+                        desired = raw_w
+                    elif cur_upper_ratio > 0.0:
+                        desired = min_neg_w / cur_upper_ratio
                     else:
-                        desired = raw_w if raw_w >= min_neg_w else min_neg_w
+                        desired = raw_w
                 if desired == 0.0:
                     desired = 0.0
                 clamped_intents.append(replace(intent, qty_value=desired))
                 tracked_syms.add(sym)
-                eff_d = desired
-                if eff_enforce_inst_lev is True:
-                    inst_c = ctx.instrument
-                    if inst_c is not None and sym == inst_c.symbol:
-                        raw_ml_c = getattr(inst_c, "max_leverage", None)
-                        if raw_ml_c is not None and math.isfinite(raw_ml_c) and raw_ml_c > 0.0:
-                            ml_c = float(raw_ml_c)
-                            if eff_d > ml_c:
-                                eff_d = ml_c
-                            elif eff_d < -ml_c:
-                                eff_d = -ml_c
-                d_lo, d_hi = _apply_protective_reductions(sym, eff_d, eff_d)
+                # CR7-05: Convert the effective target (after optional instrument leverage clamp) into
+                # marked-equity units before updating the reachable risk envelope.
+                inst_ml_c = _inst_max_leverage(sym)
+                if eff_enforce_inst_lev is True and inst_ml_c is not None:
+                    eff_vals_c: tuple[float, ...] = (max(-inst_ml_c, min(inst_ml_c, desired)),)
+                elif eff_enforce_inst_lev is False or inst_ml_c is None:
+                    eff_vals_c = (desired,)
+                else:
+                    eff_cl_c = max(-inst_ml_c, min(inst_ml_c, desired))
+                    eff_vals_c = (desired, eff_cl_c) if eff_cl_c != desired else (desired,)
+                cand_m_c = [v * r for v in eff_vals_c for r in (cur_lower_ratio, cur_upper_ratio)]
+                d_lo, d_hi = _apply_protective_reductions(sym, min(cand_m_c), max(cand_m_c))
                 base_lo[sym] = d_lo if d_lo < b_lo else b_lo
                 base_hi[sym] = d_hi if d_hi > b_hi else b_hi
                 add_buy.setdefault(sym, ab)
@@ -1197,7 +1323,15 @@ class ExposureCapOverlay:
                 continue
 
             if intent.qty_mode == "equity_fraction":
-                w = intent.qty_value * ef_ratio
+                # CR7-06: Size against the current upper settled-equity ratio (reflecting any preceding
+                # profit-realizing reductions in the same bar) and honor known instrument leverage caps.
+                cur_ef_ratio, _ = _cur_intent_ratios()
+                eff_ef = intent.qty_value
+                if eff_enforce_inst_lev is True:
+                    inst_ml_e = _inst_max_leverage(sym)
+                    if inst_ml_e is not None and eff_ef > inst_ml_e:
+                        eff_ef = inst_ml_e
+                w = eff_ef * cur_ef_ratio
                 if intent.side == "buy":
                     if hi + w <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
@@ -1208,8 +1342,8 @@ class ExposureCapOverlay:
                         add_sell.setdefault(sym, as_)
                     else:
                         allowed_w = max_abs_sym - hi
-                        if allowed_w > 1e-12 and ef_ratio > 0.0:
-                            clamped_intents.append(replace(intent, qty_value=allowed_w / ef_ratio))
+                        if allowed_w > 1e-12 and cur_ef_ratio > 0.0:
+                            clamped_intents.append(replace(intent, qty_value=allowed_w / cur_ef_ratio))
                             tracked_syms.add(sym)
                             add_buy[sym] = ab + allowed_w
                             base_lo.setdefault(sym, b_lo)
@@ -1225,8 +1359,8 @@ class ExposureCapOverlay:
                         add_buy.setdefault(sym, ab)
                     else:
                         allowed_w = max_abs_sym + lo
-                        if allowed_w > 1e-12 and ef_ratio > 0.0:
-                            clamped_intents.append(replace(intent, qty_value=allowed_w / ef_ratio))
+                        if allowed_w > 1e-12 and cur_ef_ratio > 0.0:
+                            clamped_intents.append(replace(intent, qty_value=allowed_w / cur_ef_ratio))
                             tracked_syms.add(sym)
                             add_sell[sym] = as_ + allowed_w
                             base_lo.setdefault(sym, b_lo)

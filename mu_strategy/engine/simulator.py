@@ -624,7 +624,7 @@ def _apply_sim_overlays(
     try:
         return apply_risk_overlays(overlays, ctx, output)
     finally:
-        for ov, prev_sb, prev_enf, prev_src in saved:
+        for ov, prev_sb, prev_enf, prev_src in reversed(saved):
             ov._runtime_sizing_basis = prev_sb
             ov._runtime_enforce_instrument_max_leverage = prev_enf
             ov._runtime_settled_equity_source = prev_src
@@ -2115,6 +2115,9 @@ class _SimAccount:
         p1_6_liq_open = bar_open
         p1_6_liq_high = bar_high
         p1_6_liq_low = bar_low
+        p1_6_exit_open = bar_open
+        p1_6_exit_high = bar_high
+        p1_6_exit_low = bar_low
         new_target_bracket_set = False
 
         # 1.2 Gap-at-open liquidation check for existing open position (CR1-40 pre-open inputs).
@@ -2150,6 +2153,7 @@ class _SimAccount:
                 self.liquidations += 1
                 exited_existing_this_bar = True
                 self.pending_target = None
+                self.pending_entries.clear()
 
         # 1.3 Queued reduce_only market / close_all orders at bar open (CR1-40 pre-open + CR1-47 reduce_only).
         if self.pos_qty != 0.0 and self.pending_reduce_orders:
@@ -2705,31 +2709,45 @@ class _SimAccount:
                             new_target_bracket_set = False
                         if opened_or_flipped or new_abs > prev_abs + 1e-12:
                             risk_increased_in_p1_6 = True
-                            # Compute conservative post-fill price envelope for CR1-46.
+                            # Compute conservative post-fill price envelopes for CR1-46 and CR7-09.
                             if filled_at_open:
                                 p1_6_liq_open = bar_open
                                 p1_6_liq_high = bar_high
                                 p1_6_liq_low = bar_low
+                                p1_6_exit_open = bar_open
+                                p1_6_exit_high = bar_high
+                                p1_6_exit_low = bar_low
                             else:
                                 ref_f = quote.ref_price
                                 p1_6_liq_open = ref_f
+                                p1_6_exit_open = ref_f
                                 if quote.order_type == "limit":
                                     if quote.side == "buy":
                                         # Price fell from bar_open > ref_f through ref_f to bar_low (IVT).
                                         p1_6_liq_low = bar_low if bar_low < ref_f else ref_f
                                         p1_6_liq_high = bar_close_p1 if bar_close_p1 > ref_f else ref_f
+                                        p1_6_exit_low = p1_6_liq_low
+                                        p1_6_exit_high = p1_6_liq_high
                                     else:
                                         # Price rose from bar_open < ref_f through ref_f to bar_high (IVT).
                                         p1_6_liq_high = bar_high if bar_high > ref_f else ref_f
                                         p1_6_liq_low = bar_close_p1 if bar_close_p1 < ref_f else ref_f
+                                        p1_6_exit_high = p1_6_liq_high
+                                        p1_6_exit_low = p1_6_liq_low
                                 else:
-                                    # Intrabar stop fill: pre-fill opposite extreme cannot trigger post-fill liquidation.
+                                    # Intrabar stop fill: pre-fill opposite extreme cannot trigger post-fill
+                                    # liquidation (CR1-46), while conservative adverse stops still test full
+                                    # adverse bar excursion from the post-fill anchor (never pre-entry bar_open).
                                     if quote.side == "buy":
                                         p1_6_liq_low = bar_close_p1 if bar_close_p1 < ref_f else ref_f
                                         p1_6_liq_high = bar_high if bar_high > ref_f else ref_f
+                                        p1_6_exit_low = bar_low if bar_low < ref_f else ref_f
+                                        p1_6_exit_high = p1_6_liq_high
                                     else:
                                         p1_6_liq_high = bar_close_p1 if bar_close_p1 > ref_f else ref_f
                                         p1_6_liq_low = bar_low if bar_low < ref_f else ref_f
+                                        p1_6_exit_high = bar_high if bar_high > ref_f else ref_f
+                                        p1_6_exit_low = p1_6_liq_low
                         continue
                     # CR2-19: Expire open_only orders immediately after a missed eligible open.
                     if getattr(qo.intent, "time_in_force", "gtc") == "open_only":
@@ -2745,7 +2763,7 @@ class _SimAccount:
                 else:
                     self.pending_entries = suspended_entries + next_entries
 
-        # 1.7 Same-bar conservative protective stop & post-fill liquidation recheck (CR1-46 / CR6-06).
+        # 1.7 Same-bar conservative protective stop & post-fill liquidation recheck (CR1-46 / CR6-06 / CR7-09).
         if risk_increased_in_p1_6 and self.pos_qty != 0.0:
             liqs_before_p1_7 = self.liquidations
             if fresh_entry_this_bar and (not new_target_bracket_set):
@@ -2753,9 +2771,9 @@ class _SimAccount:
                     self.process_protective_exits_with_orders(
                         i,
                         bar_open_ms,
-                        bar_open,
-                        bar_high,
-                        bar_low,
+                        p1_6_exit_open,
+                        p1_6_exit_high,
+                        p1_6_exit_low,
                         bar_close_p1,
                         bar_volume,
                         bar_atr,
@@ -2789,9 +2807,9 @@ class _SimAccount:
                         liq_price=liq_px if liq_hit else None,
                         stop_price=stop_lvl,
                         take_profit=self.active_take_profit,
-                        bar_open=bar_open,
-                        bar_high=bar_high,
-                        bar_low=bar_low,
+                        bar_open=p1_6_exit_open,
+                        bar_high=p1_6_exit_high,
+                        bar_low=p1_6_exit_low,
                         bar_close=bar_close_p1,
                         bar_volume=bar_volume,
                         bar_atr=bar_atr,

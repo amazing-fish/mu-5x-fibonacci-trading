@@ -1406,6 +1406,137 @@ class RiskOverlayTests(unittest.TestCase):
         res_short_on = ov_enf_on.filter(ctx_m05x, StrategyOutput(intents=(ro_btw_m06, opp_b160)))
         self.assertAlmostEqual(150.0, res_short_on.intents[1].qty_value, places=9)
 
+    def test_exposure_cap_protective_ef_limit_and_settled_target_conversions_cr7_04_to_cr7_06_cr7_10(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu}, now_ms=t0)
+        inst_05x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=0.5)
+        inst_5x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        inst_1x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=1.0)
+
+        # CR7-04: 80-contract long @ 100 on 10_000 equity, inst max_leverage=0.5, reduce_only 0.7 equity_fraction sell + 130 sell.
+        pos_80_eq = {sym: PositionView(sym, qty=80.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=8_000.0, leverage=0.8)}
+        pf_10k = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_80_eq,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_05x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_10k, instrument=inst_05x)
+        ro_ef07 = OrderIntent("roef07", sym, "sell", "market", "equity_fraction", 0.7, reduce_only=True)
+        opp_130 = OrderIntent("opp130", sym, "sell", "market", "contracts", 130.0)
+
+        # enforce=True -> protective 0.7 clamped to 0.5 (leaves 30 residual) -> admits full 130 contracts!
+        ov_on = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity", enforce_instrument_max_leverage=True)
+        self.assertAlmostEqual(130.0, ov_on.filter(ctx_05x, StrategyOutput(intents=(ro_ef07, opp_130))).intents[1].qty_value, places=9)
+        # enforce=False and enforce=None -> preserve full 0.7 reservation (10 residual) -> clamp to 110 contracts!
+        ov_off = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity", enforce_instrument_max_leverage=False)
+        ov_unk = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity")
+        self.assertAlmostEqual(110.0, ov_off.filter(ctx_05x, StrategyOutput(intents=(ro_ef07, opp_130))).intents[1].qty_value, places=9)
+        self.assertAlmostEqual(110.0, ov_unk.filter(ctx_05x, StrategyOutput(intents=(ro_ef07, opp_130))).intents[1].qty_value, places=9)
+
+        # Short mirror of CR7-04: -80 short, reduce_only 0.7 equity_fraction buy + 130 buy -> admits 130 when enforce=True.
+        pos_m80_eq = {sym: PositionView(sym, qty=-80.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=8_000.0, leverage=0.8)}
+        ctx_m05x = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 10_000.0, pos_m80_eq, (), 10_000.0, 10_000.0),
+            instrument=inst_05x,
+        )
+        ro_bef07 = OrderIntent("robef07", sym, "buy", "market", "equity_fraction", 0.7, reduce_only=True)
+        opp_b130 = OrderIntent("oppb130", sym, "buy", "market", "contracts", 130.0)
+        self.assertAlmostEqual(130.0, ov_on.filter(ctx_m05x, StrategyOutput(intents=(ro_bef07, opp_b130))).intents[1].qty_value, places=9)
+
+        # CR7-05: 80 long @ 75 -> ref_px=100, settled=8_000, marked=10_000 (upnl=+2_000), inst_ml=0.5, enforce=True.
+        # Non-reduce-only market sell target_weight=+0.6 followed by 150-contract market sell:
+        pos_80_prof = {sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+        pf_8k_prof = PortfolioView(
+            equity=10_000.0,
+            cash=8_000.0,
+            positions=pos_80_prof,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_8k_05x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k_prof, instrument=inst_05x)
+        tw_sell_06 = OrderIntent("tw06", sym, "sell", "market", "target_weight", 0.6)
+        opp_150 = OrderIntent("opp150", sym, "sell", "market", "contracts", 150.0)
+
+        # Under settled_equity: effective 0.5x target leaves 40 contracts (+0.4x marked) -> clamps 150 to 140 contracts!
+        ov_s_on = ExposureCapOverlay(1.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        res_cr705_s = ov_s_on.filter(ctx_8k_05x, StrategyOutput(intents=(tw_sell_06, opp_150)))
+        self.assertAlmostEqual(140.0, res_cr705_s.intents[1].qty_value, places=9)
+        # Under marked_equity: effective 0.5x target leaves 50 contracts (+0.5x marked) -> keeps full 150 contracts!
+        res_cr705_m = ov_on.filter(ctx_8k_05x, StrategyOutput(intents=(tw_sell_06, opp_150)))
+        self.assertAlmostEqual(150.0, res_cr705_m.intents[1].qty_value, places=9)
+
+        # Short mirror of CR7-05: -80 short @ 125 -> ref_px=100, settled=8_000, marked=10_000, target_weight=-0.6 buy + 150 buy -> 140.
+        pos_m80_prof = {sym: PositionView(sym, qty=-80.0, avg_entry_price=125.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+        ctx_m8k_05x = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_m80_prof, (), 10_000.0, 10_000.0),
+            instrument=inst_05x,
+        )
+        tw_buy_m06 = OrderIntent("twm06", sym, "buy", "market", "target_weight", -0.6)
+        opp_b150 = OrderIntent("oppb150", sym, "buy", "market", "contracts", 150.0)
+        self.assertAlmostEqual(140.0, ov_s_on.filter(ctx_m8k_05x, StrategyOutput(intents=(tw_buy_m06, opp_b150))).intents[1].qty_value, places=9)
+
+        # CR7-06: 80 long @ 75 -> ref_px=100, settled=8_000, marked=10_000, reduce_only 40-contract sell (+1_000 realized -> 9_000 settled)
+        # + 1.75 equity_fraction sell -> clamped to 1.4 / 0.9 = 14/9 (140 contracts on 9_000 settled -> exact -1.0x cap!).
+        ctx_8k_5x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k_prof, instrument=inst_5x)
+        ro_40 = OrderIntent("ro40", sym, "sell", "market", "contracts", 40.0, reduce_only=True)
+        ef_175 = OrderIntent("ef175", sym, "sell", "market", "equity_fraction", 1.75)
+        res_cr706 = ov_s_on.filter(ctx_8k_5x, StrategyOutput(intents=(ro_40, ef_175)))
+        self.assertAlmostEqual(1.4 / 0.9, res_cr706.intents[1].qty_value, places=9)
+        # When instrument max_leverage=1.0 binds (enforce=True), 1.0 * 0.9 = 0.9 fits within 1.4 allowance -> unchanged!
+        ctx_8k_1x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k_prof, instrument=inst_1x)
+        res_cr706_bind = ov_s_on.filter(ctx_8k_1x, StrategyOutput(intents=(ro_40, ef_175)))
+        self.assertAlmostEqual(1.75, res_cr706_bind.intents[1].qty_value, places=9)
+        # Short mirror of CR7-06: -80 short @ 125, reduce_only 40-contract buy + 1.75 equity_fraction buy -> 1.4 / 0.9!
+        ctx_m8k_5x = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_m80_prof, (), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        ro_b40 = OrderIntent("rob40", sym, "buy", "market", "contracts", 40.0, reduce_only=True)
+        ef_b175 = OrderIntent("efb175", sym, "buy", "market", "equity_fraction", 1.75)
+        self.assertAlmostEqual(1.4 / 0.9, ov_s_on.filter(ctx_m8k_5x, StrategyOutput(intents=(ro_b40, ef_b175))).intents[1].qty_value, places=9)
+
+        # CR7-10: TargetPosition capped in marked-equity units under settled_equity=12_000, marked=10_000 (1.2 ratio), 1:1 under marked_equity.
+        pf_12k_flat = PortfolioView(
+            equity=10_000.0,
+            cash=12_000.0,
+            positions={},
+            open_orders=(),
+            peak_equity=12_000.0,
+            daily_start_equity=12_000.0,
+        )
+        ctx_12k = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_12k_flat, instrument=inst_5x)
+        ov_s = ExposureCapOverlay(1.0, 1.0, sizing_basis="settled_equity")
+        ov_m = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity")
+        res_t_pos = ov_s.filter(ctx_12k, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertAlmostEqual(1.0 / 1.2, res_t_pos.targets[0].target_weight, places=9)
+        res_t_neg = ov_s.filter(ctx_12k, StrategyOutput(targets=(TargetPosition(sym, -1.0),)))
+        self.assertAlmostEqual(-1.0 / 1.2, res_t_neg.targets[0].target_weight, places=9)
+        # Gross cap across two symbols: +0.5 each => 0.6 each in marked units (1.2 gross > 1.0) => 0.5/1.2 each!
+        res_t_gross = ov_s.filter(
+            ctx_12k,
+            StrategyOutput(targets=(TargetPosition(sym, 0.5), TargetPosition("ETH-USDT-SWAP", 0.5))),
+        )
+        self.assertAlmostEqual(0.5 / 1.2, res_t_gross.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.5 / 1.2, res_t_gross.targets[1].target_weight, places=9)
+        # Under marked_equity: exact 1:1 conversion -> +1.0 unchanged!
+        res_t_marked = ov_m.filter(ctx_12k, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertAlmostEqual(1.0, res_t_marked.targets[0].target_weight, places=9)
+
 
 if __name__ == "__main__":
     unittest.main()
