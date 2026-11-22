@@ -4912,19 +4912,28 @@ class SimulatorCoreTests(unittest.TestCase):
         self.assertEqual(1, len(res_1001_l.equity_curve))
         _assert_accounting_invariants(self, res_1001_l)
 
-        # Also verify with non-zero execution model (CostModel.okx_default()): ref_exit_price <= bar high (100.0)!
+        # CR11-04: Non-zero-cost execution model (CostModel.okx_default()) at 10x leverage (open liq ~91 << 99.5)
+        # survives entry and 00:30 open cleanly, then 12% funding debit at 00:45 (-12_000) jumps liq > 100.0;
+        # MUST apply the funding debit (funding_pnl < -10_000) and fill at observed p_close=100.0 (ref_exit_price == 100.0)!
+        f_1001_cost = FundingSeries.from_events(
+            inst_100x.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 2_700_000, rate=0.12)],
+        )
         res_1001_cost = compute_buy_and_hold_benchmark(
             b_1001_l,
             starting_equity=10_000.0,
-            leverage=100.0,
+            leverage=10.0,
             warmup_bars=1,
             instrument=inst_100x,
             cost_model=CostModel.okx_default(),
-            funding=f_1001_l,
+            funding=f_1001_cost,
         )
         self.assertEqual(1, res_1001_cost.liquidations)
-        self.assertLessEqual(res_1001_cost.trades[0].ref_exit_price, 100.0)
+        self.assertEqual(t0 + 5_400_000, res_1001_cost.trades[0].exit_time_ms)
+        self.assertLess(res_1001_cost.attribution.funding_pnl, -10_000.0)
+        self.assertAlmostEqual(100.0, res_1001_cost.trades[0].ref_exit_price, places=6)
         self.assertLessEqual(res_1001_cost.trades[0].exit_price, 100.0)
+        self.assertLess(res_1001_cost.ending_equity, 0.0)
         _assert_accounting_invariants(self, res_1001_cost)
 
         # Short mirror of CR10-01: 100x short @ 100, scored 100/100.5/100/100, -2% funding at 00:45 drops liq 101 -> 99 < low=100!
@@ -5004,6 +5013,39 @@ class SimulatorCoreTests(unittest.TestCase):
         self.assertAlmostEqual(-100.0, obs_1004_qty[3], places=5)
         self.assertLessEqual(max(obs_1004_lev), 1.0 + 1e-9)
         _assert_accounting_invariants(self, res_1004)
+
+        # 3. CR11-02 E2E: 80 long @ 75, settled=8_000, mark=100, 1x cap; Bar 1 emits 0.5 ef market sell
+        #    followed by +1.2 target_weight market buy -> sell realizes +1_000 (settled=9_000) so +1.2 MUST
+        #    clamp to 10/9, leaving Bar 2 at exact +100.0 contracts (1.0x), never +108.0 (1.08x)!
+        obs_1102_qty: list[float] = []
+        obs_1102_lev: list[float] = []
+
+        class _Obs1102(_ScriptedStrategy):
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                pos = ctx.portfolio.positions.get(ctx.symbol)
+                obs_1102_qty.append(pos.qty if pos is not None else 0.0)
+                obs_1102_lev.append(pos.leverage if pos is not None else 0.0)
+                return super().on_bar(ctx)
+
+        res_1102 = sim_1004.run(
+            _Obs1102(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e80", "MU-USDT-SWAP", "buy", "market", "contracts", 80.0),)),
+                    1: StrategyOutput(
+                        intents=(
+                            OrderIntent("ms05", "MU-USDT-SWAP", "sell", "market", "equity_fraction", 0.5),
+                            OrderIntent("tw12", "MU-USDT-SWAP", "buy", "market", "target_weight", 1.2),
+                        )
+                    ),
+                },
+                warmup=0,
+            ),
+            bars_1004,
+            overlays=(ExposureCapOverlay(1.0, 1.0),),
+        )
+        self.assertAlmostEqual(100.0, obs_1102_qty[2], places=5)
+        self.assertLessEqual(max(obs_1102_lev), 1.0 + 1e-9)
+        _assert_accounting_invariants(self, res_1102)
 
 
 if __name__ == "__main__":

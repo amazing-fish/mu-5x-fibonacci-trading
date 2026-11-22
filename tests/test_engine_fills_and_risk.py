@@ -1857,6 +1857,154 @@ class RiskOverlayTests(unittest.TestCase):
         self.assertEqual(1, len(res_1008.intents))
         self.assertAlmostEqual(0.3, res_1008.intents[0].qty_value, places=9)
 
+    def test_exposure_cap_post_ef_target_weight_and_same_symbol_breach_cr11_01_to_cr11_03(self) -> None:
+        sym = "MU-USDT-SWAP"
+        sym_b = "ETH-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_eth = _make_bar_series([100.0] * 5, symbol=sym_b, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu, (sym_b, "1h"): bars_eth}, now_ms=t0)
+        inst_5x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov_1x = ExposureCapOverlay(1.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        ov_2x1x = ExposureCapOverlay(2.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        pos_a80 = {sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+
+        # CR11-01 (same-symbol): Resting A sell ef=0.5 (raises settled 8k -> 9k) + resting A buy target_weight=+1.0
+        # -> resting target_weight expands to 0.90x after fractional replay, so a 15-contract fixed buy MUST clamp to 10.0!
+        rest_s05 = OrderIntent("rs05", sym, "sell", "limit", "equity_fraction", 0.5, limit_price=100.0)
+        rest_tw10_a = OrderIntent("rtw10a", sym, "buy", "limit", "target_weight", 1.0, limit_price=100.0)
+        ctx_1101_a = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_a80, (rest_s05, rest_tw10_a), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_1101_a = ov_1x.filter(
+            ctx_1101_a,
+            StrategyOutput(intents=(OrderIntent("mb15", sym, "buy", "market", "contracts", 15.0),)),
+        )
+        self.assertEqual(1, len(res_1101_a.intents))
+        self.assertAlmostEqual(10.0, res_1101_a.intents[0].qty_value, places=6)
+
+        # CR11-01 (cross-symbol): Resting A sell ef=0.5 + resting B buy target_weight=+1.05 (0.84x pre-replay -> 0.945x post-replay)
+        # -> a 10-contract B fixed buy under 1.0x single cap MUST clamp to exact 5.5 contracts (0.055x)!
+        rest_tw105_b = OrderIntent("rtw105b", sym_b, "buy", "limit", "target_weight", 1.05, limit_price=100.0)
+        ctx_1101_b = BarContext(
+            now_ms=t0,
+            symbol=sym_b,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_a80, (rest_s05, rest_tw105_b), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_1101_b = ov_2x1x.filter(
+            ctx_1101_b,
+            StrategyOutput(intents=(OrderIntent("mb10", sym_b, "buy", "market", "contracts", 10.0),)),
+        )
+        self.assertEqual(1, len(res_1101_b.intents))
+        self.assertAlmostEqual(5.5, res_1101_b.intents[0].qty_value, places=6)
+
+        # CR11-02: 80 long @ 75, settled=8_000, mark=100, 1x cap.
+        # Submit 0.5 ef market sell then +1.2 target_weight market buy -> sell raises ratio 0.8 -> 0.9, so +1.2 clamps to 10/9!
+        ctx_1102 = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_a80, (), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_1102 = ov_1x.filter(
+            ctx_1102,
+            StrategyOutput(
+                intents=(
+                    OrderIntent("ms05", sym, "sell", "market", "equity_fraction", 0.5),
+                    OrderIntent("tw12", sym, "buy", "market", "target_weight", 1.2),
+                )
+            ),
+        )
+        self.assertEqual(2, len(res_1102.intents))
+        self.assertAlmostEqual(0.5, res_1102.intents[0].qty_value, places=9)
+        self.assertAlmostEqual(10.0 / 9.0, res_1102.intents[1].qty_value, places=6)
+
+        # Without the 0.5 sell, +1.2 target_weight (96 contracts = 0.96x) STILL passes unchanged!
+        res_1102_solo = ov_1x.filter(
+            ctx_1102,
+            StrategyOutput(intents=(OrderIntent("tw12", sym, "buy", "market", "target_weight", 1.2),)),
+        )
+        self.assertEqual(1, len(res_1102_solo.intents))
+        self.assertAlmostEqual(1.2, res_1102_solo.intents[0].qty_value, places=9)
+
+        # Reversed non-market order: limit +1.2 target_weight buy then 0.5 ef market sell -> sell clamps to keep 1.2 <= 1.0x!
+        res_1102_rev = ov_1x.filter(
+            ctx_1102,
+            StrategyOutput(
+                intents=(
+                    OrderIntent("tw12l", sym, "buy", "limit", "target_weight", 1.2, limit_price=100.0),
+                    OrderIntent("ms05", sym, "sell", "market", "equity_fraction", 0.5),
+                )
+            ),
+        )
+        self.assertEqual(2, len(res_1102_rev.intents))
+        self.assertAlmostEqual(1.2, res_1102_rev.intents[0].qty_value, places=9)
+        # Max settled equity allowed for 1.2 target_weight under 1.0x cap is 10_000 / 1.2 = 8_333.33 -> gain 333.33 -> 13.33 contracts -> ef = 1/6!
+        self.assertAlmostEqual(1.0 / 6.0, res_1102_rev.intents[1].qty_value, places=6)
+
+        # CR11-03: 0.6x long with resting 1.2x sell and 0.5x buy (pre_lo=-0.6x, pre_hi=1.1x existing breach), 1x cap.
+        # A sell target_weight intent of 0.0 moves short bound -0.6x -> -1.2x (NEW breach!) -> MUST be rejected!
+        ov_m10 = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity")
+        pos_l06 = {sym: PositionView(sym, qty=60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6)}
+        rest_s120 = OrderIntent("rs120", sym, "sell", "limit", "contracts", 120.0, limit_price=100.0)
+        rest_b50 = OrderIntent("rb50", sym, "buy", "limit", "contracts", 50.0, limit_price=100.0)
+        ctx_1103 = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 10_000.0, pos_l06, (rest_s120, rest_b50), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_1103_rej = ov_m10.filter(
+            ctx_1103,
+            StrategyOutput(intents=(OrderIntent("tw0", sym, "sell", "market", "target_weight", 0.0),)),
+        )
+        self.assertEqual((), res_1103_rej.intents)
+        # A sell target_weight intent of +0.2 leaves short bound -1.0x (within cap) and does not worsen 1.1x long bound -> allowed!
+        res_1103_ok = ov_m10.filter(
+            ctx_1103,
+            StrategyOutput(intents=(OrderIntent("tw02", sym, "sell", "market", "target_weight", 0.2),)),
+        )
+        self.assertEqual(1, len(res_1103_ok.intents))
+        self.assertAlmostEqual(0.2, res_1103_ok.intents[0].qty_value, places=9)
+        # Step 2 TargetPosition(0.0) vs TargetPosition(0.2) enforces the exact same invariant!
+        self.assertEqual((), ov_m10.filter(ctx_1103, StrategyOutput(targets=(TargetPosition(sym, 0.0),))).targets)
+        res_1103_tp_ok = ov_m10.filter(ctx_1103, StrategyOutput(targets=(TargetPosition(sym, 0.2),)))
+        self.assertEqual(1, len(res_1103_tp_ok.targets))
+        self.assertAlmostEqual(0.2, res_1103_tp_ok.targets[0].target_weight, places=9)
+        # Same CR11-03 check holds when resting orders under marked_equity are equity_fraction orders!
+        ctx_1103_ef = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(
+                10_000.0,
+                10_000.0,
+                pos_l06,
+                (
+                    OrderIntent("rsef12", sym, "sell", "limit", "equity_fraction", 1.2, limit_price=100.0),
+                    OrderIntent("rbef05", sym, "buy", "limit", "equity_fraction", 0.5, limit_price=100.0),
+                ),
+                10_000.0,
+                10_000.0,
+            ),
+            instrument=inst_5x,
+        )
+        self.assertEqual(
+            (),
+            ov_m10.filter(
+                ctx_1103_ef,
+                StrategyOutput(intents=(OrderIntent("tw0", sym, "sell", "market", "target_weight", 0.0),)),
+            ).intents,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
