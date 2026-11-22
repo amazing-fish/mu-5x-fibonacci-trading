@@ -56,6 +56,7 @@ from mu_strategy.strategies.protocol import (
     BarContext,
     OrderIntent,
     ParamSpace,
+    PriceExclusionBand,
     SessionGate,
     StrategyOutput,
     TargetPosition,
@@ -149,10 +150,12 @@ class _ScriptedStrategy:
         *,
         interval: str = "1h",
         warmup: int = 0,
+        supports_ephemeral_context: bool = False,
     ) -> None:
         self.script = dict(script)
         self.required_intervals = (interval,)
         self.warmup_bars = {interval: warmup}
+        self.supports_ephemeral_context = supports_ephemeral_context
         self.params = None
         self._step = 0
 
@@ -184,10 +187,12 @@ class _ScriptedTargetStrategy:
         *,
         interval: str = "1h",
         warmup: int = 0,
+        supports_ephemeral_context: bool = False,
     ) -> None:
         self.schedule = dict(schedule)
         self.required_intervals = (interval,)
         self.warmup_bars = {interval: warmup}
+        self.supports_ephemeral_context = supports_ephemeral_context
         self.params = None
         self.seen_now_ms: list[int] = []
         self.seen_closed_counts: list[int] = []
@@ -531,13 +536,24 @@ class SimulatorCoreTests(unittest.TestCase):
             with self.subTest(case="enter_bar1_event_close1", reuse=reuse):
                 # Signal at bar0 close -> enter 1x long at bar1 open; event at close_times[1] MUST charge -$10.
                 f = FundingSeries.from_events(inst.instrument_id, [FundingRateEvent(int(bars.close_times[1]), 0.001)])
-                res = sim.run(_ScriptedTargetStrategy({0: (1.0, None, None)}), bars, funding=f)
+                res = sim.run(
+                    _ScriptedTargetStrategy({0: (1.0, None, None)}, supports_ephemeral_context=reuse),
+                    bars,
+                    funding=f,
+                )
                 self.assertAlmostEqual(-10.0, res.attribution.funding_pnl, places=9)
                 _assert_accounting_invariants(self, res)
             with self.subTest(case="exit_bar4_event_close4", reuse=reuse):
                 # Signal flat at bar3 close -> exit at bar4 open; event at close_times[4] MUST charge 0.
                 f = FundingSeries.from_events(inst.instrument_id, [FundingRateEvent(int(bars.close_times[4]), 0.001)])
-                res = sim.run(_ScriptedTargetStrategy({0: (1.0, None, None), 3: (0.0, None, None)}), bars, funding=f)
+                res = sim.run(
+                    _ScriptedTargetStrategy(
+                        {0: (1.0, None, None), 3: (0.0, None, None)},
+                        supports_ephemeral_context=reuse,
+                    ),
+                    bars,
+                    funding=f,
+                )
                 self.assertEqual(0.0, res.attribution.funding_pnl)
                 self.assertEqual(1, res.trade_count)
                 _assert_accounting_invariants(self, res)
@@ -647,6 +663,7 @@ class SimulatorCoreTests(unittest.TestCase):
             version = "1.0.0"
             required_intervals = ("1h",)
             warmup_bars = {"1h": 2}
+            supports_ephemeral_context = True
             params = None
 
             def __init__(self) -> None:
@@ -834,22 +851,25 @@ class SimulatorCoreTests(unittest.TestCase):
 
     def test_rejects_mismatched_funding_instrument_and_contradicting_bar_keys_cr1_36_cr1_48(self) -> None:
         okx_inst = okx_swap_spec("BTCUSDT", tick_size=Decimal("0.1"), max_leverage=5.0)
-        btc_bars = _make_series([(100.0, 101.0, 99.0, 100.0, 500.0)] * 10, symbol="BTCUSDT", interval="1h")
-        eth_bars = _make_series([(10.0, 11.0, 9.0, 10.0, 500.0)] * 10, symbol="ETHUSDT", interval="1h")
-        binance_funding = FundingSeries.synthetic_constant_apr(
+        # CR2-46: Complete 24h bar & 8h funding history (zero coverage gaps) so only the identity guard can fire.
+        btc_bars = _make_series([(100.0, 101.0, 99.0, 100.0, 500.0)] * 24, symbol="BTCUSDT", interval="1h")
+        eth_bars = _make_series([(10.0, 11.0, 9.0, 10.0, 500.0)] * 24, symbol="ETHUSDT", interval="1h")
+        binance_funding = FundingSeries.from_events(
             "binance:BTCUSDT",
-            start_ms=int(btc_bars.open_times[0]),
-            end_ms=int(btc_bars.close_times[-1]),
-            interval_hours=8,
-            apr=0.10,
+            [FundingRateEvent(int(btc_bars.close_times[i]), 0.0001) for i in (7, 15, 23)],
+            settlement_interval_hours=8,
+        )
+        self.assertEqual(
+            (),
+            binance_funding.coverage_gaps(int(btc_bars.open_times[0]), int(btc_bars.close_times[-1]), 8),
         )
         sim = Simulator(okx_inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
         strat = _ScriptedStrategy({})
 
-        # CR1-36: Binance funding series rejected by OKX simulator in both run() and sensitivity().
-        with self.assertRaises(ValueError):
+        # CR1-36 + CR2-46: Assert the specific instrument-mismatch message in both run() and sensitivity().
+        with self.assertRaisesRegex(ValueError, "does not match simulator instrument"):
             sim.run(strat, btc_bars, funding=binance_funding)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "does not match simulator instrument"):
             sim.run_with_funding_sensitivity(strat, btc_bars, funding=binance_funding)
 
         # CR1-48: Bar map keys contradicting BarSeries identity rejected for both string and tuple keys.
@@ -1079,6 +1099,7 @@ class SimulatorCoreTests(unittest.TestCase):
             strat_open_after = _ScriptedStrategy(
                 {1: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0),))},
                 warmup=0,
+                supports_ephemeral_context=reuse,
             )
             res_a = sim.run(strat_open_after, bars, funding=funding)
             self.assertAlmostEqual(0.0, res_a.attribution.funding_pnl, places=9)
@@ -1091,6 +1112,7 @@ class SimulatorCoreTests(unittest.TestCase):
                     1: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 0.0),)),
                 },
                 warmup=0,
+                supports_ephemeral_context=reuse,
             )
             res_b = sim.run(strat_close_after, bars, funding=funding)
             self.assertAlmostEqual(-10.0, res_b.attribution.funding_pnl, places=6)
@@ -1407,10 +1429,17 @@ class SimulatorCoreTests(unittest.TestCase):
         self.assertAlmostEqual(10_000.0, s_default.saved_pfs[0].equity, places=6)
         self.assertGreater(s_default.saved_pfs[-1].equity, 10_000.0)
 
-        # Explicit opt-in reuse_bar_context=True: closed_bars() STILL returns immutable fixed slices,
-        # while retained ephemeral BarContext/PortfolioView/MarketView raise RuntimeError outside on_bar!
-        s_ephem = _RetainingStrategy()
+        # CR2-11: Explicit reuse_bar_context=True MUST reject strategies without supports_ephemeral_context=True.
         sim_ephem = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0, reuse_bar_context=True))
+        with self.assertRaisesRegex(ValueError, "supports_ephemeral_context"):
+            sim_ephem.run(_RetainingStrategy(), bars)
+
+        # Opt-in strategy with supports_ephemeral_context=True: closed_bars() STILL returns immutable fixed slices,
+        # while retained ephemeral BarContext/PortfolioView/MarketView raise RuntimeError outside on_bar!
+        class _OptInRetainingStrategy(_RetainingStrategy):
+            supports_ephemeral_context = True
+
+        s_ephem = _OptInRetainingStrategy()
         sim_ephem.run(s_ephem, bars)
         self.assertEqual([1, 2, 3, 4, 5, 6], [len(sl) for sl in s_ephem.saved_slices])
         with self.assertRaises(RuntimeError):
@@ -1524,6 +1553,648 @@ class SimulatorCoreTests(unittest.TestCase):
             sens.results["historical+apr_15pct"].attribution.funding_pnl,
             sens.results["historical+apr_15.000001pct"].attribution.funding_pnl,
         )
+
+    def test_require_touch_through_propagated_and_excluded_price_bands_enforced_cr2_15_cr2_44(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        bars = _make_series(
+            [
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.5, 104.0, 99.5, 103.0, 1000.0),
+                (103.0, 104.0, 102.0, 103.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+
+        # CR2-44: BarContext.require_touch_through matches SimulatorConfig.require_touch_through in both modes.
+        class _RttObserver:
+            strategy_id = "rtt_obs"
+            version = "1.0.0"
+            required_intervals = ("1h",)
+            warmup_bars = {"1h": 0}
+            supports_ephemeral_context = True
+            params = None
+
+            def __init__(self) -> None:
+                self.seen: list[bool] = []
+
+            def reset(self) -> None:
+                self.seen = []
+
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                self.seen.append(ctx.require_touch_through)
+                return EMPTY_OUTPUT
+
+            def snapshot_state(self) -> dict[str, Any]:
+                return {}
+
+            def restore_state(self, state: Mapping[str, Any]) -> None:
+                return None
+
+        for rtt_flag in (False, True):
+            for reuse in (False, True):
+                obs = _RttObserver()
+                sim_rtt = Simulator(
+                    inst,
+                    CostModel.zero_cost(),
+                    SimulatorConfig(starting_equity=10_000.0, require_touch_through=rtt_flag, reuse_bar_context=reuse),
+                )
+                sim_rtt.run(obs, bars)
+                self.assertEqual([rtt_flag] * 3, obs.seen)
+
+        # CR2-15: excluded_price_bands blocks market, limit, stop_market, and stop_limit fills inside the band
+        # without blocking fills outside the band.
+        band = (PriceExclusionBand(center=100.0, tolerance_pct=0.01),)  # excludes ~[99.01, 101.01]
+        sim = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
+        blocked_intents = (
+            OrderIntent("b_mkt", "MUUSDT", "buy", "market", "contracts", 1.0, excluded_price_bands=band, expires_after_bars=1),
+            OrderIntent("b_lim", "MUUSDT", "buy", "limit", "contracts", 1.0, limit_price=100.5, excluded_price_bands=band, expires_after_bars=1),
+            OrderIntent("b_stp", "MUUSDT", "buy", "stop_market", "contracts", 1.0, stop_price=100.5, excluded_price_bands=band, expires_after_bars=1),
+            OrderIntent("b_sl", "MUUSDT", "buy", "stop_limit", "contracts", 1.0, stop_price=100.5, limit_price=101.5, excluded_price_bands=band, expires_after_bars=1),
+        )
+        res_blocked = sim.run(_ScriptedStrategy({0: StrategyOutput(intents=blocked_intents)}, warmup=0), bars)
+        self.assertEqual(0, res_blocked.trade_count)
+
+        # Fill outside band (stop_market at 103.0) fills cleanly!
+        ok_intent = OrderIntent(
+            "ok_stp", "MUUSDT", "buy", "stop_market", "contracts", 2.0, stop_price=103.0, excluded_price_bands=band, expires_after_bars=1
+        )
+        res_ok = sim.run(_ScriptedStrategy({0: StrategyOutput(intents=(ok_intent,))}, warmup=0), bars)
+        self.assertEqual(1, res_ok.trade_count)
+        self.assertAlmostEqual(103.0, res_ok.trades[0].entry_price, places=6)
+
+    def test_blocked_target_never_overwrites_existing_bracket_cr2_16(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        # Bar 0: 14:00 UTC (10:00 ET, inside 09:45-11:30)
+        # Bar 1: 15:00 UTC (11:00 ET, inside) -> enters 1x long at 100 with stop=90
+        # Bar 2: 20:00 UTC (16:00 ET, OUTSIDE) -> queued short target (-1.0, stop=110) is BLOCKED;
+        #   existing long stop=90 MUST remain intact (NOT overwritten with 110 which would close the long at open=100!).
+        # Bar 3: 21:00 UTC (17:00 ET, OUTSIDE) -> queued scale-up target (+2.0, stop=99) is BLOCKED;
+        #   existing long stop=90 MUST remain intact!
+        # Bar 4: 14:00 UTC next day (inside) -> same-side hold (+1.0, stop=95) refreshes stop to 95;
+        #   low=94 triggers refreshed stop at 95!
+        t_in0 = int(datetime(2026, 6, 11, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_in1 = int(datetime(2026, 6, 11, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_out2 = int(datetime(2026, 6, 11, 20, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_out3 = int(datetime(2026, 6, 11, 21, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_in4 = int(datetime(2026, 6, 12, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_in5 = int(datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        candles = [
+            Candle(t_in0, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t_in1, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t_out2, 100.0, 101.0, 98.0, 100.0, 1000.0),
+            Candle(t_out3, 100.0, 101.0, 98.0, 100.0, 1000.0),
+            Candle(t_in4, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t_in5, 100.0, 101.0, 94.0, 96.0, 1000.0),
+        ]
+        bars = BarSeries.from_candles("MU-USDT-SWAP", "1h", candles)
+        sw = SessionWindowOverlay(
+            trading_windows_et=(("09:45", "11:30"),),
+            calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+        )
+        strat = _ScriptedStrategy(
+            {
+                0: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0, stop_price=90.0),)),
+                1: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", -1.0, stop_price=110.0),)),
+                2: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 2.0, stop_price=99.0),)),
+                4: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0, stop_price=95.0),)),
+            },
+            warmup=0,
+        )
+        sim = Simulator(
+            inst,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+        res = sim.run(strat, bars, overlays=(sw,))
+        self.assertEqual(1, res.trade_count)
+        self.assertEqual("long", res.trades[0].side)
+        self.assertEqual("stop_loss", res.trades[0].reason)
+        self.assertAlmostEqual(95.0, res.trades[0].exit_price, places=6)
+        self.assertEqual(t_in5, res.trades[0].exit_time_ms)
+        _assert_accounting_invariants(self, res)
+
+    def test_spot_and_equity_never_settle_funding_even_with_matching_series_cr2_17(self) -> None:
+        t0 = 1_735_689_600_000
+        h = 3_600_000
+        # Include a 3h gap between bar 1 close (t0+2h) and bar 2 open (t0+5h) so BOTH gap and bar-close funding paths are tested!
+        candles = [
+            Candle(t0, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t0 + h, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t0 + 5 * h, 100.0, 101.0, 99.0, 100.0, 1000.0),
+            Candle(t0 + 6 * h, 100.0, 101.0, 99.0, 100.0, 1000.0),
+        ]
+        for inst in (
+            spot_spec("MUUSDT", tick_size=Decimal("0.01")),
+            spot_spec("MU", venue="nasdaq", tick_size=Decimal("0.01"), asset_class="equity"),
+        ):
+            bars = BarSeries.from_candles(inst.symbol, "1h", candles)
+            matching_funding = FundingSeries.from_events(
+                inst.instrument_id,
+                [
+                    FundingRateEvent(t0 + 3 * h, 0.01),   # gap event
+                    FundingRateEvent(t0 + 6 * h, 0.01),   # bar-close event
+                ],
+                settlement_interval_hours=8,
+            )
+            for reuse in (False, True):
+                with self.subTest(instrument=inst.instrument_id, reuse=reuse):
+                    sim = Simulator(
+                        inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0, reuse_bar_context=reuse)
+                    )
+                    strat = _ScriptedStrategy(
+                        {0: StrategyOutput(targets=(TargetPosition(inst.symbol, 1.0),))},
+                        warmup=0,
+                        supports_ephemeral_context=reuse,
+                    )
+                    res = sim.run(strat, bars, funding=matching_funding)
+                    self.assertEqual("spot_no_funding", res.funding_mode)
+                    self.assertEqual(0.0, res.attribution.funding_pnl)
+                    _assert_accounting_invariants(self, res)
+
+                    sens = sim.run_with_funding_sensitivity(strat, bars, funding=matching_funding)
+                    self.assertEqual(0.0, sens.base_result.attribution.funding_pnl)
+
+    def test_intrabar_activated_protective_stop_limit_never_matches_earlier_open_cr2_18(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        sim = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
+
+        # Case 1: Protective sell stop_limit(stop=95, limit=97) on bar 2 (open=100, high=100, low=94, close=94):
+        # Activates intrabar at 95 (cannot fill at 95 < 97); MUST NOT match earlier bar 2 open=100!
+        # Bar 3 opens at 98 -> now pre-open activated, fills cleanly at bar 3 open=98.0!
+        bars_intrabar = _make_series(
+            [
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.0, 100.0, 94.0, 94.0, 1000.0),
+                (98.0, 99.0, 96.0, 98.0, 1000.0),
+                (98.0, 98.5, 97.5, 98.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        strat_intrabar = _ScriptedStrategy(
+            {
+                0: StrategyOutput(intents=(OrderIntent("e1", "MUUSDT", "buy", "market", "contracts", 10.0),)),
+                1: StrategyOutput(
+                    intents=(
+                        OrderIntent(
+                            "prot_sl",
+                            "MUUSDT",
+                            "sell",
+                            "stop_limit",
+                            "close_all",
+                            0.0,
+                            stop_price=95.0,
+                            limit_price=97.0,
+                            reduce_only=True,
+                            expires_after_bars=3,
+                        ),
+                    )
+                ),
+            },
+            warmup=0,
+        )
+        res_intra = sim.run(strat_intrabar, bars_intrabar)
+        self.assertEqual(1, res_intra.trade_count)
+        self.assertAlmostEqual(98.0, res_intra.trades[0].exit_price, places=6)
+        self.assertEqual(int(bars_intrabar.open_times[3]), res_intra.trades[0].exit_time_ms)
+        _assert_accounting_invariants(self, res_intra)
+
+        # Case 2: Activated AT OPEN past limit (sell stop=95, limit=97, bar 2 open=94, high=98, low=93):
+        # Activates at open 94, then fills intrabar on return to limit=97.0 (NOT at 94!).
+        bars_at_open = _make_series(
+            [
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (94.0, 98.0, 93.0, 96.0, 1000.0),
+                (96.0, 96.5, 95.5, 96.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        res_at_open = sim.run(strat_intrabar, bars_at_open)
+        self.assertEqual(1, res_at_open.trade_count)
+        self.assertAlmostEqual(97.0, res_at_open.trades[0].exit_price, places=6)
+        self.assertEqual(int(bars_at_open.open_times[2]), res_at_open.trades[0].exit_time_ms)
+        _assert_accounting_invariants(self, res_at_open)
+
+    def test_open_only_limits_expire_after_missed_eligible_open_in_both_queues_cr2_19(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        sim = Simulator(inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0))
+
+        # Entry queue: buy limit 95 with time_in_force="open_only" and expires_after_bars=None.
+        # Bar 1 opens at 100 (misses!) -> MUST expire; bar 2 open=90 MUST NOT fill!
+        bars_ent = _make_series(
+            [
+                (100.0, 101.0, 99.0, 100.0, 1000.0),
+                (100.0, 101.0, 90.0, 95.0, 1000.0),
+                (90.0, 91.0, 89.0, 90.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        strat_miss = _ScriptedStrategy(
+            {
+                0: StrategyOutput(
+                    intents=(
+                        OrderIntent(
+                            "oo_buy",
+                            "MUUSDT",
+                            "buy",
+                            "limit",
+                            "contracts",
+                            10.0,
+                            limit_price=95.0,
+                            time_in_force="open_only",
+                        ),
+                    )
+                )
+            },
+            warmup=0,
+        )
+        self.assertEqual(0, sim.run(strat_miss, bars_ent).trade_count)
+
+        # Marketable open_only limit (buy limit 105 on open 100) STILL fills at 100!
+        strat_hit = _ScriptedStrategy(
+            {
+                0: StrategyOutput(
+                    intents=(
+                        OrderIntent(
+                            "oo_hit",
+                            "MUUSDT",
+                            "buy",
+                            "limit",
+                            "contracts",
+                            10.0,
+                            limit_price=105.0,
+                            time_in_force="open_only",
+                        ),
+                    )
+                )
+            },
+            warmup=0,
+        )
+        res_hit = sim.run(strat_hit, bars_ent)
+        self.assertEqual(1, res_hit.trade_count)
+        self.assertAlmostEqual(100.0, res_hit.trades[0].entry_price, places=6)
+
+        # Protective queue: open_only reduce_only sell limit 110 misses bar 2 open=100 -> MUST expire before bar 3 open=115!
+        bars_prot = _make_series(
+            [
+                (100.0, 101.0, 99.0, 100.0, 1000.0),
+                (100.0, 101.0, 99.0, 100.0, 1000.0),
+                (100.0, 112.0, 99.0, 105.0, 1000.0),
+                (115.0, 116.0, 114.0, 115.0, 1000.0),
+                (102.0, 103.0, 101.0, 102.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        strat_prot = _ScriptedStrategy(
+            {
+                0: StrategyOutput(intents=(OrderIntent("e1", "MUUSDT", "buy", "market", "contracts", 10.0),)),
+                1: StrategyOutput(
+                    intents=(
+                        OrderIntent(
+                            "oo_tp",
+                            "MUUSDT",
+                            "sell",
+                            "limit",
+                            "close_all",
+                            0.0,
+                            limit_price=110.0,
+                            reduce_only=True,
+                            time_in_force="open_only",
+                        ),
+                    )
+                ),
+            },
+            warmup=0,
+        )
+        res_prot = sim.run(strat_prot, bars_prot)
+        self.assertEqual(1, res_prot.trade_count)
+        self.assertEqual("end_of_data", res_prot.trades[0].reason)
+        self.assertAlmostEqual(102.0, res_prot.trades[0].exit_price, places=6)
+
+    def test_mid_bar_liquidation_resolves_before_later_intrabar_entry_cr2_20(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        # Bar 1 opens at 100, crashes to low=65, closes at 70.
+        # 5x long opened at 100 has liq near 80 -> path 100 -> 70 MUST liquidate BEFORE queued buy limit at 70!
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 65.0, 70.0, 1000.0),
+                (70.0, 72.0, 68.0, 70.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        cost_hi_mmr = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=FixedTicks(0),
+            maintenance_margin_rate=0.05,
+            liquidation_fee_bps=0.0,
+        )
+        mkt_5x = OrderIntent("open5x", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 5.0)
+        lim_70 = OrderIntent("add70", "MU-USDT-SWAP", "buy", "limit", "contracts", 50.0, limit_price=70.0)
+
+        for label, order_pair in (("market_then_limit", (mkt_5x, lim_70)), ("limit_then_market", (lim_70, mkt_5x))):
+            for cost in (CostModel.zero_cost(), cost_hi_mmr):
+                with self.subTest(order=label, mmr=cost.maintenance_margin_rate):
+                    sim = Simulator(
+                        inst,
+                        cost,
+                        SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+                    )
+                    strat = _ScriptedStrategy({0: StrategyOutput(intents=order_pair)}, warmup=0)
+                    res = sim.run(strat, bars)
+                    self.assertEqual(1, res.liquidations)
+                    self.assertEqual(1, res.trade_count)
+                    self.assertEqual("liquidation", res.trades[0].reason)
+                    self.assertEqual(1, res.trades[0].max_stage)
+                    _assert_accounting_invariants(self, res)
+
+    def test_protective_orders_replaced_by_intent_id_not_order_type_cr2_21(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        # Bar 1: enters 10 contracts at 100.
+        # Bar 2: open=100, low=94, close=94 -> activates stop_limit "sl_a" (stop=95, limit=98) without filling!
+        #        At bar 2 close, strategy emits an independent stop_market "sl_b" (stop=90).
+        # Bar 3: open=94, high=99, low=93, close=98 -> reaches 98 (never hits 90); MUST fill "sl_a" at 98.0!
+        bars = _make_series(
+            [
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.0, 100.5, 99.5, 100.0, 1000.0),
+                (100.0, 100.0, 94.0, 94.0, 1000.0),
+                (94.0, 99.0, 93.0, 98.0, 1000.0),
+                (98.0, 98.5, 97.5, 98.0, 1000.0),
+            ],
+            symbol="MUUSDT",
+        )
+        for reuse in (False, True):
+            with self.subTest(reuse=reuse):
+                strat = _ScriptedStrategy(
+                    {
+                        0: StrategyOutput(intents=(OrderIntent("e1", "MUUSDT", "buy", "market", "contracts", 10.0),)),
+                        1: StrategyOutput(
+                            intents=(
+                                OrderIntent(
+                                    "sl_a",
+                                    "MUUSDT",
+                                    "sell",
+                                    "stop_limit",
+                                    "close_all",
+                                    0.0,
+                                    stop_price=95.0,
+                                    limit_price=98.0,
+                                    reduce_only=True,
+                                    expires_after_bars=3,
+                                    tag="activated_sl_a",
+                                ),
+                            )
+                        ),
+                        2: StrategyOutput(
+                            intents=(
+                                OrderIntent(
+                                    "sl_b",
+                                    "MUUSDT",
+                                    "sell",
+                                    "stop_market",
+                                    "close_all",
+                                    0.0,
+                                    stop_price=90.0,
+                                    reduce_only=True,
+                                    expires_after_bars=3,
+                                    tag="backup_sl_b",
+                                ),
+                            )
+                        ),
+                    },
+                    warmup=0,
+                    supports_ephemeral_context=reuse,
+                )
+                sim = Simulator(
+                    inst, CostModel.zero_cost(), SimulatorConfig(starting_equity=10_000.0, reuse_bar_context=reuse)
+                )
+                res = sim.run(strat, bars)
+                self.assertEqual(1, res.trade_count)
+                self.assertEqual("activated_sl_a", res.trades[0].reason)
+                self.assertAlmostEqual(98.0, res.trades[0].exit_price, places=6)
+                self.assertEqual(int(bars.open_times[3]), res.trades[0].exit_time_ms)
+                _assert_accounting_invariants(self, res)
+
+    def test_opening_stop_limit_and_target_fill_bar_bracket_use_causal_pre_open_atr_fallback_cr2_22_cr2_23(self) -> None:
+        inst = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        cost_atr = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=AtrBps(bps_per_atr=100.0),
+            stop_slippage_multiplier=1.0,
+        )
+        # Bar 0 is flat (high==low==100 -> pre_atr is None because atr_period=14, fallback uses pre_high-pre_low=0.0).
+        # Bar 1 has IDENTICAL open=101 in both series, differing ONLY in Bar 1's (high, low) range!
+        bars_narrow = _make_series(
+            [(100.0, 100.0, 100.0, 100.0, 1000.0), (101.0, 101.5, 100.5, 101.0, 1000.0), (101.0, 101.0, 101.0, 101.0, 1000.0)],
+            symbol="MUUSDT",
+        )
+        bars_wide = _make_series(
+            [(100.0, 100.0, 100.0, 100.0, 1000.0), (101.0, 150.0, 50.0, 101.0, 1000.0), (101.0, 101.0, 101.0, 101.0, 1000.0)],
+            symbol="MUUSDT",
+        )
+        sim = Simulator(inst, cost_atr, SimulatorConfig(starting_equity=10_000.0, atr_period=14))
+
+        # CR2-22: Buy stop_limit(stop=100.5, limit=120.0) triggered & filled AT OPEN of bar 1 ->
+        # opening execution price MUST NOT depend on bar 1's later (high, low) range!
+        strat_sl = _ScriptedStrategy(
+            {
+                0: StrategyOutput(
+                    intents=(
+                        OrderIntent(
+                            "sl_open",
+                            "MUUSDT",
+                            "buy",
+                            "stop_limit",
+                            "contracts",
+                            10.0,
+                            stop_price=100.5,
+                            limit_price=120.0,
+                        ),
+                    )
+                )
+            },
+            warmup=0,
+        )
+        res_sl_n = sim.run(strat_sl, bars_narrow)
+        res_sl_w = sim.run(strat_sl, bars_wide)
+        self.assertAlmostEqual(res_sl_n.trades[0].entry_price, res_sl_w.trades[0].entry_price, places=12)
+        self.assertAlmostEqual(101.0, res_sl_w.trades[0].entry_price, places=12)
+
+        # CR2-23: Target installs a bracket stop (stop_price=102.0) already triggered at bar 1 open=101.0 ->
+        # BOTH target-only fast path AND overlay/pending path MUST price stop strictly from pre-open data!
+        strat_tgt = _ScriptedStrategy(
+            {0: StrategyOutput(targets=(TargetPosition("MUUSDT", 1.0, stop_price=102.0),))},
+            warmup=0,
+        )
+        for overlays in ((), (ExposureCapOverlay(max_gross_leverage=5.0, max_single_weight=5.0),)):
+            res_t_n = sim.run(strat_tgt, bars_narrow, overlays=overlays)
+            res_t_w = sim.run(strat_tgt, bars_wide, overlays=overlays)
+            self.assertEqual("stop_loss", res_t_n.trades[0].reason)
+            self.assertEqual("stop_loss", res_t_w.trades[0].reason)
+            self.assertAlmostEqual(res_t_n.trades[0].exit_price, res_t_w.trades[0].exit_price, places=12)
+            self.assertAlmostEqual(101.0, res_t_w.trades[0].exit_price, places=12)
+
+    def test_same_side_reducing_target_never_flips_or_full_closes_cr2_24(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        # 100 bps half-spread => sell at open=100 executes at 99.0!
+        cost = CostModel(
+            maker_fee_bps=0.0, taker_fee_bps=0.0, half_spread_bps=100.0, slippage_model=FixedTicks(0)
+        )
+        t_in0 = int(datetime(2026, 6, 11, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_in1 = int(datetime(2026, 6, 11, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        t_out2 = int(datetime(2026, 6, 11, 20, 0, tzinfo=timezone.utc).timestamp() * 1000)  # outside session!
+        t_out3 = int(datetime(2026, 6, 11, 21, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        candles = [
+            Candle(t_in0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            Candle(t_in1, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            Candle(t_out2, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            Candle(t_out3, 100.0, 100.0, 100.0, 100.0, 1000.0),
+        ]
+        bars = BarSeries.from_candles("MU-USDT-SWAP", "1h", candles)
+        sw = SessionWindowOverlay(
+            trading_windows_et=(("09:45", "11:30"),),
+            calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+        )
+        sim = Simulator(
+            inst, cost, SimulatorConfig(starting_equity=1_000.0, allow_missing_funding_for_perp=True)
+        )
+
+        # Enter long at bar 1 open (~9.90099 units), then emit same-side reducing target_weight=0.005
+        # (desired_notional ~ 5, where naive delta/99 > live qty would flip short or full-close!).
+        for overlays in ((), (sw,)):
+            with self.subTest(has_session_overlay=bool(overlays)):
+                strat_tiny = _ScriptedStrategy(
+                    {
+                        0: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0),)),
+                        1: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 0.005),)),
+                    },
+                    warmup=0,
+                )
+                res = sim.run(strat_tiny, bars, overlays=overlays)
+                # Two trades: partial reduction on bar 2 (long) + remaining positive long closed at end_of_data!
+                self.assertEqual(2, res.trade_count)
+                self.assertEqual("long", res.trades[0].side)
+                self.assertEqual("long", res.trades[1].side)
+                self.assertEqual("end_of_data", res.trades[1].reason)
+                self.assertGreater(res.trades[1].qty, 0.04)
+                _assert_accounting_invariants(self, res)
+
+        # Ordinary partial reduction (target_weight=0.5) stays unchanged!
+        strat_half = _ScriptedStrategy(
+            {
+                0: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 1.0),)),
+                1: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 0.5),)),
+            },
+            warmup=0,
+        )
+        res_half = sim.run(strat_half, bars)
+        self.assertEqual(2, res_half.trade_count)
+        self.assertEqual("long", res_half.trades[0].side)
+        self.assertEqual("long", res_half.trades[1].side)
+        _assert_accounting_invariants(self, res_half)
+
+    def test_buy_and_hold_benchmark_round2_fixes_cr2_30_to_34_and_47(self) -> None:
+        # CR2-32: Reject instrument whose symbol does not match the bar series.
+        eth_bars = _make_series([(100.0, 101.0, 99.0, 100.0, 1000.0)] * 5, symbol="ETHUSDT", interval="1h")
+        btc_inst = okx_swap_spec("BTCUSDT", tick_size=Decimal("0.1"), max_leverage=5.0)
+        with self.assertRaisesRegex(ValueError, "does not match bars symbol"):
+            compute_buy_and_hold_benchmark(
+                eth_bars,
+                instrument=btc_inst,
+                allow_missing_funding_for_perp=True,
+            )
+
+        # CR2-47: Empty FundingSeries treated identically to None (raises without opt-in, labels missing_explicit_zero with opt-in).
+        perp = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        short_bars = _make_series([(100.0, 101.0, 99.0, 100.0, 1000.0)] * 3, symbol="MU-USDT-SWAP", interval="1h")
+        empty_funding = FundingSeries.from_events(perp.instrument_id, [], settlement_interval_hours=8)
+        with self.assertRaises(MissingFundingHistoryError):
+            compute_buy_and_hold_benchmark(short_bars, instrument=perp, funding=empty_funding)
+        bh_empty_ok = compute_buy_and_hold_benchmark(
+            short_bars,
+            instrument=perp,
+            funding=empty_funding,
+            allow_missing_funding_for_perp=True,
+        )
+        self.assertEqual("missing_explicit_zero", bh_empty_ok.funding_mode)
+
+        # CR2-33: Combining instrument + cost_model + liquidation override uses dataclasses.replace (no AttributeError)
+        # and preserves cost_model.slippage_model!
+        custom_cost = CostModel(
+            maker_fee_bps=1.0,
+            taker_fee_bps=5.0,
+            half_spread_bps=2.0,
+            slippage_model=FixedTicks(3),
+            maintenance_margin_rate=0.005,
+            liquidation_fee_bps=10.0,
+        )
+        bh_ov = compute_buy_and_hold_benchmark(
+            short_bars,
+            instrument=perp,
+            cost_model=custom_cost,
+            maintenance_margin_rate=0.02,
+            liquidation_fee_bps=25.0,
+            allow_missing_funding_for_perp=True,
+        )
+        self.assertGreater(bh_ov.attribution.slippage, 0.0)
+        _assert_accounting_invariants(self, bh_ov)
+
+        # CR2-30: With warmup_bars=0 and SqrtVolumeImpact, changing ONLY bar 0 volume MUST NOT change entry price!
+        cost_vol = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=SqrtVolumeImpact(impact_coeff=50.0, max_bps=500.0),
+        )
+        spot = spot_spec("MUUSDT", tick_size=Decimal("0.01"))
+        b_low_v = _make_series([(100.0, 101.0, 99.0, 100.0, 10.0), (100.0, 101.0, 99.0, 100.0, 1000.0)], symbol="MUUSDT")
+        b_hi_v = _make_series([(100.0, 101.0, 99.0, 100.0, 1_000_000.0), (100.0, 101.0, 99.0, 100.0, 1000.0)], symbol="MUUSDT")
+        bh_v1 = compute_buy_and_hold_benchmark(b_low_v, instrument=spot, cost_model=cost_vol, warmup_bars=0)
+        bh_v2 = compute_buy_and_hold_benchmark(b_hi_v, instrument=spot, cost_model=cost_vol, warmup_bars=0)
+        self.assertAlmostEqual(bh_v1.trades[0].entry_price, bh_v2.trades[0].entry_price, places=12)
+
+        # CR2-31: Gap-at-open liquidation in leveraged benchmark uses pre-open inputs (independent of current bar H/L/V).
+        b_gap_a = _make_series(
+            [(100.0, 101.0, 99.0, 100.0, 5_000.0), (70.0, 71.0, 69.0, 70.0, 50.0), (70.0, 70.0, 70.0, 70.0, 5_000.0)],
+            symbol="MU-USDT-SWAP",
+        )
+        b_gap_b = _make_series(
+            [(100.0, 101.0, 99.0, 100.0, 5_000.0), (70.0, 95.0, 20.0, 70.0, 5_000_000.0), (70.0, 70.0, 70.0, 70.0, 5_000.0)],
+            symbol="MU-USDT-SWAP",
+        )
+        bh_ga = compute_buy_and_hold_benchmark(
+            b_gap_a, leverage=5.0, instrument=perp, cost_model=cost_vol, allow_missing_funding_for_perp=True
+        )
+        bh_gb = compute_buy_and_hold_benchmark(
+            b_gap_b, leverage=5.0, instrument=perp, cost_model=cost_vol, allow_missing_funding_for_perp=True
+        )
+        self.assertEqual(1, bh_ga.liquidations)
+        self.assertEqual(1, bh_gb.liquidations)
+        self.assertAlmostEqual(bh_ga.trades[0].exit_price, bh_gb.trades[0].exit_price, places=12)
+        self.assertAlmostEqual(bh_ga.attribution.net_pnl, bh_gb.attribution.net_pnl, places=9)
+
+        # CR2-34: End-of-data exit under AtrBps uses Wilder ATR matching Simulator (even when final bar is flat!).
+        cost_atr = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=AtrBps(bps_per_atr=100.0),
+        )
+        wide_then_flat = [(100.0, 110.0, 90.0, 100.0, 1000.0)] * 20 + [(100.0, 100.0, 100.0, 100.0, 1000.0)]
+        b_atr = _make_series(wide_then_flat, symbol="MUUSDT")
+        bh_atr = compute_buy_and_hold_benchmark(b_atr, warmup_bars=1, instrument=spot, cost_model=cost_atr, atr_period=14)
+        sim_atr = Simulator(spot, cost_atr, SimulatorConfig(starting_equity=10_000.0, atr_period=14))
+        sim_res = sim_atr.run(_ScriptedStrategy({0: StrategyOutput(targets=(TargetPosition("MUUSDT", 1.0),))}, warmup=0), b_atr)
+        # Final bar has high==low==100.0, yet Wilder ATR > 0 -> BOTH benchmark and simulator charge identical EOD exit slippage!
+        self.assertLess(bh_atr.trades[0].exit_price, 100.0)
+        self.assertAlmostEqual(sim_res.trades[0].exit_price, bh_atr.trades[0].exit_price, places=12)
+        _assert_accounting_invariants(self, bh_atr)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ from mu_strategy.strategies.protocol import (
     OrderIntent,
     PortfolioView,
     PositionView,
+    PriceExclusionBand,
+    SessionGate,
     StrategyOutput,
     TargetPosition,
 )
@@ -814,6 +816,180 @@ class RiskOverlayTests(unittest.TestCase):
         bars_stale = _make_bar_series([100.0 + 0.1 * i for i in range(25)], symbol=sym, interval="1h", start_ms=t0 - 35 * 3_600_000)
         res_stale = ov_1h.filter(_make_ctx(now_ms=t0, bars=bars_stale), StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
         self.assertEqual((), res_stale.targets)
+
+    def test_loss_overlays_handle_entry_gates_and_stamp_reduce_only_on_target_weight_cr2_25_cr2_28(self) -> None:
+        sym = "MU-USDT-SWAP"
+        in_session_ms = _utc_ms(2026, 6, 11, 14, 0)   # 10:00 ET (inside 09:45-11:30)
+        out_session_ms = _utc_ms(2026, 6, 11, 20, 15)  # 16:15 ET (outside 09:45-11:30)
+        gate = SessionGate(
+            trading_calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+            trading_windows_et=(("09:45", "11:30"),),
+        )
+        band = (PriceExclusionBand(center=100.0, tolerance_pct=0.01),)
+        open_pos = {
+            sym: PositionView(
+                sym, qty=100.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=10_000.0, leverage=1.0
+            )
+        }
+        # DrawdownCircuitBreaker tripped (15% DD > 10% cap) with flatten_and_halt.
+        dd_in = DrawdownCircuitBreaker(max_drawdown_pct=0.10, action="flatten_and_halt")
+        ctx_in = _make_ctx(now_ms=in_session_ms, equity=8_500.0, peak_equity=10_000.0, positions=open_pos)
+
+        # CR2-25: Non-reduce_only gated intents (session_gate or excluded_price_bands) MUST NOT crash
+        # OrderIntent.__post_init__ and MUST NOT have caller gates silently stripped.
+        gated_contracts = OrderIntent("gc", sym, "sell", "market", "contracts", 20.0, session_gate=gate)
+        banded_contracts = OrderIntent("bc", sym, "sell", "market", "contracts", 20.0, excluded_price_bands=band)
+        gated_tw = OrderIntent("gtw", sym, "sell", "market", "target_weight", 0.5, session_gate=gate)
+        gated_close_all = OrderIntent("gca", sym, "sell", "market", "close_all", 0.0, session_gate=gate)
+        ungated_close_all = OrderIntent("uca", sym, "sell", "market", "close_all", 0.0)
+        # CR2-28: Ungated reducing target_weight intent must require opposing side AND receive reduce_only=True.
+        good_tw = OrderIntent("tw_red", sym, "sell", "market", "target_weight", 0.5)
+        wrong_side_tw = OrderIntent("tw_bad", sym, "buy", "market", "target_weight", 0.5)
+
+        all_intents = (
+            gated_contracts,
+            banded_contracts,
+            gated_tw,
+            gated_close_all,
+            ungated_close_all,
+            good_tw,
+            wrong_side_tw,
+        )
+
+        # 1. DrawdownCircuitBreaker flatten_and_halt: flattens open pos, keeps gated close_all only when allowed,
+        #    and stamps ungated close_all with reduce_only=True without crashing on entry-gated intents.
+        res_dd_in = dd_in.filter(ctx_in, StrategyOutput(intents=all_intents))
+        dd_by_id = {it.intent_id: it for it in res_dd_in.intents}
+        self.assertIn("gca", dd_by_id)
+        self.assertEqual(gate, dd_by_id["gca"].session_gate)
+        self.assertFalse(dd_by_id["gca"].reduce_only)
+        self.assertTrue(dd_by_id["uca"].reduce_only)
+        self.assertEqual(1, len(res_dd_in.targets))
+        self.assertEqual(0.0, res_dd_in.targets[0].target_weight)
+
+        dd_out = DrawdownCircuitBreaker(max_drawdown_pct=0.10, action="flatten_and_halt")
+        ctx_out = _make_ctx(now_ms=out_session_ms, equity=8_500.0, peak_equity=10_000.0, positions=open_pos)
+        res_dd_out = dd_out.filter(ctx_out, StrategyOutput(intents=(gated_close_all, ungated_close_all)))
+        self.assertEqual(("uca",), tuple(it.intent_id for it in res_dd_out.intents))
+        self.assertTrue(res_dd_out.intents[0].reduce_only)
+
+        # 2. VolTargetOverlay with missing vol (exercises _filter_reducing_intents at in_session_ms):
+        #    - drops gated contracts / banded contracts / gated target_weight / wrong-side target_weight
+        #    - preserves allowed gated close_all with gate intact
+        #    - stamps reduce_only=True on ungated close_all AND compatible reducing target_weight (CR2-28)
+        vt_missing = VolTargetOverlay(target_ann_vol=0.40, vol_lookback=10, interval="4h")
+        res_vt = vt_missing.filter(ctx_in, StrategyOutput(intents=all_intents))
+        vt_by_id = {it.intent_id: it for it in res_vt.intents}
+        self.assertEqual({"gca", "uca", "tw_red"}, set(vt_by_id.keys()))
+        self.assertEqual(gate, vt_by_id["gca"].session_gate)
+        self.assertFalse(vt_by_id["gca"].reduce_only)
+        self.assertTrue(vt_by_id["uca"].reduce_only)
+        self.assertTrue(vt_by_id["tw_red"].reduce_only)
+        self.assertAlmostEqual(0.5, vt_by_id["tw_red"].qty_value, places=9)
+
+        # 3. SessionWindowOverlay outside session applies the same CR2-25 + CR2-28 guarantees.
+        sw = SessionWindowOverlay(
+            trading_windows_et=(("09:45", "11:30"),),
+            calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+        )
+        res_sw = sw.filter(ctx_out, StrategyOutput(intents=all_intents))
+        self.assertEqual(("uca", "tw_red"), tuple(it.intent_id for it in res_sw.intents))
+        self.assertTrue(all(it.reduce_only for it in res_sw.intents))
+
+    def test_vol_target_empty_series_missing_and_preserves_intent_order_cr2_26_cr2_45(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        empty_series = BarSeries.from_candles(sym, "1h", [])
+        mv_empty = MarketView({(sym, "1h"): empty_series}, now_ms=t0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        open_pos = {
+            sym: PositionView(
+                sym, qty=10.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=1_000.0, leverage=0.1
+            )
+        }
+        pf_flat = PortfolioView(
+            equity=10_000.0, cash=10_000.0, positions={}, open_orders=(), peak_equity=10_000.0, daily_start_equity=10_000.0
+        )
+        pf_open = PortfolioView(
+            equity=10_000.0,
+            cash=9_000.0,
+            positions=open_pos,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ov = VolTargetOverlay(target_ann_vol=0.40, vol_lookback=10, vol_floor=0.05, max_leverage=2.0, interval="1h")
+
+        # CR2-26: Empty BarSeries (bool == False) MUST be classified as missing (fail closed), NOT warmup!
+        ctx_empty_flat = BarContext(now_ms=t0, symbol=sym, market=mv_empty, portfolio=pf_flat, instrument=inst)
+        res_entry = ov.filter(ctx_empty_flat, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertEqual((), res_entry.targets)
+
+        # CR2-45: Missing volatility MUST preserve exact relative order of retained intents
+        # (bounded partial sell remains ahead of close_all sell).
+        ctx_empty_open = BarContext(now_ms=t0, symbol=sym, market=mv_empty, portfolio=pf_open, instrument=inst)
+        partial_sell = OrderIntent("part_s", sym, "sell", "market", "contracts", 4.0)
+        close_all_sell = OrderIntent("close_s", sym, "sell", "market", "close_all", 0.0, reduce_only=True)
+        res_order = ov.filter(ctx_empty_open, StrategyOutput(intents=(partial_sell, close_all_sell)))
+        self.assertEqual(("part_s", "close_s"), tuple(it.intent_id for it in res_order.intents))
+        self.assertTrue(res_order.intents[0].reduce_only)
+        self.assertAlmostEqual(4.0, res_order.intents[0].qty_value, places=9)
+
+    def test_exposure_cap_accounts_for_resting_open_orders_before_clamping_targets_cr2_29(self) -> None:
+        sym = "MU-USDT-SWAP"
+        other = "ETH-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_eth = _make_bar_series([200.0] * 5, symbol=other, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu, (other, "1h"): bars_eth}, now_ms=t0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov = ExposureCapOverlay(max_gross_leverage=1.5, max_single_weight=1.5)
+
+        # Case 1: Resting 1.0x open buy order on MU -> MU target 1.5x MUST clamp to <= 0.5x!
+        resting_mu = OrderIntent("rest_mu", sym, "buy", "limit", "equity_fraction", 1.0, limit_price=95.0)
+        pf_same = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_mu,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_same = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_same, instrument=inst)
+        res_same = ov.filter(ctx_same, StrategyOutput(targets=(TargetPosition(sym, 1.5),)))
+        self.assertEqual(1, len(res_same.targets))
+        self.assertAlmostEqual(0.5, res_same.targets[0].target_weight, places=9)
+
+        # Case 2: Resting 1.0x open buy order on ETH (untouched symbol) -> MU target 1.5x MUST clamp to <= 0.5x!
+        resting_eth = OrderIntent("rest_eth", other, "buy", "limit", "equity_fraction", 1.0, limit_price=190.0)
+        pf_cross = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_eth,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_cross = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_cross, instrument=inst)
+        res_cross = ov.filter(ctx_cross, StrategyOutput(targets=(TargetPosition(sym, 1.5),)))
+        self.assertEqual(1, len(res_cross.targets))
+        self.assertAlmostEqual(0.5, res_cross.targets[0].target_weight, places=9)
+
+        # Case 3: Resting reduce_only order does NOT consume entry headroom.
+        resting_ro = OrderIntent(
+            "rest_ro", sym, "sell", "stop_market", "close_all", 0.0, stop_price=90.0, reduce_only=True
+        )
+        pf_ro = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_ro,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_ro = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_ro, instrument=inst)
+        res_ro = ov.filter(ctx_ro, StrategyOutput(targets=(TargetPosition(sym, 1.5),)))
+        self.assertAlmostEqual(1.5, res_ro.targets[0].target_weight, places=9)
 
 
 if __name__ == "__main__":

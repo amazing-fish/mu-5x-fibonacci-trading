@@ -37,6 +37,7 @@ from mu_strategy.strategies.protocol import (
     OrderIntent,
     ParamSpace,
     ParamSpec,
+    PriceExclusionBand,
     SessionGate,
     StrategyOutput,
 )
@@ -66,6 +67,19 @@ def _validate_margin_steps(steps: Sequence[float]) -> None:
             raise ValueError(f"first margin_step must be positive, got {step!r}")
         if step < 0.0:
             raise ValueError(f"margin_steps[{idx}] must be non-negative, got {step!r}")
+
+
+def _validate_stage_schedule(margin_steps: Sequence[float], add_thresholds: Sequence[float]) -> None:
+    _validate_margin_steps(margin_steps)
+    required_thresholds = len(margin_steps) - 1
+    if len(add_thresholds) < required_thresholds:
+        raise ValueError(
+            f"add_thresholds must contain at least {required_thresholds} entries for {len(margin_steps)} "
+            f"margin_steps, got {len(add_thresholds)}"
+        )
+    for idx, threshold in enumerate(add_thresholds):
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not _isfinite(threshold) or threshold < 0.0:
+            raise ValueError(f"add_thresholds[{idx}] must be finite and non-negative, got {threshold!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +168,7 @@ class FibonacciPullbackParams:
             raise ValueError("leverage must be positive and finite")
         if not isinstance(self.use_session_window, bool):
             raise ValueError("use_session_window must be a bool")
-        _validate_margin_steps(self.margin_steps)
+        _validate_stage_schedule(self.margin_steps, self.add_thresholds)
 
 
 def fibonacci_pullback_param_space() -> ParamSpace:
@@ -275,21 +289,26 @@ def _nearest_fib_retest_from_arrays(
     return best_level
 
 
-def _reverse_fib_resistance_from_arrays(
+def _reverse_fib_exclusion_bands_from_arrays(
     highs: Sequence[float],
     lows: Sequence[float],
     start: int,
     curr_abs_idx: int,
-    entry_price: float,
     lookback: int,
     tolerance_pct: float,
-) -> float | None:
+) -> tuple[PriceExclusionBand, ...]:
+    """Compute causal reverse-Fibonacci resistance bands known at ``curr_abs_idx``.
+
+    Evaluated at fill time against the actual fill price (e.g. ``next_bar.open`` for
+    ``direct_next_open`` or ``max(next_bar.open, curr_high)`` for ``break_high``) so
+    resistance checks match legacy ``should_execute_entry`` without look-ahead.
+    """
     rel_idx = curr_abs_idx - start
     if rel_idx <= 0 or lookback <= 0:
-        return None
+        return ()
     win_start = max(start, curr_abs_idx - lookback)
     if curr_abs_idx - win_start < 2:
-        return None
+        return ()
 
     high_idx = win_start
     high_val = highs[win_start]
@@ -306,19 +325,13 @@ def _reverse_fib_resistance_from_arrays(
             low_idx = idx
 
     if high_idx >= low_idx or high_val <= low_val:
-        return None
+        return ()
 
     span = high_val - low_val
-    tolerance = entry_price * tolerance_pct
-    best_level: float | None = None
-    best_dist = math.inf
-    for ratio in (0.382, 0.5, 0.618):
-        level = low_val + span * ratio
-        dist = abs(entry_price - level)
-        if dist <= tolerance and dist < best_dist:
-            best_dist = dist
-            best_level = level
-    return best_level
+    return tuple(
+        PriceExclusionBand(center=low_val + span * ratio, tolerance_pct=tolerance_pct)
+        for ratio in (0.382, 0.5, 0.618)
+    )
 
 
 class FibonacciPullbackStrategy:
@@ -333,7 +346,7 @@ class FibonacciPullbackStrategy:
             raise ValueError("pass either params or keyword overrides, not both")
         self.params: FibonacciPullbackParams = params if params is not None else FibonacciPullbackParams(**kwargs)
         self._config: StrategyConfig = self._build_effective_config(self.params)
-        _validate_margin_steps(self._config.margin_steps)
+        _validate_stage_schedule(self._config.margin_steps, self._config.add_thresholds)
         self._session_gate: SessionGate | None = (
             SessionGate(
                 trading_calendar_id=self._config.trading_calendar_id,
@@ -766,13 +779,16 @@ class FibonacciPullbackStrategy:
             # still scan that bar for a fresh signal (L309-316).
             if self._submitted_entry_bar_idx == curr_rel_idx:
                 self._submitted_entry_bar_idx = None
-                if (
-                    self._pending_entry is not None
-                    and self._window_allowed(curr_open_ms)
-                    and curr_low <= self._pending_entry.fib_level
-                ):
-                    self._pending_entry = None
-                    return EMPTY_OUTPUT
+                if self._pending_entry is not None and self._window_allowed(curr_open_ms):
+                    touch_through = bool(getattr(ctx, "require_touch_through", False))
+                    filled_touch = (
+                        curr_low < self._pending_entry.fib_level
+                        if touch_through
+                        else curr_low <= self._pending_entry.fib_level
+                    )
+                    if filled_touch:
+                        self._pending_entry = None
+                        return EMPTY_OUTPUT
                 self._pending_immediate = None
             elif self._pending_immediate is not None:
                 self._pending_immediate = None
@@ -1026,22 +1042,22 @@ class FibonacciPullbackStrategy:
             max_entry_price = cap_close if max_entry_price is None else min(max_entry_price, cap_close)
 
         entry_qty_fraction = cfg.margin_steps[0] * cfg.leverage
+        excluded_bands: tuple[PriceExclusionBand, ...] = (
+            _reverse_fib_exclusion_bands_from_arrays(
+                base.highs,
+                base.lows,
+                start,
+                curr_abs_idx,
+                cfg.reverse_fib_lookback,
+                cfg.reverse_fib_tolerance_pct,
+            )
+            if cfg.block_reverse_fib_resistance
+            else ()
+        )
 
         if cfg.entry_execution == "direct_next_open":
             if max_entry_price is not None and not (_isfinite(max_entry_price) and max_entry_price > 0.0):
                 return EMPTY_OUTPUT
-            if cfg.block_reverse_fib_resistance:
-                rev = _reverse_fib_resistance_from_arrays(
-                    base.highs,
-                    base.lows,
-                    start,
-                    curr_abs_idx,
-                    curr_close,
-                    cfg.reverse_fib_lookback,
-                    cfg.reverse_fib_tolerance_pct,
-                )
-                if rev is not None:
-                    return EMPTY_OUTPUT
             initial_stop = self._compute_initial_stop(curr_close, signal_stop, atr_val)
             self._pending_immediate = _PendingImmediateEntry(
                 mode="direct_next_open",
@@ -1063,6 +1079,7 @@ class FibonacciPullbackStrategy:
                     tag="fib_direct_next_open_entry",
                     time_in_force="open_only",
                     session_gate=self._session_gate,
+                    excluded_price_bands=excluded_bands,
                 )
             else:
                 dno_entry = OrderIntent(
@@ -1077,6 +1094,7 @@ class FibonacciPullbackStrategy:
                     tag="fib_direct_next_open_entry",
                     time_in_force="open_only",
                     session_gate=self._session_gate,
+                    excluded_price_bands=excluded_bands,
                 )
             return StrategyOutput(
                 intents=(
@@ -1108,18 +1126,6 @@ class FibonacciPullbackStrategy:
         trigger_stop = math.nextafter(curr_high, math.inf)
         if max_entry_price is not None and trigger_stop > max_entry_price:
             return EMPTY_OUTPUT
-        if cfg.block_reverse_fib_resistance:
-            rev = _reverse_fib_resistance_from_arrays(
-                base.highs,
-                base.lows,
-                start,
-                curr_abs_idx,
-                curr_high,
-                cfg.reverse_fib_lookback,
-                cfg.reverse_fib_tolerance_pct,
-            )
-            if rev is not None:
-                return EMPTY_OUTPUT
 
         initial_stop = self._compute_initial_stop(curr_high, signal_stop, atr_val)
         self._pending_immediate = _PendingImmediateEntry(
@@ -1144,6 +1150,7 @@ class FibonacciPullbackStrategy:
                 expires_after_bars=1,
                 tag="fib_break_high_entry",
                 session_gate=self._session_gate,
+                excluded_price_bands=excluded_bands,
             )
         else:
             entry_intent = OrderIntent(
@@ -1158,6 +1165,7 @@ class FibonacciPullbackStrategy:
                 expires_after_bars=1,
                 tag="fib_break_high_entry",
                 session_gate=self._session_gate,
+                excluded_price_bands=excluded_bands,
             )
 
         stop_intent = OrderIntent(

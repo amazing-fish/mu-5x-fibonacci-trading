@@ -37,6 +37,8 @@ _INF = math.inf
 _isfinite = math.isfinite
 _sqrt = math.sqrt
 _log = math.log
+_frexp = math.frexp
+_ldexp = math.ldexp
 
 
 def _validate_positive_int(value: Any, name: str, *, minimum: int = 1) -> int:
@@ -90,6 +92,21 @@ def _neumaier_add(total: float, comp: float, value: float) -> tuple[float, float
     else:
         comp += (value - t) + total
     return t, comp
+
+
+def _safe_window_mean(values: Sequence[float], start: int, end: int) -> float:
+    """Compute overflow-safe exact mean of finite ``values[start:end]`` via power-of-2 scaling."""
+    count = end - start
+    max_abs = 0.0
+    for j in range(start, end):
+        a = abs(values[j])
+        if a > max_abs:
+            max_abs = a
+    if max_abs == 0.0:
+        return 0.0
+    _, exp = _frexp(max_abs)
+    scaled_mean = math.fsum(_ldexp(values[j], -exp) for j in range(start, end)) / count
+    return _ldexp(scaled_mean, exp)
 
 
 def compute_sma(closes: Sequence[float], period: int) -> array:
@@ -152,7 +169,10 @@ def compute_sma(closes: Sequence[float], period: int) -> array:
                     window_sum = in_stack[-1][2] + in_stack[-1][3]
                 else:
                     window_sum = out_stack[-1][2] + out_stack[-1][3]
-                out[i] = window_sum * inv_period
+                if _isfinite(window_sum):
+                    out[i] = window_sum * inv_period
+                else:
+                    out[i] = _safe_window_mean(closes, i - period + 1, i + 1)
 
     return array("d", out)
 
@@ -346,12 +366,38 @@ def compute_donchian_low(lows: Sequence[float], period: int) -> array:
     return array("d", out)
 
 
+def _exact_window_stats_scaled(values: Sequence[float], start: int, end: int) -> tuple[float, float, int]:
+    """Compute overflow/underflow-safe ``(scaled_mean, scaled_ssd, scale_exp)`` over ``values[start:end]``.
+
+    Values are scaled by ``2**(-scale_exp)`` (exact IEEE-754 exponent shift with zero
+    mantissa rounding loss). For ordinary magnitudes (``1e-100 <= max_abs <= 1e100``),
+    ``scale_exp == 0`` so callers pay zero scaling overhead on normal market prices.
+    """
+    count = end - start
+    max_abs = 0.0
+    for j in range(start, end):
+        a = abs(values[j])
+        if a > max_abs:
+            max_abs = a
+    if max_abs == 0.0:
+        return 0.0, 0.0, 0
+    if 1e-100 <= max_abs <= 1e100:
+        mean = math.fsum(values[start:end]) / count
+        ssd = math.fsum((values[j] - mean) * (values[j] - mean) for j in range(start, end))
+        return mean, ssd, 0
+    _, exp = _frexp(max_abs)
+    scaled_vals = [_ldexp(values[j], -exp) for j in range(start, end)]
+    mean = math.fsum(scaled_vals) / count
+    ssd = math.fsum((v - mean) * (v - mean) for v in scaled_vals)
+    return mean, ssd, exp
+
+
 def _exact_window_stats(values: Sequence[float], start: int, end: int) -> tuple[float, float]:
     """Compute exact (mean, sum_sq_dev) over values[start:end] via two-pass summation."""
-    count = end - start
-    mean = math.fsum(values[start:end]) / count
-    ssd = math.fsum((values[j] - mean) * (values[j] - mean) for j in range(start, end))
-    return mean, ssd
+    mean, ssd, exp = _exact_window_stats_scaled(values, start, end)
+    if exp == 0:
+        return mean, ssd
+    return _ldexp(mean, exp), _ldexp(ssd, 2 * exp)
 
 
 def compute_realized_vol(
@@ -515,6 +561,7 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
 
     sum_d = 0.0
     sum_d2 = 0.0
+    scale_exp = 0
     if bad_count == 0:
         if run_len >= period:
             anchor = last_val
@@ -522,37 +569,38 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
             sum_d2 = 0.0
             out[period - 1] = 0.0
         else:
-            mean, ssd = _exact_window_stats(closes, 0, period)
-            anchor = mean
+            s_mean, s_ssd, scale_exp = _exact_window_stats_scaled(closes, 0, period)
+            anchor = s_mean
             sum_d = 0.0
-            sum_d2 = ssd
-            std = _sqrt(ssd * inv_dof) if ssd > 0.0 else 0.0
-            eps = 1e-12 * max(1.0, abs(mean))
+            sum_d2 = s_ssd
+            std = _sqrt(s_ssd * inv_dof) if s_ssd > 0.0 else 0.0
+            eps = 1e-12 * max(1.0, abs(s_mean))
             if std <= eps:
                 out[period - 1] = 0.0
             else:
-                z = (closes[period - 1] - mean) / std
+                last_scaled = closes[period - 1] if scale_exp == 0 else _ldexp(closes[period - 1], -scale_exp)
+                z = (last_scaled - s_mean) / std
                 out[period - 1] = 0.0 if z == 0.0 else z
     else:
-        for i in range(period):
-            v = closes[i]
-            if _isfinite(v):
-                sum_d += v
-                sum_d2 += v * v
+        # Defer sum initialization until the first full finite window triggers scaled resync.
+        sum_d = _NAN
+        sum_d2 = _NAN
 
     since_resync = 0
     for i in range(period, n):
         old_v = closes[i - period]
         new_v = closes[i]
         if _isfinite(old_v):
-            d_old = old_v - anchor
+            old_s = old_v if scale_exp == 0 else _ldexp(old_v, -scale_exp)
+            d_old = old_s - anchor
             sum_d -= d_old
             sum_d2 -= d_old * d_old
         else:
             bad_count -= 1
 
         if _isfinite(new_v):
-            d_new = new_v - anchor
+            new_s = new_v if scale_exp == 0 else _ldexp(new_v, -scale_exp)
+            d_new = new_s - anchor
             sum_d += d_new
             sum_d2 += d_new * d_new
             if run_len > 0 and new_v == last_val:
@@ -571,6 +619,7 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
 
         # Provably constant window: every close in [i - period + 1, i] equals last_val.
         if run_len >= period:
+            scale_exp = 0
             anchor = last_val
             sum_d = 0.0
             sum_d2 = 0.0
@@ -579,12 +628,21 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
             continue
 
         ssd = sum_d2 - (sum_d * sum_d) * inv_period
-        if since_resync >= resync_every or ssd <= 1e-12 * sum_d2 or ssd < 0.0:
-            mean, ssd = _exact_window_stats(closes, i - period + 1, i + 1)
-            anchor = mean
+        if (
+            since_resync >= resync_every
+            or not (_isfinite(sum_d) and _isfinite(sum_d2) and _isfinite(ssd))
+            or ssd <= 1e-12 * sum_d2
+            or ssd < 0.0
+            or (scale_exp == 0 and abs(new_v) > 1e100)
+            or (scale_exp != 0 and (abs(new_s) > 1e100 or (new_v != 0.0 and abs(new_s) < 1e-100)))
+        ):
+            s_mean, s_ssd, scale_exp = _exact_window_stats_scaled(closes, i - period + 1, i + 1)
+            anchor = s_mean
             sum_d = 0.0
-            sum_d2 = ssd
+            sum_d2 = s_ssd
+            ssd = s_ssd
             since_resync = 0
+            mean = s_mean
         else:
             mean = anchor + (sum_d * inv_period)
 
@@ -593,7 +651,8 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
         if std <= eps:
             out[i] = 0.0
         else:
-            z = (new_v - mean) / std
+            last_scaled = new_v if scale_exp == 0 else _ldexp(new_v, -scale_exp)
+            z = (last_scaled - mean) / std
             out[i] = 0.0 if z == 0.0 else z
 
     return array("d", out)
@@ -632,16 +691,23 @@ def compute_vwap(
         c = closes[i]
         v = volumes[i]
         if _isfinite(h) and _isfinite(l) and _isfinite(c) and _isfinite(v) and v >= 0.0:
-            pv = ((h + l + c) / 3.0) * v
-            if _isfinite(pv):
-                vf = float(v)
-                bad = 0
-                pos = 1 if vf > 0.0 else 0
-            else:
+            vf = float(v)
+            if vf == 0.0:
                 pv = 0.0
-                vf = 0.0
-                bad = 1
+                bad = 0
                 pos = 0
+            else:
+                tp_sum = h + l + c
+                tp = (tp_sum / 3.0) if _isfinite(tp_sum) else ((h / 3.0) + (l / 3.0) + (c / 3.0))
+                pv = tp * vf
+                if _isfinite(pv):
+                    bad = 0
+                    pos = 1
+                else:
+                    pv = 0.0
+                    vf = 0.0
+                    bad = 1
+                    pos = 0
         else:
             pv = 0.0
             vf = 0.0

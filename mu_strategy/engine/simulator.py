@@ -80,6 +80,7 @@ _set_ctx_sym = BarContext.symbol.__set__
 _set_ctx_mkt = BarContext.market.__set__
 _set_ctx_pf = BarContext.portfolio.__set__
 _set_ctx_ins = BarContext.instrument.__set__
+_set_ctx_rtt = BarContext.require_touch_through.__set__
 
 
 def _clean_zero(value: float) -> float:
@@ -140,6 +141,7 @@ def _fast_bar_context(
     market: MarketView,
     portfolio: PortfolioView,
     instrument: InstrumentSpec,
+    require_touch_through: bool = False,
 ) -> BarContext:
     ctx = _new_ctx(BarContext)
     _set_ctx_now(ctx, now_ms)
@@ -147,6 +149,7 @@ def _fast_bar_context(
     _set_ctx_mkt(ctx, market)
     _set_ctx_pf(ctx, portfolio)
     _set_ctx_ins(ctx, instrument)
+    _set_ctx_rtt(ctx, require_touch_through)
     return ctx
 
 
@@ -405,6 +408,7 @@ class _LiveBarContext(BarContext):
         _set_ctx_mkt(self, market)
         _set_ctx_pf(self, portfolio)
         _set_ctx_ins(self, instrument)
+        _set_ctx_rtt(self, acct.execution.require_touch_through)
         object.__setattr__(self, "_acct", acct)
 
     @property
@@ -450,7 +454,17 @@ _set_mv_pend = _SimMarketView._primary_end.__set__
 
 @dataclass(frozen=True, slots=True)
 class SimulatorConfig:
-    """Configuration governing deterministic two-phase simulation behavior."""
+    """Configuration governing deterministic two-phase simulation behavior.
+
+    ``reuse_bar_context`` controls the ``BarContext`` lifetime contract:
+      - ``None`` (default): pass stable immutable snapshots to standard strategies;
+        use callback-scoped ephemeral context reuse only when
+        ``getattr(strategy, "supports_ephemeral_context", False)`` is ``True``.
+      - ``False``: always pass stable immutable per-bar snapshots.
+      - ``True``: requires ``strategy.supports_ephemeral_context = True`` and
+        raises ``ValueError`` for unmarked strategies so the default snapshot
+        retention guarantee is never silently broken.
+    """
 
     starting_equity: float = 10_000.0
     primary_interval: str | None = None
@@ -530,6 +544,8 @@ class _QueuedOrder:
     bars_left: int | None
     created_while_open: bool
     activated: bool = False
+    activated_bar: int = -1
+    activated_at_open: bool = False
 
 
 class _SimAccount:
@@ -1040,6 +1056,15 @@ class _SimAccount:
                 qty_abs = 0.0
             else:
                 qty_abs = abs(delta) / exec_px
+                is_same_side_reduce = (
+                    (self.pos_qty > 0.0 and 0.0 < desired_notional < current_notional)
+                    or (self.pos_qty < 0.0 and current_notional < desired_notional < 0.0)
+                )
+                if is_same_side_reduce:
+                    pos_abs_s = abs(self.pos_qty)
+                    if qty_abs >= pos_abs_s - 1e-12:
+                        keep_qty = max(abs(desired_notional) / ref_px, 2e-12)
+                        qty_abs = max(0.0, pos_abs_s - keep_qty)
 
         # Enforce reduce_only cap immediately against live position before every fill (CR1-47).
         if is_reduce and qty_abs > 0.0:
@@ -1053,6 +1078,7 @@ class _SimAccount:
         intent: OrderIntent,
         *,
         qo: _QueuedOrder | None = None,
+        bar_idx: int = -1,
         bar_open: float,
         bar_high: float,
         bar_low: float,
@@ -1072,6 +1098,7 @@ class _SimAccount:
         side = intent.side
         reason = intent.tag or otype
         is_reduce = intent.reduce_only or intent.qty_mode == "close_all"
+        excluded_bands = () if is_reduce else intent.excluded_price_bands
 
         if is_reduce:
             pos_q = self.pos_qty
@@ -1079,6 +1106,8 @@ class _SimAccount:
                 return None, False
 
         if otype == "market":
+            if excluded_bands and any(b.excludes(bar_open) for b in excluded_bands):
+                return None, False
             # Open fill: price strictly from pre-open data (CR1-40).
             est_notional = (
                 (eq_basis * intent.qty_value)
@@ -1134,6 +1163,8 @@ class _SimAccount:
             )
             if fill_px is None:
                 return None, False
+            if excluded_bands and any(b.excludes(fill_px) for b in excluded_bands):
+                return None, False
             qty_abs = self.size_intent_qty(intent, fill_px, fill_px, eq_basis)
             if qty_abs <= 1e-12:
                 return None, False
@@ -1167,6 +1198,8 @@ class _SimAccount:
                 bar_low=bar_low,
             )
             if ref_px is None:
+                return None, False
+            if excluded_bands and any(b.excludes(ref_px) for b in excluded_bands):
                 return None, False
             triggered_at_open = (bar_open >= intent.stop_price) if side == "buy" else (bar_open <= intent.stop_price)
             p_high = pre_high if triggered_at_open else bar_high
@@ -1242,7 +1275,7 @@ class _SimAccount:
                 False,
             )
 
-        # order_type == "stop_limit" (CR1-42: persist activation state across bars without resetting expiry).
+        # order_type == "stop_limit" (CR1-42 / CR2-15 / CR2-18 / CR2-22).
         assert intent.stop_price is not None and intent.limit_price is not None
         is_activated = qo.activated if qo is not None else False
         if is_activated:
@@ -1254,6 +1287,8 @@ class _SimAccount:
                 bar_low=bar_low,
             )
             if fill_px is None:
+                return None, False
+            if excluded_bands and any(b.excludes(fill_px) for b in excluded_bands):
                 return None, False
             qty_abs = self.size_intent_qty(intent, fill_px, fill_px, eq_basis)
             if qty_abs <= 1e-12:
@@ -1284,20 +1319,91 @@ class _SimAccount:
         )
         if ref_px is None:
             return None, False
+        triggered_at_open = (bar_open >= intent.stop_price) if side == "buy" else (bar_open <= intent.stop_price)
+        if triggered_at_open:
+            within_limit = (bar_open <= intent.limit_price) if side == "buy" else (bar_open >= intent.limit_price)
+            if within_limit:
+                if excluded_bands and any(b.excludes(bar_open) for b in excluded_bands):
+                    return None, False
+                if qo is not None:
+                    qo.activated = True
+                    qo.activated_bar = bar_idx
+                    qo.activated_at_open = True
+                qty_abs = self.size_intent_qty(intent, bar_open, bar_open, eq_basis)
+                if qty_abs <= 1e-12:
+                    return None, False
+                # CR2-22: Keep ATR range fallback strictly causal using prior-bar OHLCV/ATR for opening fills.
+                raw_exec = execution._adverse_exec_price(
+                    side,
+                    bar_open,
+                    order_notional=bar_open * qty_abs,
+                    bar_high=pre_high,
+                    bar_low=pre_low,
+                    bar_close=pre_close,
+                    bar_volume=pre_volume,
+                    bar_atr=pre_atr,
+                    is_stop=True,
+                )
+                if side == "buy":
+                    exec_px = raw_exec if raw_exec <= intent.limit_price else intent.limit_price
+                else:
+                    exec_px = raw_exec if raw_exec >= intent.limit_price else intent.limit_price
+                return (
+                    execution._make_quote(
+                        side=side,
+                        order_type="stop_limit",
+                        ref_price=bar_open,
+                        exec_price=exec_px,
+                        qty=qty_abs,
+                        fee_rate=execution._taker_fee_rate,
+                        liquidity="taker",
+                        reason=reason,
+                    ),
+                    True,
+                )
+            # Triggered at open past limit_price: activates as a passive resting limit for this bar.
+            if qo is not None:
+                qo.activated = True
+                qo.activated_bar = bar_idx
+                qo.activated_at_open = True
+            if side == "buy":
+                reached = (bar_low < intent.limit_price) if execution.require_touch_through else (bar_low <= intent.limit_price)
+            else:
+                reached = (bar_high > intent.limit_price) if execution.require_touch_through else (bar_high >= intent.limit_price)
+            if not reached:
+                return None, False
+            if excluded_bands and any(b.excludes(intent.limit_price) for b in excluded_bands):
+                return None, False
+            qty_abs = self.size_intent_qty(intent, intent.limit_price, intent.limit_price, eq_basis)
+            if qty_abs <= 1e-12:
+                return None, False
+            return (
+                execution._make_quote(
+                    side=side,
+                    order_type="limit",
+                    ref_price=intent.limit_price,
+                    exec_price=intent.limit_price,
+                    qty=qty_abs,
+                    fee_rate=execution._maker_fee_rate,
+                    liquidity="maker",
+                    reason=reason,
+                ),
+                False,
+            )
+
+        # Triggered strictly intrabar at ref_px == intent.stop_price.
+        within_limit = (ref_px <= intent.limit_price) if side == "buy" else (ref_px >= intent.limit_price)
+        if within_limit and excluded_bands and any(b.excludes(ref_px) for b in excluded_bands):
+            return None, False
         if qo is not None:
             qo.activated = True
-        triggered_at_open = (bar_open >= intent.stop_price) if side == "buy" else (bar_open <= intent.stop_price)
-        size_ref = (
-            intent.limit_price
-            if ((side == "buy" and ref_px > intent.limit_price) or (side == "sell" and ref_px < intent.limit_price))
-            else ref_px
-        )
-        qty_abs = self.size_intent_qty(intent, size_ref, size_ref, eq_basis)
+            qo.activated_bar = bar_idx
+            qo.activated_at_open = False
+        if not within_limit:
+            return None, False
+        qty_abs = self.size_intent_qty(intent, ref_px, ref_px, eq_basis)
         if qty_abs <= 1e-12:
             return None, False
-        p_close = pre_close if triggered_at_open else bar_close
-        p_vol = pre_volume if triggered_at_open else bar_volume
-        p_atr = pre_atr if triggered_at_open else bar_atr
         quote, _ = execution.evaluate_stop_limit(
             side,
             qty_abs,
@@ -1307,15 +1413,12 @@ class _SimAccount:
             bar_open=bar_open,
             bar_high=bar_high,
             bar_low=bar_low,
-            bar_close=p_close,
-            bar_volume=p_vol,
-            bar_atr=p_atr,
+            bar_close=bar_close,
+            bar_volume=bar_volume,
+            bar_atr=bar_atr,
             reason=reason,
         )
-        if quote is None:
-            return None, False
-        filled_at_open = triggered_at_open and quote.order_type == "stop_limit"
-        return quote, filled_at_open
+        return quote, False
 
     def try_execute_intent(
         self,
@@ -1371,6 +1474,7 @@ class _SimAccount:
         *,
         include_active_bracket: bool = True,
         allow_liq: bool = True,
+        allow_tp: bool = True,
         liq_bar_open: float | None = None,
         liq_bar_high: float | None = None,
         liq_bar_low: float | None = None,
@@ -1490,6 +1594,7 @@ class _SimAccount:
                         quote, _ = self._try_execute_queued_order(
                             it,
                             qo=qo,
+                            bar_idx=i,
                             bar_open=bar_open,
                             bar_high=bar_open,
                             bar_low=bar_open,
@@ -1509,42 +1614,55 @@ class _SimAccount:
                             exited_any = True
                             adverse_stop_filled = True
                     else:
-                        # Protective stop_limit triggered AT OPEN (CR1-45): activate and fill ONLY if open respects limit!
+                        # Protective stop_limit triggered AT OPEN (CR1-45 / CR2-18 / CR2-22):
+                        # activate with at-open provenance and price strictly from pre-open data.
                         assert it.limit_price is not None and it.stop_price is not None
                         qo.activated = True
+                        qo.activated_bar = i
+                        qo.activated_at_open = True
                         if (close_side == "sell" and bar_open >= it.limit_price) or (
                             close_side == "buy" and bar_open <= it.limit_price
                         ):
                             qty_abs = self.size_intent_qty(it, bar_open, bar_open, _eq_basis())
                             if qty_abs > 1e-12:
-                                quote, _ = execution.evaluate_stop_limit(
+                                raw_exec = execution._adverse_exec_price(
                                     close_side,
-                                    qty_abs,
-                                    it.stop_price,
-                                    it.limit_price,
-                                    activated=False,
-                                    bar_open=bar_open,
-                                    bar_high=bar_open,
-                                    bar_low=bar_open,
+                                    bar_open,
+                                    order_notional=bar_open * qty_abs,
+                                    bar_high=pre_high,
+                                    bar_low=pre_low,
                                     bar_close=pre_close,
                                     bar_volume=pre_volume,
                                     bar_atr=pre_atr,
+                                    is_stop=True,
+                                )
+                                if close_side == "buy":
+                                    exec_px = raw_exec if raw_exec <= it.limit_price else it.limit_price
+                                else:
+                                    exec_px = raw_exec if raw_exec >= it.limit_price else it.limit_price
+                                quote = execution._make_quote(
+                                    side=close_side,
+                                    order_type="stop_limit",
+                                    ref_price=bar_open,
+                                    exec_price=exec_px,
+                                    qty=qty_abs,
+                                    fee_rate=execution._taker_fee_rate,
+                                    liquidity="taker",
                                     reason=it.tag or "stop_limit",
                                 )
-                                if quote is not None:
-                                    self.apply_fill(quote, bar_open_ms, i)
-                                    consumed_ids.add(id(qo))
-                                    exited_any = True
-                                    adverse_stop_filled = True
-                        # Else: bar_open gapped past limit_price; qo stays activated=True as resting limit!
+                                self.apply_fill(quote, bar_open_ms, i)
+                                consumed_ids.add(id(qo))
+                                exited_any = True
+                                adverse_stop_filled = True
+                        # Else: bar_open gapped past limit_price; qo stays activated=True (at_open) for intrabar reach!
                 if consumed_ids and self.pos_qty != 0.0:
                     self.pending_reduce_orders = [q for q in self.pending_reduce_orders if id(q) not in consumed_ids]
 
         if self.pos_qty == 0.0:
             return True
 
-        # A.4 Marketable take-profit / resting limit / already-activated stop_limit AT OPEN (CR1-53).
-        if not adverse_stop_filled:
+        # A.4 Marketable take-profit / resting limit / pre-open activated stop_limit AT OPEN (CR1-53 / CR2-18).
+        if allow_tp and not adverse_stop_filled:
             if include_active_bracket and self.active_take_profit is not None:
                 tp = self.active_take_profit
                 tp_at_open = (
@@ -1572,7 +1690,9 @@ class _SimAccount:
                     it = qo.intent
                     if it.side != close_side or it.limit_price is None:
                         continue
-                    is_resting_lim = (it.order_type == "limit") or (it.order_type == "stop_limit" and qo.activated)
+                    is_resting_lim = (it.order_type == "limit") or (
+                        it.order_type == "stop_limit" and qo.activated and qo.activated_bar < i
+                    )
                     if not is_resting_lim:
                         continue
                     open_only = it.order_type == "limit" and getattr(it, "time_in_force", "gtc") == "open_only"
@@ -1666,6 +1786,7 @@ class _SimAccount:
                     quote, _ = self._try_execute_queued_order(
                         qo.intent,
                         qo=qo,
+                        bar_idx=i,
                         bar_open=bar_open,
                         bar_high=bar_high,
                         bar_low=bar_low,
@@ -1688,6 +1809,7 @@ class _SimAccount:
                     quote, _ = self._try_execute_queued_order(
                         qo.intent,
                         qo=qo,
+                        bar_idx=i,
                         bar_open=bar_open,
                         bar_high=bar_high,
                         bar_low=bar_low,
@@ -1732,8 +1854,8 @@ class _SimAccount:
                     self.liquidations += 1
                     return True
 
-        # B.3 Intrabar TPs / resting limits / activated stop-limits (CONSERVATIVE: only if no stop filled).
-        if not adverse_stop_filled and self.pos_qty != 0.0:
+        # B.3 Intrabar TPs / resting limits / eligible activated stop-limits (CONSERVATIVE + CR2-18).
+        if allow_tp and not adverse_stop_filled and self.pos_qty != 0.0:
             tp_candidates: list[tuple[float, str, _QueuedOrder | None]] = []
             if include_active_bracket and self.active_take_profit is not None:
                 tp_candidates.append((self.active_take_profit, "bracket", None))
@@ -1746,7 +1868,12 @@ class _SimAccount:
                         continue  # open_only never fills intrabar
                     tp_candidates.append((it.limit_price, "limit", qo))
                 elif it.order_type == "stop_limit" and qo.activated:
-                    tp_candidates.append((it.limit_price, "stop_limit", qo))
+                    # CR2-18: Distinguish pre-open, at-open, and intrabar activation:
+                    # intrabar-activated stop-limits MUST NOT match against earlier bar_open or OHLC range.
+                    if qo.activated_bar < i:
+                        tp_candidates.append((it.limit_price, "stop_limit_pre", qo))
+                    elif qo.activated_bar == i and qo.activated_at_open:
+                        tp_candidates.append((it.limit_price, "stop_limit_open", qo))
             if tp_candidates:
                 # Encounter order moving favorably from bar_open: lowest limit first for long sell, highest for short buy.
                 tp_candidates.sort(key=lambda item: item[0], reverse=(not is_long))
@@ -1769,6 +1896,29 @@ class _SimAccount:
                             return True
                     elif qo is not None:
                         it = qo.intent
+                        if kind == "stop_limit_open":
+                            # Activated at bar_open past limit_price: fills ONLY on intrabar return to limit_price (never at bar_open).
+                            if close_side == "sell":
+                                reached = (bar_high > lp) if execution.require_touch_through else (bar_high >= lp)
+                            else:
+                                reached = (bar_low < lp) if execution.require_touch_through else (bar_low <= lp)
+                            if reached:
+                                qty_abs = self.size_intent_qty(it, lp, lp, _eq_basis())
+                                if qty_abs > 1e-12:
+                                    tq = execution._make_quote(
+                                        side=close_side,
+                                        order_type="limit",
+                                        ref_price=lp,
+                                        exec_price=lp,
+                                        qty=qty_abs,
+                                        fee_rate=execution._maker_fee_rate,
+                                        liquidity="maker",
+                                        reason=it.tag or it.order_type,
+                                    )
+                                    self.apply_fill(tq, bar_open_ms, i)
+                                    consumed_tps.add(id(qo))
+                                    exited_any = True
+                            continue
                         fill_px = execution.limit_fill_price(
                             close_side,
                             lp,
@@ -1891,6 +2041,7 @@ class _SimAccount:
                     quote, _ = self._try_execute_queued_order(
                         qo.intent,
                         qo=qo,
+                        bar_idx=i,
                         bar_open=bar_open,
                         bar_high=bar_high,
                         bar_low=bar_low,
@@ -1955,6 +2106,7 @@ class _SimAccount:
                     and ((q_now > 0.0 and t_weight > 0.0) or (q_now < 0.0 and t_weight < 0.0))
                     and abs(t_weight - self.last_applied_target_weight) <= self.deadband_w
                 )
+                target_blocked = False
                 if not same_side_hold:
                     eq_basis = (
                         self.settled_equity
@@ -1991,6 +2143,13 @@ class _SimAccount:
                                 delta_qty_abs = abs(q_now) + (abs(desired_notional) / est_exec)
                             else:
                                 delta_qty_abs = abs(delta_notional) / est_exec
+                                # CR2-24: A same-side reducing target with non-zero weight must never
+                                # cross zero or collapse into a full close due to adverse execution slippage.
+                                if is_reducing_target:
+                                    q_abs_r = abs(q_now)
+                                    if delta_qty_abs >= q_abs_r - 1e-12:
+                                        keep_qty = max(abs(desired_notional) / bar_open, 2e-12)
+                                        delta_qty_abs = max(0.0, q_abs_r - keep_qty)
                             if delta_qty_abs > 1e-12:
                                 quote = execution._make_quote(
                                     side=trade_side,
@@ -2006,7 +2165,12 @@ class _SimAccount:
                                     fresh_entry_this_bar = True
                         if not target_blocked:
                             self.last_applied_target_weight = t_weight
-                if self.pos_qty != 0.0:
+                # CR2-16: Never install a bracket from a blocked or opposite-side target.
+                target_same_side = (
+                    (self.pos_qty > 0.0 and t_weight > 0.0)
+                    or (self.pos_qty < 0.0 and t_weight < 0.0)
+                )
+                if (not target_blocked) and target_same_side:
                     self.active_stop_price = target.stop_price
                     self.active_take_profit = target.take_profit
                     self.active_stop_reason = "stop_loss"
@@ -2052,23 +2216,9 @@ class _SimAccount:
                             or (tp_lvl is not None and bar_low <= tp_lvl)
                         )
                     if might_hit:
-                        stop_at_open = (
-                            (liq_px is not None and ((bar_open <= liq_px) if self.pos_qty > 0.0 else (bar_open >= liq_px)))
-                            or (stop_lvl is not None and ((bar_open <= stop_lvl) if self.pos_qty > 0.0 else (bar_open >= stop_lvl)))
-                        )
-                        exit_quote = execution.evaluate_protective_exits(
-                            self.pos_qty,
-                            liq_price=liq_px,
-                            stop_price=stop_lvl,
-                            take_profit=tp_lvl,
-                            bar_open=bar_open,
-                            bar_high=bar_high,
-                            bar_low=bar_low,
-                            bar_close=pre_close if stop_at_open else bar_close_p1,
-                            bar_volume=pre_volume if stop_at_open else bar_volume,
-                            bar_atr=pre_atr if stop_at_open else bar_atr,
-                            stop_reason=self.active_stop_reason,
-                            tp_reason=self.active_tp_reason,
+                        # CR2-23: Use the causal pre-open pricing path when triggered at bar_open.
+                        exit_quote = self.evaluate_bracket_protective_exit(
+                            i, opens, highs, lows, closes, volumes, atr_arr
                         )
                         if exit_quote is not None:
                             self.apply_fill(exit_quote, bar_open_ms, i)
@@ -2076,7 +2226,7 @@ class _SimAccount:
                                 self.liquidations += 1
                             exited_existing_this_bar = True
 
-        # 1.6 Resting entry / scale-in OrderIntents (CR1-38/39/40/42/46).
+        # 1.6 Resting entry / scale-in OrderIntents (CR1-38/39/40/42/46 + CR2-19/20).
         if self.pending_entries:
             if self.is_halted_by_overlay():
                 # Loss overlay halted trading: cancel all queued risk-increasing entries (CR1-38).
@@ -2087,8 +2237,10 @@ class _SimAccount:
                 ]
 
             if self.pending_entries:
-                next_entries: list[_QueuedOrder] = []
-                for qo in self.pending_entries:
+                suspended_entries: list[_QueuedOrder] = []
+                eligible_entries: list[tuple[int, float, int, _QueuedOrder]] = []
+                rtt = execution.require_touch_through
+                for orig_idx, qo in enumerate(self.pending_entries):
                     # Check fill-bar session gate for risk-increasing entries (CR1-39 + CR1-20).
                     if not self.is_entry_session_allowed(bar_open_ms, qo.intent):
                         if self.should_cancel_entry_outside_session(bar_open_ms):
@@ -2099,9 +2251,66 @@ class _SimAccount:
                             if rem <= 0:
                                 continue
                             qo.bars_left = rem
-                        next_entries.append(qo)
+                        suspended_entries.append(qo)
                         continue
+                    it_e = qo.intent
+                    ot_e = it_e.order_type
+                    sd_e = it_e.side
+                    if ot_e == "market":
+                        e_phase, e_dist = 0, 0.0
+                    elif ot_e == "limit":
+                        assert it_e.limit_price is not None
+                        lp_e = it_e.limit_price
+                        if getattr(it_e, "time_in_force", "gtc") == "open_only":
+                            e_phase, e_dist = 0, 0.0
+                        elif (
+                            ((bar_open < lp_e) if rtt else (bar_open <= lp_e))
+                            if sd_e == "buy"
+                            else ((bar_open > lp_e) if rtt else (bar_open >= lp_e))
+                        ):
+                            e_phase, e_dist = 0, 0.0
+                        else:
+                            e_phase, e_dist = 1, abs(lp_e - bar_open)
+                    elif ot_e == "stop_market":
+                        assert it_e.stop_price is not None
+                        sp_e = it_e.stop_price
+                        if (bar_open >= sp_e) if sd_e == "buy" else (bar_open <= sp_e):
+                            e_phase, e_dist = 0, 0.0
+                        else:
+                            e_phase, e_dist = 1, abs(sp_e - bar_open)
+                    else:
+                        # stop_limit
+                        assert it_e.stop_price is not None and it_e.limit_price is not None
+                        sp_e = it_e.stop_price
+                        lp_e = it_e.limit_price
+                        if qo.activated:
+                            if (
+                                ((bar_open < lp_e) if rtt else (bar_open <= lp_e))
+                                if sd_e == "buy"
+                                else ((bar_open > lp_e) if rtt else (bar_open >= lp_e))
+                            ):
+                                e_phase, e_dist = 0, 0.0
+                            else:
+                                e_phase, e_dist = 1, abs(lp_e - bar_open)
+                        elif (bar_open >= sp_e) if sd_e == "buy" else (bar_open <= sp_e):
+                            if (bar_open <= lp_e) if sd_e == "buy" else (bar_open >= lp_e):
+                                e_phase, e_dist = 0, 0.0
+                            else:
+                                e_phase, e_dist = 1, abs(lp_e - bar_open)
+                        else:
+                            e_phase, e_dist = 1, abs(sp_e - bar_open)
+                    eligible_entries.append((e_phase, e_dist, orig_idx, qo))
 
+                if len(eligible_entries) > 1:
+                    # CR2-20: Execute open fills before intrabar fills, and intrabar fills in encounter order.
+                    eligible_entries.sort(key=lambda item: (item[0], item[1], item[2]))
+
+                next_entries: list[_QueuedOrder] = []
+                pos_anchor: float | None = bar_open if self.pos_qty != 0.0 else None
+                pos_has_open_exposure: bool = self.pos_qty != 0.0
+                liquidated_in_p1_6 = False
+
+                for _, _, _, qo in eligible_entries:
                     eq_basis = (
                         self.settled_equity
                         if self.sizing_settled
@@ -2111,9 +2320,13 @@ class _SimAccount:
                         continue
                     prev_qty = self.pos_qty
                     prev_abs = prev_qty if prev_qty > 0.0 else -prev_qty
+                    was_act = qo.activated
+                    was_act_bar = qo.activated_bar
+                    was_act_open = qo.activated_at_open
                     quote, filled_at_open = self._try_execute_queued_order(
                         qo.intent,
                         qo=qo,
+                        bar_idx=i,
                         bar_open=bar_open,
                         bar_high=bar_high,
                         bar_low=bar_low,
@@ -2128,9 +2341,142 @@ class _SimAccount:
                         eq_basis=eq_basis,
                     )
                     if quote is not None:
+                        # CR2-20: Before applying a later intrabar fill, check whether the live position
+                        # would already have liquidated (or hit a protective stop) along the path to it.
+                        if (not filled_at_open) and self.pos_qty != 0.0 and pos_anchor is not None:
+                            target_ref = quote.ref_price
+                            path_lo = pos_anchor if pos_anchor < target_ref else target_ref
+                            path_hi = pos_anchor if pos_anchor > target_ref else target_ref
+                            is_long_cur = self.pos_qty > 0.0
+                            if pos_has_open_exposure:
+                                if is_long_cur and target_ref >= pos_anchor:
+                                    check_lo = bar_low if bar_low < path_lo else path_lo
+                                    check_hi = path_hi
+                                elif (not is_long_cur) and target_ref <= pos_anchor:
+                                    check_lo = path_lo
+                                    check_hi = bar_high if bar_high > path_hi else path_hi
+                                else:
+                                    check_lo = path_lo
+                                    check_hi = path_hi
+                            else:
+                                check_lo = path_lo
+                                check_hi = path_hi
+
+                            liq_cur = self.cached_liq_price
+                            if liq_cur is not None and (
+                                (is_long_cur and check_lo <= liq_cur)
+                                or ((not is_long_cur) and check_hi >= liq_cur)
+                            ):
+                                liqs_before = self.liquidations
+                                if self.pending_reduce_orders:
+                                    self.process_protective_exits_with_orders(
+                                        i,
+                                        bar_open_ms,
+                                        pos_anchor,
+                                        check_hi,
+                                        check_lo,
+                                        bar_close_p1,
+                                        bar_volume,
+                                        bar_atr,
+                                        pre_high,
+                                        pre_low,
+                                        pre_close,
+                                        pre_volume,
+                                        pre_atr,
+                                        include_active_bracket=True,
+                                        allow_liq=True,
+                                        allow_tp=False,
+                                        liq_bar_open=pos_anchor,
+                                        liq_bar_high=check_hi,
+                                        liq_bar_low=check_lo,
+                                        skip_stops_at_or_beyond_entry=fresh_entry_this_bar,
+                                    )
+                                else:
+                                    stop_lvl_p = self.active_stop_price
+                                    if fresh_entry_this_bar and stop_lvl_p is not None:
+                                        if (is_long_cur and stop_lvl_p >= self.avg_exec_price) or (
+                                            (not is_long_cur) and stop_lvl_p <= self.avg_exec_price
+                                        ):
+                                            stop_lvl_p = None
+                                    pre_exit = execution.evaluate_protective_exits(
+                                        self.pos_qty,
+                                        liq_price=liq_cur,
+                                        stop_price=stop_lvl_p,
+                                        take_profit=None,
+                                        bar_open=pos_anchor,
+                                        bar_high=check_hi,
+                                        bar_low=check_lo,
+                                        bar_close=bar_close_p1,
+                                        bar_volume=bar_volume,
+                                        bar_atr=bar_atr,
+                                        stop_reason=self.active_stop_reason,
+                                        tp_reason=self.active_tp_reason,
+                                    )
+                                    if pre_exit is not None:
+                                        self.apply_fill(pre_exit, bar_open_ms, i)
+                                        if pre_exit.order_type == "liquidation":
+                                            self.liquidations += 1
+                                if self.liquidations > liqs_before:
+                                    liquidated_in_p1_6 = True
+                                    exited_existing_this_bar = True
+                                    pos_anchor = None
+                                    pos_has_open_exposure = False
+                                    break
+                                if self.pos_qty == 0.0:
+                                    exited_existing_this_bar = True
+                                    pos_anchor = None
+                                    pos_has_open_exposure = False
+                                    if qo.created_while_open:
+                                        continue
+                                    eq_basis = (
+                                        self.settled_equity
+                                        if self.sizing_settled
+                                        else (self.cash + self.pos_qty * (bar_open - self.avg_exec_price))
+                                    )
+                                    if eq_basis <= 0.0:
+                                        continue
+                                    prev_qty = 0.0
+                                    prev_abs = 0.0
+                                    qo.activated = was_act
+                                    qo.activated_bar = was_act_bar
+                                    qo.activated_at_open = was_act_open
+                                    quote, filled_at_open = self._try_execute_queued_order(
+                                        qo.intent,
+                                        qo=qo,
+                                        bar_idx=i,
+                                        bar_open=bar_open,
+                                        bar_high=bar_high,
+                                        bar_low=bar_low,
+                                        bar_close=bar_close_p1,
+                                        bar_volume=bar_volume,
+                                        bar_atr=bar_atr,
+                                        pre_high=pre_high,
+                                        pre_low=pre_low,
+                                        pre_close=pre_close,
+                                        pre_volume=pre_volume,
+                                        pre_atr=pre_atr,
+                                        eq_basis=eq_basis,
+                                    )
+                                    if quote is None:
+                                        if getattr(qo.intent, "time_in_force", "gtc") == "open_only":
+                                            continue
+                                        if qo.bars_left is not None:
+                                            rem = qo.bars_left - 1
+                                            if rem <= 0:
+                                                continue
+                                            qo.bars_left = rem
+                                        next_entries.append(qo)
+                                        continue
+
                         self.last_applied_target_weight = None
                         opened_or_flipped = self.apply_fill(quote, bar_open_ms, i)
                         new_abs = self.pos_qty if self.pos_qty > 0.0 else -self.pos_qty
+                        if self.pos_qty == 0.0:
+                            pos_anchor = None
+                            pos_has_open_exposure = False
+                        else:
+                            pos_anchor = bar_open if filled_at_open else quote.ref_price
+                            pos_has_open_exposure = filled_at_open
                         if opened_or_flipped:
                             fresh_entry_this_bar = True
                         if opened_or_flipped or new_abs > prev_abs + 1e-12:
@@ -2161,13 +2507,19 @@ class _SimAccount:
                                         p1_6_liq_high = bar_close_p1 if bar_close_p1 > ref_f else ref_f
                                         p1_6_liq_low = bar_low if bar_low < ref_f else ref_f
                         continue
+                    # CR2-19: Expire open_only orders immediately after a missed eligible open.
+                    if getattr(qo.intent, "time_in_force", "gtc") == "open_only":
+                        continue
                     if qo.bars_left is not None:
                         rem = qo.bars_left - 1
                         if rem <= 0:
                             continue
                         qo.bars_left = rem
                     next_entries.append(qo)
-                self.pending_entries = next_entries
+                if liquidated_in_p1_6:
+                    self.pending_entries = []
+                else:
+                    self.pending_entries = suspended_entries + next_entries
 
         # 1.7 Same-bar conservative protective stop & post-fill liquidation recheck (CR1-46).
         if risk_increased_in_p1_6 and self.pos_qty != 0.0:
@@ -2271,10 +2623,12 @@ class _SimAccount:
                                 if scale_exit.order_type == "liquidation":
                                     self.liquidations += 1
 
-        # Decrement TTL on surviving resting reduce_only orders.
+        # Decrement TTL and expire missed open_only orders on surviving resting reduce_only orders (CR2-19).
         if self.pending_reduce_orders:
             surviving_reduce: list[_QueuedOrder] = []
             for qo in self.pending_reduce_orders:
+                if getattr(qo.intent, "time_in_force", "gtc") == "open_only":
+                    continue
                 if qo.bars_left is not None:
                     rem = qo.bars_left - 1
                     if rem <= 0:
@@ -2498,6 +2852,22 @@ class _SimAccount:
                         delta_qty_abs = old_abs + rem_abs
                     else:
                         delta_qty_abs = abs_delta_notional / exec_px
+                        # CR2-24: Bound same-side non-zero reducing target strictly below abs(q_now).
+                        is_reducing_target = (
+                            q_now != 0.0
+                            and (
+                                (q_now > 0.0 and 0.0 < t_weight <= current_weight + 1e-12)
+                                or (q_now < 0.0 and current_weight - 1e-12 <= t_weight < 0.0)
+                            )
+                        )
+                        if is_reducing_target:
+                            q_abs_f = q_now if q_now > 0.0 else -q_now
+                            if delta_qty_abs >= q_abs_f - 1e-12:
+                                keep_qty = max(
+                                    (desired_notional if desired_notional > 0.0 else -desired_notional) / bar_open,
+                                    2e-12,
+                                )
+                                delta_qty_abs = max(0.0, q_abs_f - keep_qty)
 
                     if delta_qty_abs > 1e-12:
                         fill_ms = int(open_times[i])
@@ -2605,21 +2975,10 @@ class _SimAccount:
             self.active_stop_reason = "stop_loss"
             self.active_tp_reason = "take_profit"
             lt, ht, has_t = self.compute_triggers()
-            # 1.5 Intrabar protective exits if breached on the fill bar.
+            # 1.5 Intrabar protective exits if breached on the fill bar (CR2-23 causal pre-open pricing).
             if has_t and (lows[i] <= lt or highs[i] >= ht):
-                exit_quote = execution.evaluate_protective_exits(
-                    self.pos_qty,
-                    liq_price=self.cached_liq_price,
-                    stop_price=self.active_stop_price,
-                    take_profit=self.active_take_profit,
-                    bar_open=bar_open,
-                    bar_high=highs[i],
-                    bar_low=lows[i],
-                    bar_close=closes[i],
-                    bar_volume=volumes[i],
-                    bar_atr=atr_arr[i] if atr_arr is not None else None,
-                    stop_reason=self.active_stop_reason,
-                    tp_reason=self.active_tp_reason,
+                exit_quote = self.evaluate_bracket_protective_exit(
+                    i, opens, highs, lows, closes, volumes, atr_arr
                 )
                 if exit_quote is not None:
                     self.apply_fill(exit_quote, int(open_times[i]), i)
@@ -2764,7 +3123,14 @@ class _SimAccount:
                 daily_start_equity,
             )
 
-        return _fast_bar_context(bar_close_ms, self.symbol, causal_view, portfolio_view, self.instrument)
+        return _fast_bar_context(
+            bar_close_ms,
+            self.symbol,
+            causal_view,
+            portfolio_view,
+            self.instrument,
+            self.execution.require_touch_through,
+        )
 
 
 def _normalize_bars_map(
@@ -3051,17 +3417,26 @@ class Simulator:
         enforce_max_lev = self.config.enforce_instrument_max_leverage
         deadband_w = self.config.rebalance_deadband_weight
         rebalance_on_change = self.config.target_rebalance_mode == "on_change"
+        supports_ephemeral = bool(getattr(strategy, "supports_ephemeral_context", False))
         if self.config.reuse_bar_context is None:
-            reuse_ctx = bool(getattr(strategy, "supports_ephemeral_context", False))
+            reuse_ctx = supports_ephemeral
+        elif self.config.reuse_bar_context:
+            if not supports_ephemeral:
+                raise ValueError(
+                    "SimulatorConfig(reuse_bar_context=True) requires strategy.supports_ephemeral_context = True "
+                    "so the default immutable BarContext snapshot contract is never silently broken"
+                )
+            reuse_ctx = True
         else:
-            reuse_ctx = self.config.reuse_bar_context
+            reuse_ctx = False
         has_overlays = bool(overlays)
         fast_ctx_mode = reuse_ctx and (not has_overlays)
         on_bar_fn = strategy.on_bar
 
-        # Monotonic funding bar-index cursor: O(1) integer check in hot loop.
+        # Monotonic funding bar-index cursor: O(1) integer check in hot loop (CR2-17: perps only).
+        supports_funding = instrument.is_perp and instrument.funding_interval_hours is not None
         f_step_bars = 0
-        if primary_funding is not None and len(primary_funding) > 0:
+        if supports_funding and primary_funding is not None and len(primary_funding) > 0:
             f_ts = primary_funding.timestamps_ms
             f_rates = primary_funding.rates
             f_len = len(f_ts)
@@ -3509,15 +3884,6 @@ class Simulator:
                                 acct.pending_target = tgt
                                 has_any_pending = True
                                 p1_mode = 4
-                                if has_position and (
-                                    (pos_qty > 0.0 and t_w > 0.0)
-                                    or (pos_qty < 0.0 and t_w < 0.0)
-                                ):
-                                    acct.active_stop_price = tgt.stop_price
-                                    acct.active_take_profit = tgt.take_profit
-                                    acct.active_stop_reason = "stop_loss"
-                                    acct.active_tp_reason = "take_profit"
-                                    low_trig, high_trig, _ = acct.compute_triggers()
                             if all_steady_hold:
                                 skip_output = output
 
@@ -3525,17 +3891,21 @@ class Simulator:
                             skip_output = EMPTY_OUTPUT
                             has_any_pending = True
                             p1_mode = 4
-                            if any(
-                                it.symbol == symbol
-                                and (it.reduce_only or it.qty_mode == "close_all")
-                                and it.order_type in ("stop_market", "stop_limit")
-                                for it in out_intents
-                            ):
-                                acct.pending_reduce_orders = [
-                                    existing
-                                    for existing in acct.pending_reduce_orders
-                                    if existing.intent.order_type not in ("stop_market", "stop_limit")
-                                ]
+                            # CR2-21: Replace protective orders strictly by intent_id, preserving independent
+                            # protective orders and any already-activated stop_limit state.
+                            if acct.pending_reduce_orders:
+                                replaced_reduce_ids = {
+                                    it.intent_id
+                                    for it in out_intents
+                                    if it.symbol == symbol
+                                    and (it.reduce_only or it.qty_mode == "close_all")
+                                }
+                                if replaced_reduce_ids:
+                                    acct.pending_reduce_orders = [
+                                        existing
+                                        for existing in acct.pending_reduce_orders
+                                        if existing.intent.intent_id not in replaced_reduce_ids
+                                    ]
                             for intent in out_intents:
                                 if intent.symbol != symbol:
                                     continue
@@ -3796,32 +4166,27 @@ class Simulator:
                             acct.pending_target = tgt
                             has_any_pending = True
                             p1_mode = 4
-                            if has_position and (
-                                (pos_qty > 0.0 and t_w > 0.0)
-                                or (pos_qty < 0.0 and t_w < 0.0)
-                            ):
-                                acct.active_stop_price = tgt.stop_price
-                                acct.active_take_profit = tgt.take_profit
-                                acct.active_stop_reason = "stop_loss"
-                                acct.active_tp_reason = "take_profit"
-                                low_trig, high_trig, _ = acct.compute_triggers()
                         if all_steady_hold and not has_overlays:
                             skip_output = output
                     if out_intents:
                         skip_output = EMPTY_OUTPUT
                         has_any_pending = True
                         p1_mode = 4
-                        if any(
-                            it.symbol == symbol
-                            and (it.reduce_only or it.qty_mode == "close_all")
-                            and it.order_type in ("stop_market", "stop_limit")
-                            for it in out_intents
-                        ):
-                            acct.pending_reduce_orders = [
-                                existing
-                                for existing in acct.pending_reduce_orders
-                                if existing.intent.order_type not in ("stop_market", "stop_limit")
-                            ]
+                        # CR2-21: Replace protective orders strictly by intent_id, preserving independent
+                        # protective orders and any already-activated stop_limit state.
+                        if acct.pending_reduce_orders:
+                            replaced_reduce_ids = {
+                                it.intent_id
+                                for it in out_intents
+                                if it.symbol == symbol
+                                and (it.reduce_only or it.qty_mode == "close_all")
+                            }
+                            if replaced_reduce_ids:
+                                acct.pending_reduce_orders = [
+                                    existing
+                                    for existing in acct.pending_reduce_orders
+                                    if existing.intent.intent_id not in replaced_reduce_ids
+                                ]
                         for intent in out_intents:
                             if intent.symbol != symbol:
                                 continue

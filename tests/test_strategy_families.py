@@ -610,6 +610,34 @@ class MeanReversionStrategyTests(unittest.TestCase):
             )
         self.assertEqual(orig_snap, strat_r.snapshot_state())
 
+        # CR2-13: If feature refresh raises (e.g., _zscore_array fails), the binding is NOT marked current
+        # and a retry with the same (base, features, generation) re-runs refresh cleanly.
+        class _FlakyFeatureCache(FeatureCache):
+            def __init__(self) -> None:
+                super().__init__()
+                self.z_calls = 0
+
+            def _zscore_array(self, base, period: int):  # type: ignore[override]
+                self.z_calls += 1
+                if self.z_calls == 1:
+                    raise RuntimeError("transient zscore failure")
+                return super()._zscore_array(base, period)
+
+        flaky_fc = _FlakyFeatureCache()
+        mv_flaky = MarketView({("SOL-USDT-SWAP", "1h"): ob_ser}, now_ms=ob_ser.close_times[-1], features=flaky_fc)
+        ctx_flaky = BarContext(ob_ser.close_times[-1], "SOL-USDT-SWAP", mv_flaky, _portfolio("SOL-USDT-SWAP"), spec)
+        strat_flaky = MeanReversionStrategy(
+            MeanReversionParams(
+                rsi_period=2, zscore_period=3, entry_z=1.0, exit_z=0.25, max_ann_vol=None, stop_atr_mult=None
+            )
+        )
+        with self.assertRaises(RuntimeError):
+            strat_flaky.on_bar(ctx_flaky)
+        # Same base, same cache, same generation -> MUST retry refresh (not read None/stale arrays)!
+        out_retry = strat_flaky.on_bar(ctx_flaky)
+        self.assertEqual(2, flaky_fc.z_calls)
+        self.assertEqual(-1.0, out_retry.targets[0].target_weight)
+
 
 class FibonacciPullbackStrategyTests(unittest.TestCase):
     def _build_fib_retest_fixture(self) -> tuple[BarSeries, BarSeries, int]:
@@ -851,13 +879,42 @@ class FibonacciPullbackStrategyTests(unittest.TestCase):
         self.assertEqual(strat.snapshot_state(), strat_restored.snapshot_state())
 
     def test_round1_fibonacci_margin_validation_missing_regime_cap_and_session_gate(self) -> None:
-        # CR1-71: Reject nonpositive first margin step at construction (both direct and legacy_config paths).
+        # CR1-71 & CR2-27: Validate direct params guard AND effective legacy_config guard independently.
         with self.assertRaises(ValueError):
-            FibonacciPullbackStrategy(FibonacciPullbackParams(margin_steps=(0.0, 0.2, 0.2, 0.4)))
+            FibonacciPullbackParams(margin_steps=(0.0, 0.2, 0.2, 0.4))
         with self.assertRaises(ValueError):
-            FibonacciPullbackStrategy.from_legacy_config(StrategyConfig(margin_steps=(0.0, 0.2, 0.2, 0.4)))
+            FibonacciPullbackParams(margin_steps=())
+        # Supply valid FibonacciPullbackParams with a separate invalid legacy_config to exercise effective-config validation directly.
+        valid_params_bad_legacy = FibonacciPullbackParams(
+            legacy_parity=True,
+            legacy_config=StrategyConfig(margin_steps=(0.0, 0.2, 0.2, 0.4)),
+        )
         with self.assertRaises(ValueError):
-            FibonacciPullbackStrategy(FibonacciPullbackParams(margin_steps=()))
+            FibonacciPullbackStrategy(valid_params_bad_legacy)
+
+        # CR2-14: Every pyramid stage beyond stage 1 must have an add_threshold (len(add_thresholds) >= len(margin_steps) - 1).
+        with self.assertRaises(ValueError):
+            FibonacciPullbackParams(margin_steps=(0.2, 0.2, 0.2, 0.2, 0.2), add_thresholds=(0.02, 0.04, 0.06))
+        with self.assertRaises(ValueError):
+            FibonacciPullbackStrategy(
+                FibonacciPullbackParams(
+                    legacy_parity=True,
+                    legacy_config=StrategyConfig(
+                        margin_steps=(0.2, 0.2, 0.2, 0.2, 0.2),
+                        add_thresholds=(0.02, 0.04, 0.06),
+                    ),
+                )
+            )
+        # Default 4-stage schedule and shorter schedules with sufficient thresholds remain valid.
+        self.assertIsInstance(FibonacciPullbackStrategy(), FibonacciPullbackStrategy)
+        self.assertIsInstance(
+            FibonacciPullbackStrategy(FibonacciPullbackParams(margin_steps=(0.5, 0.5), add_thresholds=(0.02,))),
+            FibonacciPullbackStrategy,
+        )
+        self.assertIsInstance(
+            FibonacciPullbackStrategy(FibonacciPullbackParams(margin_steps=(1.0,), add_thresholds=())),
+            FibonacciPullbackStrategy,
+        )
 
         s15, s1h, sig_idx = self._build_fib_retest_fixture()
         spec = okx_swap_spec("MU-USDT-SWAP")
@@ -1081,6 +1138,198 @@ class FibonacciPullbackStrategyTests(unittest.TestCase):
             {("MU-USDT-SWAP", "15m"): BarSeries.from_candles("MU-USDT-SWAP", "15m", dno_gap_bars), ("MU-USDT-SWAP", "1h"): s1h},
         )
         self.assertEqual(0, len(res_dno_gap.trades))
+
+    def test_round2_fibonacci_touch_through_and_reverse_fib_fill_open_resistance(self) -> None:
+        s15, s1h, sig_idx = self._build_fib_retest_fixture()
+        spec = okx_swap_spec("MU-USDT-SWAP")
+        fc = FeatureCache()
+        mv_sig = MarketView({("MU-USDT-SWAP", "15m"): s15, ("MU-USDT-SWAP", "1h"): s1h}, now_ms=s15.close_times[sig_idx], features=fc)
+
+        # CR2-44: With require_touch_through=True, a bar whose low only equals fib_level does NOT clear pending_entry!
+        cfg_sp = StrategyConfig(symbol="MU-USDT-SWAP", entry_execution="second_pullback", fib_lookback=32)
+        sp_strat = FibonacciPullbackStrategy.from_legacy_config(cfg_sp)
+        out_sig = sp_strat.on_bar(
+            BarContext(s15.close_times[sig_idx], "MU-USDT-SWAP", mv_sig, _portfolio("MU-USDT-SWAP"), spec, require_touch_through=True)
+        )
+        fib_px = out_sig.intents[0].limit_price
+        assert fib_px is not None
+        bar_ms = 900_000
+        prefix = [
+            Candle(
+                open_time_ms=int(s15.open_times[i]),
+                open=float(s15.opens[i]),
+                high=float(s15.highs[i]),
+                low=float(s15.lows[i]),
+                close=float(s15.closes[i]),
+                volume=float(s15.volumes[i]),
+            )
+            for i in range(sig_idx + 1)
+        ]
+        touch_exact_bar = Candle(
+            open_time_ms=int(s15.open_times[sig_idx]) + bar_ms,
+            open=fib_px + 0.50,
+            high=fib_px + 0.80,
+            low=fib_px,  # exact touch (not strict <) -> Simulator with require_touch_through=True does NOT fill!
+            close=fib_px + 0.40,
+            volume=500.0,
+        )
+        break_through_bar = Candle(
+            open_time_ms=int(s15.open_times[sig_idx]) + 2 * bar_ms,
+            open=fib_px + 0.30,
+            high=fib_px + 1.00,
+            low=fib_px - 0.01,  # strict < fib_px -> fills cleanly and stays above stop!
+            close=fib_px + 0.80,
+            volume=500.0,
+        )
+        s15_tt = BarSeries.from_candles("MU-USDT-SWAP", "15m", prefix + [touch_exact_bar, break_through_bar])
+        mv_tt = MarketView({("MU-USDT-SWAP", "15m"): s15_tt, ("MU-USDT-SWAP", "1h"): s1h}, now_ms=s15_tt.close_times[sig_idx + 1], features=fc)
+        out_tt = sp_strat.on_bar(
+            BarContext(s15_tt.close_times[sig_idx + 1], "MU-USDT-SWAP", mv_tt, _portfolio("MU-USDT-SWAP"), spec, require_touch_through=True)
+        )
+        # Pending entry MUST survive the exact-touch bar and re-emit!
+        self.assertIsNotNone(sp_strat.snapshot_state()["pending_entry"])
+        self.assertEqual(2, len(out_tt.intents))
+        self.assertEqual("fib_second_pullback_entry", out_tt.intents[0].tag)
+
+        # End-to-end Simulator check with require_touch_through=True: skips exact-touch bar, fills on break-through bar!
+        sim_tt = Simulator(
+            spec,
+            cost_model=CostModel(
+                maker_fee_bps=0.0,
+                taker_fee_bps=0.0,
+                half_spread_bps=0.0,
+                slippage_model=FixedTicks(0.0),
+                stop_slippage_multiplier=1.0,
+            ),
+            config=SimulatorConfig(
+                primary_interval="15m",
+                close_on_end=True,
+                require_touch_through=True,
+                allow_missing_funding_for_perp=True,
+            ),
+        )
+        res_tt = sim_tt.run(
+            FibonacciPullbackStrategy.from_legacy_config(cfg_sp),
+            {("MU-USDT-SWAP", "15m"): s15_tt, ("MU-USDT-SWAP", "1h"): s1h},
+        )
+        self.assertEqual(1, len(res_tt.trades))
+        self.assertEqual(break_through_bar.open_time_ms, res_tt.trades[0].entry_time_ms)
+
+        # CR2-15: direct_next_open evaluates reverse-Fib resistance against the ACTUAL next-bar open
+        # (NOT curr_close), protecting BOTH capped open_only limit AND uncapped open_only market entries!
+        # Build a 46-bar 15m series:
+        # - Bars 0..19: prior downswing from high=122.0 (bar 1) down to low=100.0 (bar 19)
+        #   => reverse_fib_lookback=64 has resistance at 100 + 22*0.382 = 108.404 (band [108.08, 108.73]).
+        # - Bars 20..44: recent upswing from low=100.0 to high=111.0 (bar 42), fib_lookback=24.
+        # - Bar 45 (Monday 10:00 ET): retests fib_382 (~106.798), closes at ~107.25 (OUTSIDE 108.404 resistance!).
+        sig_open_ms = 1_767_625_200_000
+        start_rev = sig_open_ms - 45 * bar_ms
+        rev_bars: list[Candle] = []
+        for i in range(46):
+            open_ms = start_rev + i * bar_ms
+            if i == 0:
+                p, lo, hi = 120.0, 119.5, 120.5
+            elif i == 1:
+                p, lo, hi = 121.0, 120.5, 122.0  # prior swing HIGH = 122.0
+            elif i < 19:
+                p = 120.0 - (i - 1) * 1.1
+                lo, hi = p - 0.3, p + 0.3
+            elif i == 19:
+                p, lo, hi = 100.5, 100.0, 101.0  # prior swing LOW = 100.0
+            elif i < 42:
+                p = 100.8 + (i - 19) * 0.25
+                lo, hi = p - 0.15, p + 0.25
+            elif i == 42:
+                p, lo, hi = 106.6, 106.3, 111.0  # local swing high inside fib_lookback=24
+            elif i < 45:
+                p, lo, hi = 106.8, 106.6, 107.2
+            else:
+                # Signal bar 45: retest fib_382 of [100.0 .. 111.0] = 106.798, close at 107.25 (outside 108.404 band!)
+                swing_low = min(b.low for b in rev_bars[21:45])
+                swing_high = max(b.high for b in rev_bars[21:45])
+                fib_382 = round(swing_high - (swing_high - swing_low) * 0.382, 8)
+                p = fib_382 + 0.45
+                lo = fib_382 - 0.02
+                hi = fib_382 + 0.65
+            rev_bars.append(Candle(open_time_ms=open_ms, open=p, high=hi, low=lo, close=p, volume=500.0))
+
+        # Verify resistance center at 0.382 of [100..122] = 108.404
+        res_level = 100.0 + (122.0 - 100.0) * 0.382
+        rev_sig_close = rev_bars[45].close
+        self.assertGreater(abs(rev_sig_close - res_level), rev_sig_close * 0.003)  # curr_close is OUTSIDE band!
+
+        start_1h = start_rev - 30 * 3_600_000
+        s1h_rev = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            _build_candles([95.0 + i * 0.5 for i in range(60)], start_ms=start_1h, interval_ms=3_600_000, spread=0.3),
+        )
+        sim_rev = Simulator(
+            spec,
+            cost_model=CostModel(
+                maker_fee_bps=0.0,
+                taker_fee_bps=0.0,
+                half_spread_bps=0.0,
+                slippage_model=FixedTicks(0.0),
+                stop_slippage_multiplier=1.0,
+            ),
+            config=SimulatorConfig(
+                primary_interval="15m",
+                close_on_end=True,
+                allow_missing_funding_for_perp=True,
+            ),
+        )
+
+        # Next bar opening INSIDE resistance (108.404) vs OUTSIDE resistance (107.30) — both under cap 109.5!
+        bar_open_in_res = Candle(
+            open_time_ms=sig_open_ms + bar_ms,
+            open=res_level,
+            high=res_level + 1.0,
+            low=res_level - 0.1,
+            close=res_level + 0.5,
+            volume=500.0,
+        )
+        bar_open_clean = Candle(
+            open_time_ms=sig_open_ms + bar_ms,
+            open=rev_sig_close + 0.05,
+            high=rev_sig_close + 1.0,
+            low=rev_sig_close - 0.1,
+            close=rev_sig_close + 0.5,
+            volume=500.0,
+        )
+        for cap_pct in (0.03, None):  # test BOTH capped limit AND uncapped market direct_next_open!
+            cfg_rev = StrategyConfig(
+                symbol="MU-USDT-SWAP",
+                entry_execution="direct_next_open",
+                fib_lookback=24,
+                block_reverse_fib_resistance=True,
+                reverse_fib_lookback=64,
+                reverse_fib_tolerance_pct=0.003,
+                max_entry_above_signal_close_pct=cap_pct,
+            )
+            s_in_res = BarSeries.from_candles("MU-USDT-SWAP", "15m", rev_bars + [bar_open_in_res])
+            s_clean = BarSeries.from_candles("MU-USDT-SWAP", "15m", rev_bars + [bar_open_clean])
+            # Unit check: signal bar emits intent carrying excluded_price_bands even though curr_close is outside resistance!
+            mv_r = MarketView({("MU-USDT-SWAP", "15m"): s_in_res, ("MU-USDT-SWAP", "1h"): s1h_rev}, now_ms=s_in_res.close_times[45], features=fc)
+            out_r = FibonacciPullbackStrategy.from_legacy_config(cfg_rev).on_bar(
+                BarContext(s_in_res.close_times[45], "MU-USDT-SWAP", mv_r, _portfolio("MU-USDT-SWAP"), spec)
+            )
+            self.assertEqual(2, len(out_r.intents))
+            self.assertEqual(3, len(out_r.intents[0].excluded_price_bands))
+            self.assertTrue(any(b.excludes(res_level) for b in out_r.intents[0].excluded_price_bands))
+
+            # E2E Simulator check: next bar open inside resistance -> REJECTED (0 trades); clean open -> FILLS!
+            res_blocked = sim_rev.run(
+                FibonacciPullbackStrategy.from_legacy_config(cfg_rev),
+                {("MU-USDT-SWAP", "15m"): s_in_res, ("MU-USDT-SWAP", "1h"): s1h_rev},
+            )
+            res_allowed = sim_rev.run(
+                FibonacciPullbackStrategy.from_legacy_config(cfg_rev),
+                {("MU-USDT-SWAP", "15m"): s_clean, ("MU-USDT-SWAP", "1h"): s1h_rev},
+            )
+            self.assertEqual(0, len(res_blocked.trades), f"resistance open should be rejected (cap={cap_pct})")
+            self.assertEqual(1, len(res_allowed.trades), f"clean open should fill (cap={cap_pct})")
+            self.assertAlmostEqual(bar_open_clean.open, res_allowed.trades[0].entry_price, places=8)
 
     def test_break_high_and_direct_next_open_modes(self) -> None:
         s15, s1h, sig_idx = self._build_fib_retest_fixture()

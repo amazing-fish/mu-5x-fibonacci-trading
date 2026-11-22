@@ -81,7 +81,7 @@ def _from_le_bytes_ro(typecode: str, buf: memoryview) -> memoryview:
     arr.frombytes(buf)
     if _IS_BIG_ENDIAN:
         arr.byteswap()
-    return memoryview(arr).toreadonly()
+    return memoryview(arr.tobytes()).cast(typecode)
 
 
 def _read_all_bytes_fast(path: Path) -> bytes:
@@ -315,17 +315,18 @@ class BarSeries:
             if v_v == 0.0:
                 vo[i] = 0.0
 
+        # Freeze validated arrays into immutable ``bytes`` so public ``memoryview.obj`` is never writable.
         _OBJ_SETATTR(self, "_symbol", clean_symbol)
         _OBJ_SETATTR(self, "_interval", clean_interval)
         _OBJ_SETATTR(self, "_interval_ms", step_ms)
         _OBJ_SETATTR(self, "_uniform_close_times", uniform)
-        _OBJ_SETATTR(self, "_open_times_buf", memoryview(ot).toreadonly())
-        _OBJ_SETATTR(self, "_close_times_buf", memoryview(ct).toreadonly() if ct is not None else None)
-        _OBJ_SETATTR(self, "_opens_buf", memoryview(op).toreadonly())
-        _OBJ_SETATTR(self, "_highs_buf", memoryview(hi).toreadonly())
-        _OBJ_SETATTR(self, "_lows_buf", memoryview(lo).toreadonly())
-        _OBJ_SETATTR(self, "_closes_buf", memoryview(cl).toreadonly())
-        _OBJ_SETATTR(self, "_volumes_buf", memoryview(vo).toreadonly())
+        _OBJ_SETATTR(self, "_open_times_buf", memoryview(ot.tobytes()).cast("q"))
+        _OBJ_SETATTR(self, "_close_times_buf", memoryview(ct.tobytes()).cast("q") if ct is not None else None)
+        _OBJ_SETATTR(self, "_opens_buf", memoryview(op.tobytes()).cast("d"))
+        _OBJ_SETATTR(self, "_highs_buf", memoryview(hi.tobytes()).cast("d"))
+        _OBJ_SETATTR(self, "_lows_buf", memoryview(lo.tobytes()).cast("d"))
+        _OBJ_SETATTR(self, "_closes_buf", memoryview(cl.tobytes()).cast("d"))
+        _OBJ_SETATTR(self, "_volumes_buf", memoryview(vo.tobytes()).cast("d"))
 
     @classmethod
     def _from_trusted_buffers(
@@ -377,16 +378,16 @@ class BarSeries:
 
     @property
     def open_times(self) -> memoryview:
-        return self._open_times_buf
+        return memoryview(self._open_times_buf)
 
     @property
     def close_times(self) -> memoryview:
         ct = self._close_times_buf
         if ct is None:
             ct_arr = array("q", map(self._interval_ms.__add__, self._open_times_buf))
-            ct = memoryview(ct_arr).toreadonly()
+            ct = memoryview(ct_arr.tobytes()).cast("q")
             _OBJ_SETATTR(self, "_close_times_buf", ct)
-        return ct
+        return memoryview(ct)
 
     @property
     def is_uniform_close_times(self) -> bool:
@@ -394,23 +395,23 @@ class BarSeries:
 
     @property
     def opens(self) -> memoryview:
-        return self._opens_buf
+        return memoryview(self._opens_buf)
 
     @property
     def highs(self) -> memoryview:
-        return self._highs_buf
+        return memoryview(self._highs_buf)
 
     @property
     def lows(self) -> memoryview:
-        return self._lows_buf
+        return memoryview(self._lows_buf)
 
     @property
     def closes(self) -> memoryview:
-        return self._closes_buf
+        return memoryview(self._closes_buf)
 
     @property
     def volumes(self) -> memoryview:
-        return self._volumes_buf
+        return memoryview(self._volumes_buf)
 
     def __len__(self) -> int:
         return len(self._open_times_buf)
@@ -1116,15 +1117,15 @@ def load_or_build_bar_series(
         return series
 
     if isinstance(store_or_candles, Sequence):
-        candles = store_or_candles
+        candles_snapshot = tuple(store_or_candles)
         if cache_path is None and cache_dir is None:
             return BarSeries.from_candles(
                 clean_symbol,
                 clean_interval,
-                candles,
+                candles_snapshot,
                 interval_ms=resolved_interval_ms,
             )
-        expected_sha = source_sha256 or _compute_candles_binary_sha256(candles)
+        expected_sha = source_sha256 or _compute_candles_binary_sha256(candles_snapshot)
         resolved_cache = (
             Path(cache_path)
             if cache_path is not None
@@ -1144,7 +1145,7 @@ def load_or_build_bar_series(
         series = BarSeries.from_candles(
             clean_symbol,
             clean_interval,
-            candles,
+            candles_snapshot,
             interval_ms=resolved_interval_ms,
         )
         write_bar_series_bin(resolved_cache, series, expected_sha)
@@ -1195,6 +1196,10 @@ def _validate_market_maps(
             raise ValueError(f"bars keys must be (symbol, interval) tuples, got {key!r}")
         if not isinstance(series, BarSeries):
             raise TypeError(f"bars values must be BarSeries, got {type(series).__name__}")
+        if (series.symbol, series.interval) != key:
+            raise ValueError(
+                f"bars key {key!r} contradicts BarSeries identity ({series.symbol!r}, {series.interval!r})"
+            )
         bars_copy[key] = series
 
     if funding is None:
@@ -1286,13 +1291,14 @@ class MarketView:
         series = self._funding.get(symbol)
         if series is None:
             return None
-        hi = bisect_right(series._timestamps_ms, self._now_ms)
-        if hi == len(series):
+        ts_buf = series._timestamps_buf
+        hi = bisect_right(ts_buf, self._now_ms)
+        if hi == len(ts_buf):
             return series
         return FundingSeries(
             instrument_id=series.instrument_id,
-            timestamps_ms=series._timestamps_ms[:hi],
-            rates=series._rates[:hi],
+            timestamps_ms=ts_buf[:hi],
+            rates=series._rates_buf[:hi],
             settlement_interval_hours=series.settlement_interval_hours,
         )
 

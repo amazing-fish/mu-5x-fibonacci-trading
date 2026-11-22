@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import expm1, fsum, isfinite, log, sqrt
 from types import MappingProxyType
 from typing import Any, Literal
 
-from mu_strategy.core.instrument import CostModel, InstrumentSpec
+from mu_strategy.core.instrument import AtrBps, CostModel, InstrumentSpec
 from mu_strategy.engine.fills import ExecutionModel, compute_position_liquidation_price
 from mu_strategy.market_data.funding import MissingFundingHistoryError
+from mu_strategy.strategies.features import compute_atr
 
 __all__ = [
     "MS_PER_YEAR",
@@ -731,6 +732,7 @@ def compute_buy_and_hold_benchmark(
     half_spread_bps: float = 0.0,
     maintenance_margin_rate: float | None = None,
     liquidation_fee_bps: float | None = None,
+    atr_period: int = 14,
     warmup_bars: int = 0,
     close_on_end: bool = True,
     interval_ms: int | None = None,
@@ -744,6 +746,8 @@ def compute_buy_and_hold_benchmark(
         raise ValueError(f"leverage must be finite and positive, got {leverage}")
     if side not in ("long", "short"):
         raise ValueError(f"side must be 'long' or 'short', got {side!r}")
+    if isinstance(atr_period, bool) or not isinstance(atr_period, int) or atr_period < 1:
+        raise ValueError(f"atr_period must be an integer >= 1, got {atr_period!r}")
     if warmup_bars < 0:
         raise ValueError(f"warmup_bars must be >= 0, got {warmup_bars}")
     if funding_gap_policy not in ("fail_closed", "allow_partial"):
@@ -768,11 +772,24 @@ def compute_buy_and_hold_benchmark(
         inferred_symbol,
         inferred_interval,
     ) = _extract_bar_arrays(bars, interval_ms)
+
+    # Validate instrument against bar symbol metadata before applying costs or funding (CR2-32).
+    if instrument is not None:
+        if inferred_symbol and inferred_symbol != instrument.symbol:
+            raise ValueError(
+                f"benchmark instrument symbol {instrument.symbol!r} does not match "
+                f"bars symbol {inferred_symbol!r}"
+            )
+        if symbol and symbol != instrument.symbol:
+            raise ValueError(
+                f"benchmark symbol {symbol!r} does not match instrument symbol {instrument.symbol!r}"
+            )
+
     resolved_symbol = symbol or inferred_symbol or (instrument.symbol if instrument is not None else "")
     resolved_interval = interval or inferred_interval
     n = len(closes)
 
-    # Validate funding instrument alignment and fail-closed coverage before scoring (CR1-50).
+    # Validate funding instrument alignment and fail-closed coverage before scoring (CR1-50, CR2-47).
     bench_diagnostics: dict[str, Any] = {}
     is_perp = instrument is not None and instrument.funding_interval_hours is not None
     if instrument is not None and funding is not None and hasattr(funding, "instrument_id"):
@@ -783,17 +800,21 @@ def compute_buy_and_hold_benchmark(
             )
 
     effective_funding = funding
+    funding_is_empty = effective_funding is None or (
+        hasattr(effective_funding, "__len__") and len(effective_funding) == 0
+    )
     if instrument is not None and not is_perp:
         # Non-perpetual instruments (spot / equity) do not settle funding.
         effective_funding = None
         funding_mode = "none"
     elif is_perp:
-        if effective_funding is None:
+        if funding_is_empty:
             if not allow_missing_funding_for_perp:
                 raise MissingFundingHistoryError(
-                    f"Perpetual benchmark for {instrument.instrument_id!r} requires funding history. "
+                    f"Perpetual benchmark for {instrument.instrument_id!r} requires non-empty funding history. "
                     "Supply a complete FundingSeries or explicitly set allow_missing_funding_for_perp=True."
                 )
+            effective_funding = None
             funding_mode = "missing_explicit_zero"
         elif n > warmup_bars and hasattr(effective_funding, "coverage_gaps"):
             span_start = int(open_times[warmup_bars])
@@ -826,9 +847,17 @@ def compute_buy_and_hold_benchmark(
             funding_mode = "historical"
     else:
         # instrument is None: preserve no-funding path when funding is omitted,
-        # but strictly validate coverage whenever a FundingSeries IS supplied.
+        # but strictly validate non-empty coverage whenever a FundingSeries IS supplied.
         if effective_funding is None:
             funding_mode = "none"
+        elif funding_is_empty:
+            if not allow_missing_funding_for_perp:
+                raise MissingFundingHistoryError(
+                    f"Empty funding history supplied for benchmark ({getattr(effective_funding, 'instrument_id', resolved_symbol)!r}). "
+                    "Supply a complete FundingSeries or explicitly set allow_missing_funding_for_perp=True."
+                )
+            effective_funding = None
+            funding_mode = "missing_explicit_zero"
         elif n > warmup_bars and hasattr(effective_funding, "coverage_gaps"):
             span_start = int(open_times[warmup_bars])
             span_end = int(close_times[-1])
@@ -877,29 +906,19 @@ def compute_buy_and_hold_benchmark(
             diagnostics=bench_diagnostics,
         )
 
-    # Resolve execution & liquidation parameters using the simulator's rules (CR1-52).
+    # Resolve execution & liquidation parameters using the simulator's rules (CR1-52, CR2-33, CR2-34).
     execution: ExecutionModel | None = None
+    atr_arr = None
     if instrument is not None and cost_model is not None:
-        effective_cost = cost_model
-        if maintenance_margin_rate is not None or liquidation_fee_bps is not None:
-            effective_cost = CostModel(
-                maker_fee_bps=cost_model.maker_fee_bps,
-                taker_fee_bps=cost_model.taker_fee_bps,
-                half_spread_bps=cost_model.half_spread_bps,
-                slippage=cost_model.slippage,
-                stop_slippage_multiplier=cost_model.stop_slippage_multiplier,
-                maintenance_margin_rate=(
-                    float(maintenance_margin_rate)
-                    if maintenance_margin_rate is not None
-                    else cost_model.maintenance_margin_rate
-                ),
-                liquidation_fee_bps=(
-                    float(liquidation_fee_bps)
-                    if liquidation_fee_bps is not None
-                    else cost_model.liquidation_fee_bps
-                ),
-            )
+        overrides: dict[str, Any] = {}
+        if maintenance_margin_rate is not None:
+            overrides["maintenance_margin_rate"] = float(maintenance_margin_rate)
+        if liquidation_fee_bps is not None:
+            overrides["liquidation_fee_bps"] = float(liquidation_fee_bps)
+        effective_cost = replace(cost_model, **overrides) if overrides else cost_model
         execution = ExecutionModel(instrument, effective_cost)
+        if isinstance(effective_cost.slippage_model, AtrBps):
+            atr_arr = compute_atr(highs, lows, closes, atr_period)
         asset_class = instrument.asset_class
         mmr = float(effective_cost.maintenance_margin_rate)
         liq_fee_bps_eff = float(effective_cost.liquidation_fee_bps)
@@ -937,17 +956,22 @@ def compute_buy_and_hold_benchmark(
         raise ValueError(f"benchmark entry open price must be positive, got {ref_entry}")
 
     if execution is not None:
+        # Strictly pre-open estimates: fall back to 0.0 volume / None ATR when no prior bar exists (CR2-30).
         pre_close = float(closes[start_idx - 1]) if start_idx > 0 else ref_entry
-        pre_vol = float(volumes[start_idx - 1]) if start_idx > 0 else float(volumes[start_idx])
+        pre_vol = float(volumes[start_idx - 1]) if start_idx > 0 else 0.0
+        pre_high = float(highs[start_idx - 1]) if start_idx > 0 else ref_entry
+        pre_low = float(lows[start_idx - 1]) if start_idx > 0 else ref_entry
+        pre_atr = float(atr_arr[start_idx - 1]) if (atr_arr is not None and start_idx > 0) else None
         qty_abs = (starting_equity * leverage) / ref_entry
         entry_quote = execution.fill_market(
             entry_side,
             qty_abs,
             bar_open=ref_entry,
-            bar_high=ref_entry,
-            bar_low=ref_entry,
+            bar_high=pre_high,
+            bar_low=pre_low,
             bar_close=pre_close,
             bar_volume=pre_vol,
+            bar_atr=pre_atr,
             reason="benchmark_entry",
         )
         exec_entry = entry_quote.exec_price
@@ -995,6 +1019,7 @@ def compute_buy_and_hold_benchmark(
         bar_low = float(lows[i])
         bar_close = float(closes[i])
         bar_vol = float(volumes[i])
+        bar_atr = float(atr_arr[i]) if atr_arr is not None else None
 
         # 1. Settle any gap funding in (prev_close_ms, bar_open_ms] BEFORE bar open / intrabar liquidation.
         if is_open and effective_funding is not None and bar_open_ms > prev_close_ms:
@@ -1008,32 +1033,59 @@ def compute_buy_and_hold_benchmark(
                     accrued_funding += delta
                 liq_price = _compute_bench_liq_price(cash)
 
-        # 2. Intrabar OHLC MMR liquidation check matching Simulator rules (CR1-52).
+        # 2. Intrabar / gap-at-open OHLC MMR liquidation check matching Simulator rules (CR1-52, CR2-31).
         if is_open and liq_price is not None:
             liq_triggered = (bar_low <= liq_price) if side == "long" else (bar_high >= liq_price)
             if liq_triggered:
+                gapped_liq = (bar_open <= liq_price) if side == "long" else (bar_open >= liq_price)
                 if execution is not None:
-                    liq_quote = execution.try_fill_liquidation(
-                        signed_qty,
-                        liq_price,
-                        bar_open=bar_open,
-                        bar_high=bar_high,
-                        bar_low=bar_low,
-                        bar_close=bar_close,
-                        bar_volume=bar_vol,
-                    )
-                    assert liq_quote is not None
+                    if gapped_liq:
+                        p_high_l = float(highs[i - 1]) if i > 0 else bar_open
+                        p_low_l = float(lows[i - 1]) if i > 0 else bar_open
+                        p_close_l = float(closes[i - 1]) if i > 0 else bar_open
+                        p_vol_l = float(volumes[i - 1]) if i > 0 else 0.0
+                        p_atr_l = float(atr_arr[i - 1]) if (atr_arr is not None and i > 0) else None
+                        slip_l = execution.compute_slippage_price(
+                            bar_open,
+                            order_notional=bar_open * qty_abs,
+                            bar_close=p_close_l,
+                            bar_volume=p_vol_l,
+                            bar_atr=p_atr_l,
+                            bar_high=p_high_l,
+                            bar_low=p_low_l,
+                            is_stop=True,
+                        )
+                        adv_l = (bar_open * execution._half_spread_rate) + slip_l
+                        exec_l = (bar_open + adv_l) if close_side == "buy" else max(execution.min_price, bar_open - adv_l)
+                        liq_quote = execution._make_quote(
+                            side=close_side,
+                            order_type="liquidation",
+                            ref_price=bar_open,
+                            exec_price=exec_l,
+                            qty=qty_abs,
+                            fee_rate=execution._liq_total_fee_rate,
+                            liquidity="taker",
+                            reason="liquidation",
+                        )
+                    else:
+                        liq_quote = execution.try_fill_liquidation(
+                            signed_qty,
+                            liq_price,
+                            bar_open=bar_open,
+                            bar_high=bar_high,
+                            bar_low=bar_low,
+                            bar_close=bar_close,
+                            bar_volume=bar_vol,
+                            bar_atr=bar_atr,
+                        )
+                        assert liq_quote is not None
                     ref_exit = liq_quote.ref_price
                     exec_exit = liq_quote.exec_price
                     exit_notional = liq_quote.notional
                     exit_fee = liq_quote.fee
                     exit_slippage = liq_quote.slippage_cost
                 else:
-                    ref_exit = (
-                        bar_open
-                        if ((bar_open <= liq_price) if side == "long" else (bar_open >= liq_price))
-                        else liq_price
-                    )
+                    ref_exit = bar_open if gapped_liq else liq_price
                     exec_exit = ref_exit * (1.0 - side_sign * spread_rate)
                     if exec_exit <= 0.0:
                         exec_exit = ref_exit
@@ -1099,6 +1151,7 @@ def compute_buy_and_hold_benchmark(
                         bar_low=bar_close,
                         bar_close=bar_close,
                         bar_volume=bar_vol,
+                        bar_atr=bar_atr,
                         reason="bankrupt",
                     )
                     ref_exit = b_quote.ref_price
@@ -1165,6 +1218,7 @@ def compute_buy_and_hold_benchmark(
                     bar_low=float(lows[-1]),
                     bar_close=final_close,
                     bar_volume=float(volumes[-1]),
+                    bar_atr=(float(atr_arr[-1]) if atr_arr is not None else None),
                     reason="end_of_data",
                 )
                 ref_exit = eod_quote.ref_price

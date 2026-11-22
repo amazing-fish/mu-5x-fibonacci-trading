@@ -107,16 +107,61 @@ def _infer_interval_hours(timestamps_ms: array) -> int | None:
     return hours if hours > 0 else None
 
 
-def _infer_settlement_phase_ms(timestamps_ms: array, step_ms: int) -> int | None:
-    """Return the unique ``ts % step_ms`` phase shared by all events, or ``None`` if empty/inconsistent."""
-    n = len(timestamps_ms)
-    if n == 0:
+def _infer_settlement_phase_ms(
+    timestamps_ms: array | memoryview,
+    step_ms: int,
+    *,
+    start_idx: int = 0,
+    end_idx: int | None = None,
+) -> int | None:
+    """Return the unique ``ts % step_ms`` phase shared by ``timestamps_ms[start_idx:end_idx]``, or ``None``."""
+    hi = len(timestamps_ms) if end_idx is None else end_idx
+    if start_idx >= hi:
         return None
-    phase = int(timestamps_ms[0]) % step_ms
-    for idx in range(1, n):
+    phase = int(timestamps_ms[start_idx]) % step_ms
+    for idx in range(start_idx + 1, hi):
         if int(timestamps_ms[idx]) % step_ms != phase:
             return None
     return phase
+
+
+def _validate_archive_instrument_id(
+    requested_id: str | None,
+    *,
+    embedded_id: str,
+    expected_venue: str | None = None,
+    expected_symbol: str | None = None,
+) -> str:
+    """Verify an explicit ``requested_id`` agrees with an archive's full venue/symbol identity."""
+    if requested_id is None:
+        return embedded_id
+    if not isinstance(requested_id, str) or not requested_id or requested_id != requested_id.strip():
+        raise ValueError(f"invalid instrument_id: {requested_id!r}")
+    if requested_id == embedded_id:
+        return embedded_id
+    if ":" not in requested_id:
+        sym = expected_symbol
+        if sym is None and ":" in embedded_id:
+            sym = embedded_id.split(":", 1)[1]
+        if sym is not None and requested_id == sym:
+            return requested_id
+        raise ValueError(
+            f"funding archive identity {embedded_id!r} disagrees with requested instrument_id {requested_id!r}"
+        )
+    req_venue, req_sym = requested_id.split(":", 1)
+    if not req_venue or not req_sym:
+        raise ValueError(f"invalid instrument_id: {requested_id!r}")
+    if expected_venue is not None and req_venue != expected_venue:
+        raise ValueError(
+            f"funding archive venue {expected_venue!r} disagrees with requested instrument_id {requested_id!r}"
+        )
+    if expected_symbol is not None and req_sym != expected_symbol:
+        raise ValueError(
+            f"funding archive symbol {expected_symbol!r} disagrees with requested instrument_id {requested_id!r}"
+        )
+    raise ValueError(
+        f"funding archive identity {embedded_id!r} disagrees with requested instrument_id {requested_id!r}"
+    )
 
 
 def _first_expected_after(start_ms: int, step_ms: int, phase_ms: int) -> int:
@@ -172,10 +217,8 @@ class FundingSeries:
 
     __slots__ = (
         "_instrument_id",
-        "_timestamps_ms",
-        "_rates",
-        "_timestamps_ro",
-        "_rates_ro",
+        "_timestamps_buf",
+        "_rates_buf",
         "_settlement_interval_hours",
     )
 
@@ -192,7 +235,12 @@ class FundingSeries:
 
         if isinstance(timestamps_ms, array) and timestamps_ms.typecode == "q":
             ts_arr = array("q", timestamps_ms)
-        elif isinstance(timestamps_ms, memoryview) and timestamps_ms.format == "q":
+        elif (
+            isinstance(timestamps_ms, memoryview)
+            and timestamps_ms.format == "q"
+            and timestamps_ms.ndim == 1
+            and timestamps_ms.c_contiguous
+        ):
             ts_arr = array("q")
             ts_arr.frombytes(timestamps_ms.cast("B"))
         else:
@@ -200,7 +248,12 @@ class FundingSeries:
 
         if isinstance(rates, array) and rates.typecode == "d":
             rate_arr = array("d", rates)
-        elif isinstance(rates, memoryview) and rates.format == "d":
+        elif (
+            isinstance(rates, memoryview)
+            and rates.format == "d"
+            and rates.ndim == 1
+            and rates.c_contiguous
+        ):
             rate_arr = array("d")
             rate_arr.frombytes(rates.cast("B"))
         else:
@@ -225,11 +278,13 @@ class FundingSeries:
             if rate == 0.0:
                 rate_arr[idx] = 0.0
 
+        # Freeze validated buffers into immutable ``bytes`` so public ``memoryview.obj`` is never writable.
+        ts_buf = memoryview(ts_arr.tobytes()).cast("q")
+        rate_buf = memoryview(rate_arr.tobytes()).cast("d")
+
         object.__setattr__(self, "_instrument_id", instrument_id)
-        object.__setattr__(self, "_timestamps_ms", ts_arr)
-        object.__setattr__(self, "_rates", rate_arr)
-        object.__setattr__(self, "_timestamps_ro", memoryview(ts_arr).toreadonly())
-        object.__setattr__(self, "_rates_ro", memoryview(rate_arr).toreadonly())
+        object.__setattr__(self, "_timestamps_buf", ts_buf)
+        object.__setattr__(self, "_rates_buf", rate_buf)
         object.__setattr__(self, "_settlement_interval_hours", resolved_hours)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -244,14 +299,14 @@ class FundingSeries:
         return (
             self._instrument_id == other._instrument_id
             and self._settlement_interval_hours == other._settlement_interval_hours
-            and self._timestamps_ms == other._timestamps_ms
-            and self._rates == other._rates
+            and self._timestamps_buf == other._timestamps_buf
+            and self._rates_buf == other._rates_buf
         )
 
     def __repr__(self) -> str:
         return (
             f"FundingSeries(instrument_id={self._instrument_id!r}, "
-            f"len={len(self._timestamps_ms)}, "
+            f"len={len(self._timestamps_buf)}, "
             f"settlement_interval_hours={self._settlement_interval_hours!r})"
         )
 
@@ -265,43 +320,43 @@ class FundingSeries:
 
     @property
     def timestamps_ms(self) -> memoryview:
-        """Read-only int64 view of funding timestamps supporting indexing and ``bisect``."""
-        return self._timestamps_ro
+        """Independent read-only int64 view backed by immutable bytes (safe to ``.release()``)."""
+        return memoryview(self._timestamps_buf)
 
     @property
     def rates(self) -> memoryview:
-        """Read-only float64 view of signed funding rates."""
-        return self._rates_ro
+        """Independent read-only float64 view backed by immutable bytes (safe to ``.release()``)."""
+        return memoryview(self._rates_buf)
 
     def __len__(self) -> int:
-        return len(self._timestamps_ms)
+        return len(self._timestamps_buf)
 
     def __bool__(self) -> bool:
-        return len(self._timestamps_ms) > 0
+        return len(self._timestamps_buf) > 0
 
     def __getitem__(self, index: int) -> FundingRateEvent:
-        return FundingRateEvent(ts_ms=int(self._timestamps_ms[index]), rate=float(self._rates[index]))
+        return FundingRateEvent(ts_ms=int(self._timestamps_buf[index]), rate=float(self._rates_buf[index]))
 
     def __iter__(self) -> Iterator[FundingRateEvent]:
-        ts_arr = self._timestamps_ms
-        rate_arr = self._rates
+        ts_arr = self._timestamps_buf
+        rate_arr = self._rates_buf
         for idx in range(len(ts_arr)):
             yield FundingRateEvent(ts_ms=int(ts_arr[idx]), rate=float(rate_arr[idx]))
 
     @property
     def first_ts_ms(self) -> int | None:
-        return int(self._timestamps_ms[0]) if self._timestamps_ms else None
+        return int(self._timestamps_buf[0]) if self._timestamps_buf else None
 
     @property
     def last_ts_ms(self) -> int | None:
-        return int(self._timestamps_ms[-1]) if self._timestamps_ms else None
+        return int(self._timestamps_buf[-1]) if self._timestamps_buf else None
 
     def between_indices(self, start_ms: int, end_ms: int) -> tuple[int, int]:
         """Return ``(lo, hi)`` slice bounds for events with ``start_ms < ts_ms <= end_ms``."""
-        if end_ms <= start_ms or not self._timestamps_ms:
+        if end_ms <= start_ms or not self._timestamps_buf:
             return (0, 0)
-        lo = bisect_right(self._timestamps_ms, start_ms)
-        hi = bisect_right(self._timestamps_ms, end_ms)
+        lo = bisect_right(self._timestamps_buf, start_ms)
+        hi = bisect_right(self._timestamps_buf, end_ms)
         return (lo, hi)
 
     def between(self, start_ms: int, end_ms: int) -> tuple[FundingRateEvent, ...]:
@@ -309,8 +364,8 @@ class FundingSeries:
         lo, hi = self.between_indices(start_ms, end_ms)
         if lo >= hi:
             return ()
-        ts_arr = self._timestamps_ms
-        rate_arr = self._rates
+        ts_arr = self._timestamps_buf
+        rate_arr = self._rates_buf
         return tuple(
             FundingRateEvent(ts_ms=int(ts_arr[idx]), rate=float(rate_arr[idx]))
             for idx in range(lo, hi)
@@ -322,7 +377,7 @@ class FundingSeries:
         if lo >= hi:
             return 0.0
         total = 0.0
-        rate_arr = self._rates
+        rate_arr = self._rates_buf
         for idx in range(lo, hi):
             total += rate_arr[idx]
         return 0.0 if total == 0.0 else total
@@ -333,12 +388,15 @@ class FundingSeries:
         end_ms: int,
         interval_hours: int | None = None,
         tolerance: float = 1.5,
+        phase_ms: int | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Return ``(gap_start_ms, gap_end_ms)`` spans inside ``(start_ms, end_ms]`` with missing settlements.
 
-        Validates both interior spacing and expected settlement boundaries at the
-        leading and trailing edges (including a settlement due exactly at ``end_ms``)
-        using the series' settlement schedule phase when determinable.
+        Uses ``phase_ms`` when explicitly provided, otherwise infers the settlement
+        schedule phase strictly from in-window timestamps ``(start_ms, end_ms]`` so
+        out-of-window events cannot hide missing settlements. When in-window phase
+        evidence is ambiguous, edges spanning at least one settlement interval are
+        conservatively reported as gaps.
         """
         start = _validate_int_ts(start_ms, "start_ms")
         end = _validate_int_ts(end_ms, "end_ms")
@@ -353,35 +411,51 @@ class FundingSeries:
         tol = _validate_rate(tolerance, "tolerance")
         if tol < 1.0:
             raise ValueError("tolerance must be >= 1.0")
+        step_ms = hours * _HOUR_MS
+
+        explicit_phase: int | None = None
+        if phase_ms is not None:
+            explicit_phase = _validate_int_ts(phase_ms, "phase_ms")
+            if explicit_phase >= step_ms:
+                raise ValueError(f"phase_ms ({explicit_phase}) must be < interval_ms ({step_ms})")
+
         if end == start:
             return ()
 
-        step_ms = hours * _HOUR_MS
         threshold_ms = float(step_ms) * tol
         edge_slack_ms = float(step_ms) * (tol - 1.0)
-        phase_ms = (
-            _infer_settlement_phase_ms(self._timestamps_ms, step_ms)
-            if self._timestamps_ms
-            else 0
-        )
-
+        ts_arr = self._timestamps_buf
         lo, hi = self.between_indices(start, end)
+
         if lo >= hi:
             if (end - start) > threshold_ms:
                 return ((start, end),)
-            if phase_ms is not None and _first_expected_after(start, step_ms, phase_ms) <= end:
+            if explicit_phase is not None:
+                check_phase = explicit_phase
+            elif lo > 0 and int(ts_arr[lo - 1]) == start:
+                check_phase = int(ts_arr[lo - 1]) % step_ms
+            else:
+                check_phase = 0
+            if _first_expected_after(start, step_ms, check_phase) <= end:
                 return ((start, end),)
             return ()
 
-        ts_arr = self._timestamps_ms
-        gaps: list[tuple[int, int]] = []
+        in_window_phase = (
+            explicit_phase
+            if explicit_phase is not None
+            else _infer_settlement_phase_ms(ts_arr, step_ms, start_idx=lo, end_idx=hi)
+        )
 
+        gaps: list[tuple[int, int]] = []
         first_ts = int(ts_arr[lo])
-        leading_missing = (first_ts - start) > threshold_ms
-        if not leading_missing and phase_ms is not None:
-            first_due = _first_expected_after(start, step_ms, phase_ms)
-            if (first_ts - first_due) > edge_slack_ms:
-                leading_missing = True
+        if in_window_phase is not None:
+            first_due = _first_expected_after(start, step_ms, in_window_phase)
+            leading_missing = (first_ts - start) > threshold_ms or (first_ts - first_due) > edge_slack_ms
+        else:
+            # Ambiguous in-window phases: fail closed on any leading span >= 1 settlement interval
+            # or violating the leading event's own schedule phase.
+            first_due = _first_expected_after(start, step_ms, first_ts % step_ms)
+            leading_missing = (first_ts - start) >= step_ms or (first_ts - first_due) > edge_slack_ms
         if leading_missing:
             gaps.append((start, first_ts))
 
@@ -392,11 +466,12 @@ class FundingSeries:
                 gaps.append((prev_ts, ts))
             prev_ts = ts
 
-        trailing_missing = (end - prev_ts) > threshold_ms
-        if not trailing_missing and phase_ms is not None:
-            last_due = _last_expected_at_or_before(end, step_ms, phase_ms)
-            if (last_due - prev_ts) > edge_slack_ms:
-                trailing_missing = True
+        if in_window_phase is not None:
+            last_due = _last_expected_at_or_before(end, step_ms, in_window_phase)
+            trailing_missing = (end - prev_ts) > threshold_ms or (last_due - prev_ts) > edge_slack_ms
+        else:
+            last_due = _last_expected_at_or_before(end, step_ms, prev_ts % step_ms)
+            trailing_missing = (end - prev_ts) >= step_ms or (last_due - prev_ts) > edge_slack_ms
         if trailing_missing:
             gaps.append((prev_ts, end))
 
@@ -408,9 +483,10 @@ class FundingSeries:
         end_ms: int,
         interval_hours: int | None = None,
         tolerance: float = 1.5,
+        phase_ms: int | None = None,
     ) -> float:
         """Return fraction in ``[0.0, 1.0]`` of ``(start_ms, end_ms]`` covered without funding gaps."""
-        gaps = self.coverage_gaps(start_ms, end_ms, interval_hours, tolerance)
+        gaps = self.coverage_gaps(start_ms, end_ms, interval_hours, tolerance, phase_ms=phase_ms)
         span = end_ms - start_ms
         if span <= 0 or not gaps:
             return 1.0
@@ -432,10 +508,10 @@ class FundingSeries:
     ) -> "FundingSeries":
         """Return a new FundingSeries preserving historical events and filling detected gaps on schedule.
 
-        Synthetic gap settlements are aligned to the instrument's settlement schedule
-        phase (inferred from existing events or explicitly supplied via ``phase_ms``).
-        Raises ``ValueError`` if gaps exist and the settlement phase cannot be uniquely
-        determined (never invents misaligned settlement times).
+        Resolves and validates ``phase_ms`` BEFORE gap detection so explicit settlement
+        phases apply consistently to both gap detection and synthesis. Raises
+        ``ValueError`` if gaps exist and the settlement phase cannot be uniquely
+        determined.
         """
         hours = _validate_interval_hours(
             self._settlement_interval_hours if interval_hours is None else interval_hours,
@@ -444,16 +520,26 @@ class FundingSeries:
         if hours is None:
             raise ValueError("interval_hours is required when settlement_interval_hours is None")
         step_ms = hours * _HOUR_MS
-        gaps = self.coverage_gaps(start_ms, end_ms, hours, tolerance)
+
+        explicit_phase: int | None = None
+        if phase_ms is not None:
+            explicit_phase = _validate_int_ts(phase_ms, "phase_ms")
+            if explicit_phase >= step_ms:
+                raise ValueError(f"phase_ms ({explicit_phase}) must be < interval_ms ({step_ms})")
+
+        gaps = self.coverage_gaps(start_ms, end_ms, hours, tolerance, phase_ms=explicit_phase)
         if not gaps:
             return self
 
-        if phase_ms is not None:
-            resolved_phase = _validate_int_ts(phase_ms, "phase_ms")
-            if resolved_phase >= step_ms:
-                raise ValueError(f"phase_ms ({resolved_phase}) must be < interval_ms ({step_ms})")
+        if explicit_phase is not None:
+            resolved_phase = explicit_phase
         else:
-            inferred_phase = _infer_settlement_phase_ms(self._timestamps_ms, step_ms)
+            lo, hi = self.between_indices(start_ms, end_ms)
+            inferred_phase = (
+                _infer_settlement_phase_ms(self._timestamps_buf, step_ms, start_idx=lo, end_idx=hi)
+                if lo < hi
+                else _infer_settlement_phase_ms(self._timestamps_buf, step_ms)
+            )
             if inferred_phase is None:
                 raise ValueError(
                     "cannot fill funding gaps: settlement schedule phase cannot be uniquely "
@@ -462,8 +548,8 @@ class FundingSeries:
             resolved_phase = inferred_phase
 
         by_ts: dict[int, float] = {
-            int(self._timestamps_ms[i]): float(self._rates[i])
-            for i in range(len(self._timestamps_ms))
+            int(self._timestamps_buf[i]): float(self._rates_buf[i])
+            for i in range(len(self._timestamps_buf))
         }
         for g_start, g_end in gaps:
             synth_end = (g_end - 1) if g_end in by_ts else g_end
@@ -477,10 +563,10 @@ class FundingSeries:
                 apr=apr,
                 phase_ms=resolved_phase,
             )
-            for idx in range(len(synth._timestamps_ms)):
-                ts = int(synth._timestamps_ms[idx])
+            for idx in range(len(synth._timestamps_buf)):
+                ts = int(synth._timestamps_buf[idx])
                 if ts not in by_ts:
-                    by_ts[ts] = float(synth._rates[idx])
+                    by_ts[ts] = float(synth._rates_buf[idx])
 
         ordered_ts = sorted(by_ts)
         return FundingSeries(
@@ -568,8 +654,8 @@ class FundingSeries:
             "instrument_id": self._instrument_id,
             "settlement_interval_hours": self._settlement_interval_hours,
             "events": [
-                {"ts_ms": int(self._timestamps_ms[i]), "rate": float(self._rates[i])}
-                for i in range(len(self._timestamps_ms))
+                {"ts_ms": int(self._timestamps_buf[i]), "rate": float(self._rates_buf[i])}
+                for i in range(len(self._timestamps_buf))
             ],
         }
 
@@ -621,9 +707,18 @@ class FundingSeries:
             raw_events = raw.get("events")
             if not isinstance(raw_events, list):
                 raise ValueError("funding JSON 'events' must be a list")
-            resolved_id = instrument_id or raw.get("instrument_id")
-            if not isinstance(resolved_id, str) or not resolved_id:
-                raise ValueError("funding JSON missing instrument_id")
+            embedded_id = raw.get("instrument_id")
+            if embedded_id is not None:
+                if not isinstance(embedded_id, str) or not embedded_id or embedded_id != embedded_id.strip():
+                    raise ValueError(f"funding JSON has invalid instrument_id: {embedded_id!r}")
+                resolved_id = _validate_archive_instrument_id(
+                    instrument_id,
+                    embedded_id=embedded_id,
+                )
+            else:
+                if not isinstance(instrument_id, str) or not instrument_id or instrument_id != instrument_id.strip():
+                    raise ValueError("funding JSON missing instrument_id")
+                resolved_id = instrument_id
             events: list[FundingRateEvent] = []
             for item in raw_events:
                 if not isinstance(item, Mapping):
@@ -644,19 +739,28 @@ class FundingSeries:
         # Compatibility loader for raw OKX funding archive files (e.g. {"instId": ..., "records": [...]})
         if isinstance(raw, dict) and isinstance(raw.get("records"), list):
             inst = raw.get("instId")
-            expected_inst: str | None = None
-            if instrument_id is not None:
-                expected_inst = instrument_id.split(":", 1)[1] if ":" in instrument_id else instrument_id
-                if isinstance(inst, str) and inst and inst != expected_inst:
-                    raise ValueError(
-                        f"OKX funding JSON instId {inst!r} does not match explicit instrument_id {instrument_id!r}"
-                    )
-                resolved_id = instrument_id
-            else:
+            if inst is not None:
                 if not isinstance(inst, str) or not inst or inst != inst.strip():
-                    raise ValueError("OKX funding JSON missing instId / instrument_id")
+                    raise ValueError(f"OKX funding JSON has invalid instId: {inst!r}")
+                resolved_id = _validate_archive_instrument_id(
+                    instrument_id,
+                    embedded_id=f"okx:{inst}",
+                    expected_venue="okx",
+                    expected_symbol=inst,
+                )
                 expected_inst = inst
-                resolved_id = f"okx:{inst}"
+            else:
+                if not isinstance(instrument_id, str) or not instrument_id or instrument_id != instrument_id.strip():
+                    raise ValueError("OKX funding JSON missing instId / instrument_id")
+                if ":" in instrument_id:
+                    req_venue, expected_inst = instrument_id.split(":", 1)
+                    if req_venue != "okx" or not expected_inst:
+                        raise ValueError(
+                            f"OKX funding JSON cannot be loaded under non-OKX instrument_id {instrument_id!r}"
+                        )
+                else:
+                    expected_inst = instrument_id
+                resolved_id = instrument_id
             parsed = _parse_okx_rows(
                 raw["records"],
                 expected_inst_id=expected_inst,
@@ -667,23 +771,26 @@ class FundingSeries:
         # Compatibility loader for raw Binance funding arrays ([{"symbol": ..., "fundingTime": ..., "fundingRate": ...}])
         if isinstance(raw, list):
             if not raw:
-                if not instrument_id:
+                if not isinstance(instrument_id, str) or not instrument_id or instrument_id != instrument_id.strip():
                     raise ValueError("empty Binance funding JSON requires instrument_id")
+                if ":" in instrument_id:
+                    req_venue, req_sym = instrument_id.split(":", 1)
+                    if req_venue != "binance" or not req_sym:
+                        raise ValueError(
+                            f"Binance funding JSON cannot be loaded under non-Binance instrument_id {instrument_id!r}"
+                        )
                 return cls.from_events(instrument_id, ())
-            expected_symbol: str | None = None
-            if instrument_id is not None:
-                expected_symbol = instrument_id.split(":", 1)[1] if ":" in instrument_id else instrument_id
-                if not expected_symbol or expected_symbol != expected_symbol.strip():
-                    raise ValueError(f"invalid instrument_id: {instrument_id!r}")
-                resolved_id = instrument_id
-            else:
-                first = raw[0]
-                sym = first.get("symbol") if isinstance(first, Mapping) else None
-                if not isinstance(sym, str) or not sym or sym != sym.strip():
-                    raise ValueError("Binance funding JSON missing symbol / instrument_id")
-                expected_symbol = sym
-                resolved_id = f"binance:{sym}"
-            parsed = _parse_binance_rows(raw, expected_symbol=expected_symbol)
+            first = raw[0]
+            sym = first.get("symbol") if isinstance(first, Mapping) else None
+            if not isinstance(sym, str) or not sym or sym != sym.strip():
+                raise ValueError("Binance funding JSON missing symbol / instrument_id")
+            resolved_id = _validate_archive_instrument_id(
+                instrument_id,
+                embedded_id=f"binance:{sym}",
+                expected_venue="binance",
+                expected_symbol=sym,
+            )
+            parsed = _parse_binance_rows(raw, expected_symbol=sym)
             return cls.from_events(resolved_id, parsed, sort=True)
 
         raise ValueError(f"unrecognized funding JSON format in {target}")
@@ -693,7 +800,7 @@ class FundingSeries:
         cls,
         series: "FundingSeries | None",
         *,
-        instrument_id: str,
+        instrument_id: str | None = None,
         start_ms: int,
         end_ms: int,
         interval_hours: int | None,
@@ -748,15 +855,17 @@ def require_funding_series(
 def require_or_sensitivity_series(
     series: FundingSeries | None = None,
     *,
-    instrument_id: str = "unknown:PERP",
+    instrument_id: str | None = None,
     start_ms: int,
     end_ms: int,
     interval_hours: int | None,
     apr_band: Sequence[float] = (0.0, 0.15, 0.30),
     tolerance: float = 1.5,
 ) -> FundingResolution:
-    """Return historical funding iff it fully covers ``(start_ms, end_ms]``, else synthesize an explicit APR band.
+    """Return historical funding iff it matches ``instrument_id`` and fully covers ``(start_ms, end_ms]``, else synthesize an explicit APR band.
 
+    - If ``instrument_id`` is explicitly provided and disagrees with ``series.instrument_id``,
+      raises ``ValueError``.
     - Partial historical funding (non-empty series with coverage gaps over
       ``(start_ms, end_ms]``) fails closed with ``MissingFundingHistoryError`` rather
       than being mislabeled as ``historical``.
@@ -765,6 +874,11 @@ def require_or_sensitivity_series(
       at least one non-zero APR (default ``(0.0, 0.15, 0.30)``).
     """
     if series is not None and len(series) > 0:
+        if instrument_id is not None and series.instrument_id != instrument_id:
+            raise ValueError(
+                f"funding series instrument_id {series.instrument_id!r} does not match "
+                f"requested instrument_id {instrument_id!r}"
+            )
         resolved_hours = _validate_interval_hours(
             interval_hours if interval_hours is not None else series.settlement_interval_hours,
             "interval_hours",
@@ -785,10 +899,15 @@ def require_or_sensitivity_series(
             apr_band=(),
         )
 
+    resolved_instrument_id = (
+        instrument_id
+        if instrument_id is not None
+        else (series.instrument_id if series is not None else "unknown:PERP")
+    )
     hours = _validate_interval_hours(interval_hours, "interval_hours")
     if hours is None:
         raise MissingFundingHistoryError(
-            f"cannot synthesize funding sensitivity band for {instrument_id} without interval_hours"
+            f"cannot synthesize funding sensitivity band for {resolved_instrument_id} without interval_hours"
         )
     if isinstance(apr_band, (str, bytes)) or not isinstance(apr_band, Sequence):
         raise ValueError("apr_band must be a sequence of finite APR floats")
@@ -806,7 +925,7 @@ def require_or_sensitivity_series(
     for apr in normalized_band:
         label = format_apr_scenario_key(apr, prefix="apr_")
         synth = FundingSeries.synthetic_constant_apr(
-            instrument_id=instrument_id,
+            instrument_id=resolved_instrument_id,
             start_ms=start_ms,
             end_ms=end_ms,
             interval_hours=hours,

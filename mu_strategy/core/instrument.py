@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 import math
 from typing import Any, Literal
@@ -90,12 +90,17 @@ def _exact_round_fraction(frac: Fraction, mode: RoundingMode) -> int:
 def _exact_mul_units_step(units: int, step: Decimal) -> Decimal:
     if units == 0:
         return Decimal("0")
-    step_digits = len(step.as_tuple().digits)
-    units_digits = len(str(abs(units)))
-    with localcontext() as ctx:
-        ctx.prec = max(28, units_digits + step_digits + 4)
-        quantized = Decimal(units) * step
-    return Decimal("0") if quantized == 0 else quantized
+    tup = step.as_tuple()
+    assert isinstance(tup.exponent, int)
+    step_coeff = 0
+    for digit in tup.digits:
+        step_coeff = (step_coeff * 10) + digit
+    prod = abs(units) * step_coeff
+    if prod == 0:
+        return Decimal("0")
+    sign = (1 if units < 0 else 0) ^ tup.sign
+    digits = tuple(int(ch) for ch in str(prod))
+    return Decimal((sign, digits, tup.exponent))
 
 
 def _quantize_to_step(value: Decimal, step: Decimal, mode: RoundingMode) -> Decimal:

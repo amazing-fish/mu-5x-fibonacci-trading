@@ -109,75 +109,109 @@ def _is_reducing_intent(intent: OrderIntent, ctx: BarContext) -> bool:
     return False
 
 
+def _has_entry_gate(intent: OrderIntent) -> bool:
+    return (getattr(intent, "session_gate", None) is not None) or bool(
+        getattr(intent, "excluded_price_bands", ())
+    )
+
+
+def _filter_one_reducing_intent(
+    intent: OrderIntent,
+    ctx: BarContext,
+    rem_base_by_sym: dict[str, float],
+    rem_weight_by_sym: dict[str, float],
+) -> OrderIntent | None:
+    """Filter a single intent for exit-only / fail-closed policy without stripping caller gates."""
+    if intent.reduce_only:
+        return intent
+
+    has_gate = _has_entry_gate(intent)
+    if intent.qty_mode == "close_all":
+        if has_gate:
+            gate = getattr(intent, "session_gate", None)
+            if gate is not None and not gate.is_allowed(ctx.now_ms):
+                return None
+            # Keep gated close_all intact without stripping caller's gate (Simulator caps close_all to flat).
+            return intent
+        return replace(intent, reduce_only=True)
+
+    sym = intent.symbol
+    pos = ctx.portfolio.position(sym)
+    pos_qty = pos.qty if pos is not None else 0.0
+    equity = ctx.portfolio.equity
+
+    if pos is None or pos.is_flat:
+        return None
+    is_opposing = (pos_qty > 0.0 and intent.side == "sell") or (pos_qty < 0.0 and intent.side == "buy")
+    if not is_opposing:
+        return None
+
+    # Non-reduce_only gated intents cannot be converted to reduce_only=True without silently
+    # discarding the caller-supplied session_gate / excluded_price_bands (CR2-25): reject cleanly.
+    if has_gate:
+        return None
+
+    if intent.qty_mode == "target_weight":
+        # Require compatible opposing side and carry reduce_only=True into fill-time execution (CR2-28).
+        if intent.qty_value == 0.0:
+            return replace(intent, reduce_only=True)
+        if equity <= 0.0:
+            return None
+        curr_w = (pos.notional / equity) * (1.0 if pos_qty > 0.0 else -1.0)
+        if (curr_w > 0.0 and 0.0 <= intent.qty_value <= curr_w + 1e-12) or (
+            curr_w < 0.0 and curr_w - 1e-12 <= intent.qty_value <= 0.0
+        ):
+            return replace(intent, reduce_only=True)
+        return None
+
+    if intent.qty_mode == "contracts":
+        mult = _contract_multiplier(ctx, sym)
+        rem_base = rem_base_by_sym.get(sym, abs(pos_qty))
+        if rem_base <= 1e-12:
+            return None
+        req_base = intent.qty_value * mult
+        allow_base = req_base if req_base <= rem_base else rem_base
+        rem_base_by_sym[sym] = max(0.0, rem_base - allow_base)
+        if equity > 0.0 and pos.notional > 0.0:
+            curr_w_abs = pos.notional / equity
+            rem_w = rem_weight_by_sym.get(sym, curr_w_abs)
+            frac_used = (allow_base / abs(pos_qty)) * curr_w_abs
+            rem_weight_by_sym[sym] = max(0.0, rem_w - frac_used)
+        allow_contracts = allow_base / mult
+        if allow_contracts > 1e-12:
+            return replace(intent, qty_value=allow_contracts, reduce_only=True)
+        return None
+
+    if intent.qty_mode == "equity_fraction":
+        if equity <= 0.0:
+            return None
+        curr_w_abs = pos.notional / equity
+        rem_w = rem_weight_by_sym.get(sym, curr_w_abs)
+        if rem_w <= 1e-12:
+            return None
+        allow_w = intent.qty_value if intent.qty_value <= rem_w else rem_w
+        rem_weight_by_sym[sym] = max(0.0, rem_w - allow_w)
+        if curr_w_abs > 0.0:
+            rem_base = rem_base_by_sym.get(sym, abs(pos_qty))
+            base_used = (allow_w / curr_w_abs) * abs(pos_qty)
+            rem_base_by_sym[sym] = max(0.0, rem_base - base_used)
+        if allow_w > 1e-12:
+            return replace(intent, qty_value=allow_w, reduce_only=True)
+        return None
+
+    return None
+
+
 def _filter_reducing_intents(intents: Sequence[OrderIntent], ctx: BarContext) -> tuple[OrderIntent, ...]:
     """Keep only risk-reducing intents and cap non-reduce-only exits so combined exits cannot reverse past flat."""
     kept: list[OrderIntent] = []
-    equity = ctx.portfolio.equity
     rem_base_by_sym: dict[str, float] = {}
     rem_weight_by_sym: dict[str, float] = {}
 
     for intent in intents:
-        if intent.reduce_only or intent.qty_mode == "close_all":
-            kept.append(intent if intent.reduce_only else replace(intent, reduce_only=True))
-            continue
-
-        sym = intent.symbol
-        pos = ctx.portfolio.position(sym)
-        pos_qty = pos.qty if pos is not None else 0.0
-
-        if intent.qty_mode == "target_weight":
-            if intent.qty_value == 0.0:
-                kept.append(intent)
-                continue
-            if pos is None or pos.is_flat or equity <= 0.0:
-                continue
-            curr_w = (pos.notional / equity) * (1.0 if pos_qty > 0.0 else -1.0)
-            if (curr_w > 0.0 and 0.0 <= intent.qty_value <= curr_w + 1e-12) or (
-                curr_w < 0.0 and curr_w - 1e-12 <= intent.qty_value <= 0.0
-            ):
-                kept.append(intent)
-            continue
-
-        if pos is None or pos.is_flat:
-            continue
-        is_opposing = (pos_qty > 0.0 and intent.side == "sell") or (pos_qty < 0.0 and intent.side == "buy")
-        if not is_opposing:
-            continue
-
-        if intent.qty_mode == "contracts":
-            mult = _contract_multiplier(ctx, sym)
-            rem_base = rem_base_by_sym.get(sym, abs(pos_qty))
-            if rem_base <= 1e-12:
-                continue
-            req_base = intent.qty_value * mult
-            allow_base = req_base if req_base <= rem_base else rem_base
-            rem_base_by_sym[sym] = max(0.0, rem_base - allow_base)
-            # Also track weight budget conservatively when equity & price are known.
-            if equity > 0.0 and pos.notional > 0.0:
-                curr_w_abs = pos.notional / equity
-                rem_w = rem_weight_by_sym.get(sym, curr_w_abs)
-                frac_used = (allow_base / abs(pos_qty)) * curr_w_abs
-                rem_weight_by_sym[sym] = max(0.0, rem_w - frac_used)
-            allow_contracts = allow_base / mult
-            if allow_contracts > 1e-12:
-                kept.append(replace(intent, qty_value=allow_contracts, reduce_only=True))
-            continue
-
-        if intent.qty_mode == "equity_fraction":
-            if equity <= 0.0:
-                continue
-            curr_w_abs = pos.notional / equity
-            rem_w = rem_weight_by_sym.get(sym, curr_w_abs)
-            if rem_w <= 1e-12:
-                continue
-            allow_w = intent.qty_value if intent.qty_value <= rem_w else rem_w
-            rem_weight_by_sym[sym] = max(0.0, rem_w - allow_w)
-            if curr_w_abs > 0.0:
-                rem_base = rem_base_by_sym.get(sym, abs(pos_qty))
-                base_used = (allow_w / curr_w_abs) * abs(pos_qty)
-                rem_base_by_sym[sym] = max(0.0, rem_base - base_used)
-            if allow_w > 1e-12:
-                kept.append(replace(intent, qty_value=allow_w, reduce_only=True))
+        filtered = _filter_one_reducing_intent(intent, ctx, rem_base_by_sym, rem_weight_by_sym)
+        if filtered is not None:
+            kept.append(filtered)
 
     return tuple(kept)
 
@@ -203,7 +237,18 @@ def _filter_reducing_targets(targets: Sequence[TargetPosition], ctx: BarContext)
 
 def _flatten_output(ctx: BarContext, output: StrategyOutput, *, reason: str) -> StrategyOutput:
     """Drop all risk-increasing entries and emit explicit flat targets for open positions."""
-    kept_intents = tuple(intent for intent in output.intents if intent.reduce_only or intent.qty_mode == "close_all")
+    kept_list: list[OrderIntent] = []
+    for intent in output.intents:
+        if intent.reduce_only:
+            kept_list.append(intent)
+        elif intent.qty_mode == "close_all":
+            if _has_entry_gate(intent):
+                if intent.session_gate is not None and not intent.session_gate.is_allowed(ctx.now_ms):
+                    continue
+                kept_list.append(intent)
+            else:
+                kept_list.append(replace(intent, reduce_only=True))
+    kept_intents = tuple(kept_list)
     flatten_targets: list[TargetPosition] = []
     seen_symbols: set[str] = set()
 
@@ -346,7 +391,10 @@ class VolTargetOverlay:
         except (KeyError, ValueError):
             return "missing", None
 
-        base = getattr(bars, "_series", None) or getattr(bars, "series", None)
+        # Explicit `is None` check so an empty BarSeries (bool == False) is never discarded (CR2-26).
+        base = getattr(bars, "_series", None)
+        if base is None:
+            base = getattr(bars, "series", None)
         if base is not None and len(base) == 0:
             return "missing", None
 
@@ -470,21 +518,25 @@ class VolTargetOverlay:
 
         kept_intents: tuple[OrderIntent, ...] = output.intents
         if output.intents:
-            missing_intents: list[OrderIntent] = []
-            present_intents: list[OrderIntent] = []
+            # Filter missing-volatility intents IN PLACE without reordering survivors (CR2-45).
+            ordered_kept: list[OrderIntent] = []
+            rem_base_by_sym: dict[str, float] = {}
+            rem_weight_by_sym: dict[str, float] = {}
+            changed = False
             for intent in output.intents:
-                if intent.reduce_only or intent.qty_mode == "close_all":
-                    present_intents.append(intent)
+                if intent.reduce_only:
+                    ordered_kept.append(intent)
                     continue
                 status, _ = _get_status(intent.symbol)
                 if status == "missing":
-                    missing_intents.append(intent)
+                    changed = True
+                    filtered = _filter_one_reducing_intent(intent, ctx, rem_base_by_sym, rem_weight_by_sym)
+                    if filtered is not None:
+                        ordered_kept.append(filtered)
                 else:
-                    present_intents.append(intent)
-            if missing_intents:
-                # Preserve only bounded reductions for symbols with missing volatility series.
-                filtered_missing = _filter_reducing_intents(missing_intents, ctx)
-                kept_intents = tuple(present_intents) + filtered_missing
+                    ordered_kept.append(intent)
+            if changed:
+                kept_intents = tuple(ordered_kept)
 
         if not kept_intents and not scaled_targets:
             if output.diagnostics:
@@ -712,82 +764,123 @@ class ExposureCapOverlay:
                     sign = 1.0 if pos.qty > 0.0 else -1.0
                     existing_weights[sym] = sign * (pos.notional / equity)
 
-        # 1. Clamp individual TargetPositions to [-single_cap, +single_cap].
+        # 1. Summarize already-resting non-reduce-only open orders BEFORE admitting targets (CR2-29),
+        #    because resting orders can still fill AFTER a queued TargetPosition fills at the open.
+        rest_buy: dict[str, float] = {}
+        rest_sell: dict[str, float] = {}
+        rest_tw_lo: dict[str, float] = {}
+        rest_tw_hi: dict[str, float] = {}
+        all_known_syms: set[str] = set(existing_weights.keys())
+
+        for open_ord in ctx.portfolio.open_orders:
+            if open_ord.reduce_only or open_ord.qty_mode == "close_all":
+                continue
+            osym = open_ord.symbol
+            all_known_syms.add(osym)
+            if open_ord.qty_mode == "target_weight":
+                w = open_ord.qty_value
+                rest_tw_lo[osym] = w if osym not in rest_tw_lo else min(rest_tw_lo[osym], w)
+                rest_tw_hi[osym] = w if osym not in rest_tw_hi else max(rest_tw_hi[osym], w)
+            elif open_ord.qty_mode == "equity_fraction":
+                if open_ord.side == "buy":
+                    rest_buy[osym] = rest_buy.get(osym, 0.0) + open_ord.qty_value
+                else:
+                    rest_sell[osym] = rest_sell.get(osym, 0.0) + open_ord.qty_value
+            elif open_ord.qty_mode == "contracts":
+                ref_px = open_ord.limit_price or open_ord.stop_price or self._reference_price(ctx, osym)
+                if equity > 0.0 and ref_px is not None and ref_px > 0.0:
+                    mult = _contract_multiplier(ctx, osym)
+                    w = (open_ord.qty_value * mult * ref_px) / equity
+                    if open_ord.side == "buy":
+                        rest_buy[osym] = rest_buy.get(osym, 0.0) + w
+                    else:
+                        rest_sell[osym] = rest_sell.get(osym, 0.0) + w
+
+        def _post_target_envelope(sym: str, w_t: float | None) -> tuple[float, float]:
+            ew = existing_weights.get(sym, 0.0)
+            b_lo = ew if w_t is None else (w_t if w_t < ew else ew)
+            b_hi = ew if w_t is None else (w_t if w_t > ew else ew)
+            if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
+                b_lo = rest_tw_lo[sym]
+            if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
+                b_hi = rest_tw_hi[sym]
+            return b_lo - rest_sell.get(sym, 0.0), b_hi + rest_buy.get(sym, 0.0)
+
+        # 2. Clamp individual TargetPositions against single_cap AND resting orders on that symbol (CR2-29).
         clamped_targets: list[TargetPosition] = []
         targeted_symbols: set[str] = set()
         for t in output.targets:
-            w = max(-single_cap, min(single_cap, t.target_weight))
+            tsym = t.symbol
+            rb = rest_buy.get(tsym, 0.0)
+            rs = rest_sell.get(tsym, 0.0)
+            w = t.target_weight
+            if w > 0.0:
+                w = min(w, max(0.0, single_cap - rb))
+            elif w < 0.0:
+                w = max(w, -max(0.0, single_cap - rs))
             if w == 0.0:
                 w = 0.0
             clamped_targets.append(replace(t, target_weight=w))
-            targeted_symbols.add(t.symbol)
+            targeted_symbols.add(tsym)
+            all_known_syms.add(tsym)
 
-        # 2. Enforce max_gross_leverage across all targeted + untouched open positions.
+        # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols.
         if clamped_targets:
-            untouched_gross = math.fsum(
-                abs(w) for sym, w in existing_weights.items() if sym not in targeted_symbols
-            )
-            target_gross = math.fsum(abs(t.target_weight) for t in clamped_targets)
-            allowed_target_gross = max(0.0, self.max_gross_leverage - untouched_gross)
-            if target_gross > allowed_target_gross + 1e-12 and target_gross > 0.0:
-                ratio = allowed_target_gross / target_gross
-                clamped_targets = [
-                    replace(t, target_weight=(0.0 if t.target_weight == 0.0 else t.target_weight * ratio))
-                    for t in clamped_targets
-                ]
+            untouched_gross = 0.0
+            for usym in all_known_syms:
+                if usym not in targeted_symbols:
+                    u_lo, u_hi = _post_target_envelope(usym, None)
+                    untouched_gross += max(abs(u_lo), abs(u_hi))
+            allowed_targeted_gross = max(0.0, self.max_gross_leverage - untouched_gross)
+            # Compute worst-case gross contribution of each target (including resting add cushions).
+            target_worst = [
+                max(abs(_post_target_envelope(t.symbol, t.target_weight)[0]), abs(_post_target_envelope(t.symbol, t.target_weight)[1]))
+                for t in clamped_targets
+            ]
+            total_target_worst = math.fsum(target_worst)
+            if total_target_worst > allowed_targeted_gross + 1e-12:
+                # Reserve the unavoidable floor gross from existing positions + resting orders on targeted symbols,
+                # then proportionally scale the incremental target weights within remaining headroom.
+                base_floors = []
+                inc_contribs = []
+                for t, tw in zip(clamped_targets, target_worst):
+                    f_lo, f_hi = _post_target_envelope(t.symbol, 0.0)
+                    fl = max(abs(f_lo), abs(f_hi))
+                    base_floors.append(fl)
+                    inc_contribs.append(max(0.0, tw - fl))
+                inc_sum = math.fsum(inc_contribs)
+                rem_for_inc = max(0.0, allowed_targeted_gross - math.fsum(base_floors))
+                if inc_sum > 1e-12:
+                    ratio = min(1.0, rem_for_inc / inc_sum)
+                    new_targets: list[TargetPosition] = []
+                    for t, inc in zip(clamped_targets, inc_contribs):
+                        if inc > 0.0:
+                            # Scale the incremental part of target weight beyond 0.
+                            w_scaled = t.target_weight * ratio
+                            if w_scaled == 0.0:
+                                w_scaled = 0.0
+                            new_targets.append(replace(t, target_weight=w_scaled))
+                        else:
+                            new_targets.append(t)
+                    clamped_targets = new_targets
+                elif allowed_targeted_gross <= 1e-12:
+                    clamped_targets = [replace(t, target_weight=0.0) for t in clamped_targets]
 
-        # 3. Maintain conservative reachable weight interval [lo_w, hi_w] per symbol across
+        # 4. Seed conservative reachable weight interval [lo_w, hi_w] per symbol across
         #    existing positions, resting open orders, clamped targets, and emitted intents.
         #    This guarantees:
+        #      - CR2-29: resting orders reserved before targets and carried into intent budget.
         #      - CR1-32: single shared exposure budget across targets + intents in the same output.
         #      - CR1-31: reducing orders never release exposure headroom before filling.
         #      - CR1-29: contract_value multiplier applied symmetrically to contracts orders.
         #      - CR1-33: unpriceable contracts orders fail closed (blocked) rather than bypassing cap.
-        lo_by_sym: dict[str, float] = dict(existing_weights)
-        hi_by_sym: dict[str, float] = dict(existing_weights)
-
-        def _reserve_order_interval(order: OrderIntent) -> None:
-            if order.reduce_only or order.qty_mode == "close_all":
-                return
-            sym = order.symbol
-            lo = lo_by_sym.get(sym, 0.0)
-            hi = hi_by_sym.get(sym, 0.0)
-            if order.qty_mode == "target_weight":
-                w = order.qty_value
-                lo_by_sym[sym] = w if w < lo else lo
-                hi_by_sym[sym] = w if w > hi else hi
-                return
-            if order.qty_mode == "equity_fraction":
-                delta = order.qty_value if order.side == "buy" else -order.qty_value
-            elif order.qty_mode == "contracts":
-                ref_px = order.limit_price or order.stop_price or self._reference_price(ctx, sym)
-                if equity <= 0.0 or ref_px is None or ref_px <= 0.0:
-                    return
-                mult = _contract_multiplier(ctx, sym)
-                w = (order.qty_value * mult * ref_px) / equity
-                delta = w if order.side == "buy" else -w
-            else:
-                return
-            if delta > 0.0:
-                hi_by_sym[sym] = hi + delta
-                lo_by_sym.setdefault(sym, lo)
-            elif delta < 0.0:
-                lo_by_sym[sym] = lo + delta
-                hi_by_sym.setdefault(sym, hi)
-
-        # Reserve already-resting non-reduce-only open orders.
-        for open_ord in ctx.portfolio.open_orders:
-            _reserve_order_interval(open_ord)
-
-        # Reserve clamped target exposure in the shared budget (never shrinking the envelope
-        # before a reducing target is confirmed filled).
-        for t in clamped_targets:
-            sym = t.symbol
-            lo = lo_by_sym.get(sym, 0.0)
-            hi = hi_by_sym.get(sym, 0.0)
-            w = t.target_weight
-            lo_by_sym[sym] = w if w < lo else lo
-            hi_by_sym[sym] = w if w > hi else hi
+        lo_by_sym: dict[str, float] = {}
+        hi_by_sym: dict[str, float] = {}
+        target_w_by_sym: dict[str, float] = {t.symbol: t.target_weight for t in clamped_targets}
+        for sym in all_known_syms:
+            lo_s, hi_s = _post_target_envelope(sym, target_w_by_sym.get(sym))
+            lo_by_sym[sym] = lo_s
+            hi_by_sym[sym] = hi_s
 
         def _sym_worst_abs(sym: str) -> float:
             lo = lo_by_sym.get(sym, 0.0)

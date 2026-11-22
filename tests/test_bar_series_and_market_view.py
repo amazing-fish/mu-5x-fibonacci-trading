@@ -67,7 +67,7 @@ class BarSeriesTests(unittest.TestCase):
         self.assertEqual(candles[-1], series.latest())
         self.assertEqual(candles, series.to_candles())
 
-        # Immutability + CR1-04 read-only public columns (cannot mutate backing buffers)
+        # Immutability + CR1-04 + CR2-08 + CR2-10: read-only independent memoryview backed by immutable bytes
         with self.assertRaises(AttributeError):
             series.symbol = "OTHER"  # type: ignore[misc]
         for col in (
@@ -81,8 +81,19 @@ class BarSeriesTests(unittest.TestCase):
         ):
             self.assertIsInstance(col, memoryview)
             self.assertTrue(col.readonly)
+            self.assertIsInstance(col.obj, bytes)
             with self.assertRaises(TypeError):
                 col[0] = 0  # type: ignore[index]
+        # CR2-08: releasing caller's view handle must NOT invalidate BarSeries or bar_at()
+        with series.closes as caller_closes:
+            self.assertEqual(candles[0].close, caller_closes[0])
+        with self.assertRaises(ValueError):
+            _ = caller_closes[0]
+        self.assertEqual(candles[0], series.bar_at(0))
+        self.assertEqual(candles[0].close, series.closes[0])
+        with series.close_times as caller_ct:
+            self.assertEqual(candles[0].open_time_ms + MIN_15_MS, caller_ct[0])
+        self.assertEqual(candles[0].open_time_ms + MIN_15_MS, series.close_times[0])
 
         # CR1-60: reversed unit-step slices return empty views (len == 0, never IndexError or negative len)
         self.assertEqual(0, len(series[4:2]))
@@ -183,16 +194,22 @@ class BinaryCacheTests(unittest.TestCase):
             self.assertEqual(candles, loaded.to_candles())
             self.assertIsInstance(loaded.open_times, memoryview)
             self.assertTrue(loaded.open_times.readonly)
+            self.assertIsInstance(loaded.open_times.obj, bytes)
             self.assertEqual("q", loaded.open_times.format)
             self.assertIsInstance(loaded.close_times, memoryview)
             self.assertTrue(loaded.close_times.readonly)
+            self.assertIsInstance(loaded.close_times.obj, bytes)
             self.assertEqual("q", loaded.close_times.format)
             self.assertIsInstance(loaded.closes, memoryview)
             self.assertTrue(loaded.closes.readonly)
+            self.assertIsInstance(loaded.closes.obj, bytes)
             self.assertEqual("d", loaded.closes.format)
             self.assertEqual(list(series.closes), list(loaded.closes))
             with self.assertRaises(TypeError):
                 loaded.closes[0] = 999.0  # type: ignore[index]
+            with loaded.closes as scoped:
+                self.assertEqual(candles[0].close, scoped[0])
+            self.assertEqual(candles[0].close, loaded.closes[0])
             # Re-serializing a loaded BarSeries round-trips cleanly
             re_path = Path(tmp) / "re_mu_15m.bin"
             write_bar_series_bin(re_path, loaded, sha)
@@ -380,6 +397,33 @@ class BinaryCacheTests(unittest.TestCase):
                 load_or_build_bar_series(c2, symbol="BTCUSDT", interval="15m", cache_path=prec_cache, strict_cache=True)
             s2 = load_or_build_bar_series(c2, symbol="BTCUSDT", interval="15m", cache_path=prec_cache)
             self.assertEqual(100.000000002, s2.closes[0])
+
+            # CR2-09: in-memory sequence snapshotted once so digest and written bars cannot diverge
+            from collections.abc import Sequence as AbcSequence
+
+            class MutatingCandleSeq(AbcSequence):
+                def __init__(self) -> None:
+                    self.reads = 0
+                    self.a = [Candle(1_700_006_400_000, 100.0, 101.0, 99.0, 100.5, 10.0)]
+                    self.b = [Candle(1_700_006_400_000, 200.0, 201.0, 199.0, 200.5, 20.0)]
+
+                def __len__(self) -> int:
+                    return 1
+
+                def __getitem__(self, idx: int) -> Candle:
+                    return self.a[idx]
+
+                def __iter__(self):
+                    self.reads += 1
+                    return iter(self.a if self.reads == 1 else self.b)
+
+            mut_seq = MutatingCandleSeq()
+            snap_cache = root / "snap.bin"
+            built_snap = load_or_build_bar_series(mut_seq, symbol="BTCUSDT", interval="15m", cache_path=snap_cache)
+            self.assertEqual(1, mut_seq.reads)
+            self.assertEqual(100.5, built_snap.closes[0])
+            hit_a = load_or_build_bar_series(mut_seq.a, symbol="BTCUSDT", interval="15m", cache_path=snap_cache, strict_cache=True)
+            self.assertEqual(100.5, hit_a.closes[0])
 
             # CR1-07: cache destination resolving to CSV source MUST be rejected without altering CSV
             csv_path = root / "bars.csv"
@@ -586,6 +630,15 @@ class MarketViewCausalityTests(unittest.TestCase):
             view_a.latest_closed_bar("MU-USDT-SWAP", "15m"),
             view_b.latest_closed_bar("MU-USDT-SWAP", "15m"),
         )
+
+        # CR2-07: reject bar-map keys that contradict BarSeries (symbol, interval) identity
+        eth_1h = BarSeries.from_candles("ETH-USDT-SWAP", "1h", _make_candles(2, start_ms=base_ms, step_ms=HOUR_1_MS))
+        with self.assertRaises(ValueError):
+            MarketView({("BTC-USDT-SWAP", "1h"): eth_1h}, now_ms=cutoff_ms)
+        with self.assertRaises(ValueError):
+            MarketViewCursor({("BTC-USDT-SWAP", "1h"): eth_1h})
+        with self.assertRaises(ValueError):
+            MarketView({("ETH-USDT-SWAP", "15m"): eth_1h}, now_ms=cutoff_ms)
 
 
 if __name__ == "__main__":

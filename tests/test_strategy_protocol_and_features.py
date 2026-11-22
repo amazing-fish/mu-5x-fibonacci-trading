@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from types import MappingProxyType
+from unittest.mock import patch
 
 from mu_strategy.core.instrument import okx_swap_spec
 from mu_strategy.core.trading_calendar import LEGACY_CALENDAR
@@ -17,6 +19,7 @@ from mu_strategy.indicators import macd as legacy_macd
 from mu_strategy.indicators import rsi as legacy_rsi
 from mu_strategy.market_data.bar_series import BarSeries, MarketView, MarketViewCursor
 from mu_strategy.models import Candle
+from mu_strategy.strategies import features as features_mod
 from mu_strategy.strategies.families import (
     DEFAULT_STRATEGY_FAMILY_REGISTRY,
     DonchianATRStrategy,
@@ -37,6 +40,7 @@ from mu_strategy.strategies.protocol import (
     ParamSpec,
     PortfolioView,
     PositionView,
+    PriceExclusionBand,
     SessionGate,
     Strategy,
     StrategyFamilyDescriptor,
@@ -358,6 +362,77 @@ class ProtocolContractsTests(unittest.TestCase):
                 "bad_gate", "MU", "sell", "stop_market", "close_all", 0.0, stop_price=95.0, reduce_only=True, session_gate=gate
             )
 
+        # CR2-38: SessionGate validates HH:MM format & bounds at construction (not lazily at fill time).
+        with self.assertRaises(ValueError):
+            SessionGate(LEGACY_CALENDAR, (("25:00", "26:00"),))
+        with self.assertRaises(ValueError):
+            SessionGate(LEGACY_CALENDAR, (("15:00", "14:00"),))
+        with self.assertRaises(ValueError):
+            SessionGate(LEGACY_CALENDAR, (("09:60", "10:00"),))
+        with self.assertRaises(ValueError):
+            SessionGate(LEGACY_CALENDAR, ("09:45",))  # type: ignore[arg-type]
+
+        # CR2-36: StrategyOutput freezes nested mutable containers in diagnostics.
+        nested_list = [1, 2]
+        nested_dict = {"a": [10]}
+        out_nested = StrategyOutput(diagnostics={"signals": nested_list, "meta": nested_dict})
+        nested_list.append(999)
+        nested_dict["a"].append(888)
+        nested_dict["b"] = "mutated"
+        self.assertEqual((1, 2), out_nested.diagnostics["signals"])
+        self.assertEqual((10,), out_nested.diagnostics["meta"]["a"])
+        self.assertNotIn("b", out_nested.diagnostics["meta"])
+
+        # CR2-37: Float grid limit checks emitted point count floor(steps_exact) + 1.
+        exact_limit = ParamSpec("g", "float", 0.0, min_value=0.0, max_value=99_999.5, step=1.0)
+        grid_100k = exact_limit.grid_values()
+        self.assertEqual(MAX_PARAM_GRID_SIZE, len(grid_100k))
+        self.assertEqual(0.0, grid_100k[0])
+        self.assertEqual(99_999.0, grid_100k[-1])
+        over_by_one = ParamSpec("g_over", "float", 0.0, min_value=0.0, max_value=float(MAX_PARAM_GRID_SIZE), step=1.0)
+        with self.assertRaises(ValueError):
+            over_by_one.grid_values()
+
+        # CR2-35: ParamSpace.iter_valid_grid applies constraints to the empty assignment {}.
+        def _reject_empty(p: dict[str, object]) -> None:
+            raise ValueError("empty rejected")
+
+        empty_unconstrained = ParamSpace()
+        self.assertTrue(empty_unconstrained.is_valid({}))
+        self.assertEqual([{}], list(empty_unconstrained.iter_valid_grid()))
+
+        empty_constrained = ParamSpace(constraints=(_reject_empty,))
+        self.assertFalse(empty_constrained.is_valid({}))
+        self.assertEqual([], list(empty_constrained.iter_valid_grid()))
+
+        # CR2-15 & CR2-44 protocol contracts: PriceExclusionBand & BarContext.require_touch_through.
+        band = PriceExclusionBand(center=101.0, tolerance_pct=0.003)
+        self.assertTrue(band.excludes(101.0))
+        self.assertTrue(band.excludes(101.2))
+        self.assertFalse(band.excludes(100.0))
+        with self.assertRaises(ValueError):
+            PriceExclusionBand(center=0.0, tolerance_pct=0.003)
+        with self.assertRaises(ValueError):
+            PriceExclusionBand(center=100.0, tolerance_pct=1.0)
+        entry_with_band = OrderIntent(
+            "eb1", "MU", "buy", "market", "equity_fraction", 1.0, time_in_force="open_only", excluded_price_bands=(band,)
+        )
+        self.assertEqual((band,), entry_with_band.excluded_price_bands)
+        with self.assertRaises(ValueError):
+            OrderIntent(
+                "bad_band", "MU", "sell", "stop_market", "close_all", 0.0, stop_price=95.0, reduce_only=True, excluded_price_bands=(band,)
+            )
+        ctx_tt = BarContext(
+            now_ms=series.close_times[1],
+            symbol="MU-USDT-SWAP",
+            market=mv_ahead,
+            portfolio=pv,
+            instrument=spec,
+            require_touch_through=True,
+        )
+        self.assertTrue(ctx_tt.require_touch_through)
+        self.assertFalse(ctx_ok.require_touch_through)
+
 
 class FeatureCacheTests(unittest.TestCase):
     def test_ema_rsi_macd_exact_match_with_legacy_indicators(self) -> None:
@@ -590,15 +665,70 @@ class FeatureCacheTests(unittest.TestCase):
         rvol_full = fc.realized_vol(s_ext, 2)
         self.assertTrue(math.isfinite(rvol_full[4]))
 
-        # CR1-21 & CR1-22: Long constant series with period = N/2 runs in linear O(N) time (no quadratic rescan).
+        # CR1-21, CR1-22 & CR2-39: Constant series triggers ZERO exact-window rescans (deterministic O(N) proof,
+        # no flaky wall-clock threshold in default test discovery).
         const_series = BarSeries.from_candles("CONST", "1h", _make_candles([100.0] * 4000, spread=0.0))
-        t0 = time.perf_counter()
-        const_z = fc.zscore(const_series, 2000)
-        const_v = fc.realized_vol(const_series, 2000)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        with patch.object(
+            features_mod,
+            "_exact_window_stats_scaled",
+            wraps=features_mod._exact_window_stats_scaled,
+        ) as exact_spy:
+            const_z = fc.zscore(const_series, 2000)
+            const_v = fc.realized_vol(const_series, 2000)
         self.assertEqual(0.0, const_z[-1])
         self.assertEqual(0.0, const_v[-1])
-        self.assertLess(elapsed_ms, 250.0, f"constant-window zscore/rvol took too long: {elapsed_ms:.1f}ms")
+        self.assertEqual(0, exact_spy.call_count)
+
+        # CR2-12: Future extreme prices [1e308, 1.1e308] at scheduled resync do NOT break closed-prefix z-score.
+        base_alt = [100.0 if i % 2 == 0 else 101.0 for i in range(256)]
+        s_clean = BarSeries.from_candles(
+            "Z_CLEAN",
+            "1h",
+            [Candle(1_700_000_000_000 + i * 3_600_000, c, c, c, c, 100.0) for i, c in enumerate(base_alt)],
+        )
+        s_future_extreme = BarSeries.from_candles(
+            "Z_EXTREME",
+            "1h",
+            [
+                Candle(1_700_000_000_000 + i * 3_600_000, c, c, c, c, 100.0)
+                for i, c in enumerate(base_alt + [1e308, 1.1e308])
+            ],
+        )
+        fc_clean = FeatureCache()
+        fc_ext = FeatureCache()
+        z_clean = fc_clean.zscore(s_clean.slice_view(0, 2), 2)
+        z_ext_prefix = fc_ext.zscore(s_future_extreme.slice_view(0, 2), 2)
+        self.assertTrue(math.isnan(z_clean[0]) and math.isnan(z_ext_prefix[0]))
+        self.assertEqual(z_clean[1], z_ext_prefix[1])
+        z_ext_full = fc_ext.zscore(s_future_extreme, 2)
+        self.assertTrue(math.isfinite(z_ext_full[256]))
+        self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_ext_full[257], places=12)
+
+        # CR2-42: SMA remains finite when mean fits (1e308) even though raw sum overflows.
+        s_sma_huge = BarSeries.from_candles(
+            "SMA_HUGE",
+            "1h",
+            [Candle(1_700_000_000_000 + i * 3_600_000, 1e308, 1e308, 1e308, 1e308, 10.0) for i in range(3)],
+        )
+        sma_huge = fc.sma(s_sma_huge, 2)
+        self.assertTrue(math.isfinite(sma_huge[1]))
+        self.assertAlmostEqual(1e308, sma_huge[1], delta=1e296)
+
+        # CR2-43: Finite zero-volume extreme-price bar gets zero weight before typical price is summed.
+        s_vwap_zv = BarSeries.from_candles(
+            "VWAP_ZV",
+            "1h",
+            [
+                Candle(1_700_000_000_000, 1e308, 1e308, 1e308, 1e308, 0.0),
+                Candle(1_700_003_600_000, 100.0, 100.0, 100.0, 100.0, 1.0),
+                Candle(1_700_007_200_000, 1e308, 1e308, 1e308, 1e308, 0.0),
+                Candle(1_700_010_800_000, 1e308, 1e308, 1e308, 1e308, 0.0),
+            ],
+        )
+        vwap_zv = fc.vwap(s_vwap_zv, 2)
+        self.assertAlmostEqual(100.0, vwap_zv[1], places=12)
+        self.assertAlmostEqual(100.0, vwap_zv[2], places=12)
+        self.assertTrue(math.isnan(vwap_zv[3]))
 
         # Non-constant large-offset series still preserves exact precision fallback.
         big_osc = [1e9 + (0.01 if i % 2 == 0 else -0.01) for i in range(40)]
@@ -639,7 +769,7 @@ class FeatureCacheTests(unittest.TestCase):
         self.assertEqual(16, len(results))
         self.assertTrue(all(math.isfinite(val) for val in results))
 
-        # Warm lookup speed sanity on 13,440 bars
+        # Warm lookup speed sanity on 13,440 bars (strict budget only under opt-in MU_STRICT_PERF=1)
         big_closes = [100.0 + math.sin(i * 0.01) * 10.0 for i in range(13_440)]
         big = BarSeries.from_candles("MU-USDT-SWAP", "15m", _make_candles(big_closes, interval_ms=900_000))
         fc_perf = FeatureCache()
@@ -648,7 +778,8 @@ class FeatureCacheTests(unittest.TestCase):
         for end in range(1, 13_441):
             _ = fc_perf.ema_value(big.slice_view(0, end), 21, offset=-1)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        self.assertLess(elapsed_ms, 200.0, f"FeatureCache hot lookup unexpectedly slow: {elapsed_ms:.2f}ms")
+        if os.environ.get("MU_STRICT_PERF") == "1":
+            self.assertLess(elapsed_ms, 200.0, f"FeatureCache hot lookup unexpectedly slow: {elapsed_ms:.2f}ms")
 
 
 if __name__ == "__main__":

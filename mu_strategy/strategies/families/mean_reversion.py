@@ -386,28 +386,33 @@ class MeanReversionStrategy:
                 self._fast_pf = None
                 self._fast_acct = None
                 self._fast_sym = None
+                zscore_arr = features._zscore_array(base, self._zscore_period)
+                rsi_arr = features._rsi_array(base, self._rsi_period)
+                vol_arr = (
+                    features._realized_vol_array(base, self._vol_period, None)
+                    if self._max_ann_vol is not None
+                    else None
+                )
+                ema_arr = (
+                    features._ema_array(base, self._trend_ema_period)
+                    if self._trend_ema_period is not None
+                    else None
+                )
+                atr_arr = (
+                    features._atr_array(base, self._atr_period)
+                    if self._stop_atr_mult is not None
+                    else None
+                )
                 self._cached_base = base
                 self._cached_features = features
                 self._cached_gen = feat_gen
                 self._cached_closes = base.closes
                 self._cached_close_times = base.close_times
-                self._cached_zscore = features._zscore_array(base, self._zscore_period)
-                self._cached_rsi = features._rsi_array(base, self._rsi_period)
-                self._cached_vol = (
-                    features._realized_vol_array(base, self._vol_period, None)
-                    if self._max_ann_vol is not None
-                    else None
-                )
-                self._cached_ema = (
-                    features._ema_array(base, self._trend_ema_period)
-                    if self._trend_ema_period is not None
-                    else None
-                )
-                self._cached_atr = (
-                    features._atr_array(base, self._atr_period)
-                    if self._stop_atr_mult is not None
-                    else None
-                )
+                self._cached_zscore = zscore_arr
+                self._cached_rsi = rsi_arr
+                self._cached_vol = vol_arr
+                self._cached_ema = ema_arr
+                self._cached_atr = atr_arr
 
             if start == 0:
                 acct = getattr(market, "_acct", None)

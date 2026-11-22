@@ -50,16 +50,40 @@ class FundingSeriesTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             series.instrument_id = "other"  # type: ignore[misc]
 
-        # CR1-15: public columns are read-only views supporting indexing & bisection
-        self.assertIsInstance(series.timestamps_ms, memoryview)
-        self.assertIsInstance(series.rates, memoryview)
-        self.assertTrue(series.timestamps_ms.readonly)
-        self.assertTrue(series.rates.readonly)
+        # CR1-15 + CR2-03 + CR2-05: public columns are independent read-only views backed by immutable bytes
+        ts_view = series.timestamps_ms
+        rate_view = series.rates
+        self.assertIsInstance(ts_view, memoryview)
+        self.assertIsInstance(rate_view, memoryview)
+        self.assertTrue(ts_view.readonly)
+        self.assertTrue(rate_view.readonly)
+        self.assertIsInstance(ts_view.obj, bytes)
+        self.assertIsInstance(rate_view.obj, bytes)
+        self.assertEqual(2, bisect_right(ts_view, 2000))
+        with self.assertRaises(TypeError):
+            ts_view[0] = 9999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            rate_view[0] = -1.0  # type: ignore[index]
+        # Releasing caller's view handles must NOT invalidate series or later callers
+        with ts_view:
+            self.assertEqual(1000, ts_view[0])
+        with rate_view:
+            self.assertAlmostEqual(0.0001, rate_view[0])
+        with self.assertRaises(ValueError):
+            _ = ts_view[0]
+        self.assertEqual(1000, series.timestamps_ms[0])
+        self.assertAlmostEqual(0.0001, series.rates[0])
         self.assertEqual(2, bisect_right(series.timestamps_ms, 2000))
-        with self.assertRaises(TypeError):
-            series.timestamps_ms[0] = 9999  # type: ignore[index]
-        with self.assertRaises(TypeError):
-            series.rates[0] = -1.0  # type: ignore[index]
+
+        # CR2-41: strided memoryview slices remain valid constructor inputs
+        strided_series = FundingSeries(
+            "okx:MU-USDT-SWAP",
+            series.timestamps_ms[::2],
+            series.rates[::2],
+            settlement_interval_hours=16,
+        )
+        self.assertEqual([1000, 3000], list(strided_series.timestamps_ms))
+        self.assertEqual([0.0001, 0.0], list(strided_series.rates))
 
         # Half-open (start_ms, end_ms] semantics: start excluded, end included
         self.assertEqual(
@@ -110,6 +134,19 @@ class FundingSeriesTests(unittest.TestCase):
             self.assertEqual(series.instrument_id, loaded.instrument_id)
             self.assertEqual(series.settlement_interval_hours, loaded.settlement_interval_hours)
             self.assertEqual(list(series), list(loaded))
+            # CR2-01: canonical archive rejects mismatched venue/symbol, allows exact or symbol-only
+            self.assertEqual(
+                "okx:MU-USDT-SWAP",
+                FundingSeries.from_json_file(canonical, instrument_id="okx:MU-USDT-SWAP").instrument_id,
+            )
+            self.assertEqual(
+                "MU-USDT-SWAP",
+                FundingSeries.from_json_file(canonical, instrument_id="MU-USDT-SWAP").instrument_id,
+            )
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(canonical, instrument_id="binance:MU-USDT-SWAP")
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(canonical, instrument_id="okx:BTC-USDT-SWAP")
 
             # Raw OKX archive compatibility (CR1-11: realizedRate required by default; legacy opt-in explicit)
             okx_archive = root / "okx_raw.json"
@@ -150,9 +187,21 @@ class FundingSeriesTests(unittest.TestCase):
             self.assertEqual(2, len(binance_loaded))
             self.assertAlmostEqual(-0.00005, binance_loaded[1].rate)
 
-            # Explicit mismatched instrument_id must fail closed
+            # Explicit mismatched symbol OR venue (CR2-01) must fail closed; symbol-only allowed
             with self.assertRaises(ValueError):
                 FundingSeries.from_json_file(binance_archive, instrument_id="binance:ETHUSDT")
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(binance_archive, instrument_id="okx:BTCUSDT")
+            self.assertEqual(
+                "BTCUSDT",
+                FundingSeries.from_json_file(binance_archive, instrument_id="BTCUSDT").instrument_id,
+            )
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(
+                    okx_archive,
+                    instrument_id="binance:MU-USDT-SWAP",
+                    allow_legacy_okx_funding_rate=True,
+                )
 
             # Mixed-instrument Binance archive must fail closed even with explicit instrument_id
             mixed_binance = root / "binance_mixed.json"
@@ -218,6 +267,24 @@ class FundingSeriesTests(unittest.TestCase):
         )
         self.assertTrue(res_hist.is_historical)
         self.assertEqual([("historical", hist_complete)], list(res_hist.scenarios))
+
+        # CR2-02: reject mismatched requested instrument_id before accepting historical funding,
+        # while omitting instrument_id resolves by the series' own identity
+        res_hist_own = require_or_sensitivity_series(
+            hist_complete,
+            start_ms=start_ms,
+            end_ms=2 * EIGHT_HOURS_MS,
+            interval_hours=8,
+        )
+        self.assertTrue(res_hist_own.is_historical)
+        with self.assertRaises(ValueError):
+            require_or_sensitivity_series(
+                hist_complete,
+                instrument_id="binance:MU-USDT-SWAP",
+                start_ms=start_ms,
+                end_ms=2 * EIGHT_HOURS_MS,
+                interval_hours=8,
+            )
 
         # CR1-10: partial historical series MUST fail closed rather than be labeled historical
         with self.assertRaises(MissingFundingHistoryError):
@@ -408,6 +475,46 @@ class FundingSeriesTests(unittest.TestCase):
             mixed_phase.fill_gaps_with_apr(start_ms=t0, end_ms=t0 + 24 * HOUR_MS, interval_hours=8, apr=0.15)
         with self.assertRaises(ValueError):
             empty.fill_gaps_with_apr(start_ms=t0, end_ms=t0 + 24 * HOUR_MS, interval_hours=8, apr=0.15)
+
+        # CR2-04: explicit phase_ms applies to gap detection as well as gap filling (even on empty series)
+        self.assertEqual(
+            ((t0, t0 + 2 * HOUR_MS),),
+            empty.coverage_gaps(t0, t0 + 2 * HOUR_MS, 8, phase_ms=1 * HOUR_MS),
+        )
+        filled_empty_phase = empty.fill_gaps_with_apr(
+            start_ms=t0,
+            end_ms=t0 + 2 * HOUR_MS,
+            interval_hours=8,
+            apr=0.15,
+            phase_ms=1 * HOUR_MS,
+        )
+        self.assertEqual([t0 + 1 * HOUR_MS], list(filled_empty_phase.timestamps_ms))
+
+        # CR2-06: out-of-window event (hour 25) must NOT hide missing hour 24 in (0h, 24h]
+        with_out_of_window = FundingSeries.from_events(
+            "okx:MU-USDT-SWAP",
+            [
+                FundingRateEvent(t0 + EIGHT_HOURS_MS, 0.0001),
+                FundingRateEvent(t0 + 2 * EIGHT_HOURS_MS, 0.0001),
+                FundingRateEvent(t0 + 25 * HOUR_MS, 0.0001),
+            ],
+            settlement_interval_hours=8,
+        )
+        self.assertEqual(
+            ((t0 + 2 * EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS),),
+            with_out_of_window.coverage_gaps(t0, t0 + 3 * EIGHT_HOURS_MS, 8, tolerance=1.5),
+        )
+        # Ambiguous in-window phases must NOT falsely report complete coverage over edges >= 1 interval
+        ambiguous_in_window = FundingSeries.from_events(
+            "okx:MU-USDT-SWAP",
+            [
+                FundingRateEvent(t0 + 8 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 13 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 16 * HOUR_MS, 0.0001),
+            ],
+            settlement_interval_hours=8,
+        )
+        self.assertNotEqual((), ambiguous_in_window.coverage_gaps(t0, t0 + 24 * HOUR_MS, 8, tolerance=1.5))
 
         # Validation failures
         with self.assertRaises(ValueError):

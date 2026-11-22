@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from decimal import Decimal
+from decimal import Decimal, Overflow, localcontext
 import math
 import unittest
 
@@ -119,6 +119,16 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(Decimal("0.02"), spec.round_price(Decimal("0.015"), rounding="nearest"))
         self.assertEqual(Decimal("0.02"), spec.round_price(Decimal("0.025"), rounding="nearest"))
         self.assertEqual(Decimal("0.04"), spec.round_price(Decimal("0.035"), rounding="nearest"))
+
+        # CR2-40: exact lot reconstruction is independent of caller Decimal context Emax/traps
+        spec_int_lot = okx_swap_spec("MU-USDT-SWAP", lot_size=Decimal("1"), min_size=Decimal("1"))
+        with localcontext() as ctx:
+            ctx.Emax = 2
+            ctx.traps[Overflow] = True
+            self.assertEqual(Decimal("1000"), spec_int_lot.round_size("1000", rounding="down"))
+            res_exp = spec.round_size("1.00", rounding="down")
+            self.assertEqual(Decimal("1.00"), res_exp)
+            self.assertEqual("1.00", format(res_exp, "f"))
 
         # CR1-75: to_dict preserves >28 significant digits and trailing zeros without context rounding
         high_prec = Decimal("1." + ("0" * 28) + "1")

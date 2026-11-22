@@ -34,6 +34,7 @@ __all__ = [
     "SUPPORTED_QTY_MODES",
     "SUPPORTED_TIME_IN_FORCE",
     "SUPPORTED_SIDE_MODES",
+    "PriceExclusionBand",
     "SessionGate",
     "PositionView",
     "OrderIntent",
@@ -168,6 +169,45 @@ class PositionView:
         return "flat"
 
 
+def _parse_hhmm_minute(value: Any) -> int:
+    if not isinstance(value, str) or len(value) != 5 or value[2] != ":":
+        raise ValueError(f"invalid trading window endpoint {value!r}; expected HH:MM")
+    hh = value[:2]
+    mm = value[3:]
+    if not (hh.isdigit() and mm.isdigit()):
+        raise ValueError(f"invalid trading window endpoint {value!r}; expected HH:MM")
+    hour = int(hh)
+    minute = int(mm)
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        raise ValueError(f"trading window endpoint out of range: {value!r}")
+    return hour * 60 + minute
+
+
+@dataclass(frozen=True, slots=True)
+class PriceExclusionBand:
+    """Fill-time price exclusion band around ``center`` within ``tolerance_pct``.
+
+    Excludes candidate fill price ``price`` when
+    ``abs(price - center) <= price * tolerance_pct``.
+    """
+
+    center: float
+    tolerance_pct: float
+
+    def __post_init__(self) -> None:
+        center = _normalize_positive_float(self.center, "center")
+        if _needs_float_set(self.center, center):
+            object.__setattr__(self, "center", center)
+        tol = _normalize_non_negative_float(self.tolerance_pct, "tolerance_pct")
+        if tol >= 1.0:
+            raise ValueError("tolerance_pct must be in [0, 1)")
+        if _needs_float_set(self.tolerance_pct, tol):
+            object.__setattr__(self, "tolerance_pct", tol)
+
+    def excludes(self, price: float) -> bool:
+        return abs(price - self.center) <= price * self.tolerance_pct
+
+
 @dataclass(frozen=True, slots=True)
 class SessionGate:
     """Fill-time session eligibility gate evaluated against actual bar open timestamps."""
@@ -178,10 +218,24 @@ class SessionGate:
 
     def __post_init__(self) -> None:
         _validate_non_empty_str(self.trading_calendar_id, "trading_calendar_id")
-        windows = tuple((str(start), str(end)) for start, end in self.trading_windows_et)
-        if not windows:
+        if isinstance(self.trading_windows_et, (str, bytes)):
+            raise ValueError("trading_windows_et must be a sequence of (HH:MM, HH:MM) pairs")
+        parsed_windows: list[tuple[str, str]] = []
+        try:
+            for window in self.trading_windows_et:
+                if isinstance(window, (str, bytes)):
+                    raise ValueError("each trading window must be a pair of HH:MM strings")
+                start, end = window
+                start_min = _parse_hhmm_minute(start)
+                end_min = _parse_hhmm_minute(end)
+                if start_min > end_min:
+                    raise ValueError(f"trading window must not cross ET date boundary: {(start, end)!r}")
+                parsed_windows.append((start, end))
+        except TypeError as exc:
+            raise ValueError("trading_windows_et must be a sequence of (HH:MM, HH:MM) pairs") from exc
+        if not parsed_windows:
             raise ValueError("trading_windows_et must be non-empty")
-        object.__setattr__(self, "trading_windows_et", windows)
+        object.__setattr__(self, "trading_windows_et", tuple(parsed_windows))
         digest = calendar_sha256(self.trading_calendar_id)
         if not self.trading_calendar_sha256:
             object.__setattr__(self, "trading_calendar_sha256", digest)
@@ -209,6 +263,7 @@ class OrderIntent:
     tag: str = ""
     time_in_force: TimeInForce = "gtc"
     session_gate: SessionGate | None = None
+    excluded_price_bands: tuple[PriceExclusionBand, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_non_empty_str(self.intent_id, "intent_id")
@@ -260,6 +315,17 @@ class OrderIntent:
                 raise ValueError("session_gate must be a SessionGate or None")
             if self.reduce_only:
                 raise ValueError("session_gate is not allowed on reduce_only protective exits")
+
+        if self.excluded_price_bands:
+            if type(self.excluded_price_bands) is not tuple:
+                object.__setattr__(self, "excluded_price_bands", tuple(self.excluded_price_bands))
+            for band in self.excluded_price_bands:
+                if not isinstance(band, PriceExclusionBand):
+                    raise ValueError("excluded_price_bands entries must be PriceExclusionBand instances")
+            if self.reduce_only:
+                raise ValueError("excluded_price_bands is not allowed on reduce_only protective exits")
+        elif type(self.excluded_price_bands) is not tuple:
+            object.__setattr__(self, "excluded_price_bands", ())
 
         if self.expires_after_bars is not None:
             if (
@@ -341,6 +407,7 @@ class BarContext:
     market: MarketView
     portfolio: PortfolioView
     instrument: InstrumentSpec
+    require_touch_through: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.now_ms, bool) or not isinstance(self.now_ms, int) or self.now_ms < 0:
@@ -348,6 +415,8 @@ class BarContext:
         _validate_non_empty_str(self.symbol, "symbol")
         if not isinstance(self.portfolio, PortfolioView):
             raise ValueError("portfolio must be a PortfolioView")
+        if not isinstance(self.require_touch_through, bool):
+            raise ValueError("require_touch_through must be a bool")
         market_now = getattr(self.market, "now_ms", None)
         if market_now is not None:
             if isinstance(market_now, bool) or not isinstance(market_now, int):
@@ -414,9 +483,29 @@ class TargetPosition:
             raise ValueError("reason must be a string")
 
 
+def _freeze_diagnostic_value(value: Any) -> Any:
+    """Recursively freeze standard mutable containers in ``StrategyOutput.diagnostics``."""
+    if isinstance(value, Mapping):
+        return _MappingProxyType({k: _freeze_diagnostic_value(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_diagnostic_value(v) for v in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_diagnostic_value(v) for v in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_diagnostic_value(v) for v in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class StrategyOutput:
-    """Combined order intents, target weights, and diagnostics from ``on_bar``."""
+    """Combined order intents, target weights, and diagnostics from ``on_bar``.
+
+    ``diagnostics`` copies caller-owned mappings and recursively freezes standard
+    nested containers (``Mapping``, ``list``, ``tuple``, ``set``, ``bytearray``)
+    so later caller mutations to those containers cannot alter earlier outputs.
+    """
 
     intents: tuple[OrderIntent, ...] = ()
     targets: tuple[TargetPosition, ...] = ()
@@ -431,9 +520,11 @@ class StrategyOutput:
         if diag is not EMPTY_MAPPING:
             if not isinstance(diag, Mapping):
                 raise ValueError("diagnostics must be a mapping")
-            # Copy caller-owned mappings (including MappingProxyType) so later external mutations
-            # cannot alter an earlier StrategyOutput.
-            object.__setattr__(self, "diagnostics", _MappingProxyType(dict(diag)))
+            object.__setattr__(
+                self,
+                "diagnostics",
+                _MappingProxyType({k: _freeze_diagnostic_value(v) for k, v in diag.items()}),
+            )
 
     @classmethod
     def empty(cls, diagnostics: Mapping[str, Any] | None = None) -> StrategyOutput:
@@ -597,7 +688,7 @@ class ParamSpec:
                 steps_exact = span / d_step
                 if not steps_exact.is_finite() or steps_exact < 0:
                     raise ValueError(f"parameter {self.name!r} float grid is unrepresentable")
-                if steps_exact > Decimal(MAX_PARAM_GRID_SIZE - 1):
+                if steps_exact >= Decimal(MAX_PARAM_GRID_SIZE):
                     raise ValueError(
                         f"parameter {self.name!r} float grid exceeds limit {MAX_PARAM_GRID_SIZE}"
                     )
@@ -681,9 +772,6 @@ class ParamSpace:
 
     def iter_valid_grid(self) -> Iterator[dict[str, Any]]:
         """Yield parameter dicts from the Cartesian grid satisfying all constraints."""
-        if not self.specs:
-            yield {}
-            return
         names = tuple(spec.name for spec in self.specs)
         grids = tuple(spec.grid_values() for spec in self.specs)
         for combo in itertools.product(*grids):
@@ -733,12 +821,21 @@ class Strategy(Protocol):
     """Single-source protocol driving backtest, walk-forward, shadow, and live.
 
     Callback lifetime contract:
-      - By default, engines pass point-in-time immutable ``BarContext``, ``PortfolioView``,
-        and ``BarSeriesSlice`` snapshots that remain valid even if retained.
-      - Strategies that set class attribute ``supports_ephemeral_context = True`` explicitly
+      - Standard strategies (without ``supports_ephemeral_context = True``) always receive
+        point-in-time immutable ``BarContext``, ``PortfolioView``, and ``BarSeriesSlice``
+        snapshots that remain valid even if retained across bars.
+      - Strategies that explicitly set class attribute ``supports_ephemeral_context = True``
         opt in to callback-scoped live context / ``FastCursor`` reuse and MUST NOT retain
         ``ctx``, ``ctx.market``, or ``ctx.portfolio`` across ``on_bar`` invocations.
         Returned ``BarSeriesSlice`` objects from ``closed_bars()`` always retain fixed bounds.
+      - Engine ``reuse_bar_context`` contract:
+        * ``reuse_bar_context=None`` (default): pass stable immutable snapshots to standard
+          strategies; use callback-scoped live context only when ``supports_ephemeral_context``
+          is ``True``.
+        * ``reuse_bar_context=False``: always pass stable immutable snapshots.
+        * ``reuse_bar_context=True``: requires ``strategy.supports_ephemeral_context = True``
+          and raises ``ValueError`` for unmarked strategies so the default snapshot guarantee
+          is never silently broken.
     """
 
     strategy_id: str
