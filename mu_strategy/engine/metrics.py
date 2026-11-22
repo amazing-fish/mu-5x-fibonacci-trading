@@ -1021,6 +1021,16 @@ def compute_buy_and_hold_benchmark(
     settled_until_ms = entry_open_ms
     liq_history: list[tuple[int, float | None]] = []
     recent_flushed: list[tuple[int, int, float, float]] = []
+    # CR9-03: Enqueue warmup bars that close strictly after entry_open_ms so their OHLC
+    # enters recent_flushed as wick evidence once closed (never scored, no pre-entry funding).
+    warmup_pending: list[tuple[int, int, float, float]] = []
+    for w_idx in range(start_idx):
+        w_close_ms = int(close_times[w_idx])
+        if w_close_ms > entry_open_ms:
+            heappush(
+                warmup_pending,
+                (w_close_ms, int(open_times[w_idx]), float(lows[w_idx]), float(highs[w_idx])),
+            )
 
     def _compute_bench_liq_price(curr_cash: float) -> float | None:
         if asset_class in ("spot", "equity") and side == "long":
@@ -1092,40 +1102,31 @@ def compute_buy_and_hold_benchmark(
                     liq_history.append((ev_ts, liq_price))
             settled_until_ms = end_ms
 
-    def _effective_intrabar_liq(
+    def _covered_until_for_bar(
         p_open_ms: int,
         p_open: float,
         p_low: float,
         p_high: float,
         open_liq_price: float | None,
-        live_liq: float,
-    ) -> float | None:
-        """Compute the causal intrabar liquidation threshold for bar ``p_idx`` (CR8-02 / CR8-03 / CR4-07).
-
-        Explicit overlap policy:
-          - Compute the maximal prefix ``[p_open_ms, covered_until]`` covered by already-flushed
-            overlapping bars whose OHLC strictly excludes this bar's extreme wick (``f_low > p_low``
-            for longs; ``f_high < p_high`` for shorts). Because the bar's own open occurred at
-            ``p_open_ms``, a bar whose open already equals/breaches ``p_low``/``p_high`` (or
-            ``live_liq``) keeps ``covered_until = p_open_ms`` (preventing retroactive liquidation
-            of pre-debit opens such as CR4-07).
-          - The wick is guaranteed to have occurred in ``(covered_until, p_close_ms]``.
-          - Take the most lenient (non-retroactive) threshold active at or after ``covered_until``
-            (``min`` for longs, ``max`` for shorts). Thus:
-              * If overlapping bars prove the wick occurred strictly after a funding debit
-                (``covered_until >= debit_ts``), the post-debit threshold applies!
-              * If OHLC order vs a later debit is genuinely ambiguous (``covered_until < debit_ts``),
-                the pre-debit threshold is preserved (never retroactively liquidating an earlier wick).
-        """
+    ) -> int:
+        """Compute maximal prefix ``[p_open_ms, covered_until]`` where flushed overlap bars exclude a breach."""
         covered_until = p_open_ms
-        open_breached = (p_open <= live_liq) if side == "long" else (p_open >= live_liq)
         open_at_extreme = (p_open <= p_low) if side == "long" else (p_open >= p_high)
-        if recent_flushed and not open_breached and not open_at_extreme:
-            covering = [
-                (o_ms, c_ms)
-                for o_ms, c_ms, f_low, f_high in recent_flushed
-                if c_ms > p_open_ms and ((f_low > p_low) if side == "long" else (f_high < p_high))
-            ]
+        if recent_flushed and not open_at_extreme:
+            if side == "long":
+                min_clear = p_low if open_liq_price is None else (p_low if p_low >= open_liq_price else open_liq_price)
+                covering = [
+                    (o_ms, c_ms)
+                    for o_ms, c_ms, f_low, _ in recent_flushed
+                    if c_ms > p_open_ms and f_low > min_clear
+                ]
+            else:
+                max_clear = p_high if open_liq_price is None else (p_high if p_high <= open_liq_price else open_liq_price)
+                covering = [
+                    (o_ms, c_ms)
+                    for o_ms, c_ms, _, f_high in recent_flushed
+                    if c_ms > p_open_ms and f_high < max_clear
+                ]
             if covering:
                 covering.sort()
                 for o_ms, c_ms in covering:
@@ -1133,7 +1134,15 @@ def compute_buy_and_hold_benchmark(
                         break
                     if c_ms > covered_until:
                         covered_until = c_ms
+        return covered_until
 
+    def _effective_intrabar_liq(
+        p_open_ms: int,
+        covered_until: int,
+        open_liq_price: float | None,
+        live_liq: float,
+    ) -> float | None:
+        """Compute the causal intrabar liquidation threshold for bar ``p_idx`` (CR8-02 / CR8-03 / CR9-01 / CR9-03 / CR4-07)."""
         # Advance open_liq_price through every funding event settled at or before covered_until.
         liq_at_covered = open_liq_price
         after_vals: list[float | None] = []
@@ -1265,6 +1274,7 @@ def compute_buy_and_hold_benchmark(
 
     def _flush_pending_close(p_close_ms: int, p_idx: int, open_liq_price: float | None) -> None:
         nonlocal cash, total_traded_notional, bars_in_market, is_open, liq_price, liquidations
+        p_open_ms = int(open_times[p_idx])
         p_open = float(opens[p_idx])
         p_high = float(highs[p_idx])
         p_low = float(lows[p_idx])
@@ -1272,39 +1282,61 @@ def compute_buy_and_hold_benchmark(
         p_vol = float(volumes[p_idx])
         p_atr = float(atr_arr[p_idx]) if atr_arr is not None else None
 
+        # CR9-03: Transfer overlapping warmup bars that have closed by p_close_ms into recent_flushed.
+        while warmup_pending and warmup_pending[0][0] <= p_close_ms:
+            w_close_ms, w_open_ms, w_low, w_high = heappop(warmup_pending)
+            recent_flushed.append((w_open_ms, w_close_ms, w_low, w_high))
+
+        # CR9-02: Prune flushed overlap records and liq_history strictly at/before the earliest
+        # active pending open so rolling overlapping runs stay O(overlap_degree) instead of O(N^2).
+        if recent_flushed or liq_history:
+            earliest_open = p_open_ms
+            for _, rem_idx, _ in pending_closes:
+                rem_o = int(open_times[rem_idx])
+                if rem_o < earliest_open:
+                    earliest_open = rem_o
+            if recent_flushed:
+                recent_flushed[:] = [rec for rec in recent_flushed if rec[1] > earliest_open]
+            if liq_history:
+                liq_history[:] = [ev for ev in liq_history if ev[0] > earliest_open]
+
         # 1. Non-gap intrabar OHLC MMR liquidation check deferred to bar close so a later overlapping
         #    bar's intrabar wick cannot preempt an earlier bar's close or funding (CR7-03), using the
-        #    explicit causal overlap policy (CR8-02 / CR8-03 / CR4-07):
-        #    - When funding worsened liq_price after bar open, use live liq_price iff already-flushed
-        #      overlapping bars prove the wick occurred strictly after the debit; otherwise preserve
-        #      the non-retroactive open_liq_price threshold.
-        #    - Always pass eff_intrabar_liq consistently as both liq_threshold and gapped_open bound.
-        if is_open and liq_price is not None:
-            eff_intrabar_liq = _effective_intrabar_liq(
-                int(open_times[p_idx]),
-                p_open,
-                p_low,
-                p_high,
-                open_liq_price,
-                liq_price,
-            )
-            if eff_intrabar_liq is not None:
-                intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
-                if intrabar_hit:
-                    _liquidate_bench(
-                        exit_bar_idx=p_idx,
-                        exit_time_ms=p_close_ms,
-                        liq_threshold=eff_intrabar_liq,
-                        gapped_open=((p_open <= eff_intrabar_liq) if side == "long" else (p_open >= eff_intrabar_liq)),
-                        use_prior_open_slip=False,
-                        include_exit_bar=False,
-                        b_open=p_open,
-                        b_high=p_high,
-                        b_low=p_low,
-                        b_close=p_close,
-                        b_vol=p_vol,
-                        b_atr=p_atr,
-                    )
+        #    explicit causal overlap policy (CR8-02 / CR8-03 / CR9-01 / CR9-03 / CR4-07). Because p_open
+        #    already passed its own open-gap check at p_open_ms, any wick breach here is a non-gap fill.
+        if is_open:
+            covered_until = _covered_until_for_bar(p_open_ms, p_open, p_low, p_high, open_liq_price)
+            if covered_until > settled_until_ms:
+                _settle_funding_up_to(covered_until)
+            if liq_price is not None:
+                eff_intrabar_liq = _effective_intrabar_liq(
+                    p_open_ms,
+                    covered_until,
+                    open_liq_price,
+                    liq_price,
+                )
+                if eff_intrabar_liq is not None:
+                    intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
+                    if intrabar_hit:
+                        non_gap_open = (
+                            (p_open if p_open >= eff_intrabar_liq else eff_intrabar_liq)
+                            if side == "long"
+                            else (p_open if p_open <= eff_intrabar_liq else eff_intrabar_liq)
+                        )
+                        _liquidate_bench(
+                            exit_bar_idx=p_idx,
+                            exit_time_ms=p_close_ms,
+                            liq_threshold=eff_intrabar_liq,
+                            gapped_open=False,
+                            use_prior_open_slip=False,
+                            include_exit_bar=False,
+                            b_open=non_gap_open,
+                            b_high=p_high,
+                            b_low=p_low,
+                            b_close=p_close,
+                            b_vol=p_vol,
+                            b_atr=p_atr,
+                        )
 
         # 2. Settle all funding up to this bar's close timestamp strictly causally (CR6-01 / CR6-02).
         _settle_funding_up_to(p_close_ms)

@@ -1607,6 +1607,101 @@ class RiskOverlayTests(unittest.TestCase):
         res_mrest_5x = ov_s.filter(ctx_mrest_5x, StrategyOutput(targets=(TargetPosition(sym, -0.5),)))
         self.assertAlmostEqual(-(12.0 / 23.0) / 0.8, res_mrest_5x.targets[0].target_weight, places=9)
 
+    def test_exposure_cap_sequential_resting_ef_lower_basis_and_gross_recheck_cr9_04_to_cr9_06(self) -> None:
+        sym = "MU-USDT-SWAP"
+        sym_b = "ETH-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_eth = _make_bar_series([100.0] * 5, symbol=sym_b, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu, (sym_b, "1h"): bars_eth}, now_ms=t0)
+        inst_5x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov_s = ExposureCapOverlay(1.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+
+        # CR9-04: 80 long @ 75, settled=8_000, mark=100, two resting sell limits (0.5 and 1.5 of settled equity).
+        # With a new 10-contract market sell, sequential profit realization between 0.5 and 1.5 would reach -110.47;
+        # overlay MUST clamp the market sell to exact 320/99 (~3.2323) regardless of resting order list order!
+        pos_80_p = {sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+        lim_05 = OrderIntent("rl05", sym, "sell", "limit", "equity_fraction", 0.5, limit_price=100.0)
+        lim_15 = OrderIntent("rl15", sym, "sell", "limit", "equity_fraction", 1.5, limit_price=100.0)
+        mkt_s10 = OrderIntent("ms10", sym, "sell", "market", "contracts", 10.0)
+        for rest_pair in ((lim_05, lim_15), (lim_15, lim_05)):
+            pf_pair = PortfolioView(10_000.0, 8_000.0, pos_80_p, rest_pair, 10_000.0, 10_000.0)
+            ctx_pair = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_pair, instrument=inst_5x)
+            res_pair = ov_s.filter(ctx_pair, StrategyOutput(intents=(mkt_s10,)))
+            self.assertEqual(1, len(res_pair.intents))
+            self.assertAlmostEqual(320.0 / 99.0, res_pair.intents[0].qty_value, places=6)
+            # Without the market sell, the two resting limits leave -95 contracts and a no-op hold target (+1.0 -> 80) fits!
+            res_hold = ov_s.filter(ctx_pair, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+            self.assertAlmostEqual(1.0, res_hold.targets[0].target_weight, places=9)
+
+        # Multi-symbol CR9-04: A long 80 @ 75 has resting A sell ef=0.8 (realizes +1,600 -> settled 9,600),
+        # while flat B has resting B buys ef=0.4 and 0.5 -> A sell filling first boosts BOTH B buys to 0.9 * 0.96 = 0.864,
+        # so a 20-contract B buy under 1.0x single cap MUST clamp to exact 13.6 contracts!
+        ov_multi = ExposureCapOverlay(2.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        rest_a08 = OrderIntent("ra08", sym, "sell", "limit", "equity_fraction", 0.8, limit_price=100.0)
+        rest_b04 = OrderIntent("rb04", sym_b, "buy", "limit", "equity_fraction", 0.4, limit_price=100.0)
+        rest_b05 = OrderIntent("rb05", sym_b, "buy", "limit", "equity_fraction", 0.5, limit_price=100.0)
+        pf_multi = PortfolioView(10_000.0, 8_000.0, pos_80_p, (rest_b04, rest_a08, rest_b05), 10_000.0, 10_000.0)
+        ctx_multi = BarContext(now_ms=t0, symbol=sym_b, market=mv, portfolio=pf_multi, instrument=inst_5x)
+        res_multi = ov_multi.filter(ctx_multi, StrategyOutput(intents=(OrderIntent("mb20", sym_b, "buy", "market", "contracts", 20.0),)))
+        self.assertAlmostEqual(13.6, res_multi.intents[0].qty_value, places=6)
+
+        # CR9-05: 80 long @ 125 (mark=100, settled=12_000, marked=10_000), resting 128-contract sell limit @ 100.
+        # Submit 40-contract market reduction (-1_000 realized loss -> settled=11_000) + TargetPosition(+0.25):
+        # lower sizing basis leaves 27.5 contracts -> 27.5 - 128 = -100.5 (> 1x cap!).
+        # Overlay MUST pull target up to 0.28 / 1.1 so BOTH lower (28 - 128 = -100) AND upper (30.55) stay <= 1x!
+        pos_80_l = {sym: PositionView(sym, qty=80.0, avg_entry_price=125.0, unrealized_pnl=-2_000.0, notional=8_000.0, leverage=0.8)}
+        rest_s128 = OrderIntent("rs128", sym, "sell", "limit", "contracts", 128.0, limit_price=100.0)
+        ro_m40 = OrderIntent("rom40", sym, "sell", "market", "contracts", 40.0, reduce_only=True)
+        pf_905 = PortfolioView(10_000.0, 12_000.0, pos_80_l, (rest_s128,), 12_000.0, 12_000.0)
+        ctx_905 = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_905, instrument=inst_5x)
+        res_905 = ov_s.filter(ctx_905, StrategyOutput(targets=(TargetPosition(sym, 0.25),), intents=(ro_m40,)))
+        self.assertAlmostEqual(0.28 / 1.1, res_905.targets[0].target_weight, places=9)
+
+        # With a 120-contract resting sell (27.5 - 120 = -92.5 fits!), +0.25 passes unchanged AND retains both bounds!
+        rest_s120 = OrderIntent("rs120", sym, "sell", "limit", "contracts", 120.0, limit_price=100.0)
+        pf_905_ok = PortfolioView(10_000.0, 12_000.0, pos_80_l, (rest_s120,), 12_000.0, 12_000.0)
+        ctx_905_ok = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_905_ok, instrument=inst_5x)
+        res_905_ok = ov_s.filter(ctx_905_ok, StrategyOutput(targets=(TargetPosition(sym, 0.25),), intents=(ro_m40,)))
+        self.assertAlmostEqual(0.25, res_905_ok.targets[0].target_weight, places=9)
+
+        # CR9-06: Gross-cap scaling with a reduced target below baseline!
+        # A is long 0.6x with a 1.2x resting sell; A target = +0.2x (worst case 1.0x), B target = +0.5x.
+        pos_a06 = {sym: PositionView(sym, qty=60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6)}
+        rest_a120 = OrderIntent("ra120", sym, "sell", "limit", "contracts", 120.0, limit_price=100.0)
+        pf_906 = PortfolioView(10_000.0, 10_000.0, pos_a06, (rest_a120,), 10_000.0, 10_000.0)
+        ctx_906 = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_906, instrument=inst_5x)
+        out_906 = StrategyOutput(targets=(TargetPosition(sym, 0.2), TargetPosition(sym_b, 0.5)))
+
+        # Under 1.0x gross cap: A stays 0.2 (worst 1.0x), B scales to 0.0 -> total worst-case gross == 1.0x (NOT 1.22x!)
+        ov_g10 = ExposureCapOverlay(1.0, 1.0, sizing_basis="marked_equity")
+        res_g10 = ov_g10.filter(ctx_906, out_906)
+        self.assertAlmostEqual(0.2, res_g10.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.0, res_g10.targets[1].target_weight, places=9)
+
+        # Under 1.2x gross cap: A stays 0.2 (worst 1.0x), B gets exact remaining 0.2x -> total worst-case gross == 1.2x!
+        ov_g12 = ExposureCapOverlay(1.2, 1.0, sizing_basis="marked_equity")
+        res_g12 = ov_g12.filter(ctx_906, out_906)
+        self.assertAlmostEqual(0.2, res_g12.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.2, res_g12.targets[1].target_weight, places=9)
+
+        # Under 1.5x gross cap: worst-case gross (1.0 + 0.5 = 1.5) already fits -> BOTH pass through UNCHANGED!
+        ov_g15 = ExposureCapOverlay(1.5, 1.0, sizing_basis="marked_equity")
+        res_g15 = ov_g15.filter(ctx_906, out_906)
+        self.assertAlmostEqual(0.2, res_g15.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.5, res_g15.targets[1].target_weight, places=9)
+
+        # With untouched C=+0.3x under 1.0x gross cap (allowed_targeted_gross=0.7), A's +0.2 target (worst 1.0 > 0.7)
+        # is pulled up toward hold (+0.5 -> 0.5 - 1.2 = -0.7) so total gross == 0.7 + 0.3 == 1.0x!
+        pos_ac = {
+            sym: pos_a06[sym],
+            "BTC-USDT-SWAP": PositionView("BTC-USDT-SWAP", qty=30.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=3_000.0, leverage=0.3),
+        }
+        pf_906_c = PortfolioView(10_000.0, 10_000.0, pos_ac, (rest_a120,), 10_000.0, 10_000.0)
+        ctx_906_c = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_906_c, instrument=inst_5x)
+        res_g10_c = ov_g10.filter(ctx_906_c, StrategyOutput(targets=(TargetPosition(sym, 0.2),)))
+        self.assertAlmostEqual(0.5, res_g10_c.targets[0].target_weight, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
