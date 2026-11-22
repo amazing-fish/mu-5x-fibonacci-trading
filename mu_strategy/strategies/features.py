@@ -33,6 +33,7 @@ __all__ = [
 
 MS_PER_YEAR_24_7: float = 365.0 * 24.0 * 3600.0 * 1000.0
 _NAN = math.nan
+_INF = math.inf
 _isfinite = math.isfinite
 _sqrt = math.sqrt
 _log = math.log
@@ -81,8 +82,23 @@ def compute_ema(closes: Sequence[float], period: int) -> array:
     return array("d", out)
 
 
+def _neumaier_add(total: float, comp: float, value: float) -> tuple[float, float]:
+    """Accumulate `value` into `(total, comp)` using Neumaier compensated summation."""
+    t = total + value
+    if abs(total) >= abs(value):
+        comp += (total - t) + value
+    else:
+        comp += (value - t) + total
+    return t, comp
+
+
 def compute_sma(closes: Sequence[float], period: int) -> array:
-    """Compute O(N) rolling SMA with `math.nan` during warmup (`0..period-2`)."""
+    """Compute O(N) rolling SMA with `math.nan` during warmup (`0..period-2`).
+
+    Uses a zero-subtraction two-stack sliding window with Neumaier compensated
+    sums so a dominant outgoing value (e.g. `[1e16, 1, 1]`) never masks retained
+    values while remaining strictly O(N) for all periods.
+    """
     period = _validate_positive_int(period, "period", minimum=1)
     n = len(closes)
     if n == 0:
@@ -92,39 +108,51 @@ def compute_sma(closes: Sequence[float], period: int) -> array:
         return array("d", out)
 
     inv_period = 1.0 / period
-    resync_every = period if period > 256 else 256
-    window_sum = 0.0
-    bad_count = 0
+    # Each stack stores tuples of (value_or_0, bad_flag, agg_sum, agg_comp, agg_bad).
+    in_stack: list[tuple[float, int, float, float, int]] = []
+    out_stack: list[tuple[float, int, float, float, int]] = []
 
-    for i in range(period):
+    for i in range(n):
         v = closes[i]
         if _isfinite(v):
-            window_sum += v
+            val = float(v)
+            bad = 0
         else:
-            bad_count += 1
-    if bad_count == 0:
-        out[period - 1] = window_sum * inv_period
+            val = 0.0
+            bad = 1
 
-    since_resync = 0
-    for i in range(period, n):
-        old_v = closes[i - period]
-        new_v = closes[i]
-        if _isfinite(old_v):
-            window_sum -= old_v
+        if in_stack:
+            _, _, prev_sum, prev_comp, prev_bad = in_stack[-1]
+            agg_sum, agg_comp = _neumaier_add(prev_sum, prev_comp, val)
+            agg_bad = prev_bad + bad
         else:
-            bad_count -= 1
-        if _isfinite(new_v):
-            window_sum += new_v
-        else:
-            bad_count += 1
+            agg_sum, agg_comp, agg_bad = val, 0.0, bad
+        in_stack.append((val, bad, agg_sum, agg_comp, agg_bad))
 
-        since_resync += 1
-        if since_resync >= resync_every and bad_count == 0:
-            window_sum = math.fsum(closes[i - period + 1 : i + 1])
-            since_resync = 0
+        if i >= period:
+            if not out_stack:
+                s_sum = 0.0
+                s_comp = 0.0
+                s_bad = 0
+                while in_stack:
+                    e_val, e_bad, _, _, _ = in_stack.pop()
+                    s_sum, s_comp = _neumaier_add(s_sum, s_comp, e_val)
+                    s_bad += e_bad
+                    out_stack.append((e_val, e_bad, s_sum, s_comp, s_bad))
+            out_stack.pop()
 
-        if bad_count == 0:
-            out[i] = window_sum * inv_period
+        if i >= period - 1:
+            total_bad = (in_stack[-1][4] if in_stack else 0) + (out_stack[-1][4] if out_stack else 0)
+            if total_bad == 0:
+                if in_stack and out_stack:
+                    s_sum, s_comp = _neumaier_add(out_stack[-1][2], out_stack[-1][3], in_stack[-1][2])
+                    s_sum, s_comp = _neumaier_add(s_sum, s_comp, in_stack[-1][3])
+                    window_sum = s_sum + s_comp
+                elif in_stack:
+                    window_sum = in_stack[-1][2] + in_stack[-1][3]
+                else:
+                    window_sum = out_stack[-1][2] + out_stack[-1][3]
+                out[i] = window_sum * inv_period
 
     return array("d", out)
 
@@ -349,7 +377,11 @@ def compute_realized_vol(
         c0 = closes[i - 1]
         c1 = closes[i]
         if c0 > 0.0 and c1 > 0.0 and _isfinite(c0) and _isfinite(c1):
-            returns[i] = _log(c1 / c0)
+            ratio = c1 / c0
+            if 0.0 < ratio < _INF:
+                returns[i] = _log(ratio)
+            else:
+                returns[i] = _log(c1) - _log(c0)
 
     ann_factor = _sqrt(periods_per_year)
     inv_period = 1.0 / period
@@ -360,22 +392,38 @@ def compute_realized_vol(
     sum_d = 0.0
     sum_d2 = 0.0
     bad_count = 0
+    run_len = 0
+    last_val = _NAN
 
     for i in range(1, period + 1):
         r = returns[i]
         if _isfinite(r):
             sum_d += r
             sum_d2 += r * r
+            if run_len > 0 and r == last_val:
+                run_len += 1
+            else:
+                run_len = 1
+                last_val = r
         else:
             bad_count += 1
+            run_len = 0
+            last_val = _NAN
 
     if bad_count == 0:
-        anchor = sum_d * inv_period
-        _, ssd = _exact_window_stats(returns, 1, period + 1)
-        sum_d = 0.0
-        sum_d2 = ssd
-        vol = _sqrt(ssd * inv_dof) * ann_factor if ssd > 0.0 else 0.0
-        out[period] = 0.0 if vol == 0.0 else vol
+        if run_len >= period:
+            anchor = last_val
+            sum_d = 0.0
+            sum_d2 = 0.0
+            out[period] = 0.0
+        else:
+            anchor = sum_d * inv_period
+            mean, ssd = _exact_window_stats(returns, 1, period + 1)
+            anchor = mean
+            sum_d = 0.0
+            sum_d2 = ssd
+            vol = _sqrt(ssd * inv_dof) * ann_factor if ssd > 0.0 else 0.0
+            out[period] = 0.0 if vol == 0.0 else vol
 
     since_resync = 0
     for i in range(period + 1, n):
@@ -392,11 +440,27 @@ def compute_realized_vol(
             d_new = new_r - anchor
             sum_d += d_new
             sum_d2 += d_new * d_new
+            if run_len > 0 and new_r == last_val:
+                run_len += 1
+            else:
+                run_len = 1
+                last_val = new_r
         else:
             bad_count += 1
+            run_len = 0
+            last_val = _NAN
 
         since_resync += 1
         if bad_count != 0:
+            continue
+
+        # Provably constant window: every element in [i - period + 1, i] equals last_val.
+        if run_len >= period:
+            anchor = last_val
+            sum_d = 0.0
+            sum_d2 = 0.0
+            since_resync = 0
+            out[i] = 0.0
             continue
 
         ssd = sum_d2 - (sum_d * sum_d) * inv_period
@@ -417,7 +481,8 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
     """Compute O(N) rolling z-score (`(close - mean) / sample_std`, `ddof=1`).
 
     Indices `0..period-2` are `math.nan`. Flat windows (`std == 0`) yield `0.0`.
-    Uses anchor-shifted rolling sums with amortized exact resync for full float64 precision.
+    Uses anchor-shifted rolling sums with constant-run fast path and amortized
+    exact resync for full float64 precision.
     """
     period = _validate_positive_int(period, "period", minimum=2)
     n = len(closes)
@@ -433,24 +498,41 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
 
     bad_count = 0
     anchor = 0.0
+    run_len = 0
+    last_val = _NAN
     for i in range(period):
-        if not _isfinite(closes[i]):
+        v = closes[i]
+        if _isfinite(v):
+            if run_len > 0 and v == last_val:
+                run_len += 1
+            else:
+                run_len = 1
+                last_val = v
+        else:
             bad_count += 1
+            run_len = 0
+            last_val = _NAN
 
     sum_d = 0.0
     sum_d2 = 0.0
     if bad_count == 0:
-        mean, ssd = _exact_window_stats(closes, 0, period)
-        anchor = mean
-        sum_d = 0.0
-        sum_d2 = ssd
-        std = _sqrt(ssd * inv_dof) if ssd > 0.0 else 0.0
-        eps = 1e-12 * max(1.0, abs(mean))
-        if std <= eps:
+        if run_len >= period:
+            anchor = last_val
+            sum_d = 0.0
+            sum_d2 = 0.0
             out[period - 1] = 0.0
         else:
-            z = (closes[period - 1] - mean) / std
-            out[period - 1] = 0.0 if z == 0.0 else z
+            mean, ssd = _exact_window_stats(closes, 0, period)
+            anchor = mean
+            sum_d = 0.0
+            sum_d2 = ssd
+            std = _sqrt(ssd * inv_dof) if ssd > 0.0 else 0.0
+            eps = 1e-12 * max(1.0, abs(mean))
+            if std <= eps:
+                out[period - 1] = 0.0
+            else:
+                z = (closes[period - 1] - mean) / std
+                out[period - 1] = 0.0 if z == 0.0 else z
     else:
         for i in range(period):
             v = closes[i]
@@ -473,11 +555,27 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
             d_new = new_v - anchor
             sum_d += d_new
             sum_d2 += d_new * d_new
+            if run_len > 0 and new_v == last_val:
+                run_len += 1
+            else:
+                run_len = 1
+                last_val = new_v
         else:
             bad_count += 1
+            run_len = 0
+            last_val = _NAN
 
         since_resync += 1
         if bad_count != 0:
+            continue
+
+        # Provably constant window: every close in [i - period + 1, i] equals last_val.
+        if run_len >= period:
+            anchor = last_val
+            sum_d = 0.0
+            sum_d2 = 0.0
+            since_resync = 0
+            out[i] = 0.0
             continue
 
         ssd = sum_d2 - (sum_d * sum_d) * inv_period
@@ -508,7 +606,12 @@ def compute_vwap(
     volumes: Sequence[float],
     period: int = 20,
 ) -> array:
-    """Compute O(N) rolling typical-price VWAP (`math.nan` during warmup or zero volume)."""
+    """Compute O(N) rolling typical-price VWAP (`math.nan` during warmup or zero volume).
+
+    Tracks positive-volume observations separately and uses a zero-subtraction
+    two-stack sliding window with compensated sums so a large outgoing volume
+    (e.g. `[1e12, 1e-5, 0]`) cannot erase smaller retained positive volume.
+    """
     period = _validate_positive_int(period, "period", minimum=1)
     n = len(closes)
     if len(highs) != n or len(lows) != n or len(volumes) != n:
@@ -519,56 +622,78 @@ def compute_vwap(
     if n < period:
         return array("d", out)
 
-    resync_every = period if period > 256 else 256
-    pv_vals = [_NAN] * n
-    vol_vals = [_NAN] * n
+    # Entries: (pv, v, bad_flag, pos_flag, agg_pv, agg_pv_c, agg_v, agg_v_c, agg_bad, agg_pos)
+    in_stack: list[tuple[float, float, int, int, float, float, float, float, int, int]] = []
+    out_stack: list[tuple[float, float, int, int, float, float, float, float, int, int]] = []
+
     for i in range(n):
         h = highs[i]
         l = lows[i]
         c = closes[i]
         v = volumes[i]
         if _isfinite(h) and _isfinite(l) and _isfinite(c) and _isfinite(v) and v >= 0.0:
-            pv_vals[i] = ((h + l + c) / 3.0) * v
-            vol_vals[i] = v
-
-    sum_pv = 0.0
-    sum_v = 0.0
-    bad_count = 0
-    for i in range(period):
-        pv = pv_vals[i]
-        v = vol_vals[i]
-        if _isfinite(pv):
-            sum_pv += pv
-            sum_v += v
+            pv = ((h + l + c) / 3.0) * v
+            if _isfinite(pv):
+                vf = float(v)
+                bad = 0
+                pos = 1 if vf > 0.0 else 0
+            else:
+                pv = 0.0
+                vf = 0.0
+                bad = 1
+                pos = 0
         else:
-            bad_count += 1
-    if bad_count == 0 and sum_v > 0.0:
-        out[period - 1] = sum_pv / sum_v
+            pv = 0.0
+            vf = 0.0
+            bad = 1
+            pos = 0
 
-    since_resync = 0
-    for i in range(period, n):
-        old_pv = pv_vals[i - period]
-        new_pv = pv_vals[i]
-        if _isfinite(old_pv):
-            sum_pv -= old_pv
-            sum_v -= vol_vals[i - period]
+        if in_stack:
+            _, _, _, _, p_pv, p_pvc, p_v, p_vc, p_bad, p_pos = in_stack[-1]
+            agg_pv, agg_pvc = _neumaier_add(p_pv, p_pvc, pv)
+            agg_v, agg_vc = _neumaier_add(p_v, p_vc, vf)
+            agg_bad = p_bad + bad
+            agg_pos = p_pos + pos
         else:
-            bad_count -= 1
+            agg_pv, agg_pvc, agg_v, agg_vc, agg_bad, agg_pos = pv, 0.0, vf, 0.0, bad, pos
+        in_stack.append((pv, vf, bad, pos, agg_pv, agg_pvc, agg_v, agg_vc, agg_bad, agg_pos))
 
-        if _isfinite(new_pv):
-            sum_pv += new_pv
-            sum_v += vol_vals[i]
-        else:
-            bad_count += 1
+        if i >= period:
+            if not out_stack:
+                s_pv = 0.0
+                s_pvc = 0.0
+                s_v = 0.0
+                s_vc = 0.0
+                s_bad = 0
+                s_pos = 0
+                while in_stack:
+                    e_pv, e_v, e_bad, e_pos, _, _, _, _, _, _ = in_stack.pop()
+                    s_pv, s_pvc = _neumaier_add(s_pv, s_pvc, e_pv)
+                    s_v, s_vc = _neumaier_add(s_v, s_vc, e_v)
+                    s_bad += e_bad
+                    s_pos += e_pos
+                    out_stack.append((e_pv, e_v, e_bad, e_pos, s_pv, s_pvc, s_v, s_vc, s_bad, s_pos))
+            out_stack.pop()
 
-        since_resync += 1
-        if since_resync >= resync_every and bad_count == 0:
-            sum_pv = math.fsum(pv_vals[i - period + 1 : i + 1])
-            sum_v = math.fsum(vol_vals[i - period + 1 : i + 1])
-            since_resync = 0
-
-        if bad_count == 0 and sum_v > 0.0:
-            out[i] = sum_pv / sum_v
+        if i >= period - 1:
+            total_bad = (in_stack[-1][8] if in_stack else 0) + (out_stack[-1][8] if out_stack else 0)
+            total_pos = (in_stack[-1][9] if in_stack else 0) + (out_stack[-1][9] if out_stack else 0)
+            if total_bad == 0 and total_pos > 0:
+                if in_stack and out_stack:
+                    s_pv, s_pvc = _neumaier_add(out_stack[-1][4], out_stack[-1][5], in_stack[-1][4])
+                    s_pv, s_pvc = _neumaier_add(s_pv, s_pvc, in_stack[-1][5])
+                    sum_pv = s_pv + s_pvc
+                    s_v, s_vc = _neumaier_add(out_stack[-1][6], out_stack[-1][7], in_stack[-1][6])
+                    s_v, s_vc = _neumaier_add(s_v, s_vc, in_stack[-1][7])
+                    sum_v = s_v + s_vc
+                elif in_stack:
+                    sum_pv = in_stack[-1][4] + in_stack[-1][5]
+                    sum_v = in_stack[-1][6] + in_stack[-1][7]
+                else:
+                    sum_pv = out_stack[-1][4] + out_stack[-1][5]
+                    sum_v = out_stack[-1][6] + out_stack[-1][7]
+                if sum_v > 0.0:
+                    out[i] = sum_pv / sum_v
 
     return array("d", out)
 
@@ -733,6 +858,10 @@ class FeatureCache:
         return arr[start + idx]
 
     # ---- EMA ----
+    def _closes_tuple(self, base: Any) -> tuple[float, ...]:
+        """Return a cached immutable `tuple[float, ...]` view of `base.closes` (zero per-bar unboxing)."""
+        return self._get_or_compute(base, ("_closes_tuple",), lambda s: tuple(s.closes))  # type: ignore[return-value]
+
     def _ema_array(self, base: Any, period: int) -> array:
         period = _validate_positive_int(period, "period", minimum=1)
         return self._get_or_compute(base, ("ema", period), lambda s: compute_ema(s.closes, period))

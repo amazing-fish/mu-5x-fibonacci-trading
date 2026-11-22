@@ -8,6 +8,10 @@ from math import expm1, fsum, isfinite, log, sqrt
 from types import MappingProxyType
 from typing import Any, Literal
 
+from mu_strategy.core.instrument import CostModel, InstrumentSpec
+from mu_strategy.engine.fills import ExecutionModel, compute_position_liquidation_price
+from mu_strategy.market_data.funding import MissingFundingHistoryError
+
 __all__ = [
     "MS_PER_YEAR",
     "CostAttribution",
@@ -345,7 +349,7 @@ def _compute_return_ratios(
             else:
                 ratio = ending_equity / starting_equity
                 log_arg = log(ratio) / elapsed_years
-                if abs(log_arg) > 50.0:
+                if log_arg > 50.0:
                     ann_return = ((ending_equity / starting_equity) - 1.0) / elapsed_years
                 else:
                     ann_return = expm1(log_arg)
@@ -402,7 +406,7 @@ def _finalize_curve_stats(
             else:
                 ratio = ending_equity / starting_equity
                 log_arg = log(ratio) / elapsed_years
-                if abs(log_arg) > 50.0:
+                if log_arg > 50.0:
                     ann_return = ((ending_equity / starting_equity) - 1.0) / elapsed_years
                 else:
                     ann_return = expm1(log_arg)
@@ -650,17 +654,42 @@ def compute_simulation_metrics(
     )
 
 
-def _extract_bar_arrays(bars: Any, interval_ms: int | None) -> tuple[Sequence[int], Sequence[int], Sequence[float], Sequence[float], int, str, str]:
+def _extract_bar_arrays(
+    bars: Any,
+    interval_ms: int | None,
+) -> tuple[
+    Sequence[int],
+    Sequence[int],
+    Sequence[float],
+    Sequence[float],
+    Sequence[float],
+    Sequence[float],
+    Sequence[float],
+    int,
+    str,
+    str,
+]:
     """Support BarSeries, BarSeriesSlice, or Sequence[Candle] without hard Layer 1 import cycles."""
-    if hasattr(bars, "open_times") and hasattr(bars, "close_times") and hasattr(bars, "opens") and hasattr(bars, "closes"):
+    if (
+        hasattr(bars, "open_times")
+        and hasattr(bars, "close_times")
+        and hasattr(bars, "opens")
+        and hasattr(bars, "highs")
+        and hasattr(bars, "lows")
+        and hasattr(bars, "closes")
+    ):
         # BarSeries or BarSeriesSlice (BarSeriesSlice columns are already bounded views!)
         base = getattr(bars, "_series", None) or getattr(bars, "series", None)
         resolved_iv_ms = int(interval_ms or getattr(bars, "interval_ms", getattr(base, "interval_ms", _DEFAULT_INTERVAL_MS)))
+        vols = bars.volumes if hasattr(bars, "volumes") else [0.0] * len(bars.closes)
         return (
             bars.open_times,
             bars.close_times,
             bars.opens,
+            bars.highs,
+            bars.lows,
             bars.closes,
+            vols,
             resolved_iv_ms,
             getattr(bars, "symbol", getattr(base, "symbol", "")),
             getattr(bars, "interval", getattr(base, "interval", "")),
@@ -669,7 +698,7 @@ def _extract_bar_arrays(bars: Any, interval_ms: int | None) -> tuple[Sequence[in
     # Fallback: sequence of Candle-like objects
     seq = list(bars)
     if not seq:
-        return (), (), (), (), int(interval_ms or _DEFAULT_INTERVAL_MS), "", ""
+        return (), (), (), (), (), (), (), int(interval_ms or _DEFAULT_INTERVAL_MS), "", ""
     inferred_ms = interval_ms
     if inferred_ms is None:
         if len(seq) >= 2 and seq[1].open_time_ms > seq[0].open_time_ms:
@@ -679,8 +708,11 @@ def _extract_bar_arrays(bars: Any, interval_ms: int | None) -> tuple[Sequence[in
     open_times = [int(c.open_time_ms) for c in seq]
     close_times = [int(c.open_time_ms) + inferred_ms for c in seq]
     opens = [float(c.open) for c in seq]
+    highs = [float(c.high) for c in seq]
+    lows = [float(c.low) for c in seq]
     closes = [float(c.close) for c in seq]
-    return open_times, close_times, opens, closes, int(inferred_ms), "", ""
+    volumes = [float(getattr(c, "volume", 0.0)) for c in seq]
+    return open_times, close_times, opens, highs, lows, closes, volumes, int(inferred_ms), "", ""
 
 
 def compute_buy_and_hold_benchmark(
@@ -689,16 +721,23 @@ def compute_buy_and_hold_benchmark(
     starting_equity: float = 10_000.0,
     leverage: float = 1.0,
     side: Literal["long", "short"] = "long",
+    instrument: InstrumentSpec | None = None,
+    cost_model: CostModel | None = None,
     funding: Any | None = None,
+    allow_missing_funding_for_perp: bool = False,
+    funding_gap_policy: Literal["fail_closed", "allow_partial"] = "fail_closed",
+    funding_gap_tolerance: float = 1.5,
     taker_fee_bps: float = 0.0,
     half_spread_bps: float = 0.0,
+    maintenance_margin_rate: float | None = None,
+    liquidation_fee_bps: float | None = None,
     warmup_bars: int = 0,
     close_on_end: bool = True,
     interval_ms: int | None = None,
     symbol: str = "",
     interval: str = "",
 ) -> SimulationResult:
-    """Compute a realistic buy-and-hold (or short-and-hold) benchmark on the same bars and costs."""
+    """Compute a realistic buy-and-hold (or short-and-hold) benchmark on the same bars, funding, and liquidation rules."""
     if starting_equity <= 0.0 or not isfinite(starting_equity):
         raise ValueError(f"starting_equity must be finite and positive, got {starting_equity}")
     if leverage <= 0.0 or not isfinite(leverage):
@@ -707,13 +746,120 @@ def compute_buy_and_hold_benchmark(
         raise ValueError(f"side must be 'long' or 'short', got {side!r}")
     if warmup_bars < 0:
         raise ValueError(f"warmup_bars must be >= 0, got {warmup_bars}")
+    if funding_gap_policy not in ("fail_closed", "allow_partial"):
+        raise ValueError(f"funding_gap_policy must be 'fail_closed' or 'allow_partial', got {funding_gap_policy!r}")
+    if (
+        isinstance(funding_gap_tolerance, bool)
+        or not isinstance(funding_gap_tolerance, (int, float))
+        or not isfinite(funding_gap_tolerance)
+        or funding_gap_tolerance <= 0.0
+    ):
+        raise ValueError(f"funding_gap_tolerance must be positive finite, got {funding_gap_tolerance!r}")
 
-    open_times, close_times, opens, closes, resolved_interval_ms, inferred_symbol, inferred_interval = (
-        _extract_bar_arrays(bars, interval_ms)
-    )
-    resolved_symbol = symbol or inferred_symbol
+    (
+        open_times,
+        close_times,
+        opens,
+        highs,
+        lows,
+        closes,
+        volumes,
+        resolved_interval_ms,
+        inferred_symbol,
+        inferred_interval,
+    ) = _extract_bar_arrays(bars, interval_ms)
+    resolved_symbol = symbol or inferred_symbol or (instrument.symbol if instrument is not None else "")
     resolved_interval = interval or inferred_interval
     n = len(closes)
+
+    # Validate funding instrument alignment and fail-closed coverage before scoring (CR1-50).
+    bench_diagnostics: dict[str, Any] = {}
+    is_perp = instrument is not None and instrument.funding_interval_hours is not None
+    if instrument is not None and funding is not None and hasattr(funding, "instrument_id"):
+        if funding.instrument_id != instrument.instrument_id:
+            raise ValueError(
+                f"FundingSeries instrument_id {funding.instrument_id!r} does not match "
+                f"benchmark instrument {instrument.instrument_id!r}"
+            )
+
+    effective_funding = funding
+    if instrument is not None and not is_perp:
+        # Non-perpetual instruments (spot / equity) do not settle funding.
+        effective_funding = None
+        funding_mode = "none"
+    elif is_perp:
+        if effective_funding is None:
+            if not allow_missing_funding_for_perp:
+                raise MissingFundingHistoryError(
+                    f"Perpetual benchmark for {instrument.instrument_id!r} requires funding history. "
+                    "Supply a complete FundingSeries or explicitly set allow_missing_funding_for_perp=True."
+                )
+            funding_mode = "missing_explicit_zero"
+        elif n > warmup_bars and hasattr(effective_funding, "coverage_gaps"):
+            span_start = int(open_times[warmup_bars])
+            span_end = int(close_times[-1])
+            gaps = effective_funding.coverage_gaps(
+                span_start,
+                span_end,
+                instrument.funding_interval_hours,  # type: ignore[arg-type]
+                tolerance=funding_gap_tolerance,
+            )
+            if gaps:
+                cov_ratio = effective_funding.coverage_ratio(
+                    span_start,
+                    span_end,
+                    instrument.funding_interval_hours,  # type: ignore[arg-type]
+                    tolerance=funding_gap_tolerance,
+                )
+                if funding_gap_policy == "fail_closed" and not allow_missing_funding_for_perp:
+                    raise MissingFundingHistoryError(
+                        f"Incomplete funding history for perpetual benchmark {instrument.instrument_id!r}: "
+                        f"{len(gaps)} gap(s) covering {(1.0 - cov_ratio) * 100.0:.1f}% of scored span. "
+                        "Provide complete funding history or set funding_gap_policy='allow_partial'."
+                    )
+                funding_mode = "historical_partial"
+                bench_diagnostics["funding_coverage_ratio"] = cov_ratio
+                bench_diagnostics["funding_gap_count"] = len(gaps)
+            else:
+                funding_mode = "historical"
+        else:
+            funding_mode = "historical"
+    else:
+        # instrument is None: preserve no-funding path when funding is omitted,
+        # but strictly validate coverage whenever a FundingSeries IS supplied.
+        if effective_funding is None:
+            funding_mode = "none"
+        elif n > warmup_bars and hasattr(effective_funding, "coverage_gaps"):
+            span_start = int(open_times[warmup_bars])
+            span_end = int(close_times[-1])
+            f_iv_h = getattr(effective_funding, "settlement_interval_hours", None) or 8
+            gaps = effective_funding.coverage_gaps(
+                span_start,
+                span_end,
+                f_iv_h,
+                tolerance=funding_gap_tolerance,
+            )
+            if gaps:
+                cov_ratio = effective_funding.coverage_ratio(
+                    span_start,
+                    span_end,
+                    f_iv_h,
+                    tolerance=funding_gap_tolerance,
+                )
+                if funding_gap_policy == "fail_closed" and not allow_missing_funding_for_perp:
+                    raise MissingFundingHistoryError(
+                        f"Incomplete funding history for benchmark ({getattr(effective_funding, 'instrument_id', resolved_symbol)!r}): "
+                        f"{len(gaps)} gap(s) covering {(1.0 - cov_ratio) * 100.0:.1f}% of scored span. "
+                        "Provide complete funding history or set funding_gap_policy='allow_partial'."
+                    )
+                funding_mode = "historical_partial"
+                bench_diagnostics["funding_coverage_ratio"] = cov_ratio
+                bench_diagnostics["funding_gap_count"] = len(gaps)
+            else:
+                funding_mode = "historical"
+        else:
+            funding_mode = "historical"
+
     if n == 0 or warmup_bars >= n:
         return compute_simulation_metrics(
             starting_equity=starting_equity,
@@ -727,24 +873,95 @@ def compute_buy_and_hold_benchmark(
             symbol=resolved_symbol,
             interval=resolved_interval,
             strategy_id=f"buy_and_hold_{side}",
-            funding_mode="historical" if funding is not None else "none",
+            funding_mode=funding_mode,
+            diagnostics=bench_diagnostics,
         )
 
+    # Resolve execution & liquidation parameters using the simulator's rules (CR1-52).
+    execution: ExecutionModel | None = None
+    if instrument is not None and cost_model is not None:
+        effective_cost = cost_model
+        if maintenance_margin_rate is not None or liquidation_fee_bps is not None:
+            effective_cost = CostModel(
+                maker_fee_bps=cost_model.maker_fee_bps,
+                taker_fee_bps=cost_model.taker_fee_bps,
+                half_spread_bps=cost_model.half_spread_bps,
+                slippage=cost_model.slippage,
+                stop_slippage_multiplier=cost_model.stop_slippage_multiplier,
+                maintenance_margin_rate=(
+                    float(maintenance_margin_rate)
+                    if maintenance_margin_rate is not None
+                    else cost_model.maintenance_margin_rate
+                ),
+                liquidation_fee_bps=(
+                    float(liquidation_fee_bps)
+                    if liquidation_fee_bps is not None
+                    else cost_model.liquidation_fee_bps
+                ),
+            )
+        execution = ExecutionModel(instrument, effective_cost)
+        asset_class = instrument.asset_class
+        mmr = float(effective_cost.maintenance_margin_rate)
+        liq_fee_bps_eff = float(effective_cost.liquidation_fee_bps)
+        fee_rate = float(effective_cost.taker_fee_bps) / 10_000.0
+        spread_rate = float(effective_cost.half_spread_bps) / 10_000.0
+    else:
+        if cost_model is not None:
+            fee_rate = float(cost_model.taker_fee_bps) / 10_000.0
+            spread_rate = float(cost_model.half_spread_bps) / 10_000.0
+            mmr = float(cost_model.maintenance_margin_rate if maintenance_margin_rate is None else maintenance_margin_rate)
+            liq_fee_bps_eff = float(cost_model.liquidation_fee_bps if liquidation_fee_bps is None else liquidation_fee_bps)
+        else:
+            fee_rate = max(0.0, float(taker_fee_bps)) / 10_000.0
+            spread_rate = max(0.0, float(half_spread_bps)) / 10_000.0
+            mmr = float(maintenance_margin_rate) if maintenance_margin_rate is not None else 0.0
+            liq_fee_bps_eff = float(liquidation_fee_bps) if liquidation_fee_bps is not None else 0.0
+        asset_class = (
+            instrument.asset_class
+            if instrument is not None
+            else ("perp" if (leverage > 1.0 or side == "short" or effective_funding is not None or mmr > 0.0) else "spot")
+        )
+    if mmr < 0.0 or mmr >= 1.0 or not isfinite(mmr):
+        raise ValueError(f"maintenance_margin_rate must be in [0, 1), got {mmr!r}")
+    if liq_fee_bps_eff < 0.0 or not isfinite(liq_fee_bps_eff):
+        raise ValueError(f"liquidation_fee_bps must be non-negative finite, got {liq_fee_bps_eff!r}")
+    liq_total_fee_rate = fee_rate + (liq_fee_bps_eff / 10_000.0)
+
     side_sign = 1.0 if side == "long" else -1.0
-    fee_rate = max(0.0, float(taker_fee_bps)) / 10_000.0
-    spread_rate = max(0.0, float(half_spread_bps)) / 10_000.0
+    entry_side: Literal["buy", "sell"] = "buy" if side == "long" else "sell"
+    close_side: Literal["buy", "sell"] = "sell" if side == "long" else "buy"
 
     start_idx = warmup_bars
     ref_entry = float(opens[start_idx])
     if ref_entry <= 0.0:
         raise ValueError(f"benchmark entry open price must be positive, got {ref_entry}")
-    exec_entry = ref_entry * (1.0 + side_sign * spread_rate)
-    qty_abs = (starting_equity * leverage) / exec_entry
-    signed_qty = side_sign * qty_abs
-    entry_notional = exec_entry * qty_abs
-    entry_fee = entry_notional * fee_rate
-    entry_slippage = (exec_entry - ref_entry) * signed_qty
 
+    if execution is not None:
+        pre_close = float(closes[start_idx - 1]) if start_idx > 0 else ref_entry
+        pre_vol = float(volumes[start_idx - 1]) if start_idx > 0 else float(volumes[start_idx])
+        qty_abs = (starting_equity * leverage) / ref_entry
+        entry_quote = execution.fill_market(
+            entry_side,
+            qty_abs,
+            bar_open=ref_entry,
+            bar_high=ref_entry,
+            bar_low=ref_entry,
+            bar_close=pre_close,
+            bar_volume=pre_vol,
+            reason="benchmark_entry",
+        )
+        exec_entry = entry_quote.exec_price
+        entry_notional = entry_quote.notional
+        entry_fee = entry_quote.fee
+        entry_slippage = entry_quote.slippage_cost
+    else:
+        exec_entry = ref_entry * (1.0 + side_sign * spread_rate)
+        qty_abs = (starting_equity * leverage) / exec_entry
+        entry_notional = exec_entry * qty_abs
+        entry_fee = entry_notional * fee_rate
+        entry_slippage = (exec_entry - ref_entry) * (side_sign * qty_abs)
+
+    signed_qty = side_sign * qty_abs
     cash = starting_equity - entry_fee
     accrued_funding = 0.0
     total_traded_notional = entry_notional
@@ -754,35 +971,149 @@ def compute_buy_and_hold_benchmark(
     liquidations = 0
     is_open = True
     prev_close_ms = int(open_times[start_idx])
+    prev_close_px = float(closes[start_idx - 1]) if start_idx > 0 else ref_entry
+
+    def _compute_bench_liq_price(curr_cash: float) -> float | None:
+        if asset_class in ("spot", "equity") and side == "long":
+            return None
+        return compute_position_liquidation_price(
+            side=side,
+            entry_price=exec_entry,
+            qty=qty_abs,
+            margin_equity=curr_cash,
+            maintenance_margin_rate=mmr,
+            liquidation_fee_bps=liq_fee_bps_eff,
+        )
+
+    liq_price = _compute_bench_liq_price(cash)
 
     for i in range(start_idx, n):
+        bar_open_ms = int(open_times[i])
         bar_close_ms = int(close_times[i])
+        bar_open = float(opens[i])
+        bar_high = float(highs[i])
+        bar_low = float(lows[i])
         bar_close = float(closes[i])
+        bar_vol = float(volumes[i])
 
-        if is_open and funding is not None:
-            events = funding.between(prev_close_ms, bar_close_ms)
+        # 1. Settle any gap funding in (prev_close_ms, bar_open_ms] BEFORE bar open / intrabar liquidation.
+        if is_open and effective_funding is not None and bar_open_ms > prev_close_ms:
+            gap_events = effective_funding.between(prev_close_ms, bar_open_ms)
+            if gap_events:
+                gap_mark = prev_close_px if prev_close_px > 0.0 else bar_open
+                for ev in gap_events:
+                    rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                    delta = -signed_qty * gap_mark * float(rate)
+                    cash += delta
+                    accrued_funding += delta
+                liq_price = _compute_bench_liq_price(cash)
+
+        # 2. Intrabar OHLC MMR liquidation check matching Simulator rules (CR1-52).
+        if is_open and liq_price is not None:
+            liq_triggered = (bar_low <= liq_price) if side == "long" else (bar_high >= liq_price)
+            if liq_triggered:
+                if execution is not None:
+                    liq_quote = execution.try_fill_liquidation(
+                        signed_qty,
+                        liq_price,
+                        bar_open=bar_open,
+                        bar_high=bar_high,
+                        bar_low=bar_low,
+                        bar_close=bar_close,
+                        bar_volume=bar_vol,
+                    )
+                    assert liq_quote is not None
+                    ref_exit = liq_quote.ref_price
+                    exec_exit = liq_quote.exec_price
+                    exit_notional = liq_quote.notional
+                    exit_fee = liq_quote.fee
+                    exit_slippage = liq_quote.slippage_cost
+                else:
+                    ref_exit = (
+                        bar_open
+                        if ((bar_open <= liq_price) if side == "long" else (bar_open >= liq_price))
+                        else liq_price
+                    )
+                    exec_exit = ref_exit * (1.0 - side_sign * spread_rate)
+                    if exec_exit <= 0.0:
+                        exec_exit = ref_exit
+                    exit_notional = exec_exit * qty_abs
+                    exit_fee = exit_notional * liq_total_fee_rate
+                    exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+
+                gross_pnl = signed_qty * (ref_exit - ref_entry)
+                total_fees = entry_fee + exit_fee
+                total_slip = entry_slippage + exit_slippage
+                net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
+                cash = starting_equity + net_pnl
+                total_traded_notional += exit_notional
+                trades.append(
+                    TradeRecord(
+                        entry_time_ms=int(open_times[start_idx]),
+                        exit_time_ms=bar_open_ms,
+                        side=side,
+                        entry_price=exec_entry,
+                        exit_price=exec_exit,
+                        qty=qty_abs,
+                        gross_pnl=gross_pnl,
+                        fees=total_fees,
+                        slippage=total_slip,
+                        funding_pnl=accrued_funding,
+                        net_pnl=net_pnl,
+                        return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
+                        reason="liquidation",
+                        symbol=resolved_symbol,
+                        ref_entry_price=ref_entry,
+                        ref_exit_price=ref_exit,
+                    )
+                )
+                is_open = False
+                liq_price = None
+                liquidations += 1
+
+        # 3. Settle bar-period funding in (max(prev_close_ms, bar_open_ms), bar_close_ms] at bar close.
+        bar_fund_start = bar_open_ms if bar_open_ms > prev_close_ms else prev_close_ms
+        if is_open and effective_funding is not None and bar_close_ms > bar_fund_start:
+            events = effective_funding.between(bar_fund_start, bar_close_ms)
             if events:
-                # Funding settles at bar close on the position held after this bar's fills (mark = close).
-                mark_px = bar_close if bar_close > 0.0 else float(opens[i])
+                mark_px = bar_close if bar_close > 0.0 else bar_open
                 for ev in events:
                     rate = ev.rate if hasattr(ev, "rate") else ev[1]
                     delta = -signed_qty * mark_px * float(rate)
                     cash += delta
                     accrued_funding += delta
+                liq_price = _compute_bench_liq_price(cash)
 
+        # 4. Close valuation & bankruptcy guard.
         if is_open:
             bars_in_market += 1
             unrealized = signed_qty * (bar_close - exec_entry)
             marked_equity = cash + unrealized
             if marked_equity <= 0.0:
-                # Bankrupt at bar close
-                ref_exit = bar_close
-                exec_exit = bar_close * (1.0 - side_sign * spread_rate)
-                if exec_exit <= 0.0:
-                    exec_exit = bar_close
-                exit_notional = exec_exit * qty_abs
-                exit_fee = exit_notional * fee_rate
-                exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+                if execution is not None:
+                    b_quote = execution.fill_market(
+                        close_side,
+                        qty_abs,
+                        bar_open=bar_close,
+                        bar_high=bar_close,
+                        bar_low=bar_close,
+                        bar_close=bar_close,
+                        bar_volume=bar_vol,
+                        reason="bankrupt",
+                    )
+                    ref_exit = b_quote.ref_price
+                    exec_exit = b_quote.exec_price
+                    exit_notional = b_quote.notional
+                    exit_fee = b_quote.fee
+                    exit_slippage = b_quote.slippage_cost
+                else:
+                    ref_exit = bar_close
+                    exec_exit = bar_close * (1.0 - side_sign * spread_rate)
+                    if exec_exit <= 0.0:
+                        exec_exit = bar_close
+                    exit_notional = exec_exit * qty_abs
+                    exit_fee = exit_notional * fee_rate
+                    exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
                 gross_pnl = signed_qty * (ref_exit - ref_entry)
                 total_fees = entry_fee + exit_fee
                 total_slip = entry_slippage + exit_slippage
@@ -810,6 +1141,7 @@ def compute_buy_and_hold_benchmark(
                     )
                 )
                 is_open = False
+                liq_price = None
                 liquidations += 1
                 equity_curve.append((bar_close_ms, _clean_zero(cash)))
             else:
@@ -818,18 +1150,36 @@ def compute_buy_and_hold_benchmark(
             equity_curve.append((bar_close_ms, _clean_zero(cash)))
 
         prev_close_ms = bar_close_ms
+        prev_close_px = bar_close
 
     if is_open:
         final_close = float(closes[-1])
         final_close_ms = int(close_times[-1])
         if close_on_end:
-            ref_exit = final_close
-            exec_exit = final_close * (1.0 - side_sign * spread_rate)
-            if exec_exit <= 0.0:
-                exec_exit = final_close
-            exit_notional = exec_exit * qty_abs
-            exit_fee = exit_notional * fee_rate
-            exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+            if execution is not None:
+                eod_quote = execution.fill_market(
+                    close_side,
+                    qty_abs,
+                    bar_open=final_close,
+                    bar_high=float(highs[-1]),
+                    bar_low=float(lows[-1]),
+                    bar_close=final_close,
+                    bar_volume=float(volumes[-1]),
+                    reason="end_of_data",
+                )
+                ref_exit = eod_quote.ref_price
+                exec_exit = eod_quote.exec_price
+                exit_notional = eod_quote.notional
+                exit_fee = eod_quote.fee
+                exit_slippage = eod_quote.slippage_cost
+            else:
+                ref_exit = final_close
+                exec_exit = final_close * (1.0 - side_sign * spread_rate)
+                if exec_exit <= 0.0:
+                    exec_exit = final_close
+                exit_notional = exec_exit * qty_abs
+                exit_fee = exit_notional * fee_rate
+                exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
             gross_pnl = signed_qty * (ref_exit - ref_entry)
             total_fees = entry_fee + exit_fee
             total_slip = entry_slippage + exit_slippage
@@ -896,5 +1246,6 @@ def compute_buy_and_hold_benchmark(
         symbol=resolved_symbol,
         interval=resolved_interval,
         strategy_id=f"buy_and_hold_{side}",
-        funding_mode="historical" if funding is not None else "none",
+        funding_mode=funding_mode,
+        diagnostics=bench_diagnostics,
     )

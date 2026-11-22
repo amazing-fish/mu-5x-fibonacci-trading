@@ -132,6 +132,17 @@ class MeanReversionParams:
             raise ValueError(f"unsupported side_mode: {self.side_mode!r}")
 
 
+def _validate_mean_reversion_space(params: Mapping[str, Any]) -> None:
+    entry_z = params.get("entry_z")
+    exit_z = params.get("exit_z")
+    if entry_z is not None and exit_z is not None and exit_z >= entry_z:
+        raise ValueError(f"exit_z ({exit_z}) must be < entry_z ({entry_z})")
+    rsi_oversold = params.get("rsi_oversold")
+    rsi_overbought = params.get("rsi_overbought")
+    if rsi_oversold is not None and rsi_overbought is not None and rsi_oversold >= rsi_overbought:
+        raise ValueError(f"rsi_oversold ({rsi_oversold}) must be < rsi_overbought ({rsi_overbought})")
+
+
 def mean_reversion_param_space() -> ParamSpace:
     return ParamSpace(
         (
@@ -145,7 +156,8 @@ def mean_reversion_param_space() -> ParamSpace:
             ParamSpec("max_ann_vol", "float", 1.5, min_value=0.4, max_value=3.0, step=0.2),
             ParamSpec("target_weight", "float", 1.0, min_value=0.25, max_value=3.0, step=0.25),
             ParamSpec("side_mode", "categorical", "long_short", choices=("buy", "sell", "long_short")),
-        )
+        ),
+        constraints=(_validate_mean_reversion_space,),
     )
 
 
@@ -216,6 +228,7 @@ class MeanReversionStrategy:
     strategy_id: str = "mean_reversion"
     version: str = "1.0.0"
     supported_sides: tuple[str, ...] = ("buy", "sell", "long_short")
+    supports_ephemeral_context: bool = True
 
     def __init__(self, params: MeanReversionParams | None = None, **kwargs: Any) -> None:
         if params is not None and kwargs:
@@ -369,6 +382,10 @@ class MeanReversionStrategy:
             feat_gen = features._generation
 
             if base is not self._cached_base or features is not self._cached_features or feat_gen != self._cached_gen:
+                self._fast_mkt = None
+                self._fast_pf = None
+                self._fast_acct = None
+                self._fast_sym = None
                 self._cached_base = base
                 self._cached_features = features
                 self._cached_gen = feat_gen
@@ -513,10 +530,15 @@ class MeanReversionStrategy:
 
         atr_dist: float | None = None
         stop_mult = self._stop_atr_mult
-        if stop_mult is not None and count >= self._atr_period:
+        if stop_mult is not None:
+            if count < self._atr_period:
+                self._pending_stop = None
+                return EMPTY_OUTPUT
             atr_val = self._cached_atr[last_idx]
-            if 0.0 < atr_val < _INF:
-                atr_dist = stop_mult * atr_val
+            if not (0.0 < atr_val < _INF):
+                self._pending_stop = None
+                return EMPTY_OUTPUT
+            atr_dist = stop_mult * atr_val
 
         if long_signal:
             if atr_dist is not None:
@@ -527,7 +549,13 @@ class MeanReversionStrategy:
             self._pending_stop = stop_px
             return _fast_target_output(symbol, self._target_weight, stop_px, "mr_entry_long")
 
-        stop_px = (curr_close + atr_dist) if atr_dist is not None else None
+        if atr_dist is not None:
+            stop_px = curr_close + atr_dist
+            if not (0.0 < stop_px < _INF):
+                self._pending_stop = None
+                return EMPTY_OUTPUT
+        else:
+            stop_px = None
         self._pending_stop = stop_px
         return _fast_target_output(symbol, -self._target_weight, stop_px, "mr_entry_short")
 
@@ -563,13 +591,16 @@ class MeanReversionStrategy:
                 raise ValueError(f"invalid {key} in state")
             return float(val)
 
+        entry_stop = _opt_pos_float("entry_stop")
+        pending_stop = _opt_pos_float("pending_stop")
+
         last_bar_ms = state.get("last_bar_ms")
         if last_bar_ms is not None and (isinstance(last_bar_ms, bool) or not isinstance(last_bar_ms, int)):
             raise ValueError("invalid last_bar_ms in state")
 
         self._position_dir = int(pos_dir)
         self._bars_in_position = bars_in_pos
-        self._entry_stop = _opt_pos_float("entry_stop")
-        self._pending_stop = _opt_pos_float("pending_stop")
+        self._entry_stop = entry_stop
+        self._pending_stop = pending_stop
         self._last_bar_ms = last_bar_ms
         self._clear_ephemeral_cache()

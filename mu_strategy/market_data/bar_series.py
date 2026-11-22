@@ -5,7 +5,9 @@ from __future__ import annotations
 from array import array
 from bisect import bisect_right
 from collections.abc import Iterator, Mapping, Sequence
+import csv
 import hashlib
+import io
 import math
 import os
 from pathlib import Path
@@ -18,7 +20,7 @@ import zlib
 
 from mu_strategy.fs_durability import fsync_directory
 from mu_strategy.market_data.funding import FundingRateEvent, FundingSeries
-from mu_strategy.market_data.utils import interval_to_ms
+from mu_strategy.market_data.utils import CSV_FIELDS, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -26,7 +28,7 @@ BAR_BIN_MAGIC = b"MUBARS01"
 BAR_BIN_VERSION = 1
 # Canonical 48-byte bar schema (<qddddd: open_time_ms, open, high, low, close, volume).
 # On disk, rows are stored as 6 contiguous little-endian column blocks (exact 48 bytes/bar)
-# so pure-Python C-backed ``array.frombytes`` loads 13,000+ bars in < 1 ms.
+# so pure-Python zero-copy memoryview loading reads 13,000+ bars in < 1 ms.
 BAR_RECORD_STRUCT = struct.Struct("<qddddd")
 _FLAG_EXPLICIT_CLOSE_TIMES = 1 << 0
 _HEADER_STRUCT = struct.Struct("<8sHHqqIIHH32s")
@@ -34,6 +36,7 @@ _IS_BIG_ENDIAN = sys.byteorder != "little"
 _EMPTY_FUNDING: Mapping[str, FundingSeries] = MappingProxyType({})
 _OBJ_NEW = object.__new__
 _OBJ_SETATTR = object.__setattr__
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 
 class BarSeriesCacheError(ValueError):
@@ -52,9 +55,6 @@ def _validate_interval_ms(value: Any) -> int:
     return value
 
 
-_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-
-
 def _validate_sha256_hex(value: str) -> bytes:
     if not isinstance(value, str) or len(value) != 64 or not all(ch in _HEX_DIGITS for ch in value):
         raise ValueError("source_sha256 must be a 64-character hex SHA-256 digest")
@@ -63,7 +63,12 @@ def _validate_sha256_hex(value: str) -> bytes:
 
 def _to_le_bytes(buf: array | memoryview) -> bytes:
     if isinstance(buf, memoryview):
-        return buf.tobytes()
+        if not _IS_BIG_ENDIAN:
+            return buf.tobytes()
+        swapped = array(buf.format)
+        swapped.frombytes(buf.cast("B"))
+        swapped.byteswap()
+        return swapped.tobytes()
     if not _IS_BIG_ENDIAN:
         return buf.tobytes()
     swapped = array(buf.typecode, buf)
@@ -71,12 +76,12 @@ def _to_le_bytes(buf: array | memoryview) -> bytes:
     return swapped.tobytes()
 
 
-def _from_le_bytes(typecode: str, buf: memoryview) -> array:
+def _from_le_bytes_ro(typecode: str, buf: memoryview) -> memoryview:
     arr = array(typecode)
     arr.frombytes(buf)
     if _IS_BIG_ENDIAN:
         arr.byteswap()
-    return arr
+    return memoryview(arr).toreadonly()
 
 
 def _read_all_bytes_fast(path: Path) -> bytes:
@@ -114,11 +119,11 @@ def _read_all_bytes_fast(path: Path) -> bytes:
 
 
 class _ColumnSlice(Sequence[Any]):
-    """Zero-copy O(1) bounded read-only slice over a typed ``array`` or ``memoryview``."""
+    """Zero-copy O(1) bounded read-only slice over a read-only ``memoryview``."""
 
     __slots__ = ("_data", "_start", "_end")
 
-    def __init__(self, data: array | memoryview, start: int, end: int) -> None:
+    def __init__(self, data: memoryview, start: int, end: int) -> None:
         self._data = data
         self._start = start
         self._end = end
@@ -130,13 +135,15 @@ class _ColumnSlice(Sequence[Any]):
     def __getitem__(self, index: int) -> Any: ...
 
     @overload
-    def __getitem__(self, index: slice) -> "_ColumnSlice": ...
+    def __getitem__(self, index: slice) -> "_ColumnSlice | tuple[Any, ...]": ...
 
     def __getitem__(self, index: int | slice) -> Any:
         length = self._end - self._start
         if isinstance(index, slice):
             start, stop, step = index.indices(length)
             if step == 1:
+                if stop < start:
+                    stop = start
                 return _ColumnSlice(self._data, self._start + start, self._start + stop)
             return tuple(self._data[self._start + i] for i in range(start, stop, step))
         if index < 0:
@@ -164,7 +171,7 @@ class _UniformCloseTimeSlice(Sequence[int]):
 
     __slots__ = ("_open_times", "_interval_ms", "_start", "_end")
 
-    def __init__(self, open_times: array | memoryview, interval_ms: int, start: int, end: int) -> None:
+    def __init__(self, open_times: memoryview, interval_ms: int, start: int, end: int) -> None:
         self._open_times = open_times
         self._interval_ms = interval_ms
         self._start = start
@@ -177,13 +184,15 @@ class _UniformCloseTimeSlice(Sequence[int]):
     def __getitem__(self, index: int) -> int: ...
 
     @overload
-    def __getitem__(self, index: slice) -> "_UniformCloseTimeSlice": ...
+    def __getitem__(self, index: slice) -> "_UniformCloseTimeSlice | tuple[int, ...]": ...
 
     def __getitem__(self, index: int | slice) -> Any:
         length = self._end - self._start
         if isinstance(index, slice):
             start, stop, step = index.indices(length)
             if step == 1:
+                if stop < start:
+                    stop = start
                 return _UniformCloseTimeSlice(
                     self._open_times,
                     self._interval_ms,
@@ -212,20 +221,13 @@ class _UniformCloseTimeSlice(Sequence[int]):
 
 
 class BarSeries:
-    """Immutable columnar OHLCV bar series backed by typed stdlib ``array`` / zero-copy buffers."""
+    """Immutable columnar OHLCV bar series exposing read-only zero-copy ``memoryview`` columns."""
 
     __slots__ = (
         "_symbol",
         "_interval",
         "_interval_ms",
-        "_open_times",
-        "_close_times",
         "_uniform_close_times",
-        "_opens",
-        "_highs",
-        "_lows",
-        "_closes",
-        "_volumes",
         "_open_times_buf",
         "_close_times_buf",
         "_opens_buf",
@@ -241,13 +243,13 @@ class BarSeries:
         symbol: str,
         interval: str,
         interval_ms: int,
-        open_times: Sequence[int] | array,
-        close_times: Sequence[int] | array | None,
-        opens: Sequence[float] | array,
-        highs: Sequence[float] | array,
-        lows: Sequence[float] | array,
-        closes: Sequence[float] | array,
-        volumes: Sequence[float] | array,
+        open_times: Sequence[int] | array | memoryview,
+        close_times: Sequence[int] | array | memoryview | None,
+        opens: Sequence[float] | array | memoryview,
+        highs: Sequence[float] | array | memoryview,
+        lows: Sequence[float] | array | memoryview,
+        closes: Sequence[float] | array | memoryview,
+        volumes: Sequence[float] | array | memoryview,
     ) -> None:
         clean_symbol = _validate_non_empty_str(symbol, "symbol")
         clean_interval = _validate_non_empty_str(interval, "interval")
@@ -313,24 +315,17 @@ class BarSeries:
             if v_v == 0.0:
                 vo[i] = 0.0
 
-        object.__setattr__(self, "_symbol", clean_symbol)
-        object.__setattr__(self, "_interval", clean_interval)
-        object.__setattr__(self, "_interval_ms", step_ms)
-        object.__setattr__(self, "_open_times", ot)
-        object.__setattr__(self, "_close_times", ct)
-        object.__setattr__(self, "_uniform_close_times", uniform)
-        object.__setattr__(self, "_opens", op)
-        object.__setattr__(self, "_highs", hi)
-        object.__setattr__(self, "_lows", lo)
-        object.__setattr__(self, "_closes", cl)
-        object.__setattr__(self, "_volumes", vo)
-        object.__setattr__(self, "_open_times_buf", ot)
-        object.__setattr__(self, "_close_times_buf", ct)
-        object.__setattr__(self, "_opens_buf", op)
-        object.__setattr__(self, "_highs_buf", hi)
-        object.__setattr__(self, "_lows_buf", lo)
-        object.__setattr__(self, "_closes_buf", cl)
-        object.__setattr__(self, "_volumes_buf", vo)
+        _OBJ_SETATTR(self, "_symbol", clean_symbol)
+        _OBJ_SETATTR(self, "_interval", clean_interval)
+        _OBJ_SETATTR(self, "_interval_ms", step_ms)
+        _OBJ_SETATTR(self, "_uniform_close_times", uniform)
+        _OBJ_SETATTR(self, "_open_times_buf", memoryview(ot).toreadonly())
+        _OBJ_SETATTR(self, "_close_times_buf", memoryview(ct).toreadonly() if ct is not None else None)
+        _OBJ_SETATTR(self, "_opens_buf", memoryview(op).toreadonly())
+        _OBJ_SETATTR(self, "_highs_buf", memoryview(hi).toreadonly())
+        _OBJ_SETATTR(self, "_lows_buf", memoryview(lo).toreadonly())
+        _OBJ_SETATTR(self, "_closes_buf", memoryview(cl).toreadonly())
+        _OBJ_SETATTR(self, "_volumes_buf", memoryview(vo).toreadonly())
 
     @classmethod
     def _from_trusted_buffers(
@@ -339,45 +334,28 @@ class BarSeries:
         symbol: str,
         interval: str,
         interval_ms: int,
-        open_times_buf: array | memoryview,
-        close_times_buf: array | memoryview | None,
+        open_times_buf: memoryview,
+        close_times_buf: memoryview | None,
         uniform_close_times: bool,
-        opens_buf: array | memoryview,
-        highs_buf: array | memoryview,
-        lows_buf: array | memoryview,
-        closes_buf: array | memoryview,
-        volumes_buf: array | memoryview,
+        opens_buf: memoryview,
+        highs_buf: memoryview,
+        lows_buf: memoryview,
+        closes_buf: memoryview,
+        volumes_buf: memoryview,
     ) -> "BarSeries":
-        inst = object.__new__(cls)
-        object.__setattr__(inst, "_symbol", symbol)
-        object.__setattr__(inst, "_interval", interval)
-        object.__setattr__(inst, "_interval_ms", interval_ms)
-        object.__setattr__(inst, "_open_times", open_times_buf if isinstance(open_times_buf, array) else None)
-        object.__setattr__(inst, "_close_times", close_times_buf if isinstance(close_times_buf, array) else None)
-        object.__setattr__(inst, "_uniform_close_times", uniform_close_times)
-        object.__setattr__(inst, "_opens", opens_buf if isinstance(opens_buf, array) else None)
-        object.__setattr__(inst, "_highs", highs_buf if isinstance(highs_buf, array) else None)
-        object.__setattr__(inst, "_lows", lows_buf if isinstance(lows_buf, array) else None)
-        object.__setattr__(inst, "_closes", closes_buf if isinstance(closes_buf, array) else None)
-        object.__setattr__(inst, "_volumes", volumes_buf if isinstance(volumes_buf, array) else None)
-        object.__setattr__(inst, "_open_times_buf", open_times_buf)
-        object.__setattr__(inst, "_close_times_buf", close_times_buf)
-        object.__setattr__(inst, "_opens_buf", opens_buf)
-        object.__setattr__(inst, "_highs_buf", highs_buf)
-        object.__setattr__(inst, "_lows_buf", lows_buf)
-        object.__setattr__(inst, "_closes_buf", closes_buf)
-        object.__setattr__(inst, "_volumes_buf", volumes_buf)
+        inst = _OBJ_NEW(cls)
+        _OBJ_SETATTR(inst, "_symbol", symbol)
+        _OBJ_SETATTR(inst, "_interval", interval)
+        _OBJ_SETATTR(inst, "_interval_ms", interval_ms)
+        _OBJ_SETATTR(inst, "_uniform_close_times", uniform_close_times)
+        _OBJ_SETATTR(inst, "_open_times_buf", open_times_buf)
+        _OBJ_SETATTR(inst, "_close_times_buf", close_times_buf)
+        _OBJ_SETATTR(inst, "_opens_buf", opens_buf)
+        _OBJ_SETATTR(inst, "_highs_buf", highs_buf)
+        _OBJ_SETATTR(inst, "_lows_buf", lows_buf)
+        _OBJ_SETATTR(inst, "_closes_buf", closes_buf)
+        _OBJ_SETATTR(inst, "_volumes_buf", volumes_buf)
         return inst
-
-    def _materialize_array(self, attr: str, buf_attr: str, typecode: str) -> array:
-        arr = getattr(self, attr)
-        if arr is None:
-            buf = getattr(self, buf_attr)
-            arr = array(typecode)
-            arr.frombytes(buf.cast("B") if isinstance(buf, memoryview) else buf)
-            object.__setattr__(self, attr, arr)
-            object.__setattr__(self, buf_attr, arr)
-        return arr
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("BarSeries is immutable")
@@ -398,21 +376,15 @@ class BarSeries:
         return self._interval_ms
 
     @property
-    def open_times(self) -> array:
-        arr = self._open_times
-        return arr if arr is not None else self._materialize_array("_open_times", "_open_times_buf", "q")
+    def open_times(self) -> memoryview:
+        return self._open_times_buf
 
     @property
-    def close_times(self) -> array:
-        ct = self._close_times
+    def close_times(self) -> memoryview:
+        ct = self._close_times_buf
         if ct is None:
-            ct_buf = self._close_times_buf
-            if ct_buf is not None:
-                ct = array("q")
-                ct.frombytes(ct_buf.cast("B") if isinstance(ct_buf, memoryview) else ct_buf)
-            else:
-                ct = array("q", map(self._interval_ms.__add__, self._open_times_buf))
-            _OBJ_SETATTR(self, "_close_times", ct)
+            ct_arr = array("q", map(self._interval_ms.__add__, self._open_times_buf))
+            ct = memoryview(ct_arr).toreadonly()
             _OBJ_SETATTR(self, "_close_times_buf", ct)
         return ct
 
@@ -421,29 +393,24 @@ class BarSeries:
         return self._uniform_close_times
 
     @property
-    def opens(self) -> array:
-        arr = self._opens
-        return arr if arr is not None else self._materialize_array("_opens", "_opens_buf", "d")
+    def opens(self) -> memoryview:
+        return self._opens_buf
 
     @property
-    def highs(self) -> array:
-        arr = self._highs
-        return arr if arr is not None else self._materialize_array("_highs", "_highs_buf", "d")
+    def highs(self) -> memoryview:
+        return self._highs_buf
 
     @property
-    def lows(self) -> array:
-        arr = self._lows
-        return arr if arr is not None else self._materialize_array("_lows", "_lows_buf", "d")
+    def lows(self) -> memoryview:
+        return self._lows_buf
 
     @property
-    def closes(self) -> array:
-        arr = self._closes
-        return arr if arr is not None else self._materialize_array("_closes", "_closes_buf", "d")
+    def closes(self) -> memoryview:
+        return self._closes_buf
 
     @property
-    def volumes(self) -> array:
-        arr = self._volumes
-        return arr if arr is not None else self._materialize_array("_volumes", "_volumes_buf", "d")
+    def volumes(self) -> memoryview:
+        return self._volumes_buf
 
     def __len__(self) -> int:
         return len(self._open_times_buf)
@@ -461,6 +428,8 @@ class BarSeries:
         if isinstance(index, slice):
             start, stop, step = index.indices(len(self._open_times_buf))
             if step == 1:
+                if stop < start:
+                    stop = start
                 return BarSeriesSlice(self, start, stop)
             return tuple(self.bar_at(i) for i in range(start, stop, step))
         return self.bar_at(index)
@@ -581,9 +550,9 @@ class BarSeriesSlice:
         n = len(series)
         if start < 0 or end < start or end > n:
             raise IndexError(f"invalid BarSeriesSlice bounds [{start}, {end}) for length {n}")
-        object.__setattr__(self, "_series", series)
-        object.__setattr__(self, "_start", start)
-        object.__setattr__(self, "_end", end)
+        _OBJ_SETATTR(self, "_series", series)
+        _OBJ_SETATTR(self, "_start", start)
+        _OBJ_SETATTR(self, "_end", end)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("BarSeriesSlice is immutable")
@@ -664,6 +633,8 @@ class BarSeriesSlice:
             length = self._end - self._start
             start, stop, step = index.indices(length)
             if step == 1:
+                if stop < start:
+                    stop = start
                 return BarSeriesSlice(self._series, self._start + start, self._start + stop)
             return tuple(self.bar_at(i) for i in range(start, stop, step))
         return self.bar_at(index)
@@ -899,35 +870,35 @@ def read_bar_series_bin(
     col_bytes = row_count * 8
     offset = meta_end
     if not _IS_BIG_ENDIAN:
-        open_times_buf: array | memoryview = mv[offset : offset + col_bytes].cast("q")
+        open_times_buf = mv[offset : offset + col_bytes].cast("q")
         offset += col_bytes
-        opens_buf: array | memoryview = mv[offset : offset + col_bytes].cast("d")
+        opens_buf = mv[offset : offset + col_bytes].cast("d")
         offset += col_bytes
-        highs_buf: array | memoryview = mv[offset : offset + col_bytes].cast("d")
+        highs_buf = mv[offset : offset + col_bytes].cast("d")
         offset += col_bytes
-        lows_buf: array | memoryview = mv[offset : offset + col_bytes].cast("d")
+        lows_buf = mv[offset : offset + col_bytes].cast("d")
         offset += col_bytes
-        closes_buf: array | memoryview = mv[offset : offset + col_bytes].cast("d")
+        closes_buf = mv[offset : offset + col_bytes].cast("d")
         offset += col_bytes
-        volumes_buf: array | memoryview = mv[offset : offset + col_bytes].cast("d")
+        volumes_buf = mv[offset : offset + col_bytes].cast("d")
         offset += col_bytes
-        close_times_buf: array | memoryview | None = (
+        close_times_buf: memoryview | None = (
             mv[offset : offset + col_bytes].cast("q") if has_explicit_close else None
         )
     else:
-        open_times_buf = _from_le_bytes("q", mv[offset : offset + col_bytes])
+        open_times_buf = _from_le_bytes_ro("q", mv[offset : offset + col_bytes])
         offset += col_bytes
-        opens_buf = _from_le_bytes("d", mv[offset : offset + col_bytes])
+        opens_buf = _from_le_bytes_ro("d", mv[offset : offset + col_bytes])
         offset += col_bytes
-        highs_buf = _from_le_bytes("d", mv[offset : offset + col_bytes])
+        highs_buf = _from_le_bytes_ro("d", mv[offset : offset + col_bytes])
         offset += col_bytes
-        lows_buf = _from_le_bytes("d", mv[offset : offset + col_bytes])
+        lows_buf = _from_le_bytes_ro("d", mv[offset : offset + col_bytes])
         offset += col_bytes
-        closes_buf = _from_le_bytes("d", mv[offset : offset + col_bytes])
+        closes_buf = _from_le_bytes_ro("d", mv[offset : offset + col_bytes])
         offset += col_bytes
-        volumes_buf = _from_le_bytes("d", mv[offset : offset + col_bytes])
+        volumes_buf = _from_le_bytes_ro("d", mv[offset : offset + col_bytes])
         offset += col_bytes
-        close_times_buf = _from_le_bytes("q", mv[offset : offset + col_bytes]) if has_explicit_close else None
+        close_times_buf = _from_le_bytes_ro("q", mv[offset : offset + col_bytes]) if has_explicit_close else None
 
     return BarSeries._from_trusted_buffers(
         symbol=symbol,
@@ -944,18 +915,41 @@ def read_bar_series_bin(
     )
 
 
-def _compute_candles_sha256(candles: Sequence[Candle]) -> str:
-    from mu_strategy.market_data.trusted_data.store import candles_content_sha256
-
-    return candles_content_sha256(candles)
-
-
-def _file_sha256(path: Path) -> str:
+def _compute_candles_binary_sha256(candles: Sequence[Candle]) -> str:
+    """Lossless IEEE-754 SHA-256 matching the exact precision stored in packed `.bin` files."""
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(65536):
-            digest.update(chunk)
+    pack = BAR_RECORD_STRUCT.pack
+    for bar in candles:
+        vol = 0.0 if bar.volume == 0.0 else bar.volume
+        digest.update(pack(bar.open_time_ms, bar.open, bar.high, bar.low, bar.close, vol))
     return digest.hexdigest()
+
+
+def _parse_csv_snapshot_bytes(raw_bytes: bytes) -> list[Candle]:
+    """Parse canonical OHLCV CSV directly from an already-hashed byte snapshot (zero TOCTOU)."""
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid UTF-8 in candle CSV: {exc}") from exc
+    reader = csv.reader(io.StringIO(text, newline=""))
+    header = next(reader, None)
+    if header != CSV_FIELDS:
+        raise ValueError(f"unexpected CSV header: expected {CSV_FIELDS!r}, got {header!r}")
+    candles: list[Candle] = []
+    for row in reader:
+        if len(row) != 7:
+            raise ValueError(f"CSV row does not match CSV_FIELDS (expected 7 cols, got {len(row)})")
+        candles.append(
+            Candle(
+                open_time_ms=int(row[0]),
+                open=float(row[2]),
+                high=float(row[3]),
+                low=float(row[4]),
+                close=float(row[5]),
+                volume=float(row[6]),
+            )
+        )
+    return candles
 
 
 def load_or_build_bar_series(
@@ -971,14 +965,13 @@ def load_or_build_bar_series(
 ) -> BarSeries:
     """Read-through packed binary cache loader for ``TrustedDataStore``, CSV files, or candles.
 
-    - When ``store_or_candles`` is a ``TrustedDataStore`` (or directory ``Path``), resolves the
-      current generation manifest SHA-256 and reads/writes ``<cache_dir>/<gen>/<symbol>_<interval>.bin``
-      (defaulting to ``store.data_dir / ".bar_cache"`` unless ``cache_path``/``cache_dir`` is given).
-    - When ``store_or_candles`` is a CSV file ``Path``, keys the binary cache by file SHA-256.
-    - When ``store_or_candles`` is a ``Sequence[Candle]``, keys by ``source_sha256`` (or canonical
-      content SHA-256).
-    - If ``strict_cache=True``, any corrupt or mismatched existing ``.bin`` file raises
-      ``BarSeriesCacheError`` instead of rebuilding.
+    - ``TrustedDataStore`` (or directory ``Path``): authorizes cache lookups strictly from
+      the current manifest ``content_sha256`` (rejecting any disagreeing ``source_sha256``).
+    - CSV file ``Path``: hashes and parses one stable byte snapshot (zero TOCTOU),
+      verifies any explicit ``source_sha256`` against that snapshot, and rejects any cache
+      destination resolving to the CSV source file.
+    - ``Sequence[Candle]``: hashes losslessly at full IEEE-754 double precision matching
+      the packed binary cache (unless an explicit ``source_sha256`` is supplied).
     """
     from mu_strategy.market_data.trusted_data.contracts import AvailabilityState, IntegrityState
     from mu_strategy.market_data.trusted_data.store import TrustedDataStore, validate_storage_segment
@@ -994,16 +987,31 @@ def load_or_build_bar_series(
         if src_path.is_dir():
             store_or_candles = TrustedDataStore(data_dir=src_path)
         else:
-            expected_sha = source_sha256 or _file_sha256(src_path)
             resolved_cache = (
                 Path(cache_path)
                 if cache_path is not None
                 else (
-                    Path(cache_dir) / f"{validate_storage_segment(clean_symbol, field='symbol')}_{validate_storage_segment(clean_interval, field='interval')}.bin"
+                    Path(cache_dir)
+                    / f"{validate_storage_segment(clean_symbol, field='symbol')}_{validate_storage_segment(clean_interval, field='interval')}.bin"
                     if cache_dir is not None
                     else src_path.with_suffix(".bin")
                 )
             )
+            if resolved_cache.resolve(strict=False) == src_path.resolve(strict=False):
+                raise ValueError(
+                    f"cache destination {resolved_cache} must not resolve to CSV source {src_path}"
+                )
+
+            raw_csv_bytes = _read_all_bytes_fast(src_path)
+            snapshot_sha = hashlib.sha256(raw_csv_bytes).hexdigest()
+            if source_sha256 is not None:
+                if _validate_sha256_hex(source_sha256) != bytes.fromhex(snapshot_sha):
+                    raise BarSeriesCacheError(
+                        f"CSV snapshot SHA-256 mismatch for {src_path}: "
+                        f"expected {source_sha256}, got {snapshot_sha}"
+                    )
+            expected_sha = snapshot_sha
+
             cached = _try_read_cache(
                 resolved_cache,
                 expected_sha,
@@ -1014,7 +1022,7 @@ def load_or_build_bar_series(
             )
             if cached is not None:
                 return cached
-            candles = TrustedDataStore(data_dir=src_path.parent).read_csv(src_path)
+            candles = _parse_csv_snapshot_bytes(raw_csv_bytes)
             series = BarSeries.from_candles(
                 clean_symbol,
                 clean_interval,
@@ -1040,9 +1048,16 @@ def load_or_build_bar_series(
                 f"trusted dataset ({clean_symbol}, {clean_interval}) is not available/valid "
                 f"(availability={health.availability.value}, integrity={health.integrity.value})"
             )
-        expected_sha = source_sha256 or health.content_sha256
-        if not expected_sha:
+        manifest_sha = health.content_sha256
+        if not manifest_sha:
             raise ValueError(f"trusted dataset ({clean_symbol}, {clean_interval}) is missing content_sha256")
+        if source_sha256 is not None:
+            if _validate_sha256_hex(source_sha256) != _validate_sha256_hex(manifest_sha):
+                raise BarSeriesCacheError(
+                    f"supplied source_sha256 ({source_sha256}) disagrees with current manifest "
+                    f"content_sha256 ({manifest_sha}) for ({clean_symbol}, {clean_interval})"
+                )
+        expected_sha = manifest_sha
 
         safe_sym = validate_storage_segment(clean_symbol, field="symbol")
         safe_iv = validate_storage_segment(clean_interval, field="interval")
@@ -1052,6 +1067,19 @@ def load_or_build_bar_series(
         else:
             root = Path(cache_dir) if cache_dir is not None else (store.data_dir / ".bar_cache")
             resolved_cache = root / safe_gen / f"{safe_sym}_{safe_iv}.bin"
+
+        gen_root = manifest_result.generation_root or store.data_dir
+        dataset_csv_path = store.dataset_path(
+            manifest,
+            symbol=clean_symbol,
+            interval=clean_interval,
+            generation_root=gen_root,
+            generation_id=manifest_result.generation_id,
+        )
+        if resolved_cache.resolve(strict=False) == dataset_csv_path.resolve(strict=False):
+            raise ValueError(
+                f"cache destination {resolved_cache} must not resolve to trusted CSV source {dataset_csv_path}"
+            )
 
         cached = _try_read_cache(
             resolved_cache,
@@ -1068,7 +1096,7 @@ def load_or_build_bar_series(
             manifest,
             symbol=clean_symbol,
             interval=clean_interval,
-            generation_root=manifest_result.generation_root or store.data_dir,
+            generation_root=gen_root,
             generation_id=manifest_result.generation_id,
             verify_logical=True,
             compute_hash=True,
@@ -1096,7 +1124,7 @@ def load_or_build_bar_series(
                 candles,
                 interval_ms=resolved_interval_ms,
             )
-        expected_sha = source_sha256 or _compute_candles_sha256(candles)
+        expected_sha = source_sha256 or _compute_candles_binary_sha256(candles)
         resolved_cache = (
             Path(cache_path)
             if cache_path is not None
@@ -1157,8 +1185,39 @@ def _try_read_cache(
         return None
 
 
+def _validate_market_maps(
+    bars: Mapping[tuple[str, str], BarSeries],
+    funding: Mapping[str, FundingSeries] | None,
+) -> tuple[Mapping[tuple[str, str], BarSeries], Mapping[str, FundingSeries]]:
+    bars_copy: dict[tuple[str, str], BarSeries] = {}
+    for key, series in bars.items():
+        if not (isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], str) and isinstance(key[1], str)):
+            raise ValueError(f"bars keys must be (symbol, interval) tuples, got {key!r}")
+        if not isinstance(series, BarSeries):
+            raise TypeError(f"bars values must be BarSeries, got {type(series).__name__}")
+        bars_copy[key] = series
+
+    if funding is None:
+        funding_map: Mapping[str, FundingSeries] = _EMPTY_FUNDING
+    else:
+        funding_copy: dict[str, FundingSeries] = {}
+        for sym, fseries in funding.items():
+            if not isinstance(sym, str) or not sym:
+                raise ValueError(f"funding keys must be non-empty symbol strings, got {sym!r}")
+            if not isinstance(fseries, FundingSeries):
+                raise TypeError(f"funding values must be FundingSeries, got {type(fseries).__name__}")
+            funding_copy[sym] = fseries
+        funding_map = MappingProxyType(funding_copy)
+    return MappingProxyType(bars_copy), funding_map
+
+
 class MarketView:
-    """Strictly causal market snapshot exposing ONLY bars with ``close_time_ms <= now_ms``."""
+    """Strictly causal strategy-facing market snapshot bound to a fixed ``now_ms``.
+
+    Exposes ONLY bars with ``close_time_ms <= now_ms`` and funding events with
+    ``ts_ms <= now_ms``. Intentionally provides NO time-advancement API; engine/test
+    drivers should construct point-in-time views through ``MarketViewCursor``.
+    """
 
     __slots__ = ("_bars", "_funding", "_features", "_now_ms")
 
@@ -1172,31 +1231,11 @@ class MarketView:
     ) -> None:
         if isinstance(now_ms, bool) or not isinstance(now_ms, int):
             raise ValueError("now_ms must be an integer millisecond timestamp")
-        bars_copy: dict[tuple[str, str], BarSeries] = {}
-        for key, series in bars.items():
-            if not (isinstance(key, tuple) and len(key) == 2 and isinstance(key[0], str) and isinstance(key[1], str)):
-                raise ValueError(f"bars keys must be (symbol, interval) tuples, got {key!r}")
-            if not isinstance(series, BarSeries):
-                raise TypeError(f"bars values must be BarSeries, got {type(series).__name__}")
-            bars_copy[key] = series
-
-        funding_map: Mapping[str, FundingSeries]
-        if funding is None:
-            funding_map = _EMPTY_FUNDING
-        else:
-            funding_copy: dict[str, FundingSeries] = {}
-            for sym, fseries in funding.items():
-                if not isinstance(sym, str) or not sym:
-                    raise ValueError(f"funding keys must be non-empty symbol strings, got {sym!r}")
-                if not isinstance(fseries, FundingSeries):
-                    raise TypeError(f"funding values must be FundingSeries, got {type(fseries).__name__}")
-                funding_copy[sym] = fseries
-            funding_map = MappingProxyType(funding_copy)
-
-        object.__setattr__(self, "_bars", MappingProxyType(bars_copy))
-        object.__setattr__(self, "_funding", funding_map)
-        object.__setattr__(self, "_features", features)
-        object.__setattr__(self, "_now_ms", now_ms)
+        bars_map, funding_map = _validate_market_maps(bars, funding)
+        _OBJ_SETATTR(self, "_bars", bars_map)
+        _OBJ_SETATTR(self, "_funding", funding_map)
+        _OBJ_SETATTR(self, "_features", features)
+        _OBJ_SETATTR(self, "_now_ms", now_ms)
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("MarketView is immutable")
@@ -1247,13 +1286,13 @@ class MarketView:
         series = self._funding.get(symbol)
         if series is None:
             return None
-        hi = bisect_right(series.timestamps_ms, self._now_ms)
+        hi = bisect_right(series._timestamps_ms, self._now_ms)
         if hi == len(series):
             return series
         return FundingSeries(
             instrument_id=series.instrument_id,
-            timestamps_ms=series.timestamps_ms[:hi],
-            rates=series.rates[:hi],
+            timestamps_ms=series._timestamps_ms[:hi],
+            rates=series._rates[:hi],
             settlement_interval_hours=series.settlement_interval_hours,
         )
 
@@ -1265,19 +1304,58 @@ class MarketView:
         causal_end = end_ms if end_ms <= self._now_ms else self._now_ms
         return series.between(start_ms, causal_end)
 
-    def at(self, new_now_ms: int) -> "MarketView":
-        """Fast O(1) causal re-binding to ``new_now_ms``, sharing underlying series and FeatureCache."""
-        if type(new_now_ms) is not int and (isinstance(new_now_ms, bool) or not isinstance(new_now_ms, int)):
-            raise ValueError("new_now_ms must be an integer millisecond timestamp")
+    def __repr__(self) -> str:
+        return f"MarketView(now_ms={self._now_ms}, series={len(self._bars)})"
+
+
+class MarketViewCursor:
+    """Engine-side factory for O(1) point-in-time ``MarketView`` snapshots.
+
+    Never pass a ``MarketViewCursor`` into a strategy; pass the fixed-timestamp
+    ``MarketView`` returned by ``view_at(now_ms)`` (which cannot advance time).
+    """
+
+    __slots__ = ("_bars", "_funding", "_features")
+
+    def __init__(
+        self,
+        bars: Mapping[tuple[str, str], BarSeries],
+        *,
+        funding: Mapping[str, FundingSeries] | None = None,
+        features: Any | None = None,
+    ) -> None:
+        bars_map, funding_map = _validate_market_maps(bars, funding)
+        _OBJ_SETATTR(self, "_bars", bars_map)
+        _OBJ_SETATTR(self, "_funding", funding_map)
+        _OBJ_SETATTR(self, "_features", features)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("MarketViewCursor is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("MarketViewCursor is immutable")
+
+    @property
+    def features(self) -> Any | None:
+        return self._features
+
+    def view_at(self, now_ms: int) -> MarketView:
+        """O(1) construct a fixed-timestamp ``MarketView`` sharing underlying series and FeatureCache."""
+        if type(now_ms) is not int and (isinstance(now_ms, bool) or not isinstance(now_ms, int)):
+            raise ValueError("now_ms must be an integer millisecond timestamp")
         view = _OBJ_NEW(MarketView)
         _OBJ_SETATTR(view, "_bars", self._bars)
         _OBJ_SETATTR(view, "_funding", self._funding)
         _OBJ_SETATTR(view, "_features", self._features)
-        _OBJ_SETATTR(view, "_now_ms", new_now_ms)
+        _OBJ_SETATTR(view, "_now_ms", now_ms)
         return view
 
+    def at(self, now_ms: int) -> MarketView:
+        """Alias for ``view_at(now_ms)``."""
+        return self.view_at(now_ms)
+
     def __repr__(self) -> str:
-        return f"MarketView(now_ms={self._now_ms}, series={len(self._bars)})"
+        return f"MarketViewCursor(series={len(self._bars)})"
 
 
 __all__ = [
@@ -1288,6 +1366,7 @@ __all__ = [
     "BarSeriesCacheError",
     "BarSeriesSlice",
     "MarketView",
+    "MarketViewCursor",
     "load_or_build_bar_series",
     "read_bar_series_bin",
     "write_bar_series_bin",

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_HALF_EVEN
+from decimal import Decimal, InvalidOperation, localcontext
+from fractions import Fraction
 import math
 from typing import Any, Literal
 
@@ -13,11 +14,7 @@ AssetClass = Literal["perp", "spot", "equity"]
 RoundingMode = Literal["down", "up", "nearest"]
 
 VALID_ASSET_CLASSES: frozenset[str] = frozenset({"perp", "spot", "equity"})
-_ROUNDING_MODES = {
-    "down": ROUND_DOWN,
-    "up": ROUND_CEILING,
-    "nearest": ROUND_HALF_EVEN,
-}
+_VALID_ROUNDING_MODES: frozenset[str] = frozenset({"down", "up", "nearest"})
 _HOUR_MS = 3_600_000
 
 
@@ -74,13 +71,37 @@ def _non_negative_finite_float(value: Any, label: str) -> float:
     return result
 
 
-def _quantize_to_step(value: Decimal, step: Decimal, mode: RoundingMode) -> Decimal:
-    rounding = _ROUNDING_MODES.get(mode)
-    if rounding is None:
+def _exact_round_fraction(frac: Fraction, mode: RoundingMode) -> int:
+    if mode not in _VALID_ROUNDING_MODES:
         raise ValueError(f"unsupported rounding mode: {mode!r}")
-    units = (value / step).to_integral_value(rounding=rounding)
-    quantized = units * step
+    q, rem = divmod(frac.numerator, frac.denominator)
+    if rem == 0 or mode == "down":
+        return q
+    if mode == "up":
+        return q + 1
+    twice_rem = rem * 2
+    if twice_rem > frac.denominator:
+        return q + 1
+    if twice_rem < frac.denominator:
+        return q
+    return q if (q % 2 == 0) else q + 1
+
+
+def _exact_mul_units_step(units: int, step: Decimal) -> Decimal:
+    if units == 0:
+        return Decimal("0")
+    step_digits = len(step.as_tuple().digits)
+    units_digits = len(str(abs(units)))
+    with localcontext() as ctx:
+        ctx.prec = max(28, units_digits + step_digits + 4)
+        quantized = Decimal(units) * step
     return Decimal("0") if quantized == 0 else quantized
+
+
+def _quantize_to_step(value: Decimal, step: Decimal, mode: RoundingMode) -> Decimal:
+    frac = Fraction(value) / Fraction(step)
+    units = _exact_round_fraction(frac, mode)
+    return _exact_mul_units_step(units, step)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,8 +206,14 @@ class InstrumentSpec:
     ) -> Decimal:
         notional_val = _non_negative_decimal(notional, "notional")
         price_val = _positive_decimal(price, "price")
-        raw_contracts = notional_val / (price_val * self.contract_value)
-        return self.round_size(raw_contracts, rounding="down", enforce_min=enforce_min)
+        raw_lots = Fraction(notional_val) / (
+            Fraction(price_val) * Fraction(self.contract_value) * Fraction(self.lot_size)
+        )
+        units = _exact_round_fraction(raw_lots, "down")
+        rounded = _exact_mul_units_step(units, self.lot_size)
+        if enforce_min and rounded < self.min_size:
+            return Decimal("0")
+        return rounded
 
     def base_qty_for_contracts(self, contracts: float | str | Decimal) -> Decimal:
         dec = _non_negative_decimal(contracts, "contracts")
@@ -208,10 +235,10 @@ class InstrumentSpec:
             "venue": self.venue,
             "symbol": self.symbol,
             "asset_class": self.asset_class,
-            "tick_size": format(self.tick_size.normalize(), "f"),
-            "lot_size": format(self.lot_size.normalize(), "f"),
-            "min_size": format(self.min_size.normalize(), "f"),
-            "contract_value": format(self.contract_value.normalize(), "f"),
+            "tick_size": format(self.tick_size, "f"),
+            "lot_size": format(self.lot_size, "f"),
+            "min_size": format(self.min_size, "f"),
+            "contract_value": format(self.contract_value, "f"),
             "max_leverage": self.max_leverage,
             "calendar_id": self.calendar_id,
             "funding_interval_hours": self.funding_interval_hours,

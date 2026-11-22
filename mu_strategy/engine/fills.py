@@ -382,8 +382,19 @@ class ExecutionModel:
         bar_open: float,
         bar_high: float,
         bar_low: float,
+        open_only: bool = False,
     ) -> float | None:
-        """Return fill price for a resting limit order (with open-gap improvement), or None."""
+        """Return fill price for a resting limit order (with open-gap improvement), or None.
+
+        When ``open_only=True``, the order is evaluated strictly at ``bar_open`` and
+        never fills intrabar (fills at ``bar_open`` iff ``bar_open <= limit_price``
+        for buys or ``bar_open >= limit_price`` for sells).
+        """
+        if open_only:
+            if side == "buy":
+                return bar_open if bar_open <= limit_price else None
+            return bar_open if bar_open >= limit_price else None
+
         if side == "buy":
             if bar_open < limit_price:
                 return bar_open
@@ -416,6 +427,7 @@ class ExecutionModel:
         bar_high: float,
         bar_low: float,
         reason: str = "limit",
+        open_only: bool = False,
     ) -> FillQuote | None:
         """Fill a passive limit order if bar crosses ``limit_price`` (maker fee, 0 adverse slip)."""
         if qty <= 0.0:
@@ -426,6 +438,7 @@ class ExecutionModel:
             bar_open=bar_open,
             bar_high=bar_high,
             bar_low=bar_low,
+            open_only=open_only,
         )
         if fill_px is None:
             return None
@@ -507,6 +520,131 @@ class ExecutionModel:
             reason=reason,
         )
 
+    def evaluate_stop_limit(
+        self,
+        side: Literal["buy", "sell"],
+        qty: float,
+        stop_price: float,
+        limit_price: float,
+        *,
+        activated: bool = False,
+        bar_open: float,
+        bar_high: float,
+        bar_low: float,
+        bar_close: float,
+        bar_volume: float,
+        bar_atr: float | None = None,
+        reason: str = "stop_limit",
+    ) -> tuple[FillQuote | None, bool]:
+        """Evaluate a stop-limit order, returning ``(quote_or_none, now_activated)``.
+
+        Once the stop trigger is reached, ``now_activated`` becomes ``True`` and
+        subsequent bars match the order purely as a resting limit at ``limit_price``
+        without re-testing ``stop_price``.
+        """
+        if qty <= 0.0:
+            raise ValueError(f"qty must be positive, got {qty}")
+        if activated:
+            quote = self.try_fill_limit(
+                side,
+                qty,
+                limit_price,
+                bar_open=bar_open,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                reason=reason,
+            )
+            return quote, True
+
+        ref_price = self.stop_trigger_ref_price(
+            side,
+            stop_price,
+            bar_open=bar_open,
+            bar_high=bar_high,
+            bar_low=bar_low,
+        )
+        if ref_price is None:
+            return None, False
+
+        if side == "buy":
+            if ref_price > limit_price:
+                # Activated at the open above limit_price: rests as a buy limit for the bar.
+                if bar_open >= stop_price:
+                    reached = (bar_low < limit_price) if self.require_touch_through else (bar_low <= limit_price)
+                    if reached:
+                        return (
+                            self._make_quote(
+                                side="buy",
+                                order_type="limit",
+                                ref_price=limit_price,
+                                exec_price=limit_price,
+                                qty=qty,
+                                fee_rate=self._maker_fee_rate,
+                                liquidity="maker",
+                                reason=reason,
+                            ),
+                            True,
+                        )
+                return None, True
+            raw_exec = self._adverse_exec_price(
+                "buy",
+                ref_price,
+                order_notional=ref_price * qty,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                bar_close=bar_close,
+                bar_volume=bar_volume,
+                bar_atr=bar_atr,
+                is_stop=True,
+            )
+            exec_price = raw_exec if raw_exec <= limit_price else limit_price
+        else:
+            if ref_price < limit_price:
+                # Activated at the open below limit_price: rests as a sell limit for the bar.
+                if bar_open <= stop_price:
+                    reached = (bar_high > limit_price) if self.require_touch_through else (bar_high >= limit_price)
+                    if reached:
+                        return (
+                            self._make_quote(
+                                side="sell",
+                                order_type="limit",
+                                ref_price=limit_price,
+                                exec_price=limit_price,
+                                qty=qty,
+                                fee_rate=self._maker_fee_rate,
+                                liquidity="maker",
+                                reason=reason,
+                            ),
+                            True,
+                        )
+                return None, True
+            raw_exec = self._adverse_exec_price(
+                "sell",
+                ref_price,
+                order_notional=ref_price * qty,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                bar_close=bar_close,
+                bar_volume=bar_volume,
+                bar_atr=bar_atr,
+                is_stop=True,
+            )
+            exec_price = raw_exec if raw_exec >= limit_price else limit_price
+
+        return (
+            self._make_quote(
+                side=side,
+                order_type="stop_limit",
+                ref_price=ref_price,
+                exec_price=exec_price,
+                qty=qty,
+                fee_rate=self._taker_fee_rate,
+                liquidity="taker",
+                reason=reason,
+            ),
+            True,
+        )
+
     def try_fill_stop_limit(
         self,
         side: Literal["buy", "sell"],
@@ -523,59 +661,21 @@ class ExecutionModel:
         reason: str = "stop_limit",
     ) -> FillQuote | None:
         """Fill a stop-limit order if stop triggers and fill respects ``limit_price`` (taker fee)."""
-        if qty <= 0.0:
-            raise ValueError(f"qty must be positive, got {qty}")
-        ref_price = self.stop_trigger_ref_price(
+        quote, _ = self.evaluate_stop_limit(
             side,
+            qty,
             stop_price,
+            limit_price,
+            activated=False,
             bar_open=bar_open,
             bar_high=bar_high,
             bar_low=bar_low,
-        )
-        if ref_price is None:
-            return None
-
-        if side == "buy":
-            if ref_price > limit_price:
-                return None
-            raw_exec = self._adverse_exec_price(
-                "buy",
-                ref_price,
-                order_notional=ref_price * qty,
-                bar_high=bar_high,
-                bar_low=bar_low,
-                bar_close=bar_close,
-                bar_volume=bar_volume,
-                bar_atr=bar_atr,
-                is_stop=True,
-            )
-            exec_price = raw_exec if raw_exec <= limit_price else limit_price
-        else:
-            if ref_price < limit_price:
-                return None
-            raw_exec = self._adverse_exec_price(
-                "sell",
-                ref_price,
-                order_notional=ref_price * qty,
-                bar_high=bar_high,
-                bar_low=bar_low,
-                bar_close=bar_close,
-                bar_volume=bar_volume,
-                bar_atr=bar_atr,
-                is_stop=True,
-            )
-            exec_price = raw_exec if raw_exec >= limit_price else limit_price
-
-        return self._make_quote(
-            side=side,
-            order_type="stop_limit",
-            ref_price=ref_price,
-            exec_price=exec_price,
-            qty=qty,
-            fee_rate=self._taker_fee_rate,
-            liquidity="taker",
+            bar_close=bar_close,
+            bar_volume=bar_volume,
+            bar_atr=bar_atr,
             reason=reason,
         )
+        return quote
 
     def try_fill_liquidation(
         self,
@@ -659,6 +759,35 @@ class ExecutionModel:
         is_long = position_qty > 0.0
         close_side: Literal["buy", "sell"] = "sell" if is_long else "buy"
         qty_abs = abs(position_qty)
+
+        # 0. Evaluate orders already marketable AT THE BAR OPEN before intrabar paths.
+        #    Open-priority order: liquidation > stop-loss > marketable take-profit.
+        liq_at_open = (
+            liq_price is not None
+            and liq_price > 0.0
+            and ((bar_open <= liq_price) if is_long else (bar_open >= liq_price))
+        )
+        stop_at_open = (
+            stop_price is not None
+            and stop_price > 0.0
+            and ((bar_open <= stop_price) if is_long else (bar_open >= stop_price))
+        )
+        if not liq_at_open and not stop_at_open and take_profit is not None and take_profit > 0.0:
+            if is_long:
+                tp_at_open = (bar_open > take_profit) if self.require_touch_through else (bar_open >= take_profit)
+            else:
+                tp_at_open = (bar_open < take_profit) if self.require_touch_through else (bar_open <= take_profit)
+            if tp_at_open:
+                return self._make_quote(
+                    side=close_side,
+                    order_type="limit",
+                    ref_price=bar_open,
+                    exec_price=bar_open,
+                    qty=qty_abs,
+                    fee_rate=self._maker_fee_rate,
+                    liquidity="maker",
+                    reason=tp_reason,
+                )
 
         stop_ref = (
             self.stop_trigger_ref_price(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import struct
 from tempfile import TemporaryDirectory
 import time
 import unittest
+from unittest.mock import patch
 
 from mu_strategy.market_data.bar_series import (
     BAR_BIN_MAGIC,
@@ -18,6 +20,7 @@ from mu_strategy.market_data.bar_series import (
     BarSeriesCacheError,
     BarSeriesSlice,
     MarketView,
+    MarketViewCursor,
     load_or_build_bar_series,
     read_bar_series_bin,
     write_bar_series_bin,
@@ -64,9 +67,29 @@ class BarSeriesTests(unittest.TestCase):
         self.assertEqual(candles[-1], series.latest())
         self.assertEqual(candles, series.to_candles())
 
-        # Immutability
+        # Immutability + CR1-04 read-only public columns (cannot mutate backing buffers)
         with self.assertRaises(AttributeError):
             series.symbol = "OTHER"  # type: ignore[misc]
+        for col in (
+            series.open_times,
+            series.close_times,
+            series.opens,
+            series.highs,
+            series.lows,
+            series.closes,
+            series.volumes,
+        ):
+            self.assertIsInstance(col, memoryview)
+            self.assertTrue(col.readonly)
+            with self.assertRaises(TypeError):
+                col[0] = 0  # type: ignore[index]
+
+        # CR1-60: reversed unit-step slices return empty views (len == 0, never IndexError or negative len)
+        self.assertEqual(0, len(series[4:2]))
+        self.assertEqual([], series[4:2].to_candles())
+        self.assertEqual(0, len(series.slice_view(0, 6)[4:2]))
+        self.assertEqual(0, len(series.slice_view(0, 6).closes[4:2]))
+        self.assertEqual(0, len(series.slice_view(0, 6).close_times[4:2]))
 
         # index_at_or_before (by open & by close)
         t0 = candles[0].open_time_ms
@@ -158,13 +181,18 @@ class BinaryCacheTests(unittest.TestCase):
             self.assertEqual(series.interval_ms, loaded.interval_ms)
             self.assertTrue(loaded.is_uniform_close_times)
             self.assertEqual(candles, loaded.to_candles())
-            self.assertIsInstance(loaded.open_times, array)
-            self.assertEqual("q", loaded.open_times.typecode)
-            self.assertIsInstance(loaded.close_times, array)
-            self.assertEqual("q", loaded.close_times.typecode)
-            self.assertIsInstance(loaded.closes, array)
-            self.assertEqual("d", loaded.closes.typecode)
+            self.assertIsInstance(loaded.open_times, memoryview)
+            self.assertTrue(loaded.open_times.readonly)
+            self.assertEqual("q", loaded.open_times.format)
+            self.assertIsInstance(loaded.close_times, memoryview)
+            self.assertTrue(loaded.close_times.readonly)
+            self.assertEqual("q", loaded.close_times.format)
+            self.assertIsInstance(loaded.closes, memoryview)
+            self.assertTrue(loaded.closes.readonly)
+            self.assertEqual("d", loaded.closes.format)
             self.assertEqual(list(series.closes), list(loaded.closes))
+            with self.assertRaises(TypeError):
+                loaded.closes[0] = 999.0  # type: ignore[index]
             # Re-serializing a loaded BarSeries round-trips cleanly
             re_path = Path(tmp) / "re_mu_15m.bin"
             write_bar_series_bin(re_path, loaded, sha)
@@ -338,6 +366,74 @@ class BinaryCacheTests(unittest.TestCase):
             self.assertEqual("1h", rebuilt_iv.interval)
             self.assertEqual(HOUR_1_MS, rebuilt_iv.interval_ms)
 
+    def test_in_memory_lossless_digest_csv_snapshot_binding_and_manifest_authority(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # CR1-03: closes differing beyond 8 decimals must NOT collide in cache
+            c1 = [Candle(1_700_006_400_000, 100.0, 101.0, 99.0, 100.000000001, 10.0)]
+            c2 = [Candle(1_700_006_400_000, 100.0, 101.0, 99.0, 100.000000002, 10.0)]
+            prec_cache = root / "prec.bin"
+            s1 = load_or_build_bar_series(c1, symbol="BTCUSDT", interval="15m", cache_path=prec_cache)
+            self.assertEqual(100.000000001, s1.closes[0])
+            with self.assertRaises(BarSeriesCacheError):
+                load_or_build_bar_series(c2, symbol="BTCUSDT", interval="15m", cache_path=prec_cache, strict_cache=True)
+            s2 = load_or_build_bar_series(c2, symbol="BTCUSDT", interval="15m", cache_path=prec_cache)
+            self.assertEqual(100.000000002, s2.closes[0])
+
+            # CR1-07: cache destination resolving to CSV source MUST be rejected without altering CSV
+            csv_path = root / "bars.csv"
+            TrustedDataStore(data_dir=root).write_csv(_make_candles(5), csv_path)
+            orig_csv_bytes = csv_path.read_bytes()
+            with self.assertRaises(ValueError):
+                load_or_build_bar_series(csv_path, symbol="BTCUSDT", interval="15m", cache_path=csv_path)
+            self.assertEqual(orig_csv_bytes, csv_path.read_bytes())
+
+            # CR1-08: CSV digest bound to the exact single byte snapshot; mismatched source_sha256 fails closed
+            csv_cache = root / "bars_cache.bin"
+            with self.assertRaises(BarSeriesCacheError):
+                load_or_build_bar_series(
+                    csv_path,
+                    symbol="BTCUSDT",
+                    interval="15m",
+                    cache_path=csv_cache,
+                    source_sha256="a" * 64,
+                )
+            self.assertFalse(csv_cache.exists())
+            exact_sha = hashlib.sha256(orig_csv_bytes).hexdigest()
+            with patch(
+                "mu_strategy.market_data.bar_series._read_all_bytes_fast",
+                wraps=lambda p: Path(p).read_bytes(),
+            ) as spy_read:
+                loaded_csv = load_or_build_bar_series(
+                    csv_path,
+                    symbol="BTCUSDT",
+                    interval="15m",
+                    cache_path=csv_cache,
+                    source_sha256=exact_sha,
+                )
+            self.assertEqual(5, len(loaded_csv))
+            self.assertEqual(1, spy_read.call_count)  # single snapshot read (no double-open TOCTOU)
+
+            # CR1-06: TrustedDataStore rejects disagreeing source_sha256 even when stale cache exists
+            if (LIVE_DATA_DIR / "current.json").exists():
+                store = TrustedDataStore(data_dir=LIVE_DATA_DIR)
+                stale_sha = "b" * 64
+                stale_cache = root / "stale_trusted.bin"
+                write_bar_series_bin(
+                    stale_cache,
+                    BarSeries.from_candles("MU-USDT-SWAP", "1h", _make_candles(3, step_ms=HOUR_1_MS)),
+                    stale_sha,
+                )
+                with self.assertRaises(BarSeriesCacheError):
+                    load_or_build_bar_series(
+                        store,
+                        symbol="MU-USDT-SWAP",
+                        interval="1h",
+                        cache_path=stale_cache,
+                        source_sha256=stale_sha,
+                    )
+
     def test_warm_binary_load_under_1ms_on_data_live(self) -> None:
         if not (LIVE_DATA_DIR / "current.json").exists():
             self.skipTest("data/live not present")
@@ -405,12 +501,16 @@ class MarketViewCausalityTests(unittest.TestCase):
             ],
         )
         sentinel_features = object()
-        view0 = MarketView(
+        cursor = MarketViewCursor(
             {("MU-USDT-SWAP", "15m"): bars_15m, ("MU-USDT-SWAP", "1h"): bars_1h},
-            now_ms=base_ms,
             funding={"MU-USDT-SWAP": funding},
             features=sentinel_features,
         )
+        view0 = cursor.view_at(base_ms)
+
+        # CR1-05: strategy-facing MarketView cannot advance time (no .at() / .view_at())
+        self.assertFalse(hasattr(view0, "at"))
+        self.assertFalse(hasattr(view0, "view_at"))
 
         # At exact open of bar 0: NOTHING has closed yet!
         self.assertEqual(0, len(view0.closed_bars("MU-USDT-SWAP", "15m")))
@@ -420,20 +520,20 @@ class MarketViewCausalityTests(unittest.TestCase):
         self.assertEqual(0, len(view0.funding_series("MU-USDT-SWAP")))  # type: ignore[arg-type]
 
         # 1 ms before bar 0 closes: STILL nothing closed!
-        view_before_close = view0.at(base_ms + MIN_15_MS - 1)
+        view_before_close = cursor.view_at(base_ms + MIN_15_MS - 1)
         self.assertIs(sentinel_features, view_before_close.features)
         self.assertEqual(0, len(view_before_close.closed_bars("MU-USDT-SWAP", "15m")))
         self.assertIsNone(view_before_close.latest_closed_bar("MU-USDT-SWAP", "15m"))
 
         # At exact close of 15m bar 0: 15m has 1 closed bar; 1h STILL has 0 closed bars!
-        view_15m = view0.at(base_ms + MIN_15_MS)
+        view_15m = cursor.view_at(base_ms + MIN_15_MS)
         self.assertEqual(1, len(view_15m.closed_bars("MU-USDT-SWAP", "15m")))
         self.assertEqual(bars_15m[0], view_15m.latest_closed_bar("MU-USDT-SWAP", "15m"))
         self.assertEqual(0, len(view_15m.closed_bars("MU-USDT-SWAP", "1h")))
 
         # At 1h + 45m (7 closed 15m bars): 1h has ONLY bar 0 (closed at +1h); bar 1 (closes at +2h) is HIDDEN!
         t_1h45 = base_ms + HOUR_1_MS + 3 * MIN_15_MS
-        view_1h45 = view0.at(t_1h45)
+        view_1h45 = cursor.view_at(t_1h45)
         closed_15m = view_1h45.closed_bars("MU-USDT-SWAP", "15m")
         closed_1h = view_1h45.closed_bars("MU-USDT-SWAP", "1h")
         self.assertEqual(7, len(closed_15m))

@@ -6,11 +6,15 @@ Layer 2 strategies and the Layer 3 composable backtest/runtime engine.
 
 from __future__ import annotations
 
+import itertools
 import math
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, is_dataclass
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, is_dataclass
+from decimal import ROUND_FLOOR, Decimal, localcontext
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+
+from mu_strategy.core.trading_calendar import calendar_sha256, is_trading_window_allowed
 
 if TYPE_CHECKING:
     from mu_strategy.core.instrument import InstrumentSpec
@@ -19,14 +23,18 @@ if TYPE_CHECKING:
 __all__ = [
     "EMPTY_MAPPING",
     "EMPTY_OUTPUT",
+    "MAX_PARAM_GRID_SIZE",
     "OrderSide",
     "OrderType",
     "QtyMode",
+    "TimeInForce",
     "SideMode",
     "SUPPORTED_ORDER_SIDES",
     "SUPPORTED_ORDER_TYPES",
     "SUPPORTED_QTY_MODES",
+    "SUPPORTED_TIME_IN_FORCE",
     "SUPPORTED_SIDE_MODES",
+    "SessionGate",
     "PositionView",
     "OrderIntent",
     "PortfolioView",
@@ -46,14 +54,17 @@ __all__ = [
 OrderSide = Literal["buy", "sell"]
 OrderType = Literal["market", "limit", "stop_market", "stop_limit"]
 QtyMode = Literal["target_weight", "equity_fraction", "contracts", "close_all"]
+TimeInForce = Literal["gtc", "open_only"]
 SideMode = Literal["buy", "sell", "long_short"]
 ParamKind = Literal["int", "float", "bool", "categorical"]
 
 SUPPORTED_ORDER_SIDES: frozenset[str] = frozenset({"buy", "sell"})
 SUPPORTED_ORDER_TYPES: frozenset[str] = frozenset({"market", "limit", "stop_market", "stop_limit"})
 SUPPORTED_QTY_MODES: frozenset[str] = frozenset({"target_weight", "equity_fraction", "contracts", "close_all"})
+SUPPORTED_TIME_IN_FORCE: frozenset[str] = frozenset({"gtc", "open_only"})
 SUPPORTED_SIDE_MODES: frozenset[str] = frozenset({"buy", "sell", "long_short"})
 _SUPPORTED_PARAM_KINDS: frozenset[str] = frozenset({"int", "float", "bool", "categorical"})
+MAX_PARAM_GRID_SIZE: int = 100_000
 
 EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 _isfinite = math.isfinite
@@ -158,6 +169,30 @@ class PositionView:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionGate:
+    """Fill-time session eligibility gate evaluated against actual bar open timestamps."""
+
+    trading_calendar_id: str
+    trading_windows_et: tuple[tuple[str, str], ...]
+    trading_calendar_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        _validate_non_empty_str(self.trading_calendar_id, "trading_calendar_id")
+        windows = tuple((str(start), str(end)) for start, end in self.trading_windows_et)
+        if not windows:
+            raise ValueError("trading_windows_et must be non-empty")
+        object.__setattr__(self, "trading_windows_et", windows)
+        digest = calendar_sha256(self.trading_calendar_id)
+        if not self.trading_calendar_sha256:
+            object.__setattr__(self, "trading_calendar_sha256", digest)
+        elif self.trading_calendar_sha256 != digest:
+            raise ValueError("trading_calendar_sha256 does not match trading_calendar_id")
+
+    def is_allowed(self, ts_ms: int) -> bool:
+        return is_trading_window_allowed(ts_ms, self)
+
+
+@dataclass(frozen=True, slots=True)
 class OrderIntent:
     """Explicit executable order intent emitted by a Strategy."""
 
@@ -172,6 +207,8 @@ class OrderIntent:
     reduce_only: bool = False
     expires_after_bars: int | None = None
     tag: str = ""
+    time_in_force: TimeInForce = "gtc"
+    session_gate: SessionGate | None = None
 
     def __post_init__(self) -> None:
         _validate_non_empty_str(self.intent_id, "intent_id")
@@ -182,6 +219,10 @@ class OrderIntent:
             raise ValueError(f"unsupported order_type: {self.order_type!r}")
         if self.qty_mode not in SUPPORTED_QTY_MODES:
             raise ValueError(f"unsupported qty_mode: {self.qty_mode!r}")
+        if self.time_in_force not in SUPPORTED_TIME_IN_FORCE:
+            raise ValueError(f"unsupported time_in_force: {self.time_in_force!r}")
+        if self.time_in_force == "open_only" and self.order_type not in ("market", "limit"):
+            raise ValueError("time_in_force='open_only' is only valid for market and limit orders")
 
         qty_val = _normalize_float(self.qty_value, "qty_value")
         if self.qty_mode in ("contracts", "equity_fraction"):
@@ -213,6 +254,12 @@ class OrderIntent:
 
         if not isinstance(self.reduce_only, bool):
             raise ValueError("reduce_only must be a bool")
+
+        if self.session_gate is not None:
+            if not isinstance(self.session_gate, SessionGate):
+                raise ValueError("session_gate must be a SessionGate or None")
+            if self.reduce_only:
+                raise ValueError("session_gate is not allowed on reduce_only protective exits")
 
         if self.expires_after_bars is not None:
             if (
@@ -252,9 +299,11 @@ class PortfolioView:
         if _needs_float_set(self.daily_start_equity, daily):
             object.__setattr__(self, "daily_start_equity", daily)
 
-        if type(self.positions) is not _MappingProxyType:
+        if self.positions is not EMPTY_MAPPING:
             if not isinstance(self.positions, Mapping):
                 raise ValueError("positions must be a mapping")
+            # Always copy caller-supplied mappings (including MappingProxyType over a caller dict)
+            # so later external mutations cannot alter this snapshot.
             object.__setattr__(self, "positions", _MappingProxyType(dict(self.positions)))
 
         if type(self.open_orders) is not tuple:
@@ -299,6 +348,14 @@ class BarContext:
         _validate_non_empty_str(self.symbol, "symbol")
         if not isinstance(self.portfolio, PortfolioView):
             raise ValueError("portfolio must be a PortfolioView")
+        market_now = getattr(self.market, "now_ms", None)
+        if market_now is not None:
+            if isinstance(market_now, bool) or not isinstance(market_now, int):
+                raise ValueError("market.now_ms must be an integer")
+            if market_now != self.now_ms:
+                raise ValueError(
+                    f"market.now_ms ({market_now}) must match BarContext.now_ms ({self.now_ms})"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,9 +428,11 @@ class StrategyOutput:
         if type(self.targets) is not tuple:
             object.__setattr__(self, "targets", tuple(self.targets))
         diag = self.diagnostics
-        if diag is not EMPTY_MAPPING and type(diag) is not _MappingProxyType:
+        if diag is not EMPTY_MAPPING:
             if not isinstance(diag, Mapping):
                 raise ValueError("diagnostics must be a mapping")
+            # Copy caller-owned mappings (including MappingProxyType) so later external mutations
+            # cannot alter an earlier StrategyOutput.
             object.__setattr__(self, "diagnostics", _MappingProxyType(dict(diag)))
 
     @classmethod
@@ -445,7 +504,19 @@ class ParamSpec:
                 raise ValueError("choices must be non-empty when provided")
             object.__setattr__(self, "choices", choices_tuple)
 
-        if self.kind in ("int", "float"):
+        if self.kind == "int":
+            if self.min_value is not None:
+                if isinstance(self.min_value, bool) or not isinstance(self.min_value, int):
+                    raise ValueError("int ParamSpec min_value must be an int")
+            if self.max_value is not None:
+                if isinstance(self.max_value, bool) or not isinstance(self.max_value, int):
+                    raise ValueError("int ParamSpec max_value must be an int")
+            if self.min_value is not None and self.max_value is not None and self.min_value > self.max_value:
+                raise ValueError("min_value must be <= max_value")
+            if self.step is not None:
+                if isinstance(self.step, bool) or not isinstance(self.step, int) or self.step <= 0:
+                    raise ValueError("int ParamSpec step must be a positive int")
+        elif self.kind == "float":
             if self.min_value is not None:
                 _normalize_float(self.min_value, "min_value")
             if self.max_value is not None:
@@ -463,9 +534,13 @@ class ParamSpec:
             if self.min_value is not None or self.max_value is not None or self.step is not None:
                 raise ValueError("bool ParamSpec cannot set min_value, max_value, or step")
 
+        if self.choices is not None:
+            for choice in self.choices:
+                self._validate_type_and_bounds(choice)
+
         self.validate(self.default)
 
-    def validate(self, value: Any) -> None:
+    def _validate_type_and_bounds(self, value: Any) -> None:
         if self.kind == "bool":
             if not isinstance(value, bool):
                 raise ValueError(f"parameter {self.name!r} must be a bool")
@@ -487,6 +562,8 @@ class ParamSpec:
             if value not in self.choices:
                 raise ValueError(f"parameter {self.name!r} must be one of {self.choices!r}")
 
+    def validate(self, value: Any) -> None:
+        self._validate_type_and_bounds(value)
         if self.choices is not None and value not in self.choices:
             raise ValueError(f"parameter {self.name!r} must be one of {self.choices!r}")
 
@@ -496,33 +573,61 @@ class ParamSpec:
         if self.kind == "bool":
             return (False, True)
         if self.kind == "int" and self.min_value is not None and self.max_value is not None:
-            step = int(self.step) if self.step is not None else 1
-            return tuple(range(int(self.min_value), int(self.max_value) + 1, step))
+            lo_i = int(self.min_value)
+            hi_i = int(self.max_value)
+            step_i = int(self.step) if self.step is not None else 1
+            count = ((hi_i - lo_i) // step_i) + 1
+            if count > MAX_PARAM_GRID_SIZE:
+                raise ValueError(
+                    f"parameter {self.name!r} grid size {count} exceeds limit {MAX_PARAM_GRID_SIZE}"
+                )
+            return tuple(range(lo_i, hi_i + 1, step_i))
         if self.kind == "float" and self.min_value is not None and self.max_value is not None and self.step is not None:
-            values: list[float] = []
             lo = float(self.min_value)
             hi = float(self.max_value)
             step = float(self.step)
-            idx = 0
-            while True:
-                val = lo + idx * step
-                if val > hi + (step * 1e-9):
-                    break
-                values.append(round(min(val, hi), 12))
-                idx += 1
-            return tuple(values)
+            with localcontext() as ctx:
+                ctx.prec = 50
+                ctx.Emax = 10_000
+                ctx.Emin = -10_000
+                d_lo = Decimal(str(lo))
+                d_hi = Decimal(str(hi))
+                d_step = Decimal(str(step))
+                span = d_hi - d_lo
+                steps_exact = span / d_step
+                if not steps_exact.is_finite() or steps_exact < 0:
+                    raise ValueError(f"parameter {self.name!r} float grid is unrepresentable")
+                if steps_exact > Decimal(MAX_PARAM_GRID_SIZE - 1):
+                    raise ValueError(
+                        f"parameter {self.name!r} float grid exceeds limit {MAX_PARAM_GRID_SIZE}"
+                    )
+                count = int(steps_exact.to_integral_value(rounding=ROUND_FLOOR)) + 1
+                values: list[float] = []
+                for idx in range(count):
+                    val = float(d_lo + (d_step * idx))
+                    if not _isfinite(val):
+                        raise ValueError(f"parameter {self.name!r} grid point overflows float")
+                    if val < lo:
+                        val = lo
+                    elif val > hi:
+                        val = hi
+                    values.append(0.0 if val == 0.0 else val)
+                return tuple(values)
         return (self.default,)
 
 
 @dataclass(frozen=True, slots=True)
 class ParamSpace:
-    """Immutable collection of parameter specifications for a strategy family."""
+    """Immutable collection of parameter specifications and cross-parameter constraints."""
 
     specs: tuple[ParamSpec, ...] = ()
+    constraints: tuple[Callable[[Mapping[str, Any]], None], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.specs) is not tuple:
             object.__setattr__(self, "specs", tuple(self.specs))
+        if type(self.constraints) is not tuple:
+            object.__setattr__(self, "constraints", tuple(self.constraints))
         seen: set[str] = set()
         for spec in self.specs:
             if not isinstance(spec, ParamSpec):
@@ -530,6 +635,9 @@ class ParamSpace:
             if spec.name in seen:
                 raise ValueError(f"duplicate parameter name in ParamSpace: {spec.name!r}")
             seen.add(spec.name)
+        for constraint in self.constraints:
+            if not callable(constraint):
+                raise ValueError("ParamSpace constraints must be callable")
 
     def names(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.specs)
@@ -541,27 +649,66 @@ class ParamSpace:
         return {spec.name: spec.default for spec in self.specs}
 
     def validate_params(self, params: Any) -> None:
+        effective: dict[str, Any] = {}
         if isinstance(params, Mapping):
             for spec in self.specs:
                 if spec.name in params:
-                    spec.validate(params[spec.name])
-            return
-        if is_dataclass(params) or hasattr(params, "__dict__") or hasattr(params, "__slots__"):
+                    val = params[spec.name]
+                    spec.validate(val)
+                    effective[spec.name] = val
+                else:
+                    effective[spec.name] = spec.default
+        elif is_dataclass(params) or hasattr(params, "__dict__") or hasattr(params, "__slots__"):
             for spec in self.specs:
                 if hasattr(params, spec.name):
-                    spec.validate(getattr(params, spec.name))
+                    val = getattr(params, spec.name)
+                    spec.validate(val)
+                    effective[spec.name] = val
+                else:
+                    effective[spec.name] = spec.default
+        else:
+            raise ValueError("params must be a mapping or parameter object")
+
+        for constraint in self.constraints:
+            constraint(effective)
+
+    def is_valid(self, params: Any) -> bool:
+        try:
+            self.validate_params(params)
+            return True
+        except ValueError:
+            return False
+
+    def iter_valid_grid(self) -> Iterator[dict[str, Any]]:
+        """Yield parameter dicts from the Cartesian grid satisfying all constraints."""
+        if not self.specs:
+            yield {}
             return
-        raise ValueError("params must be a mapping or parameter object")
+        names = tuple(spec.name for spec in self.specs)
+        grids = tuple(spec.grid_values() for spec in self.specs)
+        for combo in itertools.product(*grids):
+            candidate = dict(zip(names, combo))
+            if not self.constraints:
+                yield candidate
+                continue
+            try:
+                for constraint in self.constraints:
+                    constraint(candidate)
+            except ValueError:
+                continue
+            yield candidate
 
 
 @runtime_checkable
 class FastCursor(Protocol):
     """Documented strictly-causal O(1) cursor contract exposed optionally by fast engines.
 
-    Implementers MUST maintain these invariants on every ``Strategy.on_bar(ctx)`` call:
+    Implementers MUST maintain these invariants during every ``Strategy.on_bar(ctx)`` call:
       - ``bar_idx`` equals ``ctx.market.closed_bars(symbol, interval).end - 1`` with
         slice ``start == 0`` (never exposing bars past ``ctx.now_ms``).
       - ``pos_qty`` equals ``ctx.portfolio.position_qty(symbol)``.
+      - The cursor is callback-scoped; engines enforce that retained live views
+        cannot be read outside an active ``on_bar(ctx)`` invocation.
     """
 
     bar_idx: int
@@ -570,7 +717,11 @@ class FastCursor(Protocol):
 
 @runtime_checkable
 class FastCursorMarket(Protocol):
-    """Optional fast-path MarketView extension bound to a single primary ``(symbol, interval)``."""
+    """Optional fast-path MarketView extension bound to a single primary ``(symbol, interval)``.
+
+    Calls to ``closed_bars()`` MUST still return fixed-bound immutable ``BarSeriesSlice``
+    snapshots whose bounds do not mutate across subsequent bars.
+    """
 
     _acct: FastCursor
     _p_sym: str
@@ -579,7 +730,16 @@ class FastCursorMarket(Protocol):
 
 @runtime_checkable
 class Strategy(Protocol):
-    """Single-source protocol driving backtest, walk-forward, shadow, and live."""
+    """Single-source protocol driving backtest, walk-forward, shadow, and live.
+
+    Callback lifetime contract:
+      - By default, engines pass point-in-time immutable ``BarContext``, ``PortfolioView``,
+        and ``BarSeriesSlice`` snapshots that remain valid even if retained.
+      - Strategies that set class attribute ``supports_ephemeral_context = True`` explicitly
+        opt in to callback-scoped live context / ``FastCursor`` reuse and MUST NOT retain
+        ``ctx``, ``ctx.market``, or ``ctx.portfolio`` across ``on_bar`` invocations.
+        Returned ``BarSeriesSlice`` objects from ``closed_bars()`` always retain fixed bounds.
+    """
 
     strategy_id: str
     version: str

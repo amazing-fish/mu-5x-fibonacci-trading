@@ -131,6 +131,7 @@ class TSMomentumStrategy:
         "_lookback",
         "_deadband",
         "_target_weight",
+        "_neg_target_weight",
         "_side_mode",
         "_use_hysteresis",
         "_vol_max",
@@ -157,6 +158,7 @@ class TSMomentumStrategy:
     strategy_id: str = "ts_momentum"
     version: str = "1.0.0"
     supported_sides: tuple[str, ...] = ("buy", "sell", "long_short")
+    supports_ephemeral_context: bool = True
 
     def __init__(self, params: TSMomentumParams | None = None, **kwargs: Any) -> None:
         if params is not None and kwargs:
@@ -182,6 +184,7 @@ class TSMomentumStrategy:
         self._lookback = p.lookback_bars
         self._deadband = p.deadband_return
         self._target_weight = p.target_weight
+        self._neg_target_weight = -p.target_weight
         self._side_mode = p.side_mode
         self._use_hysteresis = p.use_deadband_hysteresis
         self._vol_max = p.vol_filter_max_ann_vol
@@ -251,10 +254,14 @@ class TSMomentumStrategy:
                 if curr_close > past_close:
                     self._bars_seen += 1
                     self._last_bar_idx = last_idx
+                    self._last_direction = 1
+                    self._last_target_weight = self._target_weight
                     return self._out_long  # type: ignore[return-value]
                 if curr_close < past_close:
                     self._bars_seen += 1
                     self._last_bar_idx = last_idx
+                    self._last_direction = -1
+                    self._last_target_weight = self._neg_target_weight
                     return self._out_short  # type: ignore[return-value]
             else:
                 self._bars_seen += 1
@@ -303,9 +310,14 @@ class TSMomentumStrategy:
         stop_mult = self._stop_atr_mult
         if vol_max is None and stop_mult is None:
             if base is not self._cached_base:
+                self._fast_ctx = None
+                self._fast_acct = None
                 self._cached_base = base
                 self._cached_start = start
-                self._cached_closes = base.closes
+                fc = getattr(market, "_features", None)
+                if fc is None:
+                    fc = getattr(market, "features", getattr(market, "feature_cache", None))
+                self._cached_closes = fc._closes_tuple(base) if fc is not None and hasattr(fc, "_closes_tuple") else base.closes
                 self._cached_close_times = base.close_times
         else:
             try:
@@ -316,6 +328,8 @@ class TSMomentumStrategy:
                 features = self._fallback_features
             feat_gen = features._generation
             if base is not self._cached_base or features is not self._cached_features or feat_gen != self._cached_gen:
+                self._fast_ctx = None
+                self._fast_acct = None
                 self._cached_base = base
                 self._cached_start = start
                 self._cached_features = features
@@ -398,10 +412,10 @@ class TSMomentumStrategy:
             return self._out_flat  # type: ignore[return-value]
 
         desired_weight = self._target_weight if desired_dir > 0 else -self._target_weight
-        self._last_direction = desired_dir
-        self._last_target_weight = desired_weight
 
         if stop_mult is None:
+            self._last_direction = desired_dir
+            self._last_target_weight = desired_weight
             if symbol != self._out_sym:
                 w = self._target_weight
                 self._out_sym = symbol
@@ -417,19 +431,21 @@ class TSMomentumStrategy:
                 sp = curr_close - (stop_mult * atr_val)
                 stop_price = sp if sp > 1e-12 else 1e-12
             else:
-                stop_price = curr_close + (stop_mult * atr_val)
+                sp = curr_close + (stop_mult * atr_val)
+                if not (0.0 < sp < _INF):
+                    raise ValueError(f"derived short stop_price must be positive and finite, got {sp!r}")
+                stop_price = sp
 
         reason = "tsmom_long" if desired_dir > 0 else "tsmom_short"
-        return StrategyOutput(
-            targets=(
-                TargetPosition(
-                    symbol=symbol,
-                    target_weight=desired_weight,
-                    stop_price=stop_price,
-                    reason=reason,
-                ),
-            ),
+        target = TargetPosition(
+            symbol=symbol,
+            target_weight=desired_weight,
+            stop_price=stop_price,
+            reason=reason,
         )
+        self._last_direction = desired_dir
+        self._last_target_weight = desired_weight
+        return StrategyOutput(targets=(target,))
 
     def snapshot_state(self) -> dict[str, Any]:
         last_bar_ms = self._last_bar_ms

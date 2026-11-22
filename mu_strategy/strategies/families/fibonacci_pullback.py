@@ -37,6 +37,7 @@ from mu_strategy.strategies.protocol import (
     OrderIntent,
     ParamSpace,
     ParamSpec,
+    SessionGate,
     StrategyOutput,
 )
 from mu_strategy.strategy import (
@@ -53,6 +54,18 @@ __all__ = [
 
 _isfinite = math.isfinite
 _VALID_ENTRY_MODES = frozenset({"second_pullback", "break_high", "direct_next_open"})
+
+
+def _validate_margin_steps(steps: Sequence[float]) -> None:
+    if not steps:
+        raise ValueError("margin_steps must not be empty")
+    for idx, step in enumerate(steps):
+        if isinstance(step, bool) or not isinstance(step, (int, float)) or not _isfinite(step):
+            raise ValueError(f"margin_steps[{idx}] must be finite, got {step!r}")
+        if idx == 0 and step <= 0.0:
+            raise ValueError(f"first margin_step must be positive, got {step!r}")
+        if step < 0.0:
+            raise ValueError(f"margin_steps[{idx}] must be non-negative, got {step!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +154,7 @@ class FibonacciPullbackParams:
             raise ValueError("leverage must be positive and finite")
         if not isinstance(self.use_session_window, bool):
             raise ValueError("use_session_window must be a bool")
+        _validate_margin_steps(self.margin_steps)
 
 
 def fibonacci_pullback_param_space() -> ParamSpace:
@@ -319,6 +333,16 @@ class FibonacciPullbackStrategy:
             raise ValueError("pass either params or keyword overrides, not both")
         self.params: FibonacciPullbackParams = params if params is not None else FibonacciPullbackParams(**kwargs)
         self._config: StrategyConfig = self._build_effective_config(self.params)
+        _validate_margin_steps(self._config.margin_steps)
+        self._session_gate: SessionGate | None = (
+            SessionGate(
+                trading_calendar_id=self._config.trading_calendar_id,
+                trading_windows_et=self._config.trading_windows_et,
+                trading_calendar_sha256=self._config.trading_calendar_sha256 or "",
+            )
+            if (self.params.legacy_parity or self.params.use_session_window)
+            else None
+        )
         self.required_intervals: tuple[str, ...] = (
             self.params.primary_interval,
             self.params.regime_interval,
@@ -540,16 +564,16 @@ class FibonacciPullbackStrategy:
         stop = max(hard_stop, stop)
         return max(1e-12, min(stop, entry_price * (1.0 - 1e-9)))
 
-    def _hourly_regime_at(self, ctx: BarContext, target_ts_ms: int, features: FeatureCache) -> str:
+    def _hourly_regime_at(self, ctx: BarContext, target_ts_ms: int, features: FeatureCache) -> str | None:
         market = ctx.market
         regime_iv = self.params.regime_interval
         has_series = getattr(market, "has_series", None)
         if has_series is not None and not has_series(ctx.symbol, regime_iv):
-            return "yellow"
+            return "yellow" if self.params.legacy_parity else None
         try:
             h1_bars = market.closed_bars(ctx.symbol, regime_iv)
         except KeyError:
-            return "yellow"
+            return "yellow" if self.params.legacy_parity else None
 
         try:
             h1_base = h1_bars._series
@@ -558,7 +582,7 @@ class FibonacciPullbackStrategy:
         except AttributeError:
             h1_base, h1_start, h1_end = _unwrap_series_bounds(h1_bars)
         if h1_end <= h1_start:
-            return "yellow"
+            return "yellow" if self.params.legacy_parity else None
 
         feat_gen = getattr(features, "_generation", 0)
         if (
@@ -578,16 +602,21 @@ class FibonacciPullbackStrategy:
         # Strictly causal: bounded by h1_end (already <= ctx.now_ms) AND close_time_ms <= target_ts_ms.
         k = bisect_right(self._cached_h1_close_times, target_ts_ms, h1_start, h1_end) - 1
         if k < h1_start:
-            return "yellow"
+            return "yellow" if self.params.legacy_parity else None
 
         h1_close = float(self._cached_h1_closes[k])
         h1_ema21 = float(self._cached_h1_ema21[k])
         h1_rsi14 = float(self._cached_h1_rsi14[k])
-        if not _isfinite(h1_rsi14):
-            h1_rsi14 = 50.0
         hist_arr = self._cached_h1_hist
         h1_hist = float(hist_arr[k])
         h1_prev_hist = float(hist_arr[k - 1]) if k > h1_start else h1_hist
+        if not (_isfinite(h1_close) and _isfinite(h1_ema21) and _isfinite(h1_hist) and _isfinite(h1_prev_hist)):
+            return "yellow" if self.params.legacy_parity else None
+        if not _isfinite(h1_rsi14):
+            if self.params.legacy_parity:
+                h1_rsi14 = 50.0
+            else:
+                return None
         return one_hour_regime(h1_close, h1_ema21, h1_rsi14, h1_hist, h1_prev_hist)
 
     def _position_snapshot(self) -> PositionStateSnapshot:
@@ -605,7 +634,6 @@ class FibonacciPullbackStrategy:
         self,
         ctx: BarContext,
         curr_rel_idx: int,
-        next_open_ms: int,
         atr_val: float | None,
     ) -> StrategyOutput:
         pending = self._pending_entry
@@ -613,8 +641,6 @@ class FibonacciPullbackStrategy:
             return EMPTY_OUTPUT
         next_bar_idx = curr_rel_idx + 1
         if next_bar_idx > pending.expires_bar_idx:
-            return EMPTY_OUTPUT
-        if not self._window_allowed(next_open_ms):
             return EMPTY_OUTPUT
 
         entry_qty_fraction = self._config.margin_steps[0] * self._config.leverage
@@ -630,6 +656,7 @@ class FibonacciPullbackStrategy:
             reduce_only=False,
             expires_after_bars=1,
             tag="fib_second_pullback_entry",
+            session_gate=self._session_gate,
         )
         stop_intent = OrderIntent(
             intent_id=f"fib_sp_init_stop_{curr_rel_idx}",
@@ -739,7 +766,11 @@ class FibonacciPullbackStrategy:
             # still scan that bar for a fresh signal (L309-316).
             if self._submitted_entry_bar_idx == curr_rel_idx:
                 self._submitted_entry_bar_idx = None
-                if self._pending_entry is not None and curr_low <= self._pending_entry.fib_level:
+                if (
+                    self._pending_entry is not None
+                    and self._window_allowed(curr_open_ms)
+                    and curr_low <= self._pending_entry.fib_level
+                ):
                     self._pending_entry = None
                     return EMPTY_OUTPUT
                 self._pending_immediate = None
@@ -823,6 +854,7 @@ class FibonacciPullbackStrategy:
             hist_val = float(self._cached_hist[curr_abs_idx])
             prev_hist_val = float(self._cached_hist[curr_abs_idx - 1])
             curr_regime = self._hourly_regime_at(ctx, curr_open_ms, features)
+            tighten_regime = curr_regime if curr_regime is not None else "yellow"
             candle_view = _BarSeriesCandleAdapter(base, start, end)
             curr_candle = candle_view[curr_rel_idx]
             outcome = tighten_stop(
@@ -830,7 +862,7 @@ class FibonacciPullbackStrategy:
                 curr_candle,
                 index=curr_rel_idx,
                 candles=candle_view,
-                regime=curr_regime,
+                regime=tighten_regime,
                 config=cfg,
             )
             self._stop_price = outcome.stop_price
@@ -852,7 +884,7 @@ class FibonacciPullbackStrategy:
                 )
             ]
 
-            if _isfinite(rsi_val) and ctx.portfolio.equity > 0.0:
+            if curr_regime is not None and _isfinite(rsi_val) and ctx.portfolio.equity > 0.0:
                 snapshot = self._position_snapshot()
                 plan = decide_pyramid_add(
                     snapshot,
@@ -863,39 +895,42 @@ class FibonacciPullbackStrategy:
                     regime=curr_regime,
                     config=cfg,
                 )
-                if plan.should_add and self._window_allowed(next_open_ms):
+                if plan.should_add:
                     # Re-check regime at next bar open (strictly causal: close_time_ms <= ctx.now_ms).
                     next_regime = self._hourly_regime_at(ctx, next_open_ms, features)
-                    exec_check = decide_pyramid_add(
-                        snapshot,
-                        curr_candle,
-                        rsi_value=rsi_val,
-                        macd_hist=hist_val,
-                        previous_macd_hist=prev_hist_val,
-                        regime=next_regime,
-                        config=cfg,
-                    )
-                    if (
-                        exec_check.should_add
-                        and plan.stage is not None
-                        and plan.margin_fraction is not None
-                        and plan.trigger_price is not None
-                    ):
-                        intents.append(
-                            OrderIntent(
-                                intent_id=f"fib_add_s{plan.stage}_{curr_rel_idx}",
-                                symbol=ctx.symbol,
-                                side="buy",
-                                order_type="stop_market",
-                                qty_mode="equity_fraction",
-                                qty_value=plan.margin_fraction * cfg.leverage,
-                                stop_price=plan.trigger_price,
-                                reduce_only=False,
-                                expires_after_bars=1,
-                                tag=f"fib_pyramid_stage_{plan.stage}",
-                            )
+                    if next_regime is not None:
+                        exec_check = decide_pyramid_add(
+                            snapshot,
+                            curr_candle,
+                            rsi_value=rsi_val,
+                            macd_hist=hist_val,
+                            previous_macd_hist=prev_hist_val,
+                            regime=next_regime,
+                            config=cfg,
                         )
-                        self._pending_add_stage = plan.stage
+                        if (
+                            exec_check.should_add
+                            and plan.stage is not None
+                            and plan.margin_fraction is not None
+                            and plan.margin_fraction > 0.0
+                            and plan.trigger_price is not None
+                        ):
+                            intents.append(
+                                OrderIntent(
+                                    intent_id=f"fib_add_s{plan.stage}_{curr_rel_idx}",
+                                    symbol=ctx.symbol,
+                                    side="buy",
+                                    order_type="stop_market",
+                                    qty_mode="equity_fraction",
+                                    qty_value=plan.margin_fraction * cfg.leverage,
+                                    stop_price=plan.trigger_price,
+                                    reduce_only=False,
+                                    expires_after_bars=1,
+                                    tag=f"fib_pyramid_stage_{plan.stage}",
+                                    session_gate=self._session_gate,
+                                )
+                            )
+                            self._pending_add_stage = plan.stage
 
             return StrategyOutput(
                 intents=tuple(intents),
@@ -921,7 +956,7 @@ class FibonacciPullbackStrategy:
                 # Matches legacy `backtest.py:228-229`: expire and fall through to scan curr bar.
             else:
                 # Pending entry still alive on this bar and did not fill -> do not scan a new signal.
-                return self._emit_second_pullback_intents(ctx, curr_rel_idx, next_open_ms, atr_val)
+                return self._emit_second_pullback_intents(ctx, curr_rel_idx, atr_val)
 
         if not self.params.legacy_parity and count < self.warmup_bars[self.params.primary_interval]:
             return EMPTY_OUTPUT
@@ -949,7 +984,7 @@ class FibonacciPullbackStrategy:
                 return EMPTY_OUTPUT
 
         curr_regime = self._hourly_regime_at(ctx, curr_open_ms, features)
-        if curr_regime not in cfg.allowed_regimes:
+        if curr_regime is None or curr_regime not in cfg.allowed_regimes:
             return EMPTY_OUTPUT
         if rsi_val < cfg.rsi_floor:
             return EMPTY_OUTPUT
@@ -971,12 +1006,10 @@ class FibonacciPullbackStrategy:
                 expires_bar_idx=curr_rel_idx + cfg.second_pullback_wait_bars,
                 signal_stop=signal_stop,
             )
-            return self._emit_second_pullback_intents(ctx, curr_rel_idx, next_open_ms, atr_val)
+            return self._emit_second_pullback_intents(ctx, curr_rel_idx, atr_val)
 
-        # `direct_next_open` or `break_high`: execution happens on the immediately following bar.
-        if not self._window_allowed(next_open_ms):
-            return EMPTY_OUTPUT
-
+        # `direct_next_open` or `break_high`: execution happens on the immediately following bar
+        # and session eligibility is enforced at fill time against the actual fill bar open via `session_gate`.
         signal_range_pct = (curr_high - curr_low) / curr_close if curr_close else 0.0
         if cfg.max_signal_range_pct is not None and signal_range_pct > cfg.max_signal_range_pct:
             return EMPTY_OUTPUT
@@ -995,6 +1028,8 @@ class FibonacciPullbackStrategy:
         entry_qty_fraction = cfg.margin_steps[0] * cfg.leverage
 
         if cfg.entry_execution == "direct_next_open":
+            if max_entry_price is not None and not (_isfinite(max_entry_price) and max_entry_price > 0.0):
+                return EMPTY_OUTPUT
             if cfg.block_reverse_fib_resistance:
                 rev = _reverse_fib_resistance_from_arrays(
                     base.highs,
@@ -1008,21 +1043,44 @@ class FibonacciPullbackStrategy:
                 if rev is not None:
                     return EMPTY_OUTPUT
             initial_stop = self._compute_initial_stop(curr_close, signal_stop, atr_val)
-            self._pending_immediate = _PendingImmediateEntry(mode="direct_next_open", signal_stop=signal_stop)
+            self._pending_immediate = _PendingImmediateEntry(
+                mode="direct_next_open",
+                signal_stop=signal_stop,
+                max_entry_price=max_entry_price,
+            )
             self._submitted_entry_bar_idx = curr_rel_idx + 1
+            if max_entry_price is not None:
+                dno_entry = OrderIntent(
+                    intent_id=f"fib_dno_entry_{curr_rel_idx}",
+                    symbol=ctx.symbol,
+                    side="buy",
+                    order_type="limit",
+                    qty_mode="equity_fraction",
+                    qty_value=entry_qty_fraction,
+                    limit_price=max_entry_price,
+                    reduce_only=False,
+                    expires_after_bars=1,
+                    tag="fib_direct_next_open_entry",
+                    time_in_force="open_only",
+                    session_gate=self._session_gate,
+                )
+            else:
+                dno_entry = OrderIntent(
+                    intent_id=f"fib_dno_entry_{curr_rel_idx}",
+                    symbol=ctx.symbol,
+                    side="buy",
+                    order_type="market",
+                    qty_mode="equity_fraction",
+                    qty_value=entry_qty_fraction,
+                    reduce_only=False,
+                    expires_after_bars=1,
+                    tag="fib_direct_next_open_entry",
+                    time_in_force="open_only",
+                    session_gate=self._session_gate,
+                )
             return StrategyOutput(
                 intents=(
-                    OrderIntent(
-                        intent_id=f"fib_dno_entry_{curr_rel_idx}",
-                        symbol=ctx.symbol,
-                        side="buy",
-                        order_type="market",
-                        qty_mode="equity_fraction",
-                        qty_value=entry_qty_fraction,
-                        reduce_only=False,
-                        expires_after_bars=1,
-                        tag="fib_direct_next_open_entry",
-                    ),
+                    dno_entry,
                     OrderIntent(
                         intent_id=f"fib_dno_init_stop_{curr_rel_idx}",
                         symbol=ctx.symbol,
@@ -1037,7 +1095,12 @@ class FibonacciPullbackStrategy:
                     ),
                 ),
                 diagnostics=MappingProxyType(
-                    {"mode": "direct_next_open", "fib_level": fib_level, "initial_stop": initial_stop}
+                    {
+                        "mode": "direct_next_open",
+                        "fib_level": fib_level,
+                        "initial_stop": initial_stop,
+                        "max_entry_price": max_entry_price,
+                    }
                 ),
             )
 
@@ -1080,6 +1143,7 @@ class FibonacciPullbackStrategy:
                 reduce_only=False,
                 expires_after_bars=1,
                 tag="fib_break_high_entry",
+                session_gate=self._session_gate,
             )
         else:
             entry_intent = OrderIntent(
@@ -1093,6 +1157,7 @@ class FibonacciPullbackStrategy:
                 reduce_only=False,
                 expires_after_bars=1,
                 tag="fib_break_high_entry",
+                session_gate=self._session_gate,
             )
 
         stop_intent = OrderIntent(

@@ -75,6 +75,13 @@ class DonchianATRParams:
             raise ValueError("allow_flip must be a bool")
 
 
+def _validate_donchian_atr_space(params: Mapping[str, Any]) -> None:
+    entry_period = params.get("entry_period")
+    exit_period = params.get("exit_period")
+    if entry_period is not None and exit_period is not None and exit_period > entry_period:
+        raise ValueError(f"exit_period ({exit_period}) must be <= entry_period ({entry_period})")
+
+
 def donchian_atr_param_space() -> ParamSpace:
     return ParamSpace(
         (
@@ -86,7 +93,8 @@ def donchian_atr_param_space() -> ParamSpace:
             ParamSpec("target_weight", "float", 1.0, min_value=0.25, max_value=3.0, step=0.25),
             ParamSpec("side_mode", "categorical", "long_short", choices=("buy", "sell", "long_short")),
             ParamSpec("allow_flip", "bool", True),
-        )
+        ),
+        constraints=(_validate_donchian_atr_space,),
     )
 
 
@@ -152,6 +160,7 @@ class DonchianATRStrategy:
     strategy_id: str = "donchian_atr"
     version: str = "1.0.0"
     supported_sides: tuple[str, ...] = ("buy", "sell", "long_short")
+    supports_ephemeral_context: bool = True
 
     def __init__(self, params: DonchianATRParams | None = None, **kwargs: Any) -> None:
         if params is not None and kwargs:
@@ -293,6 +302,10 @@ class DonchianATRStrategy:
             feat_gen = features._generation
 
             if base is not self._cached_base or features is not self._cached_features or feat_gen != self._cached_gen:
+                self._fast_mkt = None
+                self._fast_pf = None
+                self._fast_acct = None
+                self._fast_sym = None
                 self._cached_base = base
                 self._cached_features = features
                 self._cached_gen = feat_gen
@@ -347,8 +360,10 @@ class DonchianATRStrategy:
                     atr_val = self._cached_atr[last_idx]
                     if 0.0 < atr_val < _INF:
                         stop_px = curr_close + (self._atr_stop_mult * atr_val)
-                        self._pending_initial_stop = stop_px
-                        return _fast_target_output(symbol, -self._target_weight, stop_px, "donchian_breakout_short")
+                        if 0.0 < stop_px < _INF:
+                            self._pending_initial_stop = stop_px
+                            return _fast_target_output(symbol, -self._target_weight, stop_px, "donchian_breakout_short")
+                    self._pending_initial_stop = None
                     return EMPTY_OUTPUT
             self._pending_initial_stop = None
             return EMPTY_OUTPUT
@@ -378,6 +393,8 @@ class DonchianATRStrategy:
                     init_stop = pending_stop
                 self._trailing_stop = init_stop
                 self._pending_initial_stop = None
+            else:
+                self._pending_initial_stop = None
 
             highest = self._highest_close
             if highest is None or curr_close > highest:
@@ -395,13 +412,12 @@ class DonchianATRStrategy:
                 entry_low = self._cached_entry_low[prev_idx]
                 if -_INF < entry_low < _INF and curr_close < entry_low:
                     short_stop = curr_close + atr_dist
-                    self._pending_initial_stop = short_stop
-                    self._clear_position_state()
-                    return _fast_target_output(symbol, -self._target_weight, short_stop, "donchian_flip_short")
+                    if 0.0 < short_stop < _INF:
+                        self._pending_initial_stop = short_stop
+                        return _fast_target_output(symbol, -self._target_weight, short_stop, "donchian_flip_short")
 
             if curr_close < exit_low or curr_close <= stop:
                 reason = "donchian_trailing_stop_long" if curr_close <= stop else "donchian_exit_long"
-                self._clear_position_state()
                 self._pending_initial_stop = None
                 return self._flat_output(symbol, reason)
 
@@ -425,11 +441,19 @@ class DonchianATRStrategy:
             self._position_dir = -1
             self._lowest_close = anchor
             self._highest_close = None
-            init_stop = anchor + atr_dist
+            raw_init_stop = anchor + atr_dist
+            init_stop_short: float | None = raw_init_stop if 0.0 < raw_init_stop < _INF else None
             pending_stop = self._pending_initial_stop
-            if pending_stop is not None and pending_stop > curr_close and pending_stop < init_stop:
-                init_stop = pending_stop
-            self._trailing_stop = init_stop
+            if (
+                pending_stop is not None
+                and 0.0 < pending_stop < _INF
+                and pending_stop > curr_close
+                and (init_stop_short is None or pending_stop < init_stop_short)
+            ):
+                init_stop_short = pending_stop
+            self._trailing_stop = init_stop_short
+            self._pending_initial_stop = None
+        else:
             self._pending_initial_stop = None
 
         lowest = self._lowest_close
@@ -438,7 +462,7 @@ class DonchianATRStrategy:
             self._lowest_close = lowest
         candidate_stop = lowest + atr_dist
         stop = self._trailing_stop
-        if stop is None or candidate_stop < stop:
+        if 0.0 < candidate_stop < _INF and (stop is None or candidate_stop < stop):
             stop = candidate_stop
             self._trailing_stop = stop
 
@@ -449,14 +473,15 @@ class DonchianATRStrategy:
                 if long_stop < 1e-12:
                     long_stop = 1e-12
                 self._pending_initial_stop = long_stop
-                self._clear_position_state()
                 return _fast_target_output(symbol, self._target_weight, long_stop, "donchian_flip_long")
 
-        if curr_close > exit_high or curr_close >= stop:
-            reason = "donchian_trailing_stop_short" if curr_close >= stop else "donchian_exit_short"
-            self._clear_position_state()
+        if curr_close > exit_high or (stop is not None and curr_close >= stop):
+            reason = "donchian_trailing_stop_short" if (stop is not None and curr_close >= stop) else "donchian_exit_short"
             self._pending_initial_stop = None
             return self._flat_output(symbol, reason)
+
+        if stop is None or not (0.0 < stop < _INF):
+            return EMPTY_OUTPUT
 
         if self._cached_hold_stop == stop and self._cached_hold_dir == -1 and self._cached_hold_sym == symbol:
             return self._cached_hold_out  # type: ignore[return-value]
@@ -497,14 +522,19 @@ class DonchianATRStrategy:
                 raise ValueError(f"invalid {key} in state")
             return float(val)
 
+        trailing_stop = _opt_pos_float("trailing_stop")
+        highest_close = _opt_pos_float("highest_close")
+        lowest_close = _opt_pos_float("lowest_close")
+        pending_initial_stop = _opt_pos_float("pending_initial_stop")
+
         last_bar_ms = state.get("last_bar_ms")
         if last_bar_ms is not None and (isinstance(last_bar_ms, bool) or not isinstance(last_bar_ms, int)):
             raise ValueError("invalid last_bar_ms in state")
 
         self._position_dir = int(pos_dir)
-        self._trailing_stop = _opt_pos_float("trailing_stop")
-        self._highest_close = _opt_pos_float("highest_close")
-        self._lowest_close = _opt_pos_float("lowest_close")
-        self._pending_initial_stop = _opt_pos_float("pending_initial_stop")
+        self._trailing_stop = trailing_stop
+        self._highest_close = highest_close
+        self._lowest_close = lowest_close
+        self._pending_initial_stop = pending_initial_stop
         self._last_bar_ms = last_bar_ms
         self._clear_ephemeral_cache()

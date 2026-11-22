@@ -99,6 +99,43 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(Decimal("5.0"), spec.base_qty_for_contracts(contracts))
         self.assertEqual(Decimal("500.0"), spec.notional_for_contracts(contracts, price=100))
 
+    def test_exact_quotient_rounding_and_high_precision_serialization(self) -> None:
+        # CR1-74: exact quotient prevents 28-digit Decimal context rounding from exceeding input
+        spec = okx_swap_spec(
+            "MU-USDT-SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            contract_value=Decimal("1"),
+        )
+        near_one = Decimal("0.99999999999999999999999999999")
+        self.assertEqual(Decimal("0.99"), spec.round_size(near_one, rounding="down"))
+        self.assertEqual(Decimal("1.00"), spec.round_size(near_one, rounding="up"))
+        self.assertEqual(Decimal("0.99"), spec.contracts_for_notional(near_one, price=Decimal("1")))
+        # Exact multiples stay exact
+        self.assertEqual(Decimal("1.00"), spec.round_size(Decimal("1.00"), rounding="down"))
+        self.assertEqual(Decimal("1.00"), spec.round_size(Decimal("1.00"), rounding="up"))
+        # ROUND_HALF_EVEN tie behavior preserved for nearest
+        self.assertEqual(Decimal("0.02"), spec.round_price(Decimal("0.015"), rounding="nearest"))
+        self.assertEqual(Decimal("0.02"), spec.round_price(Decimal("0.025"), rounding="nearest"))
+        self.assertEqual(Decimal("0.04"), spec.round_price(Decimal("0.035"), rounding="nearest"))
+
+        # CR1-75: to_dict preserves >28 significant digits and trailing zeros without context rounding
+        high_prec = Decimal("1." + ("0" * 28) + "1")
+        spec_hp = okx_swap_spec(
+            "MU-USDT-SWAP",
+            tick_size=high_prec,
+            lot_size=Decimal("1.00"),
+            min_size=Decimal("1.000"),
+            contract_value=Decimal("2.50"),
+        )
+        payload = spec_hp.to_dict()
+        self.assertEqual("1." + ("0" * 28) + "1", payload["tick_size"])
+        self.assertEqual("1.00", payload["lot_size"])
+        self.assertEqual("1.000", payload["min_size"])
+        self.assertEqual("2.50", payload["contract_value"])
+        self.assertEqual(spec_hp, InstrumentSpec.from_dict(payload))
+
     def test_validation_rejects_invalid_inputs(self) -> None:
         base = dict(
             instrument_id="okx:MU-USDT-SWAP",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+from bisect import bisect_right
 from dataclasses import FrozenInstanceError
 import json
 import math
@@ -16,6 +17,7 @@ from mu_strategy.market_data.funding import (
     MissingFundingHistoryError,
     fetch_binance_funding_history,
     fetch_okx_funding_history,
+    format_apr_scenario_key,
     require_funding_series,
     require_or_sensitivity_series,
 )
@@ -47,6 +49,17 @@ class FundingSeriesTests(unittest.TestCase):
 
         with self.assertRaises(FrozenInstanceError):
             series.instrument_id = "other"  # type: ignore[misc]
+
+        # CR1-15: public columns are read-only views supporting indexing & bisection
+        self.assertIsInstance(series.timestamps_ms, memoryview)
+        self.assertIsInstance(series.rates, memoryview)
+        self.assertTrue(series.timestamps_ms.readonly)
+        self.assertTrue(series.rates.readonly)
+        self.assertEqual(2, bisect_right(series.timestamps_ms, 2000))
+        with self.assertRaises(TypeError):
+            series.timestamps_ms[0] = 9999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            series.rates[0] = -1.0  # type: ignore[index]
 
         # Half-open (start_ms, end_ms] semantics: start excluded, end included
         self.assertEqual(
@@ -98,28 +111,30 @@ class FundingSeriesTests(unittest.TestCase):
             self.assertEqual(series.settlement_interval_hours, loaded.settlement_interval_hours)
             self.assertEqual(list(series), list(loaded))
 
-            # Raw OKX archive compatibility (records list, realizedRate preferred over fundingRate)
+            # Raw OKX archive compatibility (CR1-11: realizedRate required by default; legacy opt-in explicit)
             okx_archive = root / "okx_raw.json"
             okx_archive.write_text(
                 json.dumps(
                     {
                         "instId": "MU-USDT-SWAP",
                         "records": [
-                            {"fundingTime": "1700035200000", "fundingRate": "0.0005", "realizedRate": "-0.00015"},
-                            {"fundingTime": "1700006400000", "fundingRate": "0.0001", "realizedRate": ""},
+                            {"instId": "MU-USDT-SWAP", "fundingTime": "1700035200000", "fundingRate": "0.0005", "realizedRate": "-0.00015"},
+                            {"instId": "MU-USDT-SWAP", "fundingTime": "1700006400000", "fundingRate": "0.0001", "realizedRate": ""},
                         ],
                     }
                 ),
                 encoding="utf-8",
             )
-            okx_loaded = FundingSeries.from_json_file(okx_archive)
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(okx_archive)
+            okx_loaded = FundingSeries.from_json_file(okx_archive, allow_legacy_okx_funding_rate=True)
             self.assertEqual("okx:MU-USDT-SWAP", okx_loaded.instrument_id)
             self.assertEqual(
                 [FundingRateEvent(1_700_006_400_000, 0.0001), FundingRateEvent(1_700_035_200_000, -0.00015)],
                 list(okx_loaded),
             )
 
-            # Raw Binance list compatibility
+            # Raw Binance list compatibility + CR1-14 mixed-instrument rejection
             binance_archive = root / "binance_raw.json"
             binance_archive.write_text(
                 json.dumps(
@@ -134,6 +149,34 @@ class FundingSeriesTests(unittest.TestCase):
             self.assertEqual("binance:BTCUSDT", binance_loaded.instrument_id)
             self.assertEqual(2, len(binance_loaded))
             self.assertAlmostEqual(-0.00005, binance_loaded[1].rate)
+
+            # Explicit mismatched instrument_id must fail closed
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(binance_archive, instrument_id="binance:ETHUSDT")
+
+            # Mixed-instrument Binance archive must fail closed even with explicit instrument_id
+            mixed_binance = root / "binance_mixed.json"
+            mixed_binance.write_text(
+                json.dumps(
+                    [
+                        {"symbol": "BTCUSDT", "fundingTime": 1_700_006_400_000, "fundingRate": "0.0001"},
+                        {"symbol": "ETHUSDT", "fundingTime": 1_700_035_200_000, "fundingRate": "0.0002"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(mixed_binance)
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(mixed_binance, instrument_id="binance:BTCUSDT")
+
+            missing_sym_binance = root / "binance_missing_sym.json"
+            missing_sym_binance.write_text(
+                json.dumps([{"fundingTime": 1_700_006_400_000, "fundingRate": "0.0001"}]),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                FundingSeries.from_json_file(missing_sym_binance, instrument_id="binance:BTCUSDT")
 
             # Corrupt / malformed JSON fails closed
             bad_json = root / "bad.json"
@@ -160,17 +203,48 @@ class FundingSeriesTests(unittest.TestCase):
         with self.assertRaises(MissingFundingHistoryError):
             require_funding_series(empty, instrument_id="okx:MU-USDT-SWAP")
 
-        # Historical series returned directly when present
-        hist = FundingSeries.from_events("okx:MU-USDT-SWAP", [FundingRateEvent(EIGHT_HOURS_MS, 0.0001)])
+        # Historical series returned directly ONLY when it fully covers the requested window
+        hist_complete = FundingSeries.from_events(
+            "okx:MU-USDT-SWAP",
+            [FundingRateEvent(EIGHT_HOURS_MS, 0.0001), FundingRateEvent(2 * EIGHT_HOURS_MS, 0.0001)],
+            settlement_interval_hours=8,
+        )
         res_hist = require_or_sensitivity_series(
-            hist,
+            hist_complete,
             instrument_id="okx:MU-USDT-SWAP",
             start_ms=start_ms,
-            end_ms=one_year_ms,
+            end_ms=2 * EIGHT_HOURS_MS,
             interval_hours=8,
         )
         self.assertTrue(res_hist.is_historical)
-        self.assertEqual([("historical", hist)], list(res_hist.scenarios))
+        self.assertEqual([("historical", hist_complete)], list(res_hist.scenarios))
+
+        # CR1-10: partial historical series MUST fail closed rather than be labeled historical
+        with self.assertRaises(MissingFundingHistoryError):
+            require_or_sensitivity_series(
+                hist_complete,
+                instrument_id="okx:MU-USDT-SWAP",
+                start_ms=start_ms,
+                end_ms=one_year_ms,
+                interval_hours=8,
+            )
+
+        # CR1-12: distinct close APRs keep distinct keys without :g collisions
+        res_close = require_or_sensitivity_series(
+            None,
+            instrument_id="okx:MU-USDT-SWAP",
+            start_ms=start_ms,
+            end_ms=2 * EIGHT_HOURS_MS,
+            interval_hours=8,
+            apr_band=(0.15, 0.1500001, 0.15000001),
+        )
+        close_dict = res_close.as_dict()
+        self.assertEqual(3, len(close_dict))
+        self.assertEqual(
+            {"apr_15pct", "apr_15.00001pct", "apr_15.000001pct"},
+            set(close_dict.keys()),
+        )
+        self.assertEqual("historical+apr_15.000001pct", format_apr_scenario_key(0.15000001, prefix="historical+apr_"))
 
         # Missing series synthesizes explicit 0% / +15% / +30% APR band
         res_sens = require_or_sensitivity_series(
@@ -268,11 +342,72 @@ class FundingSeriesTests(unittest.TestCase):
         for missing_idx in (1, 2, 5, 6, 9, 10, 11):
             self.assertAlmostEqual(expected_synth, by_ts[t0 + missing_idx * EIGHT_HOURS_MS], places=12)
 
-        # Empty series over long window reports full-window gap; short window (<= 1.5 * 8h) reports none
+        # Empty series: window crossing settlement at exact end_ms detects gap (CR1-09);
+        # intra-interval window with no due settlement detects none
         empty = FundingSeries.from_events("okx:MU-USDT-SWAP", (), settlement_interval_hours=8)
         self.assertEqual(((t0, t0 + 3 * EIGHT_HOURS_MS),), empty.coverage_gaps(t0, t0 + 3 * EIGHT_HOURS_MS, 8))
         self.assertEqual(0.0, empty.coverage_ratio(t0, t0 + 3 * EIGHT_HOURS_MS, 8))
-        self.assertEqual((), empty.coverage_gaps(t0, t0 + EIGHT_HOURS_MS, 8))
+        self.assertEqual(((t0, t0 + EIGHT_HOURS_MS),), empty.coverage_gaps(t0, t0 + EIGHT_HOURS_MS, 8))
+        self.assertEqual((), empty.coverage_gaps(t0 + HOUR_MS, t0 + 7 * HOUR_MS, 8))
+
+        # CR1-09: missing settlement right at end_ms (e.g. events at 8h & 16h, query (8h, 24h])
+        edge_missing = FundingSeries.from_events(
+            "okx:MU-USDT-SWAP",
+            [
+                FundingRateEvent(t0 + EIGHT_HOURS_MS, 0.0001),
+                FundingRateEvent(t0 + 2 * EIGHT_HOURS_MS, 0.0001),
+            ],
+            settlement_interval_hours=8,
+        )
+        self.assertEqual(
+            ((t0 + 2 * EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS),),
+            edge_missing.coverage_gaps(t0 + EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS, 8, tolerance=1.5),
+        )
+        # Missing leading edge settlement at 16h in (8h, 24h] when only 24h is present
+        lead_missing = FundingSeries.from_events(
+            "okx:MU-USDT-SWAP",
+            [FundingRateEvent(t0 + 3 * EIGHT_HOURS_MS, 0.0001)],
+            settlement_interval_hours=8,
+        )
+        self.assertEqual(
+            ((t0 + EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS),),
+            lead_missing.coverage_gaps(t0 + EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS, 8, tolerance=1.5),
+        )
+
+        # CR1-13: phase-aligned gap fill on offset schedule (UTC hours 1 and 17 -> inserts ONLY hour 9)
+        offset_series = FundingSeries.from_events(
+            "okx:OFFSET-SWAP",
+            [
+                FundingRateEvent(t0 + 1 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 17 * HOUR_MS, 0.0002),
+            ],
+            settlement_interval_hours=8,
+        )
+        filled_offset = offset_series.fill_gaps_with_apr(
+            start_ms=t0,
+            end_ms=t0 + 17 * HOUR_MS,
+            interval_hours=8,
+            apr=0.15,
+        )
+        self.assertEqual(
+            [t0 + 1 * HOUR_MS, t0 + 9 * HOUR_MS, t0 + 17 * HOUR_MS],
+            list(filled_offset.timestamps_ms),
+        )
+        self.assertEqual((), filled_offset.coverage_gaps(t0, t0 + 17 * HOUR_MS, 8))
+
+        # CR1-13: reject gap fill when phase cannot be determined (mixed phases or empty without phase_ms)
+        mixed_phase = FundingSeries.from_events(
+            "okx:MIXED-SWAP",
+            [
+                FundingRateEvent(t0 + 1 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 4 * HOUR_MS, 0.0002),
+            ],
+            settlement_interval_hours=8,
+        )
+        with self.assertRaises(ValueError):
+            mixed_phase.fill_gaps_with_apr(start_ms=t0, end_ms=t0 + 24 * HOUR_MS, interval_hours=8, apr=0.15)
+        with self.assertRaises(ValueError):
+            empty.fill_gaps_with_apr(start_ms=t0, end_ms=t0 + 24 * HOUR_MS, interval_hours=8, apr=0.15)
 
         # Validation failures
         with self.assertRaises(ValueError):
@@ -284,11 +419,11 @@ class FundingSeriesTests(unittest.TestCase):
         t0 = 1_700_006_400_000
         # 5 events spaced by 8h; OKX returns newest-first in pages of limit=2
         all_rows = [
-            {"fundingTime": str(t0 + 4 * EIGHT_HOURS_MS), "fundingRate": "0.0002", "realizedRate": "0.0002"},
-            {"fundingTime": str(t0 + 3 * EIGHT_HOURS_MS), "fundingRate": "-0.0001", "realizedRate": "-0.0001"},
-            {"fundingTime": str(t0 + 2 * EIGHT_HOURS_MS), "fundingRate": "0.00005", "realizedRate": ""},
-            {"fundingTime": str(t0 + 1 * EIGHT_HOURS_MS), "fundingRate": "0", "realizedRate": "0"},
-            {"fundingTime": str(t0), "fundingRate": "-0.0003", "realizedRate": "-0.0003"},
+            {"instId": "MU-USDT-SWAP", "fundingTime": str(t0 + 4 * EIGHT_HOURS_MS), "fundingRate": "0.0002", "realizedRate": "0.0002"},
+            {"instId": "MU-USDT-SWAP", "fundingTime": str(t0 + 3 * EIGHT_HOURS_MS), "fundingRate": "-0.0001", "realizedRate": "-0.0001"},
+            {"instId": "MU-USDT-SWAP", "fundingTime": str(t0 + 2 * EIGHT_HOURS_MS), "fundingRate": "0.00099", "realizedRate": "0.00005"},
+            {"instId": "MU-USDT-SWAP", "fundingTime": str(t0 + 1 * EIGHT_HOURS_MS), "fundingRate": "0", "realizedRate": "0"},
+            {"instId": "MU-USDT-SWAP", "fundingTime": str(t0), "fundingRate": "-0.0003", "realizedRate": "-0.0003"},
         ]
         seen_urls: list[str] = []
 
@@ -333,6 +468,25 @@ class FundingSeriesTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 fetch_okx_funding_history("INVALID-SWAP")
+
+        # CR1-11: exchange history MUST reject blank/missing realizedRate rather than using predicted fundingRate
+        with patch(
+            "mu_strategy.market_data.funding.get_json",
+            return_value={
+                "code": "0",
+                "msg": "",
+                "data": [
+                    {
+                        "instId": "MU-USDT-SWAP",
+                        "fundingTime": str(1_700_006_400_000),
+                        "fundingRate": "0.0005",
+                        "realizedRate": "",
+                    }
+                ],
+            },
+        ):
+            with self.assertRaises(ValueError):
+                fetch_okx_funding_history("MU-USDT-SWAP")
 
     def test_fetch_binance_funding_history_paginated_mocked_no_network(self) -> None:
         t0 = 1_700_006_400_000

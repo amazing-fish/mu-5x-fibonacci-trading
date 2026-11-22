@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -10,10 +11,11 @@ from dataclasses import FrozenInstanceError
 from types import MappingProxyType
 
 from mu_strategy.core.instrument import okx_swap_spec
+from mu_strategy.core.trading_calendar import LEGACY_CALENDAR
 from mu_strategy.indicators import ema as legacy_ema
 from mu_strategy.indicators import macd as legacy_macd
 from mu_strategy.indicators import rsi as legacy_rsi
-from mu_strategy.market_data.bar_series import BarSeries, MarketView
+from mu_strategy.market_data.bar_series import BarSeries, MarketView, MarketViewCursor
 from mu_strategy.models import Candle
 from mu_strategy.strategies.families import (
     DEFAULT_STRATEGY_FAMILY_REGISTRY,
@@ -24,7 +26,9 @@ from mu_strategy.strategies.families import (
 )
 from mu_strategy.strategies.features import FeatureCache, FeatureSlice
 from mu_strategy.strategies.protocol import (
+    EMPTY_MAPPING,
     EMPTY_OUTPUT,
+    MAX_PARAM_GRID_SIZE,
     BarContext,
     FastCursor,
     FastCursorMarket,
@@ -33,6 +37,7 @@ from mu_strategy.strategies.protocol import (
     ParamSpec,
     PortfolioView,
     PositionView,
+    SessionGate,
     Strategy,
     StrategyFamilyDescriptor,
     StrategyFamilyRegistry,
@@ -260,6 +265,99 @@ class ProtocolContractsTests(unittest.TestCase):
         self.assertIsInstance(_DummyCursor(), FastCursor)
         self.assertIsInstance(_DummyFastMarket(), FastCursorMarket)
 
+    def test_round1_protocol_immutability_causality_param_grid_and_session_gate(self) -> None:
+        # CR1-01: PortfolioView copies caller-supplied MappingProxyType (preserving EMPTY_MAPPING fast path).
+        backing_pos = {"BTC": PositionView("BTC", 2.0, 100.0, 0.0, 200.0, 1.0)}
+        pv = PortfolioView(
+            equity=1000.0,
+            cash=800.0,
+            positions=MappingProxyType(backing_pos),
+            open_orders=(),
+            peak_equity=1000.0,
+            daily_start_equity=1000.0,
+        )
+        backing_pos.clear()
+        self.assertEqual(2.0, pv.position_qty("BTC"))
+
+        pv_empty = PortfolioView(
+            equity=1000.0,
+            cash=1000.0,
+            positions=EMPTY_MAPPING,
+            open_orders=(),
+            peak_equity=1000.0,
+            daily_start_equity=1000.0,
+        )
+        self.assertIs(pv_empty.positions, EMPTY_MAPPING)
+
+        # CR1-56: StrategyOutput copies caller-supplied MappingProxyType diagnostics.
+        backing_diag = {"signal": 1.0}
+        out = StrategyOutput(diagnostics=MappingProxyType(backing_diag))
+        backing_diag["signal"] = -99.0
+        self.assertEqual(1.0, out.diagnostics["signal"])
+        self.assertIs(EMPTY_OUTPUT.diagnostics, EMPTY_MAPPING)
+
+        # CR1-02: BarContext rejects a MarketView whose timestamp disagrees with ctx.now_ms.
+        candles = _make_candles([100.0, 101.0, 102.0])
+        series = BarSeries.from_candles("MU-USDT-SWAP", "1h", candles)
+        spec = okx_swap_spec("MU-USDT-SWAP")
+        mv_ahead = MarketView({("MU-USDT-SWAP", "1h"): series}, now_ms=series.close_times[1])
+        with self.assertRaises(ValueError):
+            BarContext(now_ms=series.close_times[0], symbol="MU-USDT-SWAP", market=mv_ahead, portfolio=pv, instrument=spec)
+        ctx_ok = BarContext(now_ms=series.close_times[1], symbol="MU-USDT-SWAP", market=mv_ahead, portfolio=pv, instrument=spec)
+        self.assertEqual(series.close_times[1], ctx_ok.now_ms)
+
+        # CR1-55: ParamSpec validates every explicit choice against type and bounds.
+        with self.assertRaises(ValueError):
+            ParamSpec("k", "int", 1, choices=(1, 1.5))
+        with self.assertRaises(ValueError):
+            ParamSpec("k", "int", 2, min_value=2, max_value=10, choices=(1, 2))
+
+        # CR1-58: ParamSpec rejects fractional bounds/steps for kind="int".
+        with self.assertRaises(ValueError):
+            ParamSpec("k", "int", 2, min_value=1, max_value=3, step=0.5)
+        with self.assertRaises(ValueError):
+            ParamSpec("k", "int", 2, min_value=1.5, max_value=3, step=1)
+        self.assertEqual((10, 20, 30), ParamSpec("k", "int", 20, min_value=10, max_value=30, step=10).grid_values())
+
+        # CR1-54: Float grid preserves sub-1e-12 bounds/steps without rounding outside declared range.
+        tiny = ParamSpec("eps", "float", 1e-13, min_value=1e-13, max_value=3e-13, step=1e-13)
+        tiny_grid = tiny.grid_values()
+        self.assertEqual(3, len(tiny_grid))
+        for val in tiny_grid:
+            tiny.validate(val)
+            self.assertGreaterEqual(val, 1e-13)
+            self.assertLessEqual(val, 3e-13)
+
+        # CR1-57: Float grid bounds generation before allocating (handles sys.float_info.max & oversized grids).
+        huge = ParamSpec("huge", "float", 0.0, min_value=0.0, max_value=sys.float_info.max, step=1e308)
+        huge_grid = huge.grid_values()
+        self.assertEqual((0.0, 1e308), huge_grid)
+        oversized = ParamSpec("too_many", "float", 0.0, min_value=0.0, max_value=float(MAX_PARAM_GRID_SIZE + 5), step=1.0)
+        with self.assertRaises(ValueError):
+            oversized.grid_values()
+
+        # CR1-59 & SessionGate / open_only OrderIntent contract checks.
+        self.assertTrue(TSMomentumStrategy.supports_ephemeral_context)
+        self.assertTrue(MeanReversionStrategy.supports_ephemeral_context)
+        self.assertTrue(DonchianATRStrategy.supports_ephemeral_context)
+        self.assertFalse(getattr(FibonacciPullbackStrategy, "supports_ephemeral_context", False))
+
+        gate = SessionGate(LEGACY_CALENDAR, (("09:45", "11:30"),))
+        self.assertTrue(gate.is_allowed(1_767_625_200_000))  # 2026-01-05 10:00 ET
+        self.assertFalse(gate.is_allowed(1_767_661_200_000))  # 2026-01-05 20:00 ET
+
+        open_lim = OrderIntent(
+            "ol1", "MU", "buy", "limit", "equity_fraction", 1.0, limit_price=105.0, time_in_force="open_only", session_gate=gate
+        )
+        self.assertEqual("open_only", open_lim.time_in_force)
+        self.assertEqual(gate, open_lim.session_gate)
+        with self.assertRaises(ValueError):
+            OrderIntent("bad_tif", "MU", "buy", "stop_market", "contracts", 1.0, stop_price=100.0, time_in_force="open_only")
+        with self.assertRaises(ValueError):
+            OrderIntent(
+                "bad_gate", "MU", "sell", "stop_market", "close_all", 0.0, stop_price=95.0, reduce_only=True, session_gate=gate
+            )
+
 
 class FeatureCacheTests(unittest.TestCase):
     def test_ema_rsi_macd_exact_match_with_legacy_indicators(self) -> None:
@@ -384,30 +482,34 @@ class FeatureCacheTests(unittest.TestCase):
 
         s1 = BarSeries.from_candles("MU", "1h", _make_candles(base_closes))
         s2 = BarSeries.from_candles("MU", "1h", _make_candles(perturbed_closes))
-        fc = FeatureCache()
 
+        # CR1-26: Compute perturbed-future prefix comparisons with TWO SEPARATE FeatureCaches
+        # so a cache-key collision can never mask a look-ahead leak!
+        fc_a = FeatureCache()
+        fc_b = FeatureCache()
         cutoff_ts = s1.close_times[34]
-        mv1 = MarketView({("MU", "1h"): s1}, now_ms=cutoff_ts, features=fc)
-        mv2 = MarketView({("MU", "1h"): s2}, now_ms=cutoff_ts, features=fc)
+        mv1 = MarketView({("MU", "1h"): s1}, now_ms=cutoff_ts, features=fc_a)
+        mv2 = MarketView({("MU", "1h"): s2}, now_ms=cutoff_ts, features=fc_b)
 
         sl1 = mv1.closed_bars("MU", "1h")
         sl2 = mv2.closed_bars("MU", "1h")
         self.assertEqual(35, len(sl1))
 
         # Every single indicator on [0..34] must be bit-for-bit identical despite wild future bars [35..59]!
-        for name, fn in (
-            ("ema", lambda sl: fc.ema(sl, 12)),
-            ("sma", lambda sl: fc.sma(sl, 10)),
-            ("rsi", lambda sl: fc.rsi(sl, 14)),
-            ("atr", lambda sl: fc.atr(sl, 14)),
-            ("dh", lambda sl: fc.donchian_high(sl, 10)),
-            ("dl", lambda sl: fc.donchian_low(sl, 10)),
-            ("rvol", lambda sl: fc.realized_vol(sl, 15)),
-            ("zscore", lambda sl: fc.zscore(sl, 15)),
-            ("vwap", lambda sl: fc.vwap(sl, 10)),
-        ):
-            f1 = fn(sl1)
-            f2 = fn(sl2)
+        indicator_specs = (
+            ("ema", lambda fc, sl: fc.ema(sl, 12)),
+            ("sma", lambda fc, sl: fc.sma(sl, 10)),
+            ("rsi", lambda fc, sl: fc.rsi(sl, 14)),
+            ("atr", lambda fc, sl: fc.atr(sl, 14)),
+            ("dh", lambda fc, sl: fc.donchian_high(sl, 10)),
+            ("dl", lambda fc, sl: fc.donchian_low(sl, 10)),
+            ("rvol", lambda fc, sl: fc.realized_vol(sl, 15)),
+            ("zscore", lambda fc, sl: fc.zscore(sl, 15)),
+            ("vwap", lambda fc, sl: fc.vwap(sl, 10)),
+        )
+        for name, fn in indicator_specs:
+            f1 = fn(fc_a, sl1)
+            f2 = fn(fc_b, sl2)
             self.assertIsInstance(f1, FeatureSlice)
             self.assertEqual(35, len(f1))
             # Cannot read past slice.end!
@@ -425,17 +527,85 @@ class FeatureCacheTests(unittest.TestCase):
                 else:
                     self.assertEqual(v1, v2, f"{name}[{idx}] look-ahead leak detected!")
 
-        # Advancing MarketView.at(now_ms) reuses cached underlying arrays (zero recompute!).
+        # CR1-26: With a SHARED cache, the two distinct series with identical (symbol, interval)
+        # MUST NOT collide and MUST diverge after bar 34 where their inputs differ!
+        fc_shared = FeatureCache()
+        full_sl1 = s1.slice_view(0, len(s1))
+        full_sl2 = s2.slice_view(0, len(s2))
+        for name, fn in indicator_specs:
+            g1 = fn(fc_shared, full_sl1)
+            g2 = fn(fc_shared, full_sl2)
+            self.assertTrue(
+                any(g1[i] != g2[i] for i in range(35, len(s1))),
+                f"shared cache collision: {name} identical after bar 34!",
+            )
+
+        # Advancing MarketViewCursor.view_at(now_ms) reuses cached underlying arrays (zero recompute!).
         fc2 = FeatureCache()
-        mv = MarketView({("MU", "1h"): s1}, now_ms=s1.close_times[20], features=fc2)
+        cursor = MarketViewCursor({("MU", "1h"): s1}, features=fc2)
         for bar_idx in range(20, 60):
-            view = mv.at(s1.close_times[bar_idx])
+            view = cursor.view_at(s1.close_times[bar_idx])
             bars = view.closed_bars("MU", "1h")
             val = fc2.ema_value(bars, 21, offset=-1)
             self.assertTrue(math.isfinite(val))
         stats = fc2.stats()
         self.assertEqual(1, stats["misses"])
         self.assertEqual(39, stats["hits"])
+
+    def test_round1_feature_numerical_stability_and_linear_constant_windows(self) -> None:
+        fc = FeatureCache()
+
+        # CR1-70: Dominant outgoing SMA value [1e16, 1, 1] with period=2 recovers exact 1.0.
+        s_sma = BarSeries.from_candles("SMA_BIG", "1h", _make_candles([1e16, 1.0, 1.0], spread=0.0))
+        sma2 = fc.sma(s_sma, 2)
+        self.assertAlmostEqual(1.0, sma2[2], places=12)
+
+        # CR1-68: VWAP stays defined when positive volume remains after a dominant outgoing bar.
+        s_vwap = BarSeries.from_candles(
+            "VWAP_BIG", "1h", _make_candles([100.0, 100.0, 100.0, 100.0], spread=0.0, volumes=[1e12, 1e-5, 0.0, 0.0])
+        )
+        vwap2 = fc.vwap(s_vwap, 2)
+        self.assertAlmostEqual(100.0, vwap2[2], places=10)
+        self.assertTrue(math.isnan(vwap2[3]))
+
+        # CR1-69: Unseen extreme future closes [1e200, 1e-200] do not break closed-prefix realized_vol.
+        ext_closes = [100.0, 101.0, 102.0, 1e200, 1e-200]
+        ext_candles = [
+            Candle(
+                open_time_ms=1_700_000_000_000 + i * 3_600_000,
+                open=c,
+                high=c,
+                low=c,
+                close=c,
+                volume=100.0,
+            )
+            for i, c in enumerate(ext_closes)
+        ]
+        s_ext = BarSeries.from_candles("EXT", "1h", ext_candles)
+        prefix = s_ext.slice_view(0, 3)
+        rvol_prefix = fc.realized_vol(prefix, 2)
+        self.assertEqual(3, len(rvol_prefix))
+        self.assertTrue(math.isfinite(rvol_prefix[2]))
+        self.assertGreater(rvol_prefix[2], 0.0)
+        rvol_full = fc.realized_vol(s_ext, 2)
+        self.assertTrue(math.isfinite(rvol_full[4]))
+
+        # CR1-21 & CR1-22: Long constant series with period = N/2 runs in linear O(N) time (no quadratic rescan).
+        const_series = BarSeries.from_candles("CONST", "1h", _make_candles([100.0] * 4000, spread=0.0))
+        t0 = time.perf_counter()
+        const_z = fc.zscore(const_series, 2000)
+        const_v = fc.realized_vol(const_series, 2000)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.assertEqual(0.0, const_z[-1])
+        self.assertEqual(0.0, const_v[-1])
+        self.assertLess(elapsed_ms, 250.0, f"constant-window zscore/rvol took too long: {elapsed_ms:.1f}ms")
+
+        # Non-constant large-offset series still preserves exact precision fallback.
+        big_osc = [1e9 + (0.01 if i % 2 == 0 else -0.01) for i in range(40)]
+        s_osc = BarSeries.from_candles("OSC", "1h", _make_candles(big_osc, spread=0.0))
+        z_osc = fc.zscore(s_osc, 20)
+        self.assertTrue(math.isfinite(z_osc[-1]))
+        self.assertAlmostEqual(-0.97467943448, z_osc[-1], places=6)
 
     def test_empty_single_bar_and_thread_safety(self) -> None:
         empty = BarSeries.from_candles("EMPTY", "1h", [])

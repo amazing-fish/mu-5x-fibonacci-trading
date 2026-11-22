@@ -573,6 +573,248 @@ class RiskOverlayTests(unittest.TestCase):
         )
         self.assertAlmostEqual(1.5, stacked.targets[0].target_weight)
 
+    def test_open_marketable_take_profit_fills_before_intrabar_stop_cr1_53(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        cost = CostModel(maker_fee_bps=2.0, taker_fee_bps=5.0, half_spread_bps=0.0, slippage_model=FixedTicks(0))
+        em = ExecutionModel(inst, cost)
+
+        # Long TP=105, SL=98: bar opens at 107 (marketable TP!) then drops to 97 -> TP fills at 107!
+        q_long = em.evaluate_protective_exits(
+            10.0,
+            liq_price=80.0,
+            stop_price=98.0,
+            take_profit=105.0,
+            bar_open=107.0,
+            bar_high=108.0,
+            bar_low=97.0,
+            bar_close=99.0,
+            bar_volume=1000.0,
+        )
+        self.assertIsNotNone(q_long)
+        assert q_long is not None
+        self.assertEqual("take_profit", q_long.reason)
+        self.assertEqual("limit", q_long.order_type)
+        self.assertAlmostEqual(107.0, q_long.exec_price)
+
+        # Short TP=95, SL=102: bar opens at 93 then spikes to 104 -> TP fills at 93!
+        q_short = em.evaluate_protective_exits(
+            -10.0,
+            liq_price=120.0,
+            stop_price=102.0,
+            take_profit=95.0,
+            bar_open=93.0,
+            bar_high=104.0,
+            bar_low=92.0,
+            bar_close=101.0,
+            bar_volume=1000.0,
+        )
+        self.assertIsNotNone(q_short)
+        assert q_short is not None
+        self.assertEqual("take_profit", q_short.reason)
+        self.assertAlmostEqual(93.0, q_short.exec_price)
+
+        # Open between SL=98 and TP=105 (ambiguous intrabar order) -> CONSERVATIVE SL-first preserved!
+        q_ambig = em.evaluate_protective_exits(
+            10.0,
+            liq_price=80.0,
+            stop_price=98.0,
+            take_profit=105.0,
+            bar_open=101.0,
+            bar_high=107.0,
+            bar_low=97.0,
+            bar_close=103.0,
+            bar_volume=1000.0,
+        )
+        self.assertIsNotNone(q_ambig)
+        assert q_ambig is not None
+        self.assertEqual("stop_loss", q_ambig.reason)
+        self.assertAlmostEqual(98.0, q_ambig.exec_price)
+
+    def test_exposure_cap_uses_contract_multiplier_in_both_conversions_cr1_29(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), contract_value=Decimal("10"), max_leverage=5.0)
+        bars = _make_bar_series([100.0] * 10, symbol=sym, start_ms=t0 - 10 * 3_600_000)
+        market = MarketView({(sym, "1h"): bars}, now_ms=t0)
+        pf = PortfolioView(equity=10_000.0, cash=10_000.0, positions={}, open_orders=(), peak_equity=10_000.0, daily_start_equity=10_000.0)
+        ctx = BarContext(now_ms=t0, symbol=sym, market=market, portfolio=pf, instrument=inst)
+
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+        # 100 contracts * contract_value=10 * price=100 = $100,000 (10x!) -> must clamp to 10 contracts ($10,000 = 1x).
+        out = StrategyOutput(intents=(OrderIntent("c1", sym, "buy", "market", "contracts", 100.0),))
+        res = ov.filter(ctx, out)
+        self.assertEqual(1, len(res.intents))
+        self.assertAlmostEqual(10.0, res.intents[0].qty_value, places=9)
+
+    def test_daily_loss_limit_includes_opening_bar_loss_cr1_30(self) -> None:
+        sym = "MU-USDT-SWAP"
+        long_out = StrategyOutput(targets=(TargetPosition(sym, 1.0),))
+        open_pos = {sym: PositionView(sym, qty=10.0, avg_entry_price=100.0, unrealized_pnl=-600.0, notional=9_400.0, leverage=1.0)}
+        ov = DailyLossLimitOverlay(max_daily_loss_pct=0.05, reset_tz="UTC")
+
+        # Day 0 closes at 10_000
+        d0_end = _utc_ms(2026, 6, 11, 23, 0)
+        r0 = ov.filter(_make_ctx(now_ms=d0_end, equity=10_000.0), long_out)
+        self.assertAlmostEqual(1.0, r0.targets[0].target_weight)
+        self.assertFalse(ov.is_halted)
+
+        # Day 1 opening bar carries position from 10_000 -> 9_400 (-6% > 5% limit): MUST trigger immediately!
+        d1_open = _utc_ms(2026, 6, 12, 1, 0)
+        r1 = ov.filter(_make_ctx(now_ms=d1_open, equity=9_400.0, positions=open_pos), long_out)
+        self.assertTrue(ov.is_halted)
+        self.assertEqual(1, len(r1.targets))
+        self.assertAlmostEqual(0.0, r1.targets[0].target_weight)
+
+        # Day 2 opening bar flat at 9_400 -> cleanly resets with baseline 9_400 (0% loss)!
+        d2_open = _utc_ms(2026, 6, 13, 1, 0)
+        r2 = ov.filter(_make_ctx(now_ms=d2_open, equity=9_400.0), long_out)
+        self.assertFalse(ov.is_halted)
+        self.assertAlmostEqual(1.0, r2.targets[0].target_weight)
+
+    def test_exposure_cap_does_not_release_headroom_before_reduce_fills_cr1_31(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        # Start already at 1.0x long cap
+        pos = {sym: PositionView(sym, qty=100.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=10_000.0, leverage=1.0)}
+        ctx = _make_ctx(now_ms=t0, equity=10_000.0, positions=pos)
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+
+        # Sell limit (might not fill!) followed by market buy 1.0x -> buy MUST be dropped!
+        out = StrategyOutput(
+            intents=(
+                OrderIntent("s_lim", sym, "sell", "limit", "equity_fraction", 1.0, limit_price=110.0),
+                OrderIntent("b_mkt", sym, "buy", "market", "equity_fraction", 1.0),
+            )
+        )
+        res = ov.filter(ctx, out)
+        self.assertEqual(1, len(res.intents))
+        self.assertEqual("s_lim", res.intents[0].intent_id)
+
+    def test_exposure_cap_shared_budget_across_targets_and_intents_cr1_32(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        ctx = _make_ctx(now_ms=t0, equity=10_000.0)
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+
+        # Flat account + 1x cap: 1x target + 1x buy intent -> intent dropped!
+        out_full = StrategyOutput(
+            targets=(TargetPosition(sym, 1.0),),
+            intents=(OrderIntent("b1", sym, "buy", "market", "equity_fraction", 1.0),),
+        )
+        res_full = ov.filter(ctx, out_full)
+        self.assertEqual(1, len(res_full.targets))
+        self.assertAlmostEqual(1.0, res_full.targets[0].target_weight)
+        self.assertEqual((), res_full.intents)
+
+        # Partial budget: 0.6x target + 0.8x buy intent -> intent clamped to 0.4x!
+        out_partial = StrategyOutput(
+            targets=(TargetPosition(sym, 0.6),),
+            intents=(OrderIntent("b2", sym, "buy", "market", "equity_fraction", 0.8),),
+        )
+        res_partial = ov.filter(ctx, out_partial)
+        self.assertEqual(1, len(res_partial.intents))
+        self.assertAlmostEqual(0.4, res_partial.intents[0].qty_value, places=9)
+
+    def test_exposure_cap_resolves_4h_series_and_blocks_unpriceable_contracts_cr1_33(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 16, 0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        # 4h-only series (not in old fixed lookup list!)
+        step_4h = 4 * 3_600_000
+        c4h = [Candle(open_time_ms=t0 - (5 - i) * step_4h, open=100.0, high=101.0, low=99.0, close=100.0, volume=500.0) for i in range(5)]
+        s4h = BarSeries.from_candles(sym, "4h", c4h)
+        mv_4h = MarketView({(sym, "4h"): s4h}, now_ms=t0)
+        pf = PortfolioView(equity=10_000.0, cash=10_000.0, positions={}, open_orders=(), peak_equity=10_000.0, daily_start_equity=10_000.0)
+        ctx_4h = BarContext(now_ms=t0, symbol=sym, market=mv_4h, portfolio=pf, instrument=inst)
+
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+        out = StrategyOutput(intents=(OrderIntent("c1", sym, "buy", "market", "contracts", 200.0),))
+        res_4h = ov.filter(ctx_4h, out)
+        self.assertEqual(1, len(res_4h.intents))
+        self.assertAlmostEqual(100.0, res_4h.intents[0].qty_value, places=9)
+
+        # Truly unpriceable symbol -> new exposure blocked, explicit reduce_only exit preserved!
+        mv_other = MarketView({("OTHER", "4h"): BarSeries.from_candles("OTHER", "4h", c4h)}, now_ms=t0)
+        ctx_unp = BarContext(now_ms=t0, symbol=sym, market=mv_other, portfolio=pf, instrument=inst)
+        exit_ord = OrderIntent("ex", sym, "sell", "market", "close_all", 0.0, reduce_only=True)
+        out_unp = StrategyOutput(
+            intents=(OrderIntent("c2", sym, "buy", "market", "contracts", 200.0), exit_ord)
+        )
+        res_unp = ov.filter(ctx_unp, out_unp)
+        self.assertEqual((exit_ord,), res_unp.intents)
+
+    def test_session_window_prevents_outside_session_reduction_reversal_cr1_34(self) -> None:
+        sym = "MU-USDT-SWAP"
+        ov = SessionWindowOverlay(
+            trading_windows_et=(("09:45", "11:30"),),
+            calendar_id=US_EQUITIES_ALGORITHMIC_CALENDAR,
+        )
+        out_session_ms = _utc_ms(2026, 6, 11, 20, 15)  # 16:15 ET
+        open_pos = {sym: PositionView(sym, qty=10.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=1000.0, leverage=0.1)}
+        ctx = _make_ctx(now_ms=out_session_ms, positions=open_pos)
+
+        # Oversized non-reduce_only sell of 20 on long 10 -> capped to 10 with reduce_only=True!
+        out_rev = StrategyOutput(intents=(OrderIntent("s20", sym, "sell", "market", "contracts", 20.0),))
+        res_rev = ov.filter(ctx, out_rev)
+        self.assertEqual(1, len(res_rev.intents))
+        self.assertTrue(res_rev.intents[0].reduce_only)
+        self.assertAlmostEqual(10.0, res_rev.intents[0].qty_value, places=9)
+
+        # Two non-reduce_only sells of 7 each -> capped to 7 + 3 = 10 total, both reduce_only=True!
+        out_two = StrategyOutput(
+            intents=(
+                OrderIntent("s7a", sym, "sell", "market", "contracts", 7.0),
+                OrderIntent("s7b", sym, "sell", "market", "contracts", 7.0),
+            )
+        )
+        res_two = ov.filter(ctx, out_two)
+        self.assertEqual(2, len(res_two.intents))
+        self.assertAlmostEqual(7.0, res_two.intents[0].qty_value, places=9)
+        self.assertAlmostEqual(3.0, res_two.intents[1].qty_value, places=9)
+        self.assertTrue(all(it.reduce_only for it in res_two.intents))
+
+        # Valid partial exit (sell 4) and close_all remain eligible!
+        out_ok = StrategyOutput(
+            intents=(
+                OrderIntent("s4", sym, "sell", "market", "contracts", 4.0),
+                OrderIntent("ca", sym, "sell", "market", "close_all", 0.0, reduce_only=True),
+            )
+        )
+        res_ok = ov.filter(ctx, out_ok)
+        self.assertEqual(2, len(res_ok.intents))
+        self.assertAlmostEqual(4.0, res_ok.intents[0].qty_value, places=9)
+
+    def test_vol_target_blocks_new_exposure_when_vol_series_missing_or_stale_cr1_35(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_1h = _make_bar_series([100.0 + 0.2 * i for i in range(30)], symbol=sym, interval="1h", start_ms=t0 - 30 * 3_600_000)
+
+        # Overlay requests 4h bars, market has ONLY 1h bars -> missing series fails closed!
+        ov_4h = VolTargetOverlay(target_ann_vol=0.40, vol_lookback=10, vol_floor=0.05, max_leverage=2.0, interval="4h")
+        ctx_1h_only = _make_ctx(now_ms=t0, bars=bars_1h)
+        res_entry = ov_4h.filter(ctx_1h_only, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertEqual((), res_entry.targets)
+
+        # Explicit flat exit and same-side reduction are preserved when vol series is missing!
+        open_pos = {sym: PositionView(sym, qty=100.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=10_000.0, leverage=1.0)}
+        ctx_open = _make_ctx(now_ms=t0, bars=bars_1h, positions=open_pos)
+        res_exit = ov_4h.filter(ctx_open, StrategyOutput(targets=(TargetPosition(sym, 0.0), TargetPosition(sym, 0.5))))
+        self.assertEqual(2, len(res_exit.targets))
+        self.assertAlmostEqual(0.0, res_exit.targets[0].target_weight)
+        self.assertAlmostEqual(0.5, res_exit.targets[1].target_weight)
+
+        # Present series still in warmup (5 bars < lookback+1=11) -> bounded neutral warmup scale preserved!
+        bars_short = _make_bar_series([100.0, 101.0, 100.5, 101.5, 102.0], symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        ov_1h = VolTargetOverlay(target_ann_vol=0.40, vol_lookback=10, vol_floor=0.05, max_leverage=2.0, interval="1h")
+        res_warm = ov_1h.filter(_make_ctx(now_ms=t0, bars=bars_short), StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertEqual(1, len(res_warm.targets))
+        self.assertAlmostEqual(1.0, res_warm.targets[0].target_weight)
+
+        # Stale series (last closed 1h bar is 10 hours old on 24/7 perp) -> fails closed!
+        bars_stale = _make_bar_series([100.0 + 0.1 * i for i in range(25)], symbol=sym, interval="1h", start_ms=t0 - 35 * 3_600_000)
+        res_stale = ov_1h.filter(_make_ctx(now_ms=t0, bars=bars_stale), StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
+        self.assertEqual((), res_stale.targets)
+
 
 if __name__ == "__main__":
     unittest.main()

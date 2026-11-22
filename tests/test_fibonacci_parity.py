@@ -220,6 +220,17 @@ class FibonacciParityTests(unittest.TestCase):
                         ut.entry_time_ms,
                         f"{mode_label} trade[{idx}] entry_time_ms mismatch",
                     )
+                    # Normalize unified end_of_data bar-close timestamp to legacy bar-open timestamp (CR1-28).
+                    normalized_ut_exit_ms = (
+                        ut.exit_time_ms - s15.interval_ms
+                        if ut.reason == "end_of_data"
+                        else ut.exit_time_ms
+                    )
+                    self.assertEqual(
+                        lt.exit_time_ms,
+                        normalized_ut_exit_ms,
+                        f"{mode_label} trade[{idx}] exit bar mismatch (legacy={lt.exit_time_ms}, unified={ut.exit_time_ms}, reason={ut.reason})",
+                    )
                     self.assertAlmostEqual(
                         lt.entry_price,
                         ut.entry_price,
