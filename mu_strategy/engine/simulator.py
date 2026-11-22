@@ -1143,6 +1143,7 @@ class _SimAccount:
         pre_volume: float,
         pre_atr: float | None,
         eq_basis: float,
+        raw_bar_open: float | None = None,
     ) -> tuple[FillQuote | None, bool]:
         """Match an OrderIntent and return ``(FillQuote | None, filled_at_open)``."""
         execution = self.execution
@@ -1152,6 +1153,9 @@ class _SimAccount:
         is_reduce = intent.reduce_only or intent.qty_mode == "close_all"
         # CR3-04: Preserve caller-supplied exclusion bands on non-reduce_only close_all intents.
         excluded_bands = () if intent.reduce_only else intent.excluded_price_bands
+        # CR5-06: Always test ``price_source="open"`` exclusion bands against the true raw bar open
+        # even when protective rechecks pass an intrabar path anchor as ``bar_open``.
+        band_open_px = bar_open if raw_bar_open is None else raw_bar_open
 
         if is_reduce:
             pos_q = self.pos_qty
@@ -1197,8 +1201,8 @@ class _SimAccount:
                 bar_atr=pre_atr,
                 reason=reason,
             )
-            # CR3-04 / CR4-08: Enforce exclusion bands against open or final execution price per band.
-            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=bar_open):
+            # CR3-04 / CR4-08 / CR5-06: Enforce exclusion bands against raw bar open or final execution price per band.
+            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=band_open_px):
                 return None, False
             return quote, True
 
@@ -1215,7 +1219,7 @@ class _SimAccount:
             )
             if fill_px is None:
                 return None, False
-            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=fill_px, open_px=bar_open):
+            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=fill_px, open_px=band_open_px):
                 return None, False
             qty_abs = self.size_intent_qty(intent, fill_px, fill_px, eq_basis)
             if qty_abs <= 1e-12:
@@ -1308,8 +1312,8 @@ class _SimAccount:
                     liquidity="taker",
                     reason=reason,
                 )
-                # CR3-04 / CR4-08: Enforce exclusion bands against open or final execution price per band.
-                if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=bar_open):
+                # CR3-04 / CR4-08 / CR5-06: Enforce exclusion bands against raw bar open or final execution price per band.
+                if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=band_open_px):
                     return None, False
                 return quote, True
             quote = execution.try_fill_stop_market(
@@ -1326,11 +1330,11 @@ class _SimAccount:
             )
             if quote is None:
                 return None, False
-            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=bar_open):
+            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=band_open_px):
                 return None, False
             return quote, False
 
-        # order_type == "stop_limit" (CR1-42 / CR2-15 / CR2-18 / CR2-22 / CR4-03 / CR4-08).
+        # order_type == "stop_limit" (CR1-42 / CR2-15 / CR2-18 / CR2-22 / CR4-03 / CR4-08 / CR5-06).
         assert intent.stop_price is not None and intent.limit_price is not None
         is_activated = qo.activated if qo is not None else False
         if is_activated:
@@ -1343,7 +1347,7 @@ class _SimAccount:
             )
             if fill_px is None:
                 return None, False
-            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=fill_px, open_px=bar_open):
+            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=fill_px, open_px=band_open_px):
                 return None, False
             qty_abs = self.size_intent_qty(intent, fill_px, fill_px, eq_basis)
             if qty_abs <= 1e-12:
@@ -1408,7 +1412,7 @@ class _SimAccount:
                     exec_px = raw_exec if raw_exec <= intent.limit_price else intent.limit_price
                 else:
                     exec_px = raw_exec if raw_exec >= intent.limit_price else intent.limit_price
-                if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=exec_px, open_px=bar_open):
+                if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=exec_px, open_px=band_open_px):
                     return None, False
                 return (
                     execution._make_quote(
@@ -1430,7 +1434,7 @@ class _SimAccount:
                 reached = (bar_high > intent.limit_price) if execution.require_touch_through else (bar_high >= intent.limit_price)
             if not reached:
                 return None, False
-            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=intent.limit_price, open_px=bar_open):
+            if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=intent.limit_price, open_px=band_open_px):
                 return None, False
             qty_abs = self.size_intent_qty(intent, intent.limit_price, intent.limit_price, eq_basis)
             if qty_abs <= 1e-12:
@@ -1472,7 +1476,7 @@ class _SimAccount:
         )
         if quote is None:
             return None, False
-        if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=bar_open):
+        if excluded_bands and _bands_exclude_price(excluded_bands, fill_px=quote.exec_price, open_px=band_open_px):
             return None, False
         return quote, False
 
@@ -1535,6 +1539,7 @@ class _SimAccount:
         liq_bar_high: float | None = None,
         liq_bar_low: float | None = None,
         skip_stops_at_or_beyond_entry: bool = False,
+        raw_bar_open: float | None = None,
     ) -> bool:
         """Resolve liquidation, bracket stops/TPs, and resting reduce-only orders accurately (CR1-44/45/53)."""
         if self.pos_qty == 0.0:
@@ -1546,6 +1551,8 @@ class _SimAccount:
         liq_o = bar_open if liq_bar_open is None else liq_bar_open
         liq_h = bar_high if liq_bar_high is None else liq_bar_high
         liq_l = bar_low if liq_bar_low is None else liq_bar_low
+        # CR5-06: Always evaluate ``price_source="open"`` exclusion bands against the true raw bar open.
+        band_open_px = bar_open if raw_bar_open is None else raw_bar_open
 
         def _eq_basis() -> float:
             return (
@@ -1665,6 +1672,7 @@ class _SimAccount:
                             pre_volume=pre_volume,
                             pre_atr=pre_atr,
                             eq_basis=_eq_basis(),
+                            raw_bar_open=band_open_px,
                         )
                         if quote is not None:
                             self.apply_fill(quote, bar_open_ms, i)
@@ -1705,7 +1713,7 @@ class _SimAccount:
                                 sl_bands = () if it.reduce_only else it.excluded_price_bands
                                 if not (
                                     sl_bands
-                                    and _bands_exclude_price(sl_bands, fill_px=exec_px, open_px=bar_open)
+                                    and _bands_exclude_price(sl_bands, fill_px=exec_px, open_px=band_open_px)
                                 ):
                                     quote = execution._make_quote(
                                         side=close_side,
@@ -1782,7 +1790,7 @@ class _SimAccount:
                             break
                         it = qo.intent
                         lim_bands = () if it.reduce_only else it.excluded_price_bands
-                        if lim_bands and _bands_exclude_price(lim_bands, fill_px=bar_open, open_px=bar_open):
+                        if lim_bands and _bands_exclude_price(lim_bands, fill_px=bar_open, open_px=band_open_px):
                             continue
                         qty_abs = self.size_intent_qty(it, bar_open, bar_open, _eq_basis())
                         if qty_abs > 1e-12:
@@ -1873,6 +1881,7 @@ class _SimAccount:
                         pre_volume=pre_volume,
                         pre_atr=pre_atr,
                         eq_basis=_eq_basis(),
+                        raw_bar_open=band_open_px,
                     )
                     if quote is not None:
                         self.apply_fill(quote, bar_open_ms, i)
@@ -1896,6 +1905,7 @@ class _SimAccount:
                         pre_volume=pre_volume,
                         pre_atr=pre_atr,
                         eq_basis=_eq_basis(),
+                        raw_bar_open=band_open_px,
                     )
                     if quote is not None:
                         self.apply_fill(quote, bar_open_ms, i)
@@ -1980,7 +1990,7 @@ class _SimAccount:
                             else:
                                 reached = (bar_low < lp) if execution.require_touch_through else (bar_low <= lp)
                             if reached and not (
-                                tp_bands and _bands_exclude_price(tp_bands, fill_px=lp, open_px=bar_open)
+                                tp_bands and _bands_exclude_price(tp_bands, fill_px=lp, open_px=band_open_px)
                             ):
                                 qty_abs = self.size_intent_qty(it, lp, lp, _eq_basis())
                                 if qty_abs > 1e-12:
@@ -2006,7 +2016,7 @@ class _SimAccount:
                             bar_low=bar_low,
                         )
                         if fill_px is not None and not (
-                            tp_bands and _bands_exclude_price(tp_bands, fill_px=fill_px, open_px=bar_open)
+                            tp_bands and _bands_exclude_price(tp_bands, fill_px=fill_px, open_px=band_open_px)
                         ):
                             qty_abs = self.size_intent_qty(it, fill_px, fill_px, _eq_basis())
                             if qty_abs > 1e-12:
@@ -2433,6 +2443,7 @@ class _SimAccount:
                                 for q_r in self.pending_reduce_orders
                             )
                             if has_elig_oo:
+                                liqs_before_oo = self.liquidations
                                 self.process_protective_exits_with_orders(
                                     i,
                                     bar_open_ms,
@@ -2453,7 +2464,17 @@ class _SimAccount:
                                     liq_bar_high=bar_open,
                                     liq_bar_low=bar_open,
                                     skip_stops_at_or_beyond_entry=fresh_entry_this_bar,
+                                    raw_bar_open=bar_open,
                                 )
+                                # CR5-07: Cancel all remaining queued entries if the opening transition liquidated
+                                # the position (do NOT cancel on an ordinary non-liquidation open_only exit).
+                                if self.liquidations > liqs_before_oo:
+                                    liquidated_in_p1_6 = True
+                                    exited_existing_this_bar = True
+                                    pos_anchor = None
+                                    pos_has_open_exposure = False
+                                    _expire_eligible_open_only_reduces()
+                                    break
                                 if self.pos_qty == 0.0:
                                     pos_anchor = None
                                     pos_has_open_exposure = False
@@ -2543,6 +2564,7 @@ class _SimAccount:
                                         liq_bar_high=check_hi,
                                         liq_bar_low=check_lo,
                                         skip_stops_at_or_beyond_entry=fresh_entry_this_bar,
+                                        raw_bar_open=bar_open,
                                     )
                                 else:
                                     stop_lvl_p = self.active_stop_price
@@ -2767,6 +2789,7 @@ class _SimAccount:
                                 liq_bar_open=p1_6_liq_open,
                                 liq_bar_high=p1_6_liq_high,
                                 liq_bar_low=p1_6_liq_low,
+                                raw_bar_open=bar_open,
                             )
                         else:
                             scale_exit = execution.evaluate_protective_exits(

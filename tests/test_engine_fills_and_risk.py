@@ -1147,6 +1147,159 @@ class RiskOverlayTests(unittest.TestCase):
         self.assertEqual(1, len(res_short.intents))
         self.assertAlmostEqual(0.4, res_short.intents[0].qty_value, places=9)
 
+    def test_exposure_cap_docstring_baseline_scaling_and_protective_reductions_cr5_03_cr5_04_cr5_05(self) -> None:
+        sym_a = "MU-USDT-SWAP"
+        sym_b = "ETH-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_a = _make_bar_series([100.0] * 5, symbol=sym_a, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_b = _make_bar_series([100.0] * 5, symbol=sym_b, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym_a, "1h"): bars_a, (sym_b, "1h"): bars_b}, now_ms=t0)
+        inst = okx_swap_spec(sym_a, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+
+        # CR5-03: Docstring removes nonexistent SimulatorConfig(max_leverage=...) and states per-position fill-time cap.
+        doc = ExposureCapOverlay.__doc__ or ""
+        self.assertNotIn("SimulatorConfig(max_leverage", doc)
+        self.assertIn("enforce_instrument_max_leverage", doc)
+        self.assertIn("per-position", doc.lower())
+
+        # CR5-04: With 1x gross cap, existing 0.6x long in A, B flat: targets A=(1.0, 0.6), B=(0.6).
+        # Scale factor 0.4 applies ONLY to requested increases above baseline 0.6 -> A=(0.76, 0.6), B=(0.24)!
+        pos_a06 = {
+            sym_a: PositionView(sym_a, qty=60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6)
+        }
+        pf_a06 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_a06,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_a06 = BarContext(now_ms=t0, symbol=sym_a, market=mv, portfolio=pf_a06, instrument=inst)
+        res_scale = ov.filter(
+            ctx_a06,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, 1.0), TargetPosition(sym_a, 0.6), TargetPosition(sym_b, 0.6)),
+            ),
+        )
+        self.assertEqual(3, len(res_scale.targets))
+        self.assertAlmostEqual(0.76, res_scale.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.60, res_scale.targets[1].target_weight, places=9)
+        self.assertAlmostEqual(0.24, res_scale.targets[2].target_weight, places=9)
+
+        # Flat book still scales proportionally from zero: A=1.0, B=0.6 under 1x cap -> (0.625, 0.375).
+        pf_flat = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_flat = BarContext(now_ms=t0, symbol=sym_a, market=mv, portfolio=pf_flat, instrument=inst)
+        res_flat = ov.filter(
+            ctx_flat,
+            StrategyOutput(targets=(TargetPosition(sym_a, 1.0), TargetPosition(sym_b, 0.6))),
+        )
+        self.assertAlmostEqual(0.625, res_flat.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(0.375, res_flat.targets[1].target_weight, places=9)
+
+        # Short baseline mirror: existing -0.6x in A, B flat -> A=(-0.76, -0.6), B=(-0.24).
+        pos_am06 = {
+            sym_a: PositionView(sym_a, qty=-60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6)
+        }
+        pf_am06 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_am06,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_am06 = BarContext(now_ms=t0, symbol=sym_a, market=mv, portfolio=pf_am06, instrument=inst)
+        res_short_scale = ov.filter(
+            ctx_am06,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, -1.0), TargetPosition(sym_a, -0.6), TargetPosition(sym_b, -0.6)),
+            ),
+        )
+        self.assertAlmostEqual(-0.76, res_short_scale.targets[0].target_weight, places=9)
+        self.assertAlmostEqual(-0.60, res_short_scale.targets[1].target_weight, places=9)
+        self.assertAlmostEqual(-0.24, res_short_scale.targets[2].target_weight, places=9)
+
+        # CR5-05: 1x cap, existing 0.8x long, targets (0.6, 0.8), reduce_only stop 0.5x, non-reduce_only 1.6x sell.
+        # Protective reduction lowers reachable long floor from 0.6 -> 0.1, clamping the 1.6x sell to 1.1x!
+        pos_a08 = {
+            sym_a: PositionView(sym_a, qty=80.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=8_000.0, leverage=0.8)
+        }
+        pf_a08 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_a08,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_a08 = BarContext(now_ms=t0, symbol=sym_a, market=mv, portfolio=pf_a08, instrument=inst)
+        stop_05 = OrderIntent("stp05", sym_a, "sell", "stop_market", "equity_fraction", 0.5, stop_price=95.0, reduce_only=True)
+        stop_50c = OrderIntent("stp50c", sym_a, "sell", "stop_market", "contracts", 50.0, stop_price=95.0, reduce_only=True)
+        sell_16 = OrderIntent("s16", sym_a, "sell", "market", "equity_fraction", 1.6)
+        res_with_stop = ov.filter(
+            ctx_a08,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, 0.6), TargetPosition(sym_a, 0.8)),
+                intents=(stop_05, sell_16),
+            ),
+        )
+        self.assertEqual(2, len(res_with_stop.intents))
+        self.assertAlmostEqual(1.1, res_with_stop.intents[1].qty_value, places=9)
+
+        # Same with contracts reduce-only stop (50 contracts @ stop 95 on 100 ref price -> 0.50x reduction, clamps sell to 1.1x).
+        res_with_cstop = ov.filter(
+            ctx_a08,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, 0.6), TargetPosition(sym_a, 0.8)),
+                intents=(stop_50c, sell_16),
+            ),
+        )
+        self.assertAlmostEqual(1.1, res_with_cstop.intents[1].qty_value, places=9)
+
+        # Without protective stop, 1.6x sell against 0.6x lower bound ends at exact -1.0x and passes unchanged!
+        res_no_stop = ov.filter(
+            ctx_a08,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, 0.6), TargetPosition(sym_a, 0.8)),
+                intents=(sell_16,),
+            ),
+        )
+        self.assertEqual(1, len(res_no_stop.intents))
+        self.assertAlmostEqual(1.6, res_no_stop.intents[0].qty_value, places=9)
+
+        # Short mirror: existing -0.8x short, targets (-0.6, -0.8), reduce_only buy stop 0.5x + 1.6x buy -> clamped to 1.1x.
+        pos_am08 = {
+            sym_a: PositionView(sym_a, qty=-80.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=8_000.0, leverage=0.8)
+        }
+        pf_am08 = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions=pos_am08,
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_am08 = BarContext(now_ms=t0, symbol=sym_a, market=mv, portfolio=pf_am08, instrument=inst)
+        bstop_05 = OrderIntent("bstp05", sym_a, "buy", "stop_market", "equity_fraction", 0.5, stop_price=105.0, reduce_only=True)
+        buy_16 = OrderIntent("b16", sym_a, "buy", "market", "equity_fraction", 1.6)
+        res_short_stop = ov.filter(
+            ctx_am08,
+            StrategyOutput(
+                targets=(TargetPosition(sym_a, -0.6), TargetPosition(sym_a, -0.8)),
+                intents=(bstop_05, buy_16),
+            ),
+        )
+        self.assertAlmostEqual(1.1, res_short_stop.intents[1].qty_value, places=9)
+
 
 if __name__ == "__main__":
     unittest.main()

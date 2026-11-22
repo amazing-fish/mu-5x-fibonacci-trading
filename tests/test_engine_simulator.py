@@ -3264,6 +3264,327 @@ class SimulatorCoreTests(unittest.TestCase):
         self.assertAlmostEqual(101.0, res_open_acc.trades[0].entry_price, places=6)
         self.assertEqual(0, res_fill_rej.trade_count)
 
+    def test_benchmark_causal_funding_marks_and_close_equity_curve_on_overlapping_bars_cr5_01_cr5_02(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        t0 = 1_735_689_600_000
+
+        # CR5-01: Overlapping bars 00:00..01:00 and 00:30..01:30 with +1% funding at 00:15.
+        # Changing ONLY the later 00:30 open from 100 -> 200 MUST NOT change the 00:15 funding debit or ending equity!
+        f_0015 = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 900_000, rate=0.01)],  # 00:15
+        )
+        bars_open100 = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 100.0, 100.0, 100.0, 100.0, 1000.0),
+            ],
+        )
+        bars_open200 = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 200.0, 200.0, 100.0, 100.0, 1000.0),
+            ],
+        )
+        r100 = compute_buy_and_hold_benchmark(
+            bars_open100,
+            starting_equity=10_000.0,
+            leverage=1.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0015,
+            close_on_end=True,
+        )
+        r200 = compute_buy_and_hold_benchmark(
+            bars_open200,
+            starting_equity=10_000.0,
+            leverage=1.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0015,
+            close_on_end=True,
+        )
+        self.assertAlmostEqual(-100.0, r100.attribution.funding_pnl, places=6)
+        self.assertAlmostEqual(-100.0, r200.attribution.funding_pnl, places=6)
+        self.assertAlmostEqual(9_900.0, r100.ending_equity, places=6)
+        self.assertAlmostEqual(9_900.0, r200.ending_equity, places=6)
+        self.assertAlmostEqual(9_900.0, r200.equity_curve[0][1], places=6)
+        _assert_accounting_invariants(self, r100)
+        _assert_accounting_invariants(self, r200)
+
+        # CR5-02: Overlapping bars 00:00..01:00, 01:00..02:00, 01:30..02:30 (5x long @ 100, liq=80.0).
+        # Bar 1's close-time equity point at 02:00 MUST reflect funding occurring <= 02:00 (both 01:15 and 01:45),
+        # while 01:45 funding STILL must not trigger false liquidation at Bar 2's earlier 01:30 open of 81.0!
+        overlap_3 = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 3_600_000, 100.0, 100.0, 95.0, 100.0, 1000.0),
+                Candle(t0 + 5_400_000, 81.0, 85.0, 81.0, 85.0, 1000.0),
+            ],
+        )
+        f_0115 = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 4_500_000, rate=0.02)],  # 01:15
+        )
+        res_0115 = compute_buy_and_hold_benchmark(
+            overlap_3,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0115,
+            close_on_end=True,
+        )
+        # 02:00 curve point includes 01:15 debit (-1000 -> 9000), AND 01:30 open liquidates!
+        self.assertAlmostEqual(9_000.0, res_0115.equity_curve[1][1], places=6)
+        self.assertEqual(1, res_0115.liquidations)
+        _assert_accounting_invariants(self, res_0115)
+
+        f_0145 = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 6_300_000, rate=0.02)],  # 01:45
+        )
+        res_0145 = compute_buy_and_hold_benchmark(
+            overlap_3,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0145,
+            close_on_end=True,
+        )
+        # 02:00 curve point reflects 01:45 debit (-1000 -> 9000), WHILE 01:30 open survives (no false liquidation)!
+        self.assertAlmostEqual(9_000.0, res_0145.equity_curve[1][1], places=6)
+        self.assertEqual(0, res_0145.liquidations)
+        _assert_accounting_invariants(self, res_0145)
+
+    def test_exposure_cap_protective_stop_e2e_never_exceeds_cap_cr5_05(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        sim = Simulator(
+            inst,
+            CostModel.zero_cost(),
+            SimulatorConfig(
+                starting_equity=10_000.0,
+                target_rebalance_mode="on_change",
+                allow_missing_funding_for_perp=True,
+            ),
+        )
+        observed_leverages: list[float] = []
+
+        class _TrackingStrategy(_ScriptedStrategy):
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                pos = ctx.portfolio.positions.get(ctx.symbol)
+                observed_leverages.append(pos.leverage if pos is not None else 0.0)
+                return super().on_bar(ctx)
+
+        # Bar 0 opens 0.8x long; bar 1 emits targets (0.6, 0.8), reduce_only stop 0.5x (at 100 so it triggers),
+        # and non-reduce_only 1.6x sell -> overlay clamps sell to 1.1x so resulting short stays <= 1.0x!
+        strat = _TrackingStrategy(
+            {
+                0: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 0.8),)),
+                1: StrategyOutput(
+                    targets=(TargetPosition("MU-USDT-SWAP", 0.6), TargetPosition("MU-USDT-SWAP", 0.8)),
+                    intents=(
+                        OrderIntent(
+                            "ro_stop",
+                            "MU-USDT-SWAP",
+                            "sell",
+                            "stop_market",
+                            "equity_fraction",
+                            0.5,
+                            stop_price=100.0,
+                            reduce_only=True,
+                        ),
+                        OrderIntent("opp_sell", "MU-USDT-SWAP", "sell", "market", "equity_fraction", 1.6),
+                    ),
+                ),
+            },
+            warmup=0,
+        )
+        res = sim.run(strat, bars, overlays=(ExposureCapOverlay(1.0, 1.0),))
+        self.assertLessEqual(max(observed_leverages), 1.0 + 1e-9)
+        self.assertAlmostEqual(1.0, observed_leverages[2], places=6)
+        _assert_accounting_invariants(self, res)
+
+    def test_protective_recheck_uses_raw_bar_open_for_open_exclusion_band_cr5_06(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        # Bar 1: enter 1x long @ 100 (100 units, cash=10_000).
+        # Bar 2: opens at 100.0, dips to 75.0 (close 76.0).
+        # - Queued close_all sell stop @ 89.0 with band around 100.0:
+        #   * price_source="open": MUST reject on BOTH Step 1.5 AND Step 1.7 scale-in recheck
+        #     (even though Step 1.7 passes p1_6_liq_open=90.0 as matching anchor!), so liquidation fires!
+        #   * price_source="fill": quote.exec_price=89.0 is outside [99, 101] -> stop fills @ 89.0 (no liquidation)!
+        # - Queued buy limit @ 90.0 (4x equity_fraction = 444.44 units): combined avg ~91.84, liq ~73.47 ->
+        #   use 5x scale-in (555.56 units, total ~655.56, avg ~91.53, liq = (655.56*91.53 - 10_000)/655.56 = 76.27 > 75.0!).
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 75.0, 76.0, 1000.0),
+                (76.0, 77.0, 75.0, 76.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        sim = Simulator(
+            inst,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+
+        # 1. price_source="open" band around 100.0 -> rejected on BOTH passes, liquidates instead of filling stop!
+        band_open = (PriceExclusionBand(center=100.0, tolerance_pct=0.01, price_source="open"),)
+        res_open = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e1", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 1.0),)),
+                    1: StrategyOutput(
+                        intents=(
+                            OrderIntent(
+                                "ca_stop89",
+                                "MU-USDT-SWAP",
+                                "sell",
+                                "stop_market",
+                                "close_all",
+                                0.0,
+                                stop_price=89.0,
+                                reduce_only=False,
+                                excluded_price_bands=band_open,
+                                tag="banded_stop",
+                            ),
+                            OrderIntent(
+                                "scale5x",
+                                "MU-USDT-SWAP",
+                                "buy",
+                                "limit",
+                                "equity_fraction",
+                                5.0,
+                                limit_price=90.0,
+                            ),
+                        )
+                    ),
+                },
+                warmup=0,
+            ),
+            bars,
+        )
+        self.assertEqual(1, res_open.liquidations)
+        self.assertEqual("liquidation", res_open.trades[0].reason)
+        _assert_accounting_invariants(self, res_open)
+
+        # 2. price_source="fill" band around 100.0 -> stop at 89.0 is outside band, so stop fills cleanly!
+        band_fill = (PriceExclusionBand(center=100.0, tolerance_pct=0.01, price_source="fill"),)
+        res_fill = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e1", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 1.0),)),
+                    1: StrategyOutput(
+                        intents=(
+                            OrderIntent(
+                                "ca_stop89",
+                                "MU-USDT-SWAP",
+                                "sell",
+                                "stop_market",
+                                "close_all",
+                                0.0,
+                                stop_price=89.0,
+                                reduce_only=False,
+                                excluded_price_bands=band_fill,
+                                tag="banded_stop",
+                            ),
+                            OrderIntent(
+                                "scale5x",
+                                "MU-USDT-SWAP",
+                                "buy",
+                                "limit",
+                                "equity_fraction",
+                                5.0,
+                                limit_price=90.0,
+                            ),
+                        )
+                    ),
+                },
+                warmup=0,
+            ),
+            bars,
+        )
+        self.assertEqual(0, res_fill.liquidations)
+        self.assertEqual("banded_stop", res_fill.trades[0].reason)
+        self.assertAlmostEqual(89.0, res_fill.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_fill)
+
+    def test_opening_transition_liquidation_cancels_remaining_pending_entries_cr5_07(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        # Zero trading costs + 25% MMR: 5x buy @ 100 gives liq = (500*100 - 10_000)/(500*0.75) = 106.67 > 100!
+        # With an eligible open_only reduction AND a queued buy limit @ 90, the Phase 0 -> Phase 1 transition
+        # liquidates the 5x position at 100 and MUST cancel the queued buy limit @ 90 (no post-liquidation reopen!).
+        cost = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=FixedTicks(0.0),
+            stop_slippage_multiplier=1.0,
+            maintenance_margin_rate=0.25,
+            liquidation_fee_bps=0.0,
+        )
+        bars = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 88.0, 95.0, 1000.0),
+                (95.0, 96.0, 94.0, 95.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        sim = Simulator(
+            inst,
+            cost,
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+        res = sim.run(
+            _ScriptedStrategy(
+                {
+                    0: StrategyOutput(
+                        intents=(
+                            OrderIntent("buy5x", "MU-USDT-SWAP", "buy", "market", "equity_fraction", 5.0),
+                            OrderIntent("reopen90", "MU-USDT-SWAP", "buy", "limit", "contracts", 10.0, limit_price=90.0),
+                            OrderIntent(
+                                "oo_red",
+                                "MU-USDT-SWAP",
+                                "sell",
+                                "limit",
+                                "close_all",
+                                0.0,
+                                limit_price=105.0,
+                                reduce_only=True,
+                                time_in_force="open_only",
+                            ),
+                        )
+                    )
+                },
+                warmup=0,
+            ),
+            bars,
+        )
+        self.assertEqual(1, res.liquidations)
+        self.assertEqual(1, res.trade_count)
+        self.assertEqual("liquidation", res.trades[0].reason)
+        self.assertAlmostEqual(100.0, res.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res)
+
 
 if __name__ == "__main__":
     unittest.main()

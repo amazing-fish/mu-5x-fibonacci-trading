@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import expm1, fsum, isfinite, log, sqrt
@@ -1028,6 +1029,44 @@ def compute_buy_and_hold_benchmark(
             liquidation_fee_bps=liq_fee_bps_eff,
         )
 
+    def _causal_event_mark(ev_ts_ms: int, max_idx: int) -> float:
+        """Select the latest causally observable mark at or before ``ev_ts_ms`` (CR5-01).
+
+        Checks bars ``0..max_idx``: prefers the latest bar close with
+        ``close_time_ms <= ev_ts_ms`` (breaking exact timestamp ties in favor of close),
+        or a strictly newer bar open with ``open_time_ms <= ev_ts_ms``, falling back to
+        ``ref_entry`` when no bar mark exists at or before ``ev_ts_ms``. Never reads a
+        later bar's open or close (``> ev_ts_ms``).
+        """
+        best_close_ts: int | None = None
+        best_close_px = 0.0
+        for j in range(max_idx, -1, -1):
+            c_ts = int(close_times[j])
+            if c_ts <= ev_ts_ms:
+                if best_close_ts is None or c_ts > best_close_ts:
+                    c_px = float(closes[j])
+                    if c_px > 0.0:
+                        best_close_ts = c_ts
+                        best_close_px = c_px
+                elif c_ts < best_close_ts:
+                    break
+        # open_times is strictly increasing in BarSeries.
+        open_pos = bisect_right(open_times, ev_ts_ms, 0, max_idx + 1) - 1
+        best_open_ts: int | None = None
+        best_open_px = 0.0
+        while open_pos >= 0:
+            o_px = float(opens[open_pos])
+            if o_px > 0.0:
+                best_open_ts = int(open_times[open_pos])
+                best_open_px = o_px
+                break
+            open_pos -= 1
+        if best_close_ts is not None and (best_open_ts is None or best_close_ts >= best_open_ts):
+            return best_close_px
+        if best_open_ts is not None:
+            return best_open_px
+        return ref_entry
+
     liq_price = _compute_bench_liq_price(cash)
 
     for i in range(start_idx, n):
@@ -1040,18 +1079,16 @@ def compute_buy_and_hold_benchmark(
         bar_vol = float(volumes[i])
         bar_atr = float(atr_arr[i]) if atr_arr is not None else None
 
-        # 1. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar open / liquidation
-        #    using strictly causal prior-closed mark prices (CR4-07).
+        # 1. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar open / liquidation,
+        #    pricing each event strictly from marks available at or before ev.ts_ms (CR4-07 / CR5-01).
         if is_open and effective_funding is not None and bar_open_ms > settled_until_ms:
             gap_events = effective_funding.between(settled_until_ms, bar_open_ms)
             if gap_events:
-                prior_idx = _prior_closed_index(i, bar_open_ms)
-                gap_mark = float(closes[prior_idx]) if prior_idx is not None else bar_open
-                if gap_mark <= 0.0:
-                    gap_mark = bar_open
                 for ev in gap_events:
+                    ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
                     rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                    delta = -signed_qty * gap_mark * float(rate)
+                    ev_mark = _causal_event_mark(ev_ts, i)
+                    delta = -signed_qty * ev_mark * float(rate)
                     cash += delta
                     accrued_funding += delta
                 liq_price = _compute_bench_liq_price(cash)
@@ -1148,22 +1185,52 @@ def compute_buy_and_hold_benchmark(
                 liq_price = None
                 liquidations += 1
 
-        # 3. Settle bar-period funding at bar close ONLY when bar_close_ms <= next bar's open (CR4-07).
-        #    When overlapping bar i+1 opens before bar i closes, defer settlement so Step 1 of bar i+1
-        #    settles events <= open_times[i+1] causally before bar i+1's open check and never debits
-        #    future funding (> open_times[i+1]) before bar i+1 opens.
+        # 3. Settle bar-period funding in strict timestamp order (CR4-07 / CR5-01 / CR5-02):
+        #    - Non-overlapping bar (bar_close_ms <= next_open_ms): settle (settled_until_ms, bar_close_ms]
+        #      into live cash at bar close.
+        #    - Overlapping bar (next_open_ms < bar_close_ms):
+        #      (a) settle events strictly before next_open_ms into live cash right now using strictly
+        #          causal per-event marks (<= ev.ts_ms), advancing settled_until_ms to next_open_ms - 1;
+        #      (b) keep events in [next_open_ms, bar_close_ms] OUT of live cash / liq_price so bar i+1's
+        #          opening check at next_open_ms never sees future funding, while adding a non-mutating
+        #          deferred_close_funding_delta to bar i's recorded close-time equity_curve point!
         next_open_ms = int(open_times[i + 1]) if (i + 1 < n) else bar_close_ms
-        if is_open and effective_funding is not None and bar_close_ms <= next_open_ms and bar_close_ms > settled_until_ms:
-            events = effective_funding.between(settled_until_ms, bar_close_ms)
-            if events:
-                mark_px = bar_close if bar_close > 0.0 else bar_open
-                for ev in events:
-                    rate = ev.rate if hasattr(ev, "rate") else ev[1]
-                    delta = -signed_qty * mark_px * float(rate)
-                    cash += delta
-                    accrued_funding += delta
-                liq_price = _compute_bench_liq_price(cash)
-            settled_until_ms = bar_close_ms
+        deferred_close_funding_delta = 0.0
+        if is_open and effective_funding is not None and bar_close_ms > settled_until_ms:
+            if bar_close_ms <= next_open_ms:
+                events = effective_funding.between(settled_until_ms, bar_close_ms)
+                if events:
+                    for ev in events:
+                        ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
+                        rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                        mark_px = bar_close if bar_close > 0.0 else _causal_event_mark(ev_ts, i)
+                        delta = -signed_qty * mark_px * float(rate)
+                        cash += delta
+                        accrued_funding += delta
+                    liq_price = _compute_bench_liq_price(cash)
+                settled_until_ms = bar_close_ms
+            else:
+                # Overlapping bar i+1 opens at next_open_ms < bar_close_ms.
+                early_cap_ms = next_open_ms - 1
+                if early_cap_ms > settled_until_ms:
+                    early_events = effective_funding.between(settled_until_ms, early_cap_ms)
+                    if early_events:
+                        for ev in early_events:
+                            ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
+                            rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                            ev_mark = _causal_event_mark(ev_ts, i)
+                            delta = -signed_qty * ev_mark * float(rate)
+                            cash += delta
+                            accrued_funding += delta
+                        liq_price = _compute_bench_liq_price(cash)
+                    settled_until_ms = early_cap_ms
+                deferred_events = effective_funding.between(settled_until_ms, bar_close_ms)
+                if deferred_events:
+                    for ev in deferred_events:
+                        ev_ts = int(ev.ts_ms) if hasattr(ev, "ts_ms") else int(ev[0])
+                        rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                        mark_px = bar_close if bar_close > 0.0 else _causal_event_mark(ev_ts, i)
+                        deferred_close_funding_delta += -signed_qty * mark_px * float(rate)
 
         # 4. Close valuation & bankruptcy guard.
         if is_open:
@@ -1227,7 +1294,7 @@ def compute_buy_and_hold_benchmark(
                 liquidations += 1
                 equity_curve.append((bar_close_ms, _clean_zero(cash)))
             else:
-                equity_curve.append((bar_close_ms, _clean_zero(marked_equity)))
+                equity_curve.append((bar_close_ms, _clean_zero(marked_equity + deferred_close_funding_delta)))
         else:
             equity_curve.append((bar_close_ms, _clean_zero(cash)))
 

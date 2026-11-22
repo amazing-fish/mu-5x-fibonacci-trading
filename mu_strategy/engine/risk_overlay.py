@@ -757,15 +757,18 @@ class ExposureCapOverlay:
       - Caps (`max_gross_leverage`, `max_single_weight`) apply pre-trade at
         bar-close decision time inside ``filter(ctx, output)`` against the causal
         decision-time portfolio equity and reference prices.
-      - Weight-based outputs (``TargetPosition``, ``OrderIntent(qty_mode="target_weight")``,
-        ``OrderIntent(qty_mode="equity_fraction")``) express exposure relative to fill-time
-        equity/price when subsequently executed by the simulator.
+      - Target-weight outputs (``TargetPosition`` and ``OrderIntent(qty_mode="target_weight")``)
+        express exposure relative to fill-time equity/price. When
+        ``SimulatorConfig(enforce_instrument_max_leverage=True)`` (the default) is enabled,
+        the simulator clamps each target weight to ``±InstrumentSpec.max_leverage`` at fill
+        time; this is a per-position fill-time cap, not a portfolio-level gross cap.
+      - Incremental ``OrderIntent(qty_mode="equity_fraction")`` orders only clamp the single
+        order's notional to ``eq_basis * InstrumentSpec.max_leverage`` at fill time and do
+        not bound held-plus-order exposure across opening gaps.
       - Fixed-quantity ``OrderIntent(qty_mode="contracts")`` orders are clamped at
         decision time using the order's limit/stop price or causal decision-time
         reference price (``qty * contract_value * ref_px / equity``); they are not
-        re-clamped at fill time if the next bar opens at a gapped price. For strict
-        fill-time leverage capping across opening gaps, use weight-based sizing or
-        configure ``SimulatorConfig(max_leverage=...)``.
+        re-clamped at fill time if the next bar opens at a gapped price.
     """
 
     cap_scope: Literal["decision_time"] = "decision_time"
@@ -796,16 +799,67 @@ class ExposureCapOverlay:
                     sign = 1.0 if pos.qty > 0.0 else -1.0
                     existing_weights[sym] = sign * (pos.notional / equity)
 
-        # 1. Summarize already-resting non-reduce-only open orders BEFORE admitting targets (CR2-29),
-        #    because resting orders can still fill AFTER a queued TargetPosition fills at the open.
+        # 1. Summarize already-resting open orders AND protective reductions BEFORE admitting targets
+        #    (CR2-29 / CR3-16 / CR5-05):
+        #    - Non-reduce-only resting orders can still fill AFTER a queued TargetPosition fills.
+        #    - Protective reduce_only / close_all orders (resting + same-output, deduplicated by intent_id)
+        #      can shrink a positive long down toward 0.0 (never negative) or a negative short up toward 0.0
+        #      (never positive) BEFORE a non-reduce-only opposing order executes!
         rest_buy: dict[str, float] = {}
         rest_sell: dict[str, float] = {}
         rest_tw_lo: dict[str, float] = {}
         rest_tw_hi: dict[str, float] = {}
+        red_sell: dict[str, float] = {}
+        red_buy: dict[str, float] = {}
+        red_sell_floor: dict[str, float] = {}
+        red_buy_ceil: dict[str, float] = {}
         all_known_syms: set[str] = set(existing_weights.keys())
+
+        def _record_protective_reduction(ord_obj: OrderIntent) -> None:
+            osym = ord_obj.symbol
+            all_known_syms.add(osym)
+            qm = ord_obj.qty_mode
+            if qm == "close_all":
+                if ord_obj.side == "sell":
+                    red_sell[osym] = math.inf
+                else:
+                    red_buy[osym] = math.inf
+            elif qm == "equity_fraction":
+                if ord_obj.side == "sell":
+                    red_sell[osym] = red_sell.get(osym, 0.0) + ord_obj.qty_value
+                else:
+                    red_buy[osym] = red_buy.get(osym, 0.0) + ord_obj.qty_value
+            elif qm == "contracts":
+                ord_px = ord_obj.limit_price or ord_obj.stop_price
+                dec_px = self._reference_price(ctx, osym)
+                px_candidates = [p for p in (ord_px, dec_px) if p is not None and p > 0.0]
+                if equity > 0.0 and px_candidates:
+                    mult = _contract_multiplier(ctx, osym)
+                    w_red = (ord_obj.qty_value * mult * max(px_candidates)) / equity
+                else:
+                    w_red = math.inf
+                if ord_obj.side == "sell":
+                    red_sell[osym] = red_sell.get(osym, 0.0) + w_red
+                else:
+                    red_buy[osym] = red_buy.get(osym, 0.0) + w_red
+            elif qm == "target_weight":
+                if ord_obj.side == "sell":
+                    fl = max(0.0, ord_obj.qty_value)
+                    red_sell_floor[osym] = fl if osym not in red_sell_floor else min(red_sell_floor[osym], fl)
+                else:
+                    cl = min(0.0, ord_obj.qty_value)
+                    red_buy_ceil[osym] = cl if osym not in red_buy_ceil else max(red_buy_ceil[osym], cl)
+
+        same_output_reduce_ids = {
+            it.intent_id
+            for it in output.intents
+            if it.reduce_only or it.qty_mode == "close_all"
+        }
 
         for open_ord in ctx.portfolio.open_orders:
             if open_ord.reduce_only or open_ord.qty_mode == "close_all":
+                if open_ord.intent_id not in same_output_reduce_ids:
+                    _record_protective_reduction(open_ord)
                 continue
             osym = open_ord.symbol
             all_known_syms.add(osym)
@@ -828,6 +882,33 @@ class ExposureCapOverlay:
                     else:
                         rest_sell[osym] = rest_sell.get(osym, 0.0) + w
 
+        for it_pre in output.intents:
+            if it_pre.reduce_only or it_pre.qty_mode == "close_all":
+                _record_protective_reduction(it_pre)
+
+        for t_pre in output.targets:
+            if t_pre.stop_price is not None or t_pre.take_profit is not None:
+                if t_pre.target_weight > 0.0:
+                    red_sell[t_pre.symbol] = math.inf
+                elif t_pre.target_weight < 0.0:
+                    red_buy[t_pre.symbol] = math.inf
+
+        def _apply_protective_reductions(sym: str, lo_val: float, hi_val: float) -> tuple[float, float]:
+            # Shrink only the inner side toward 0.0 (never crossing 0.0, preserving CR3-16 & CR1-31).
+            if lo_val > 0.0:
+                if sym in red_sell_floor and red_sell_floor[sym] < lo_val:
+                    lo_val = red_sell_floor[sym]
+                rs_red = red_sell.get(sym, 0.0)
+                if rs_red > 0.0:
+                    lo_val = max(0.0, lo_val - rs_red)
+            if hi_val < 0.0:
+                if sym in red_buy_ceil and red_buy_ceil[sym] > hi_val:
+                    hi_val = red_buy_ceil[sym]
+                rb_red = red_buy.get(sym, 0.0)
+                if rb_red > 0.0:
+                    hi_val = min(0.0, hi_val + rb_red)
+            return lo_val, hi_val
+
         def _post_target_envelope(
             sym: str,
             w_lo: float | None,
@@ -846,6 +927,7 @@ class ExposureCapOverlay:
                 b_lo = rest_tw_lo[sym]
             if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
                 b_hi = rest_tw_hi[sym]
+            b_lo, b_hi = _apply_protective_reductions(sym, b_lo, b_hi)
             return b_lo - rest_sell.get(sym, 0.0), b_hi + rest_buy.get(sym, 0.0)
 
         # 2. Clamp individual TargetPositions against single_cap AND resting orders on that symbol (CR2-29).
@@ -903,9 +985,20 @@ class ExposureCapOverlay:
                     ratio = min(1.0, rem_for_inc / inc_sum)
                     new_targets: list[TargetPosition] = []
                     for t in clamped_targets:
-                        if inc_contribs.get(t.symbol, 0.0) > 0.0:
-                            # Scale the incremental part of target weight beyond 0.
-                            w_scaled = t.target_weight * ratio
+                        tsym = t.symbol
+                        if inc_contribs.get(tsym, 0.0) > 0.0:
+                            # CR5-04: Preserve each symbol's baseline (existing position / floor) and
+                            # scale ONLY the requested increase above that baseline; flat books scale from 0.
+                            fl_sym = base_floors[tsym]
+                            w_cur = t.target_weight
+                            if w_cur > 0.0:
+                                base_pos = max(0.0, fl_sym - rest_buy.get(tsym, 0.0))
+                                w_scaled = (base_pos + (w_cur - base_pos) * ratio) if w_cur > base_pos else w_cur
+                            elif w_cur < 0.0:
+                                base_neg = max(0.0, fl_sym - rest_sell.get(tsym, 0.0))
+                                w_scaled = -(base_neg + (-w_cur - base_neg) * ratio) if (-w_cur) > base_neg else w_cur
+                            else:
+                                w_scaled = 0.0
                             if w_scaled == 0.0:
                                 w_scaled = 0.0
                             new_targets.append(replace(t, target_weight=w_scaled))
@@ -919,6 +1012,7 @@ class ExposureCapOverlay:
         #    bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
         #    Reachable exposure is [base_lo - add_sell, base_hi + add_buy].
         #    This guarantees:
+        #      - CR5-05: protective reductions adjust inner bound toward 0.0 for opposing orders.
         #      - CR4-01: reserve min/max across every surviving target per symbol (so on_change cannot bypass cap).
         #      - CR3-22: pending buy/sell increments are reserved AFTER any new target_weight fill.
         #      - CR2-29: resting orders reserved before targets and carried into intent budget.
@@ -950,6 +1044,7 @@ class ExposureCapOverlay:
                 b_lo = rest_tw_lo[sym]
             if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
                 b_hi = rest_tw_hi[sym]
+            b_lo, b_hi = _apply_protective_reductions(sym, b_lo, b_hi)
             base_lo[sym] = b_lo
             base_hi[sym] = b_hi
             add_buy[sym] = rest_buy.get(sym, 0.0)
@@ -1003,8 +1098,9 @@ class ExposureCapOverlay:
                     desired = 0.0
                 clamped_intents.append(replace(intent, qty_value=desired))
                 tracked_syms.add(sym)
-                base_lo[sym] = desired if desired < b_lo else b_lo
-                base_hi[sym] = desired if desired > b_hi else b_hi
+                d_lo, d_hi = _apply_protective_reductions(sym, desired, desired)
+                base_lo[sym] = d_lo if d_lo < b_lo else b_lo
+                base_hi[sym] = d_hi if d_hi > b_hi else b_hi
                 add_buy.setdefault(sym, ab)
                 add_sell.setdefault(sym, as_)
                 continue
