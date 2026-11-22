@@ -1,0 +1,900 @@
+"""Unified performance metrics, cost attribution, and benchmark utilities for Layer 3."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from math import expm1, fsum, isfinite, log, sqrt
+from types import MappingProxyType
+from typing import Any, Literal
+
+__all__ = [
+    "MS_PER_YEAR",
+    "CostAttribution",
+    "SimulationResult",
+    "TradeRecord",
+    "compute_buy_and_hold_benchmark",
+    "compute_simulation_metrics",
+]
+
+MS_PER_YEAR: float = 365.0 * 86_400_000.0
+_DEFAULT_INTERVAL_MS: int = 3_600_000
+_ATTRIBUTION_TOLERANCE: float = 1e-6
+
+
+def _clean_zero(value: float) -> float:
+    return 0.0 if value == 0.0 else float(value)
+
+
+def _require_finite(name: str, value: float) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    return _clean_zero(float(value))
+
+
+@dataclass(frozen=True)
+class CostAttribution:
+    """Exact PnL decomposition obeying ``net_pnl == gross_pnl - fees - slippage + funding_pnl``."""
+
+    gross_pnl: float
+    fees: float
+    slippage: float
+    funding_pnl: float
+    net_pnl: float
+
+    def __post_init__(self) -> None:
+        gross = _require_finite("gross_pnl", self.gross_pnl)
+        fees = _require_finite("fees", self.fees)
+        slippage = _require_finite("slippage", self.slippage)
+        funding = _require_finite("funding_pnl", self.funding_pnl)
+        net = _require_finite("net_pnl", self.net_pnl)
+
+        expected = fsum((gross, -fees, -slippage, funding))
+        if abs(net - expected) > _ATTRIBUTION_TOLERANCE:
+            raise ValueError(
+                f"CostAttribution identity violated: net_pnl={net} != "
+                f"gross_pnl({gross}) - fees({fees}) - slippage({slippage}) + funding_pnl({funding}) = {expected}"
+            )
+
+        object.__setattr__(self, "gross_pnl", gross)
+        object.__setattr__(self, "fees", fees)
+        object.__setattr__(self, "slippage", slippage)
+        object.__setattr__(self, "funding_pnl", funding)
+        object.__setattr__(self, "net_pnl", net)
+
+    @classmethod
+    def zero(cls) -> CostAttribution:
+        return cls(0.0, 0.0, 0.0, 0.0, 0.0)
+
+    @classmethod
+    def from_components(
+        cls,
+        *,
+        gross_pnl: float,
+        fees: float,
+        slippage: float,
+        funding_pnl: float,
+    ) -> CostAttribution:
+        net_pnl = fsum((gross_pnl, -fees, -slippage, funding_pnl))
+        return cls(
+            gross_pnl=gross_pnl,
+            fees=fees,
+            slippage=slippage,
+            funding_pnl=funding_pnl,
+            net_pnl=net_pnl,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TradeRecord:
+    """Closed trade record with full cost attribution."""
+
+    entry_time_ms: int
+    exit_time_ms: int
+    side: Literal["long", "short"]
+    entry_price: float
+    exit_price: float
+    qty: float
+    gross_pnl: float
+    fees: float
+    slippage: float
+    funding_pnl: float
+    net_pnl: float
+    return_pct: float
+    reason: str
+    symbol: str = ""
+    max_stage: int = 1
+    ref_entry_price: float | None = None
+    ref_exit_price: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.side not in ("long", "short"):
+            raise ValueError(f"side must be 'long' or 'short', got {self.side!r}")
+        entry_price = _require_finite("entry_price", self.entry_price)
+        exit_price = _require_finite("exit_price", self.exit_price)
+        qty = _require_finite("qty", self.qty)
+        if entry_price <= 0.0:
+            raise ValueError(f"entry_price must be positive, got {entry_price}")
+        if exit_price <= 0.0:
+            raise ValueError(f"exit_price must be positive, got {exit_price}")
+        if qty <= 0.0:
+            raise ValueError(f"qty must be positive, got {qty}")
+
+        gross = _require_finite("gross_pnl", self.gross_pnl)
+        fees = _require_finite("fees", self.fees)
+        slippage = _require_finite("slippage", self.slippage)
+        funding = _require_finite("funding_pnl", self.funding_pnl)
+        net = _require_finite("net_pnl", self.net_pnl)
+        ret = _require_finite("return_pct", self.return_pct)
+
+        expected = fsum((gross, -fees, -slippage, funding))
+        if abs(net - expected) > _ATTRIBUTION_TOLERANCE:
+            raise ValueError(
+                f"TradeRecord attribution identity violated: net_pnl={net} != {expected}"
+            )
+
+        object.__setattr__(self, "entry_price", entry_price)
+        object.__setattr__(self, "exit_price", exit_price)
+        object.__setattr__(self, "qty", qty)
+        object.__setattr__(self, "gross_pnl", gross)
+        object.__setattr__(self, "fees", fees)
+        object.__setattr__(self, "slippage", slippage)
+        object.__setattr__(self, "funding_pnl", funding)
+        object.__setattr__(self, "net_pnl", net)
+        object.__setattr__(self, "return_pct", ret)
+
+    @classmethod
+    def _from_validated(
+        cls,
+        *,
+        entry_time_ms: int,
+        exit_time_ms: int,
+        side: Literal["long", "short"],
+        entry_price: float,
+        exit_price: float,
+        qty: float,
+        gross_pnl: float,
+        fees: float,
+        slippage: float,
+        funding_pnl: float,
+        net_pnl: float,
+        return_pct: float,
+        reason: str,
+        symbol: str,
+        max_stage: int,
+        ref_entry_price: float | None,
+        ref_exit_price: float | None,
+    ) -> TradeRecord:
+        obj = cls.__new__(cls)
+        _tr_set_et(obj, entry_time_ms)
+        _tr_set_xt(obj, exit_time_ms)
+        _tr_set_side(obj, side)
+        _tr_set_ep(obj, entry_price)
+        _tr_set_xp(obj, exit_price)
+        _tr_set_qty(obj, qty)
+        _tr_set_gross(obj, 0.0 if gross_pnl == 0.0 else gross_pnl)
+        _tr_set_fees(obj, 0.0 if fees == 0.0 else fees)
+        _tr_set_slip(obj, 0.0 if slippage == 0.0 else slippage)
+        _tr_set_fund(obj, 0.0 if funding_pnl == 0.0 else funding_pnl)
+        _tr_set_net(obj, 0.0 if net_pnl == 0.0 else net_pnl)
+        _tr_set_ret(obj, 0.0 if return_pct == 0.0 else return_pct)
+        _tr_set_rsn(obj, reason)
+        _tr_set_sym(obj, symbol)
+        _tr_set_stg(obj, max_stage)
+        _tr_set_rep(obj, ref_entry_price)
+        _tr_set_rxp(obj, ref_exit_price)
+        return obj
+
+
+_tr_set_et = TradeRecord.entry_time_ms.__set__
+_tr_set_xt = TradeRecord.exit_time_ms.__set__
+_tr_set_side = TradeRecord.side.__set__
+_tr_set_ep = TradeRecord.entry_price.__set__
+_tr_set_xp = TradeRecord.exit_price.__set__
+_tr_set_qty = TradeRecord.qty.__set__
+_tr_set_gross = TradeRecord.gross_pnl.__set__
+_tr_set_fees = TradeRecord.fees.__set__
+_tr_set_slip = TradeRecord.slippage.__set__
+_tr_set_fund = TradeRecord.funding_pnl.__set__
+_tr_set_net = TradeRecord.net_pnl.__set__
+_tr_set_ret = TradeRecord.return_pct.__set__
+_tr_set_rsn = TradeRecord.reason.__set__
+_tr_set_sym = TradeRecord.symbol.__set__
+_tr_set_stg = TradeRecord.max_stage.__set__
+_tr_set_rep = TradeRecord.ref_entry_price.__set__
+_tr_set_rxp = TradeRecord.ref_exit_price.__set__
+
+
+@dataclass(frozen=True)
+class SimulationResult:
+    """Unified simulation output with canonical bar-close equity curve and <= 0.0 drawdown."""
+
+    starting_equity: float
+    ending_equity: float
+    equity_curve: tuple[tuple[int, float], ...]
+    trades: tuple[TradeRecord, ...]
+    attribution: CostAttribution
+    total_return_pct: float
+    max_drawdown_pct: float
+    sharpe_ratio: float
+    sortino_ratio: float
+    calmar_ratio: float
+    profit_factor: float
+    win_rate: float
+    expectancy: float
+    turnover: float
+    time_in_market_pct: float
+    ex_top3_net_pnl: float
+    ex_top5_net_pnl: float
+    top3_pnl_share: float | None
+    liquidations: int
+    symbol: str = ""
+    interval: str = ""
+    strategy_id: str = ""
+    bars_processed: int = 0
+    bars_scored: int = 0
+    funding_mode: str = "historical"
+    diagnostics: Mapping[str, Any] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        max_dd = _require_finite("max_drawdown_pct", self.max_drawdown_pct)
+        if max_dd > 0.0:
+            raise ValueError(f"max_drawdown_pct must be <= 0.0, got {max_dd}")
+        object.__setattr__(self, "starting_equity", _require_finite("starting_equity", self.starting_equity))
+        object.__setattr__(self, "ending_equity", _require_finite("ending_equity", self.ending_equity))
+        object.__setattr__(self, "total_return_pct", _require_finite("total_return_pct", self.total_return_pct))
+        object.__setattr__(self, "max_drawdown_pct", max_dd)
+        object.__setattr__(self, "sharpe_ratio", _require_finite("sharpe_ratio", self.sharpe_ratio))
+        object.__setattr__(self, "sortino_ratio", _require_finite("sortino_ratio", self.sortino_ratio))
+        object.__setattr__(self, "calmar_ratio", _require_finite("calmar_ratio", self.calmar_ratio))
+        object.__setattr__(self, "win_rate", _require_finite("win_rate", self.win_rate))
+        object.__setattr__(self, "expectancy", _require_finite("expectancy", self.expectancy))
+        object.__setattr__(self, "turnover", _require_finite("turnover", self.turnover))
+        object.__setattr__(self, "time_in_market_pct", _require_finite("time_in_market_pct", self.time_in_market_pct))
+        object.__setattr__(self, "ex_top3_net_pnl", _require_finite("ex_top3_net_pnl", self.ex_top3_net_pnl))
+        object.__setattr__(self, "ex_top5_net_pnl", _require_finite("ex_top5_net_pnl", self.ex_top5_net_pnl))
+        if self.top3_pnl_share is not None:
+            object.__setattr__(self, "top3_pnl_share", _require_finite("top3_pnl_share", self.top3_pnl_share))
+        if not isinstance(self.diagnostics, MappingProxyType):
+            object.__setattr__(self, "diagnostics", MappingProxyType(dict(self.diagnostics)))
+
+    @property
+    def trade_count(self) -> int:
+        return len(self.trades)
+
+
+def _infer_interval_ms(equity_curve: Sequence[tuple[int, float]], interval_ms: int | None) -> int:
+    if interval_ms is not None and interval_ms > 0:
+        return int(interval_ms)
+    if len(equity_curve) < 2:
+        return _DEFAULT_INTERVAL_MS
+    diffs = [
+        equity_curve[i][0] - equity_curve[i - 1][0]
+        for i in range(1, len(equity_curve))
+        if equity_curve[i][0] > equity_curve[i - 1][0]
+    ]
+    if not diffs:
+        return _DEFAULT_INTERVAL_MS
+    diffs.sort()
+    return diffs[len(diffs) // 2]
+
+
+def _compute_max_drawdown(starting_equity: float, equity_curve: Sequence[tuple[int, float]]) -> float:
+    if not equity_curve:
+        return 0.0
+    peak = starting_equity if starting_equity > 0.0 else equity_curve[0][1]
+    max_dd = 0.0
+    for _, equity in equity_curve:
+        if equity > peak:
+            peak = equity
+        if peak > 0.0:
+            dd = (equity / peak) - 1.0
+            if dd < max_dd:
+                max_dd = dd
+    return _clean_zero(min(0.0, max_dd))
+
+
+def _compute_return_ratios(
+    starting_equity: float,
+    ending_equity: float,
+    equity_curve: Sequence[tuple[int, float]],
+    max_drawdown_pct: float,
+    interval_ms: int,
+    periods_per_year: float | None = None,
+) -> tuple[float, float, float]:
+    n_points = len(equity_curve)
+    if n_points < 2:
+        return 0.0, 0.0, 0.0
+
+    ppy = periods_per_year if (periods_per_year is not None and periods_per_year > 0.0) else (MS_PER_YEAR / interval_ms)
+    returns: list[float] = []
+    prev_eq = equity_curve[0][1]
+    for idx in range(1, n_points):
+        curr_eq = equity_curve[idx][1]
+        if prev_eq > 0.0:
+            returns.append((curr_eq - prev_eq) / prev_eq)
+        else:
+            returns.append(0.0)
+        prev_eq = curr_eq
+
+    n_ret = len(returns)
+    if n_ret == 0:
+        return 0.0, 0.0, 0.0
+
+    mean_r = fsum(returns) / n_ret
+    scale = sqrt(ppy)
+
+    sharpe = 0.0
+    if n_ret >= 2:
+        var = fsum((r - mean_r) * (r - mean_r) for r in returns) / (n_ret - 1)
+        std_r = sqrt(var) if var > 0.0 else 0.0
+        if std_r > 1e-15:
+            sharpe = (mean_r / std_r) * scale
+
+    downside_sq = fsum(r * r for r in returns if r < 0.0)
+    downside_dev = sqrt(downside_sq / n_ret) if downside_sq > 0.0 else 0.0
+    sortino = (mean_r / downside_dev) * scale if downside_dev > 1e-15 else 0.0
+
+    calmar = 0.0
+    if max_drawdown_pct < -1e-15 and starting_equity > 0.0:
+        elapsed_ms = equity_curve[-1][0] - equity_curve[0][0]
+        elapsed_years = (elapsed_ms / MS_PER_YEAR) if elapsed_ms > 0 else (n_ret / ppy)
+        if elapsed_years > 0.0:
+            if ending_equity <= 0.0:
+                ann_return = -1.0
+            else:
+                ratio = ending_equity / starting_equity
+                log_arg = log(ratio) / elapsed_years
+                if abs(log_arg) > 50.0:
+                    ann_return = ((ending_equity / starting_equity) - 1.0) / elapsed_years
+                else:
+                    ann_return = expm1(log_arg)
+            calmar = ann_return / abs(max_drawdown_pct)
+
+    return _clean_zero(sharpe), _clean_zero(sortino), _clean_zero(calmar)
+
+
+def _finalize_curve_stats(
+    *,
+    starting_equity: float,
+    ending_equity: float,
+    first_ts: int,
+    last_ts: int,
+    n_points: int,
+    max_dd: float,
+    avg_equity: float,
+    sum_r: float,
+    sum_r2: float,
+    downside_sq: float,
+    interval_ms: int,
+    periods_per_year: float | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Finalize (max_drawdown_pct, avg_equity, sharpe, sortino, calmar) from online accumulators."""
+    max_dd_clean = _clean_zero(min(0.0, max_dd))
+    if n_points <= 1:
+        return max_dd_clean, avg_equity, 0.0, 0.0, 0.0
+    n_ret = n_points - 1
+    ppy = periods_per_year if (periods_per_year is not None and periods_per_year > 0.0) else (MS_PER_YEAR / interval_ms)
+    mean_r = sum_r / n_ret
+    scale = sqrt(ppy)
+
+    sharpe = 0.0
+    if n_ret >= 2:
+        ssd = sum_r2 - (sum_r * mean_r)
+        if ssd > 0.0:
+            std_r = sqrt(ssd / (n_ret - 1))
+            if std_r > 1e-15:
+                sharpe = (mean_r / std_r) * scale
+
+    sortino = 0.0
+    if downside_sq > 0.0:
+        downside_dev = sqrt(downside_sq / n_ret)
+        if downside_dev > 1e-15:
+            sortino = (mean_r / downside_dev) * scale
+
+    calmar = 0.0
+    if max_dd_clean < -1e-15 and starting_equity > 0.0:
+        elapsed_ms = last_ts - first_ts
+        elapsed_years = (elapsed_ms / MS_PER_YEAR) if elapsed_ms > 0 else (n_ret / ppy)
+        if elapsed_years > 0.0:
+            if ending_equity <= 0.0:
+                ann_return = -1.0
+            else:
+                ratio = ending_equity / starting_equity
+                log_arg = log(ratio) / elapsed_years
+                if abs(log_arg) > 50.0:
+                    ann_return = ((ending_equity / starting_equity) - 1.0) / elapsed_years
+                else:
+                    ann_return = expm1(log_arg)
+            calmar = ann_return / abs(max_dd_clean)
+
+    return max_dd_clean, avg_equity, _clean_zero(sharpe), _clean_zero(sortino), _clean_zero(calmar)
+
+
+def _compute_curve_stats_from_values(
+    starting_equity: float,
+    ending_equity: float,
+    first_ts: int,
+    last_ts: int,
+    eq_values: Sequence[float],
+    interval_ms: int,
+    periods_per_year: float | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Single-pass stats directly over a flat equity sequence (zero tuple unpacking)."""
+    n_points = len(eq_values)
+    if n_points == 0:
+        return 0.0, starting_equity, 0.0, 0.0, 0.0
+
+    prev_eq = eq_values[0]
+    peak = starting_equity if starting_equity > 0.0 else prev_eq
+    if prev_eq > peak:
+        peak = prev_eq
+    min_ratio = (prev_eq / peak) if (peak > 0.0 and prev_eq < peak) else 1.0
+
+    if n_points == 1:
+        return _clean_zero(min(0.0, min_ratio - 1.0)), prev_eq, 0.0, 0.0, 0.0
+
+    avg_equity = sum(eq_values) / n_points
+    sum_r = 0.0
+    sum_r2 = 0.0
+    downside_sq = 0.0
+
+    all_positive = min(eq_values) > 0.0 and peak > 0.0
+    it = iter(eq_values)
+    next(it)
+
+    if all_positive:
+        dd_thresh = peak * min_ratio
+        for curr_eq in it:
+            if curr_eq == prev_eq:
+                continue
+            if curr_eq > peak:
+                peak = curr_eq
+                dd_thresh = peak * min_ratio
+            elif curr_eq < dd_thresh:
+                min_ratio = curr_eq / peak
+                dd_thresh = curr_eq
+            r = (curr_eq - prev_eq) / prev_eq
+            sum_r += r
+            r2 = r * r
+            sum_r2 += r2
+            if r < 0.0:
+                downside_sq += r2
+            prev_eq = curr_eq
+        max_dd = min(0.0, min_ratio - 1.0)
+    else:
+        max_dd = min(0.0, min_ratio - 1.0)
+        for curr_eq in it:
+            if curr_eq == prev_eq:
+                continue
+            if curr_eq > peak:
+                peak = curr_eq
+            elif peak > 0.0:
+                dd = (curr_eq / peak) - 1.0
+                if dd < max_dd:
+                    max_dd = dd
+            if prev_eq > 0.0:
+                r = (curr_eq - prev_eq) / prev_eq
+                sum_r += r
+                r2 = r * r
+                sum_r2 += r2
+                if r < 0.0:
+                    downside_sq += r2
+            prev_eq = curr_eq
+
+    return _finalize_curve_stats(
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        n_points=n_points,
+        max_dd=max_dd,
+        avg_equity=avg_equity,
+        sum_r=sum_r,
+        sum_r2=sum_r2,
+        downside_sq=downside_sq,
+        interval_ms=interval_ms,
+        periods_per_year=periods_per_year,
+    )
+
+
+def _compute_curve_stats(
+    starting_equity: float,
+    ending_equity: float,
+    equity_curve: Sequence[tuple[int, float]],
+    interval_ms: int,
+    periods_per_year: float | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Single-pass computation of (max_drawdown_pct, avg_equity, sharpe, sortino, calmar)."""
+    if not equity_curve:
+        return 0.0, starting_equity, 0.0, 0.0, 0.0
+    eq_values = [pt[1] for pt in equity_curve]
+    return _compute_curve_stats_from_values(
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        first_ts=equity_curve[0][0],
+        last_ts=equity_curve[-1][0],
+        eq_values=eq_values,
+        interval_ms=interval_ms,
+        periods_per_year=periods_per_year,
+    )
+
+
+def compute_simulation_metrics(
+    *,
+    starting_equity: float,
+    ending_equity: float,
+    equity_curve: Sequence[tuple[int, float]],
+    trades: Sequence[TradeRecord],
+    attribution: CostAttribution,
+    total_traded_notional: float = 0.0,
+    bars_in_market: int = 0,
+    bars_scored: int = 0,
+    bars_processed: int = 0,
+    liquidations: int = 0,
+    interval_ms: int | None = None,
+    periods_per_year: float | None = None,
+    symbol: str = "",
+    interval: str = "",
+    strategy_id: str = "",
+    funding_mode: str = "historical",
+    diagnostics: Mapping[str, Any] | None = None,
+    curve_normalized: bool = False,
+    equity_values: Sequence[float] | None = None,
+    precomputed_curve_stats: tuple[float, float, float, float, float] | None = None,
+) -> SimulationResult:
+    """Compute unified Layer 3 metrics from canonical bar-close equity curve and trades."""
+    if curve_normalized:
+        curve_tuple = equity_curve if type(equity_curve) is tuple else tuple(equity_curve)
+    else:
+        curve_tuple = tuple((int(ts), _clean_zero(float(eq))) for ts, eq in equity_curve)
+    trades_tuple = trades if type(trades) is tuple else tuple(trades)
+
+    total_return_pct = (
+        ((ending_equity / starting_equity) - 1.0) if starting_equity > 0.0 else 0.0
+    )
+    resolved_interval_ms = _infer_interval_ms(curve_tuple, interval_ms)
+    if precomputed_curve_stats is not None:
+        max_drawdown_pct, avg_equity, sharpe, sortino, calmar = precomputed_curve_stats
+    elif equity_values is not None and curve_tuple:
+        max_drawdown_pct, avg_equity, sharpe, sortino, calmar = _compute_curve_stats_from_values(
+            starting_equity=starting_equity,
+            ending_equity=ending_equity,
+            first_ts=curve_tuple[0][0],
+            last_ts=curve_tuple[-1][0],
+            eq_values=equity_values,
+            interval_ms=resolved_interval_ms,
+            periods_per_year=periods_per_year,
+        )
+    else:
+        max_drawdown_pct, avg_equity, sharpe, sortino, calmar = _compute_curve_stats(
+            starting_equity=starting_equity,
+            ending_equity=ending_equity,
+            equity_curve=curve_tuple,
+            interval_ms=resolved_interval_ms,
+            periods_per_year=periods_per_year,
+        )
+
+    n_trades = len(trades_tuple)
+    if n_trades > 0:
+        wins = 0
+        gross_profit = 0.0
+        gross_loss = 0.0
+        total_trade_net_pnl = 0.0
+        indexed_winners: list[tuple[int, float]] = []
+        for idx, t in enumerate(trades_tuple):
+            pnl = t.net_pnl
+            total_trade_net_pnl += pnl
+            if pnl > 0.0:
+                wins += 1
+                gross_profit += pnl
+                indexed_winners.append((idx, pnl))
+            elif pnl < 0.0:
+                gross_loss -= pnl
+
+        win_rate = wins / n_trades
+        expectancy = total_trade_net_pnl / n_trades
+        if gross_loss == 0.0:
+            profit_factor = float("inf") if gross_profit > 0.0 else 0.0
+        else:
+            profit_factor = gross_profit / gross_loss
+
+        ranked_winners = sorted(indexed_winners, key=lambda item: (-item[1], item[0]))
+        top3_pnl = fsum(pnl for _, pnl in ranked_winners[:3])
+        top5_pnl = fsum(pnl for _, pnl in ranked_winners[:5])
+        ex_top3_net_pnl = fsum((total_trade_net_pnl, -top3_pnl))
+        ex_top5_net_pnl = fsum((total_trade_net_pnl, -top5_pnl))
+        top3_pnl_share = (top3_pnl / total_trade_net_pnl) if total_trade_net_pnl > 0.0 else None
+    else:
+        win_rate = 0.0
+        expectancy = 0.0
+        profit_factor = 0.0
+        ex_top3_net_pnl = 0.0
+        ex_top5_net_pnl = 0.0
+        top3_pnl_share = None
+
+    denom_equity = avg_equity if avg_equity > 0.0 else starting_equity
+    turnover = (total_traded_notional / denom_equity) if denom_equity > 0.0 else 0.0
+
+    scored_count = bars_scored if bars_scored > 0 else len(curve_tuple)
+    time_in_market_pct = (bars_in_market / scored_count) if scored_count > 0 else 0.0
+    time_in_market_pct = min(1.0, max(0.0, time_in_market_pct))
+
+    return SimulationResult(
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        equity_curve=curve_tuple,
+        trades=trades_tuple,
+        attribution=attribution,
+        total_return_pct=_clean_zero(total_return_pct),
+        max_drawdown_pct=max_drawdown_pct,
+        sharpe_ratio=sharpe,
+        sortino_ratio=sortino,
+        calmar_ratio=calmar,
+        profit_factor=profit_factor,
+        win_rate=_clean_zero(win_rate),
+        expectancy=_clean_zero(expectancy),
+        turnover=_clean_zero(turnover),
+        time_in_market_pct=_clean_zero(time_in_market_pct),
+        ex_top3_net_pnl=_clean_zero(ex_top3_net_pnl),
+        ex_top5_net_pnl=_clean_zero(ex_top5_net_pnl),
+        top3_pnl_share=_clean_zero(top3_pnl_share) if top3_pnl_share is not None else None,
+        liquidations=liquidations,
+        symbol=symbol,
+        interval=interval,
+        strategy_id=strategy_id,
+        bars_processed=bars_processed if bars_processed > 0 else len(curve_tuple),
+        bars_scored=scored_count,
+        funding_mode=funding_mode,
+        diagnostics=MappingProxyType(dict(diagnostics or {})),
+    )
+
+
+def _extract_bar_arrays(bars: Any, interval_ms: int | None) -> tuple[Sequence[int], Sequence[int], Sequence[float], Sequence[float], int, str, str]:
+    """Support BarSeries, BarSeriesSlice, or Sequence[Candle] without hard Layer 1 import cycles."""
+    if hasattr(bars, "open_times") and hasattr(bars, "close_times") and hasattr(bars, "opens") and hasattr(bars, "closes"):
+        # BarSeries or BarSeriesSlice (BarSeriesSlice columns are already bounded views!)
+        base = getattr(bars, "_series", None) or getattr(bars, "series", None)
+        resolved_iv_ms = int(interval_ms or getattr(bars, "interval_ms", getattr(base, "interval_ms", _DEFAULT_INTERVAL_MS)))
+        return (
+            bars.open_times,
+            bars.close_times,
+            bars.opens,
+            bars.closes,
+            resolved_iv_ms,
+            getattr(bars, "symbol", getattr(base, "symbol", "")),
+            getattr(bars, "interval", getattr(base, "interval", "")),
+        )
+
+    # Fallback: sequence of Candle-like objects
+    seq = list(bars)
+    if not seq:
+        return (), (), (), (), int(interval_ms or _DEFAULT_INTERVAL_MS), "", ""
+    inferred_ms = interval_ms
+    if inferred_ms is None:
+        if len(seq) >= 2 and seq[1].open_time_ms > seq[0].open_time_ms:
+            inferred_ms = seq[1].open_time_ms - seq[0].open_time_ms
+        else:
+            inferred_ms = _DEFAULT_INTERVAL_MS
+    open_times = [int(c.open_time_ms) for c in seq]
+    close_times = [int(c.open_time_ms) + inferred_ms for c in seq]
+    opens = [float(c.open) for c in seq]
+    closes = [float(c.close) for c in seq]
+    return open_times, close_times, opens, closes, int(inferred_ms), "", ""
+
+
+def compute_buy_and_hold_benchmark(
+    bars: Any,
+    *,
+    starting_equity: float = 10_000.0,
+    leverage: float = 1.0,
+    side: Literal["long", "short"] = "long",
+    funding: Any | None = None,
+    taker_fee_bps: float = 0.0,
+    half_spread_bps: float = 0.0,
+    warmup_bars: int = 0,
+    close_on_end: bool = True,
+    interval_ms: int | None = None,
+    symbol: str = "",
+    interval: str = "",
+) -> SimulationResult:
+    """Compute a realistic buy-and-hold (or short-and-hold) benchmark on the same bars and costs."""
+    if starting_equity <= 0.0 or not isfinite(starting_equity):
+        raise ValueError(f"starting_equity must be finite and positive, got {starting_equity}")
+    if leverage <= 0.0 or not isfinite(leverage):
+        raise ValueError(f"leverage must be finite and positive, got {leverage}")
+    if side not in ("long", "short"):
+        raise ValueError(f"side must be 'long' or 'short', got {side!r}")
+    if warmup_bars < 0:
+        raise ValueError(f"warmup_bars must be >= 0, got {warmup_bars}")
+
+    open_times, close_times, opens, closes, resolved_interval_ms, inferred_symbol, inferred_interval = (
+        _extract_bar_arrays(bars, interval_ms)
+    )
+    resolved_symbol = symbol or inferred_symbol
+    resolved_interval = interval or inferred_interval
+    n = len(closes)
+    if n == 0 or warmup_bars >= n:
+        return compute_simulation_metrics(
+            starting_equity=starting_equity,
+            ending_equity=starting_equity,
+            equity_curve=(),
+            trades=(),
+            attribution=CostAttribution.zero(),
+            bars_processed=n,
+            bars_scored=0,
+            interval_ms=resolved_interval_ms,
+            symbol=resolved_symbol,
+            interval=resolved_interval,
+            strategy_id=f"buy_and_hold_{side}",
+            funding_mode="historical" if funding is not None else "none",
+        )
+
+    side_sign = 1.0 if side == "long" else -1.0
+    fee_rate = max(0.0, float(taker_fee_bps)) / 10_000.0
+    spread_rate = max(0.0, float(half_spread_bps)) / 10_000.0
+
+    start_idx = warmup_bars
+    ref_entry = float(opens[start_idx])
+    if ref_entry <= 0.0:
+        raise ValueError(f"benchmark entry open price must be positive, got {ref_entry}")
+    exec_entry = ref_entry * (1.0 + side_sign * spread_rate)
+    qty_abs = (starting_equity * leverage) / exec_entry
+    signed_qty = side_sign * qty_abs
+    entry_notional = exec_entry * qty_abs
+    entry_fee = entry_notional * fee_rate
+    entry_slippage = (exec_entry - ref_entry) * signed_qty
+
+    cash = starting_equity - entry_fee
+    accrued_funding = 0.0
+    total_traded_notional = entry_notional
+    equity_curve: list[tuple[int, float]] = []
+    trades: list[TradeRecord] = []
+    bars_in_market = 0
+    liquidations = 0
+    is_open = True
+    prev_close_ms = int(open_times[start_idx])
+
+    for i in range(start_idx, n):
+        bar_close_ms = int(close_times[i])
+        bar_close = float(closes[i])
+
+        if is_open and funding is not None:
+            events = funding.between(prev_close_ms, bar_close_ms)
+            if events:
+                # Funding settles at bar close on the position held after this bar's fills (mark = close).
+                mark_px = bar_close if bar_close > 0.0 else float(opens[i])
+                for ev in events:
+                    rate = ev.rate if hasattr(ev, "rate") else ev[1]
+                    delta = -signed_qty * mark_px * float(rate)
+                    cash += delta
+                    accrued_funding += delta
+
+        if is_open:
+            bars_in_market += 1
+            unrealized = signed_qty * (bar_close - exec_entry)
+            marked_equity = cash + unrealized
+            if marked_equity <= 0.0:
+                # Bankrupt at bar close
+                ref_exit = bar_close
+                exec_exit = bar_close * (1.0 - side_sign * spread_rate)
+                if exec_exit <= 0.0:
+                    exec_exit = bar_close
+                exit_notional = exec_exit * qty_abs
+                exit_fee = exit_notional * fee_rate
+                exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+                gross_pnl = signed_qty * (ref_exit - ref_entry)
+                total_fees = entry_fee + exit_fee
+                total_slip = entry_slippage + exit_slippage
+                net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
+                cash = starting_equity + net_pnl
+                total_traded_notional += exit_notional
+                trades.append(
+                    TradeRecord(
+                        entry_time_ms=int(open_times[start_idx]),
+                        exit_time_ms=bar_close_ms,
+                        side=side,
+                        entry_price=exec_entry,
+                        exit_price=exec_exit,
+                        qty=qty_abs,
+                        gross_pnl=gross_pnl,
+                        fees=total_fees,
+                        slippage=total_slip,
+                        funding_pnl=accrued_funding,
+                        net_pnl=net_pnl,
+                        return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
+                        reason="bankrupt",
+                        symbol=resolved_symbol,
+                        ref_entry_price=ref_entry,
+                        ref_exit_price=ref_exit,
+                    )
+                )
+                is_open = False
+                liquidations += 1
+                equity_curve.append((bar_close_ms, _clean_zero(cash)))
+            else:
+                equity_curve.append((bar_close_ms, _clean_zero(marked_equity)))
+        else:
+            equity_curve.append((bar_close_ms, _clean_zero(cash)))
+
+        prev_close_ms = bar_close_ms
+
+    if is_open:
+        final_close = float(closes[-1])
+        final_close_ms = int(close_times[-1])
+        if close_on_end:
+            ref_exit = final_close
+            exec_exit = final_close * (1.0 - side_sign * spread_rate)
+            if exec_exit <= 0.0:
+                exec_exit = final_close
+            exit_notional = exec_exit * qty_abs
+            exit_fee = exit_notional * fee_rate
+            exit_slippage = (exec_exit - ref_exit) * (-signed_qty)
+            gross_pnl = signed_qty * (ref_exit - ref_entry)
+            total_fees = entry_fee + exit_fee
+            total_slip = entry_slippage + exit_slippage
+            net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
+            ending_equity = starting_equity + net_pnl
+            total_traded_notional += exit_notional
+            trades.append(
+                TradeRecord(
+                    entry_time_ms=int(open_times[start_idx]),
+                    exit_time_ms=final_close_ms,
+                    side=side,
+                    entry_price=exec_entry,
+                    exit_price=exec_exit,
+                    qty=qty_abs,
+                    gross_pnl=gross_pnl,
+                    fees=total_fees,
+                    slippage=total_slip,
+                    funding_pnl=accrued_funding,
+                    net_pnl=net_pnl,
+                    return_pct=net_pnl / entry_notional if entry_notional > 0.0 else 0.0,
+                    reason="end_of_data",
+                    symbol=resolved_symbol,
+                    ref_entry_price=ref_entry,
+                    ref_exit_price=ref_exit,
+                )
+            )
+            equity_curve[-1] = (final_close_ms, _clean_zero(ending_equity))
+            attribution = CostAttribution.from_components(
+                gross_pnl=gross_pnl,
+                fees=total_fees,
+                slippage=total_slip,
+                funding_pnl=accrued_funding,
+            )
+        else:
+            gross_pnl = signed_qty * (final_close - ref_entry)
+            ending_equity = equity_curve[-1][1]
+            attribution = CostAttribution.from_components(
+                gross_pnl=gross_pnl,
+                fees=entry_fee,
+                slippage=entry_slippage,
+                funding_pnl=accrued_funding,
+            )
+    else:
+        ending_equity = cash
+        attribution = CostAttribution.from_components(
+            gross_pnl=fsum(t.gross_pnl for t in trades),
+            fees=fsum(t.fees for t in trades),
+            slippage=fsum(t.slippage for t in trades),
+            funding_pnl=fsum(t.funding_pnl for t in trades),
+        )
+
+    return compute_simulation_metrics(
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        equity_curve=equity_curve,
+        trades=trades,
+        attribution=attribution,
+        total_traded_notional=total_traded_notional,
+        bars_in_market=bars_in_market,
+        bars_scored=len(equity_curve),
+        bars_processed=n,
+        liquidations=liquidations,
+        interval_ms=resolved_interval_ms,
+        symbol=resolved_symbol,
+        interval=resolved_interval,
+        strategy_id=f"buy_and_hold_{side}",
+        funding_mode="historical" if funding is not None else "none",
+    )
