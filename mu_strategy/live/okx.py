@@ -3,25 +3,265 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
+import ssl
+import threading
+import time
+import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
 from mu_strategy.execution.instruments import OKXInstrumentSpec
+from mu_strategy.market_data.http_pool import ProxyTarget, resolve_proxy, validate_proxy_for_target
 
 
 OKX_BASE_URL = "https://www.okx.com"
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
 OKX_CANCEL_ORDER_PATH = "/api/v5/trade/cancel-order"
 OKX_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9]{1,32}$")
+_RETRYABLE_GET_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_RETRY_AFTER_SECONDS = 5.0
+_SSL_CONTEXT_LOCK = threading.Lock()
+_DEFAULT_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _default_ssl_context() -> ssl.SSLContext:
+    """Cache the default TLS context once per process (avoids multi-second Windows cert-store reloads)."""
+    global _DEFAULT_SSL_CONTEXT
+    context = _DEFAULT_SSL_CONTEXT
+    if context is None:
+        with _SSL_CONTEXT_LOCK:
+            context = _DEFAULT_SSL_CONTEXT
+            if context is None:
+                context = ssl.create_default_context()
+                _DEFAULT_SSL_CONTEXT = context
+    return context
+
+
+class OKXHTTPError(RuntimeError):
+    """Structured HTTP error preserving OKX JSON code/msg payload when present."""
+
+    def __init__(
+        self,
+        status: int,
+        *,
+        code: str | None = None,
+        msg: str = "",
+        payload: dict[str, Any] | None = None,
+        body: str = "",
+        url: str = "",
+    ) -> None:
+        self.status = status
+        self.code = code
+        self.msg = msg
+        self.payload = payload
+        self.body = body
+        self.url = url
+        detail = f"code={code} msg={msg}" if code is not None else (msg or body[:200] or "empty response")
+        super().__init__(f"OKX HTTP {status}: {detail}")
+
+
+def _decode_http_error(status: int, raw_body: bytes, *, url: str = "") -> OKXHTTPError:
+    text = raw_body.decode("utf-8", errors="replace")
+    payload: dict[str, Any] | None = None
+    code: str | None = None
+    msg = ""
+    if text.strip():
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            msg = text.strip()[:200]
+        else:
+            if isinstance(parsed, dict):
+                payload = parsed
+                raw_code = parsed.get("code")
+                code = str(raw_code) if raw_code is not None else None
+                msg = str(parsed.get("msg") or "")
+            else:
+                msg = text.strip()[:200]
+    return OKXHTTPError(status, code=code, msg=msg, payload=payload, body=text, url=url)
+
+
+def _parse_retry_after(header_value: str | None) -> float | None:
+    if not header_value:
+        return None
+    try:
+        delay = float(header_value.strip())
+    except ValueError:
+        return None
+    if delay < 0:
+        return None
+    return min(delay, _MAX_RETRY_AFTER_SECONDS)
+
+
+class _PooledHTTPTransport:
+    """Thread-safe persistent HTTP/HTTPS keep-alive transport with bounded GET retries."""
+
+    def __init__(
+        self,
+        *,
+        max_get_attempts: int = 3,
+        backoff_seconds: float = 0.2,
+        sleeper: Callable[[float], None] = time.sleep,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
+        if max_get_attempts < 1:
+            raise ValueError("max_get_attempts must be at least 1")
+        self.max_get_attempts = max_get_attempts
+        self.backoff_seconds = backoff_seconds
+        self.sleeper = sleeper
+        self.ssl_context = ssl_context
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._all_connections: set[http.client.HTTPConnection] = set()
+
+    def _pool(self) -> dict[tuple[Any, ...], http.client.HTTPConnection]:
+        pool = getattr(self._local, "connections", None)
+        if pool is None:
+            pool = {}
+            self._local.connections = pool
+        return pool
+
+    def _acquire(self, key: tuple[Any, ...]) -> tuple[http.client.HTTPConnection, bool]:
+        pool = self._pool()
+        conn = pool.get(key)
+        if conn is not None:
+            if conn.sock is not None:
+                return conn, True
+            self._evict(key, conn)
+        if len(key) == 4:
+            scheme, host, port, timeout = key
+            proxy = resolve_proxy(scheme, host, port)
+        else:
+            scheme, host, port, timeout, proxy = key
+        validate_proxy_for_target(scheme, proxy if isinstance(proxy, ProxyTarget) else None)
+        if scheme == "https":
+            context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
+            if isinstance(proxy, ProxyTarget):
+                conn = http.client.HTTPSConnection(proxy.host, proxy.port, timeout=timeout, context=context)
+                tunnel_headers = {"Proxy-Authorization": proxy.auth_header} if proxy.auth_header else None
+                conn.set_tunnel(host, port=port, headers=tunnel_headers)
+            else:
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
+        elif scheme == "http":
+            if isinstance(proxy, ProxyTarget):
+                if proxy.scheme == "https":
+                    context = self.ssl_context if self.ssl_context is not None else _default_ssl_context()
+                    conn = http.client.HTTPSConnection(proxy.host, proxy.port, timeout=timeout, context=context)
+                else:
+                    conn = http.client.HTTPConnection(proxy.host, proxy.port, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        else:
+            raise ValueError(f"unsupported URL scheme: {scheme}")
+        pool[key] = conn
+        with self._lock:
+            self._all_connections.add(conn)
+        return conn, False
+
+    def _evict(self, key: tuple[Any, ...], conn: http.client.HTTPConnection) -> None:
+        pool = self._pool()
+        if pool.get(key) is conn:
+            del pool[key]
+        with self._lock:
+            self._all_connections.discard(conn)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            connections = list(self._all_connections)
+            self._all_connections.clear()
+        pool = getattr(self._local, "connections", None)
+        if pool is not None:
+            pool.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        body: str | None,
+        timeout: int,
+    ) -> dict[str, Any]:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        if not host:
+            raise ValueError(f"invalid URL: {url}")
+        port = parsed.port or (443 if scheme == "https" else 80)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+
+        method_upper = method.upper()
+        idempotent = method_upper == "GET"
+        max_attempts = self.max_get_attempts if idempotent else 1
+        encoded_body = body.encode("utf-8") if body is not None else None
+        request_headers = dict(headers)
+        if not any(key.lower() == "connection" for key in request_headers):
+            request_headers["Connection"] = "keep-alive"
+
+        proxy = resolve_proxy(scheme, host, parsed.port)
+        validate_proxy_for_target(scheme, proxy)
+
+        if scheme == "http" and proxy is not None:
+            host_part = f"[{host}]" if ":" in host else host
+            netloc = f"{host_part}:{parsed.port}" if parsed.port is not None else host_part
+            request_target = f"http://{netloc}{target}"
+            if proxy.auth_header and not any(k.lower() == "proxy-authorization" for k in request_headers):
+                request_headers["Proxy-Authorization"] = proxy.auth_header
+        else:
+            request_target = target
+
+        key: tuple[Any, ...] = (scheme, host, port, timeout, proxy)
+        for attempt in range(1, max_attempts + 1):
+            conn, reused = self._acquire(key)
+            try:
+                conn.request(method_upper, request_target, body=encoded_body, headers=request_headers)
+                response = conn.getresponse()
+                raw_body = response.read()
+                status = response.status
+                retry_after = response.getheader("Retry-After")
+                will_close = response.will_close
+            except (OSError, http.client.HTTPException):
+                self._evict(key, conn)
+                if not idempotent or attempt >= max_attempts:
+                    raise
+                if not (reused and attempt == 1):
+                    self.sleeper(self.backoff_seconds * attempt)
+                continue
+
+            if will_close:
+                self._evict(key, conn)
+
+            if status >= 400:
+                error = _decode_http_error(status, raw_body, url=url)
+                if idempotent and (status in _RETRYABLE_GET_STATUSES or 500 <= status < 600) and attempt < max_attempts:
+                    delay = _parse_retry_after(retry_after)
+                    self.sleeper(delay if delay is not None else self.backoff_seconds * attempt)
+                    continue
+                raise error
+
+            return json.loads(raw_body.decode("utf-8"))
+
+        raise RuntimeError("unreachable")
 
 
 @dataclass(frozen=True)
@@ -112,13 +352,25 @@ class OKXRestClient:
         transport: Callable[..., dict[str, Any]] | None = None,
         timeout: int = 20,
         timestamp_factory: Callable[[], str] | None = None,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.credentials = credentials
         self.demo = demo
         self.base_url = base_url.rstrip("/")
-        self.transport = transport or _urllib_transport
+        self._owned_transport = _PooledHTTPTransport(ssl_context=ssl_context) if transport is None else None
+        self.transport = transport if transport is not None else self._owned_transport
         self.timeout = timeout
         self.timestamp_factory = timestamp_factory or _utc_timestamp
+
+    def close(self) -> None:
+        if self._owned_transport is not None:
+            self._owned_transport.close()
+
+    def __enter__(self) -> "OKXRestClient":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
 
     def get_balance(self, *, ccy: str | None = None) -> dict[str, Any]:
         query = {"ccy": ccy} if ccy else None
@@ -166,13 +418,7 @@ class OKXRestClient:
         if not confirm_demo_order:
             raise PermissionError("confirm_demo_order=True is required before sending a demo order")
         prepared = self.prepare_demo_order(request)
-        return self.transport(
-            prepared.method,
-            f"{self.base_url}{prepared.path}",
-            headers=prepared.headers,
-            body=prepared.body,
-            timeout=self.timeout,
-        )
+        return self._dispatch(prepared)
 
     def place_limit_buy(
         self,
@@ -234,13 +480,21 @@ class OKXRestClient:
         request_path = _request_path(path, query)
         body_text = _compact_json(body) if body is not None else None
         prepared = self._prepare_request(method, request_path, body=body_text, private=private)
-        return self.transport(
-            method,
-            f"{self.base_url}{prepared.path}",
-            headers=prepared.headers,
-            body=prepared.body,
-            timeout=self.timeout,
-        )
+        return self._dispatch(prepared)
+
+    def _dispatch(self, prepared: PreparedRequest) -> dict[str, Any]:
+        url = f"{self.base_url}{prepared.path}"
+        try:
+            return self.transport(
+                prepared.method,
+                url,
+                headers=prepared.headers,
+                body=prepared.body,
+                timeout=self.timeout,
+            )
+        except urllib.error.HTTPError as exc:
+            raw_body = exc.read() if exc.fp is not None else b""
+            raise _decode_http_error(exc.code, raw_body, url=url) from exc
 
     def _prepare_request(self, method: str, path: str, *, body: str | None, private: bool) -> PreparedRequest:
         method = method.upper()
@@ -368,28 +622,20 @@ def _request_path(path: str, query: dict[str, str] | None) -> str:
 def _credential_values_from_source(prefix: str, source: str | None) -> dict[str, str]:
     resolved_source = (source or os.environ.get(f"{prefix}_ENV_SOURCE") or "auto").strip().lower()
     if resolved_source == "auto":
-        for values in _auto_credential_sources(prefix):
-            if _credential_values_are_complete(prefix, values):
-                return values
-        return _process_credential_values(prefix)
+        process_values = _process_credential_values(prefix)
+        if _credential_values_are_complete(prefix, process_values):
+            return process_values
+        if os.name == "nt":
+            for scope in ("user", "machine"):
+                values = _read_windows_environment(prefix, scope)
+                if _credential_values_are_complete(prefix, values):
+                    return values
+        return process_values
     if resolved_source == "process":
         return _process_credential_values(prefix)
     if resolved_source in {"user", "machine"}:
         return _read_windows_environment(prefix, resolved_source)
     raise ValueError(f"unsupported {prefix}_ENV_SOURCE: {resolved_source}")
-
-
-def _auto_credential_sources(prefix: str) -> list[dict[str, str]]:
-    sources = []
-    if os.name == "nt":
-        sources.extend(
-            [
-                _read_windows_environment(prefix, "user"),
-                _read_windows_environment(prefix, "machine"),
-            ]
-        )
-    sources.append(_process_credential_values(prefix))
-    return sources
 
 
 def _process_credential_values(prefix: str) -> dict[str, str]:
@@ -446,12 +692,6 @@ def _compact_json(value: dict[str, Any]) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
 
 
-def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-    if step <= 0:
-        raise ValueError("step must be positive")
-    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
-
-
 def _decimal_to_string(value: Decimal) -> str:
     normalized = value.normalize()
     if normalized == normalized.to_integral_value():
@@ -467,10 +707,3 @@ def _sign(*, timestamp: str, method: str, request_path: str, body: str, secret_k
 
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _urllib_transport(method: str, url: str, *, headers: dict[str, str], body: str | None, timeout: int) -> dict[str, Any]:
-    data = body.encode("utf-8") if body is not None else None
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))

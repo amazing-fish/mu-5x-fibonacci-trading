@@ -17,8 +17,21 @@ from mu_strategy.viz.position_ledger import render_position_management_editor
 from mu_strategy.viz.signal_review import render_signal_review
 from tests import test_manual_positions as manual
 from tests import test_signal_review as fixtures
-from tests import test_trusted_segmented_storage as storage_fixtures
 from tests.factories.scan_cycle import trusted_scan_bundle
+
+
+class _BundleProvider:
+    def __init__(self, rows_by_interval: dict[str, list[Candle]]):
+        self.rows_by_interval = rows_by_interval
+
+    def fetch_tickers(self):
+        raise AssertionError("explicit symbol refresh must not fetch tickers")
+
+    def fetch_history(self, symbol: str, interval: str, *, days: int) -> list[Candle]:
+        return list(self.rows_by_interval[interval])
+
+    def fetch_incremental(self, symbol: str, interval: str, *, since_time_ms: int) -> list[Candle]:
+        return [candle for candle in self.rows_by_interval[interval] if candle.open_time_ms >= since_time_ms]
 
 
 class PositionManagementFixture(manual.ManualPositionTestCase):
@@ -215,19 +228,86 @@ class PositionManagementTests(PositionManagementFixture):
         self.assertNotEqual(low_risk["provenance"]["effective_configuration_sha256"], high_risk["provenance"]["effective_configuration_sha256"])
 
     def test_out_of_coverage_stop_is_partial_review_and_never_permits_add(self):
+        from mu_strategy.core.trading_calendar import CalendarUnavailable
+
         at = int(datetime(2029, 1, 2, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
         identity = self.ready(at=at)
         before = self.ledger.path.read_bytes()
-        result = self.review(identity, self.loader(end=at + 4 * BAR_MS, lows={at: 94}), at=at + 4 * BAR_MS)
-        self.assertEqual('partial', result['status'])
-        self.assertEqual('exit_review', result['evaluation']['outcome'])
-        self.assertEqual('stop', result['evaluation']['earliest_exit']['exit_reason'])
-        self.assertIsNone(result['evaluation']['addition'])
-        self.assertIn('日历', result['messages'][0])
-        unknown = self.review(identity, self.loader(end=at + 4 * BAR_MS), at=at + 4 * BAR_MS)
-        self.assertEqual('data_blocked', unknown['status'])
-        self.assertIsNone(unknown['evaluation'])
+        with patch("mu_strategy.live_exit.is_preferred_us_cash_window", side_effect=CalendarUnavailable("calendar unavailable")):
+            result = self.review(identity, self.loader(end=at + 4 * BAR_MS, lows={at: 94}), at=at + 4 * BAR_MS)
+            self.assertEqual('partial', result['status'])
+            self.assertEqual('exit_review', result['evaluation']['outcome'])
+            self.assertEqual('stop', result['evaluation']['earliest_exit']['exit_reason'])
+            self.assertIsNone(result['evaluation']['addition'])
+            self.assertIn('日历', result['messages'][0])
+            unknown = self.review(identity, self.loader(end=at + 4 * BAR_MS), at=at + 4 * BAR_MS)
+            self.assertEqual('data_blocked', unknown['status'])
+            self.assertIsNone(unknown['evaluation'])
         self.assertEqual(before, self.ledger.path.read_bytes())
+
+    def test_short_review_window_requested_and_gaps_fail_closed(self):
+        identity = self.ready()
+        loader = self.loader()
+        result = self.review(identity, loader)
+        self.assertEqual("evaluated", result["status"], result)
+        query = loader.execute.call_args.args[0]
+        self.assertEqual(2, query.days)
+
+        # Any gap in the loaded sequence strictly fails closed.
+        for interval in ("15m", "1h"):
+            with self.subTest(interval=interval):
+                gapped_loader = self.loader()
+                del gapped_loader.execute.return_value.candles_by_interval[interval][5]
+                self.assertEqual("data_blocked", self.review(identity, gapped_loader)["status"])
+
+    def test_refresh_produced_generation_evaluates_clean_window_and_blocks_gapped_or_stale(self):
+        identity = self.ready()
+        end = fixtures.NOW + 4 * BAR_MS  # 1 hour after confirmation
+        start = int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp() * 1000)
+
+        def refresh_with(*, drop_15m_hours_ago=None, run_id="a" * 32):
+            gap_ts = end - drop_15m_hours_ago * 3_600_000 if drop_15m_hours_ago is not None else None
+            five = [
+                Candle(at, 100.0, 101.0, 94.0 if at == fixtures.NOW else 99.0, 100.0, 1.0)
+                for at in range(start, end, 300_000)
+                if gap_ts is None or not (gap_ts <= at < gap_ts + BAR_MS)
+            ]
+            fifteen = aggregate_candles(five, interval="15m")
+            hourly = aggregate_candles(five, interval="1h")
+            store = TrustedDataStore(data_dir=self.fixture.data_dir)
+            return RefreshTrustedMarketData(store, _BundleProvider({"5m": five, "15m": fifteen, "1h": hourly})).execute(
+                RefreshTrustedMarketDataRequest(
+                    requested_intervals=("15m", "1h"), symbols=(fixtures.SYMBOL,), days=7, now_ms=end, run_id=run_id
+                )
+            )
+
+        # Refresh generation with a 15m gap (40h ago) is rejected by RefreshTrustedMarketData (INVALID/TIMESTAMP_GAP)
+        # and strictly blocked by position review.
+        gapped_run = refresh_with(drop_15m_hours_ago=40, run_id="b" * 32)
+        self.assertEqual(HealthReason.TIMESTAMP_GAP, gapped_run.datasets[(fixtures.SYMBOL, "15m")].primary_reason)
+        blocked = self.review(identity)
+        self.assertEqual("data_blocked", blocked["status"])
+
+        # Clean refresh generation evaluates cleanly with tight 2-day window.
+        clean_run = refresh_with(run_id="c" * 32)
+        self.assertEqual(HealthReason.OK, clean_run.datasets[(fixtures.SYMBOL, "15m")].primary_reason)
+        ok = self.review(identity)
+        self.assertEqual("evaluated", ok["status"], ok)
+        self.assertEqual(2, ok["provenance"]["requested_days"])
+        self.assertEqual("exit_review", ok["evaluation"]["outcome"])
+
+        # Advancing clock past freshness SLA strictly blocks the same generation.
+        stale = self.review(identity, at=end + 2 * 3_600_000)
+        self.assertEqual("data_blocked", stale["status"])
+
+    def test_programming_bugs_propagate_instead_of_masking_as_data_blocked(self):
+        identity = self.ready()
+        for error in (KeyError("bug_key"), TypeError("bug_type")):
+            with self.subTest(error=type(error).__name__):
+                loader = self.loader()
+                loader.execute.side_effect = error
+                with self.assertRaises(type(error)):
+                    self.review(identity, loader)
 
     def test_latest_shared_add_candidate_does_not_write_a_fill(self):
         at = int(datetime(2026, 9, 8, 14, 0, tzinfo=timezone.utc).timestamp() * 1000)
@@ -283,7 +363,7 @@ class PositionManagementTests(PositionManagementFixture):
         self.assertEqual("data_blocked", self.review(identity)["status"])
         start = int(datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp() * 1000)
         rows = [Candle(at, 100, 101, 94 if at == fixtures.NOW else 99, 100, 1) for at in range(start, end, 300_000)]
-        provider = storage_fixtures.MutableBundleProvider({"5m": rows, "15m": aggregate_candles(rows, interval="15m"), "1h": aggregate_candles(rows, interval="1h")})
+        provider = _BundleProvider({"5m": rows, "15m": aggregate_candles(rows, interval="15m"), "1h": aggregate_candles(rows, interval="1h")})
         store = TrustedDataStore(data_dir=self.fixture.data_dir)
         RefreshTrustedMarketData(store, provider).execute(RefreshTrustedMarketDataRequest(
             requested_intervals=("15m", "1h"), symbols=(fixtures.SYMBOL,), days=7, now_ms=end, run_id="d" * 32))

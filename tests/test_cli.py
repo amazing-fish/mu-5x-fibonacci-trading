@@ -20,7 +20,7 @@ class CliTests(unittest.TestCase):
         for module, program_name in (
             (cli, "mu_strategy.cli"),
             (viz_backtest, "mu_strategy.visualize"),
-            (walk_forward, "mu_strategy.walk_forward"),
+            (walk_forward, "mu_strategy.experiments.walk_forward"),
             (all_existing_data_backtests, "mu_strategy.all_existing_data_backtests"),
         ):
             with self.subTest(program_name=program_name):
@@ -303,13 +303,82 @@ class CliTests(unittest.TestCase):
         self.assertEqual("limit", configs[0].fee_profile)
         self.assertAlmostEqual(0.0002, configs[0].fee_rate)
 
+    def test_cli_list_strategies_prints_registered_strategies_without_loading_data(self):
+        from mu_strategy import cli
+
+        stdout = io.StringIO()
+        with patch("sys.argv", ["mu_strategy.cli", "--list-strategies"]):
+            with patch("mu_strategy.cli.refresh_trusted_candle_bundle", side_effect=AssertionError("must not load data")):
+                with patch("sys.stdout", stdout):
+                    cli.main()
+
+        output = stdout.getvalue()
+        self.assertIn("baseline", output)
+        self.assertIn("optimized_v2", output)
+        self.assertIn("baseline_green_only_wide", output)
+        self.assertIn("second_pullback_limit_8", output)
+
+    def test_cli_unknown_strategy_error_lists_available_strategies(self):
+        from mu_strategy import cli
+
+        stderr = io.StringIO()
+        with patch("sys.argv", ["mu_strategy.cli", "--strategy", "does_not_exist"]):
+            with patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.main()
+
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("Available strategies:", stderr.getvalue())
+        self.assertIn("baseline", stderr.getvalue())
+        self.assertIn("optimized_v2", stderr.getvalue())
+        self.assertIn("--list-strategies", stderr.getvalue())
+
+    def test_cli_generation_id_aligns_partial_coverage_by_default_and_strict_coverage_fails_closed(self):
+        from mu_strategy import cli
+
+        root = Path(__file__).resolve().parents[1]
+        data_dir = root / "data/live"
+        generation_id = "0114f8334f2e40d6ba5b5030faf6007b"
+
+        with TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "partial.md"
+            argv = [
+                "mu_strategy.cli",
+                "--data-dir",
+                str(data_dir),
+                "--generation-id",
+                generation_id,
+                "--days",
+                "180",
+                "--report",
+                str(report_path),
+            ]
+            with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO):
+                cli.main()
+
+            text = report_path.read_text(encoding="utf-8")
+            self.assertIn("partial_available_history", text)
+            self.assertIn('"requested_days": 180', text)
+            self.assertIn('"effective_days": 142', text)
+
+            strict_report = Path(tmp) / "strict.md"
+            strict_argv = [*argv[:-2], "--strict-coverage", "--report", str(strict_report)]
+            stderr = io.StringIO()
+            with patch("sys.argv", strict_argv), patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    cli.main()
+
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("insufficient_coverage", stderr.getvalue())
+            self.assertFalse(strict_report.exists())
+
 
 def _candle(open_time_ms: int, close: float) -> Candle:
     return Candle(open_time_ms, close - 1, close + 1, close - 2, close, 1000)
 
 
 def _status(symbol: str, interval: str, path: Path, *, is_valid: bool = True, is_stale: bool = False, reason: str = "ok"):
-    from mu_strategy.market_data.trusted import DataStatus
+    from mu_strategy.market_data.trusted_data.compat import DataStatus
 
     return DataStatus(
         symbol=symbol,

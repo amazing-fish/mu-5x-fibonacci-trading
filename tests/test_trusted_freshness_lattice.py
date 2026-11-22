@@ -113,7 +113,7 @@ class ManifestSchemaConsistencyTests(unittest.TestCase):
 class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
     def test_strict_policy_uses_requested_intervals_for_freshness_when_base_is_validation_only(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
-        from mu_strategy.market_data.trusted_data.policy import research_strict_policy
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy, trading_strict_policy
 
         context = _context_with_status("stale", attempt_status="degraded")
         health_by_interval = {
@@ -122,7 +122,7 @@ class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
             "1h": _health("MU-USDT-SWAP", "1h"),
         }
 
-        decision = research_strict_policy().decide(
+        decision = trading_strict_policy().decide(
             context=context,
             health_by_interval=health_by_interval,
             required_intervals=("5m", "15m", "1h"),
@@ -133,7 +133,7 @@ class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
 
         requested_stale = dict(health_by_interval)
         requested_stale["15m"] = _health("MU-USDT-SWAP", "15m", freshness=FreshnessState.STALE)
-        blocked = research_strict_policy().decide(
+        blocked = trading_strict_policy().decide(
             context=context,
             health_by_interval=requested_stale,
             required_intervals=("5m", "15m", "1h"),
@@ -141,6 +141,17 @@ class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
         )
         self.assertFalse(blocked.allowed)
         self.assertEqual(HealthReason.STALE_BY_CLOCK, blocked.reason)
+
+        # Offline research policy does not block valid snapshots on clock staleness,
+        # while still enforcing manifest validity and dataset integrity.
+        research_allowed = research_strict_policy().decide(
+            context=context,
+            health_by_interval=requested_stale,
+            required_intervals=("5m", "15m", "1h"),
+            freshness_intervals=("15m", "1h"),
+        )
+        self.assertTrue(research_allowed.allowed)
+        self.assertFalse(research_strict_policy().require_fresh)
 
     def test_strict_policies_block_unknown_freshness_with_non_ok_reason(self):
         from mu_strategy.market_data.trusted_data.contracts import FreshnessState, HealthReason
@@ -156,7 +167,6 @@ class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
 
         policies = (
             trading_strict_policy(),
-            research_strict_policy(),
             TrustPolicy(name="custom", require_manifest_success=False, require_fresh=True),
         )
         for policy in policies:
@@ -170,6 +180,7 @@ class StrictPolicyUnknownFreshnessTests(unittest.TestCase):
                 self.assertNotEqual(HealthReason.OK, decision.reason)
                 self.assertEqual(HealthReason.FRESHNESS_UNKNOWN, decision.reason)
 
+        self.assertFalse(research_strict_policy().require_fresh)
         observe_decision = observe_only_policy().decide(
             context=context,
             health_by_interval=health_by_interval,

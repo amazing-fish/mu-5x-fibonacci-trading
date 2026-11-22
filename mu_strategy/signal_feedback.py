@@ -3,13 +3,29 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import contextmanager
 from pathlib import Path
 
 
 FEEDBACK_STATUSES = {
     "unreviewed": "未处理", "seen": "已查看", "traded": "已手动交易", "skipped": "已跳过",
 }
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+@contextmanager
+def _connect(path: Path, *, readonly: bool = False):
+    if readonly:
+        db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    else:
+        db = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    try:
+        db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        if not readonly:
+            db.execute("PRAGMA journal_mode = WAL")
+        yield db
+    finally:
+        db.close()
 
 
 class SignalFeedbackStore:
@@ -20,7 +36,7 @@ class SignalFeedbackStore:
     def read(self) -> dict:
         if not self.path.exists():
             return {}
-        with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
+        with _connect(self.path, readonly=True) as db:
             db.row_factory = sqlite3.Row
             return {row["event_id"]: dict(row) for row in db.execute("SELECT * FROM feedback")}
 
@@ -33,7 +49,7 @@ class SignalFeedbackStore:
             raise ValueError("note must contain at most 2000 characters")
         record = {"event_id": event_id, "status": status, "note": note.strip(), "updated_at_ms": now_ms}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.path)) as db, db:
+        with _connect(self.path) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS feedback (event_id TEXT PRIMARY KEY, status TEXT NOT NULL, note TEXT NOT NULL, updated_at_ms INTEGER NOT NULL)")
             db.execute("INSERT INTO feedback VALUES (:event_id, :status, :note, :updated_at_ms) "
                        "ON CONFLICT(event_id) DO UPDATE SET status=excluded.status,note=excluded.note,updated_at_ms=excluded.updated_at_ms", record)

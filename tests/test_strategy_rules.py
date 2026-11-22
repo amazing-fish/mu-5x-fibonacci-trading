@@ -2,21 +2,28 @@ import unittest
 from datetime import datetime, timezone
 
 from mu_strategy.models import Candle, EntryDecisionCode, EntryDecisionStage, EntryDisposition, EntrySignal
+from mu_strategy.strategies.components import StrategyComponents
+from mu_strategy.strategies.presets.fibonacci import preferred_fib_lookback, preferred_fibonacci_parameter
+from mu_strategy.strategies.registry import (
+    StrategyGroup,
+    default_strategy_groups,
+    selected_strategy_groups,
+    strategy_group,
+)
 from mu_strategy.strategy import (
     EntryExecution,
     StrategyConfig,
     fee_profile_label,
     fibonacci_levels,
     is_preferred_us_cash_window,
+    nearest_fib_retest_level,
     one_hour_regime,
-    optimized_strategy_group,
+    recent_higher_low,
+    recent_swing,
     should_enter_long,
     should_execute_entry,
     with_fee_profile,
 )
-from mu_strategy.strategies.components import StrategyComponents
-from mu_strategy.strategies.presets.fibonacci import preferred_fibonacci_parameter, preferred_fib_lookback
-from mu_strategy.strategies.registry import StrategyGroup, default_strategy_groups, selected_strategy_groups
 
 
 class StrategyRuleTests(unittest.TestCase):
@@ -26,6 +33,75 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertAlmostEqual(levels["0.382"], 112.36)
         self.assertAlmostEqual(levels["0.5"], 110.0)
         self.assertAlmostEqual(levels["0.618"], 107.64)
+
+    def test_recent_swing_requires_genuine_upswing_order(self):
+        upswing = [
+            Candle(0, 100, 103, 98, 102, 1000),
+            Candle(900_000, 102, 108, 101, 107, 1000),
+            Candle(1_800_000, 107, 120, 106, 118, 1000),
+            Candle(2_700_000, 118, 119, 110, 112, 1000),
+        ]
+        downtrend = [
+            Candle(0, 118, 120, 115, 116, 1000),
+            Candle(900_000, 116, 117, 108, 109, 1000),
+            Candle(1_800_000, 109, 110, 98, 100, 1000),
+            Candle(2_700_000, 100, 105, 99, 104, 1000),
+        ]
+        same_bar_extreme = [
+            Candle(0, 100, 120, 98, 110, 1000),
+            Candle(900_000, 110, 115, 105, 112, 1000),
+            Candle(1_800_000, 112, 114, 108, 110, 1000),
+        ]
+
+        self.assertEqual((98, 120), recent_swing(upswing, 3, 8))
+        self.assertIsNone(recent_swing(downtrend, 3, 8))
+        self.assertIsNone(recent_swing(same_bar_extreme, 2, 8))
+
+    def test_nearest_fib_retest_level_accepts_reclaim_even_when_high_below_tolerance_band(self):
+        # Upswing 100 -> 120 gives 0.5 level = 110.0.
+        # With tol=0.002, level*(1+tol)=110.22. Candle dips to 109.9 and reclaims close=110.1 with high=110.15 < 110.22.
+        config = StrategyConfig(fib_lookback=8, fib_tolerance_pct=0.002)
+        candles = [
+            Candle(0, 101, 105, 100, 104, 1000),
+            Candle(900_000, 104, 120, 103, 119, 1000),
+            Candle(1_800_000, 110.05, 110.15, 109.9, 110.1, 1000),
+        ]
+
+        level = nearest_fib_retest_level(candles, 2, config)
+
+        self.assertAlmostEqual(110.0, level)
+
+        # Candle that breaks below all levels without reclaiming must be rejected.
+        broken = candles[:2] + [Candle(1_800_000, 110.0, 110.5, 102.0, 103.0, 1000)]
+        self.assertIsNone(nearest_fib_retest_level(broken, 2, config))
+
+    def test_recent_higher_low_honors_lookback_and_rejects_lower_lows(self):
+        falling = [Candle(i * 900_000, 120 - i * 2, 121 - i * 2, 118 - i * 2, 119 - i * 2, 1000) for i in range(6)]
+        self.assertIsNone(recent_higher_low(falling, 5, lookback=8))
+
+        # Structural pivot higher low at index 6 (low=106) above index 0 (low=100), visible with lookback=8 but not lookback=4.
+        lows = [100, 105, 106, 107, 108, 107, 106, 107]
+        candles = [Candle(i * 900_000, low + 1, low + 2, low, low + 1, 1000) for i, low in enumerate(lows)]
+        self.assertAlmostEqual(106.0, recent_higher_low(candles, len(candles), lookback=8))
+        self.assertIsNone(recent_higher_low(candles, len(candles), lookback=4))
+
+        # Pivot broken by a subsequent new lower low must return None.
+        broken_lows = [100, 105, 108, 104, 107, 98]
+        broken_candles = [Candle(i * 900_000, low + 1, low + 2, low, low + 1, 1000) for i, low in enumerate(broken_lows)]
+        self.assertIsNone(recent_higher_low(broken_candles, len(broken_candles), lookback=8))
+
+    def test_strategy_config_risk_limits_and_dead_field_removal(self):
+        config = StrategyConfig(max_account_drawdown_pct=0.04, daily_loss_limit_pct=0.04)
+        self.assertAlmostEqual(0.04, config.max_account_drawdown_pct)
+        self.assertAlmostEqual(0.04, config.daily_loss_limit_pct)
+        self.assertFalse(hasattr(config, "trading_windows_bjt"))
+
+        for bad in (0.0, -0.05, 1.5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    StrategyConfig(max_account_drawdown_pct=bad)
+                with self.assertRaises(ValueError):
+                    StrategyConfig(daily_loss_limit_pct=bad)
 
     def test_one_hour_red_blocks_longs(self):
         state = one_hour_regime(close=100, ema21=105, rsi14=42, macd_hist=-0.5, macd_hist_prev=-0.2)
@@ -195,9 +271,12 @@ class StrategyRuleTests(unittest.TestCase):
 
     def test_known_assets_record_preferred_fibonacci_lookbacks(self):
         self.assertEqual(8, preferred_fib_lookback("MU-USDT-SWAP"))
+        self.assertEqual(8, preferred_fib_lookback("MUUSDT"))
         self.assertEqual(8, preferred_fib_lookback("SPCX-USDT-SWAP"))
+        self.assertEqual(8, preferred_fib_lookback("Space X"))
         self.assertEqual(36, preferred_fib_lookback("META-USDT-SWAP"))
         self.assertEqual(12, preferred_fib_lookback("BTC-USDT-SWAP"))
+        self.assertEqual(12, preferred_fib_lookback("BTCUSDT"))
         self.assertEqual(32, preferred_fib_lookback("UNKNOWN-USDT-SWAP"))
 
         meta = preferred_fibonacci_parameter("META-USDT-SWAP")
@@ -224,7 +303,7 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertAlmostEqual(0.0002, limit_config.fee_rate)
 
     def test_optimized_execution_rejects_chasing_too_far_above_fib(self):
-        config = optimized_strategy_group().config
+        config = strategy_group("optimized_v2").config
         candles = [
             Candle(0, 100, 101, 99, 100, 1000),
             Candle(900_000, 100.4, 101.2, 100.0, 101.0, 1000),
@@ -240,7 +319,7 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertIs(EntryDecisionStage.EXECUTION, decision.stage)
 
     def test_optimized_execution_rejects_wide_signal_candle(self):
-        config = optimized_strategy_group().config
+        config = strategy_group("optimized_v2").config
         candles = [
             Candle(0, 100, 101, 99, 100, 1000),
             Candle(900_000, 100, 101, 98.8, 100.2, 1000),

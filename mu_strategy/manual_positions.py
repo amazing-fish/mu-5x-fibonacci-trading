@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -16,8 +17,30 @@ from mu_strategy.position_management import MAX_MAPPED_FILLS, baseline_configura
 from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2, parse_strategy_config_payload
 
 
+logger = logging.getLogger(__name__)
 BEIJING = timezone(timedelta(hours=8))
 UNITS = {"contracts": "合约张数", "base": "标的数量"}
+SQLITE_BUSY_TIMEOUT_MS = 5000
+_POSITION_REQUIRED_KEYS = {"position_id", "symbol", "unit"}
+_FILL_REQUIRED_KEYS = {"action", "quantity", "price", "time_ms", "stage", "stop_price", "note", "voided"}
+
+
+@contextmanager
+def _connect(path: Path, *, mode: str = "rwc"):
+    timeout_s = SQLITE_BUSY_TIMEOUT_MS / 1000
+    if mode == "ro":
+        db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=timeout_s)
+    elif mode == "rw":
+        db = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=timeout_s)
+    else:
+        db = sqlite3.connect(path, timeout=timeout_s)
+    try:
+        db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        if mode != "ro":
+            db.execute("PRAGMA journal_mode = WAL")
+        yield db
+    finally:
+        db.close()
 
 
 def _identifier(value):
@@ -215,15 +238,25 @@ class ManualPositionLedger:
 
     @staticmethod
     def _read(db):
-        positions = [json.loads(row[0]) for row in db.execute("SELECT payload FROM positions ORDER BY rowid DESC")]
+        positions = []
+        for row in db.execute("SELECT payload FROM positions ORDER BY rowid DESC"):
+            position = json.loads(row[0])
+            if not isinstance(position, dict) or not _POSITION_REQUIRED_KEYS.issubset(position):
+                raise ValueError("invalid position record")
+            positions.append(position)
         histories = {position["position_id"]: [] for position in positions}
         for seq, position_id, fill_id, revision, recorded_at_ms, raw in db.execute(
                 "SELECT sequence, position_id, fill_id, revision, recorded_at_ms, payload FROM fill_revisions ORDER BY sequence"):
-            histories[position_id].append({**json.loads(raw), "sequence": seq, "fill_id": fill_id,
+            fill = json.loads(raw)
+            if not isinstance(fill, dict) or not _FILL_REQUIRED_KEYS.issubset(fill) or position_id not in histories:
+                raise ValueError("invalid fill revision record")
+            histories[position_id].append({**fill, "sequence": seq, "fill_id": fill_id,
                                            "revision": revision, "recorded_at_ms": recorded_at_ms})
         states = {position["position_id"]: [] for position in positions}
         if _has_state_table(db):
             for position_id, revision, raw in db.execute("SELECT position_id, revision, payload FROM position_state_revisions ORDER BY revision"):
+                if position_id not in states:
+                    raise ValueError("invalid position state reference")
                 state = json.loads(raw)
                 if (not isinstance(state, dict) or set(state) != {"stage", "stop_price", "note", "fill_sequence", "confirmed_at_ms"}
                         or type(state["fill_sequence"]) is not int or state["fill_sequence"] <= 0
@@ -239,6 +272,8 @@ class ManualPositionLedger:
         if _has_management_table(db):
             identities = {position["position_id"]: position for position in positions}
             for position_id, revision, raw in db.execute("SELECT position_id, revision, payload FROM position_management_revisions ORDER BY revision"):
+                if position_id not in identities:
+                    raise ValueError("invalid management history reference")
                 record = _management_record(json.loads(raw), identities[position_id])
                 if type(revision) is not int or revision != len(management[position_id]) + 1:
                     raise ValueError("invalid management history sequence")
@@ -256,21 +291,22 @@ class ManualPositionLedger:
     def read(self):
         if not self.path.exists():
             return []
-        with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
+        with _connect(self.path, mode="ro") as db:
             db.execute("BEGIN")
             return self._read(db)
 
     def view(self):
         try:
             return {"available": True, "positions": self.read(), "path": str(self.path)}
-        except (OSError, sqlite3.Error, ValueError, KeyError, TypeError):
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            logger.warning("Manual position ledger unavailable at %s: %s", self.path, exc)
             return {"available": False, "positions": [], "path": str(self.path)}
 
     def save(self, payload: dict, *, now_ms: int) -> str:
         """Commit one manual fact revision atomically; a retried request is counted once."""
         request_id, position_id, digest = _request_identity(payload)
         if self.path.exists():
-            with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as db:
+            with _connect(self.path, mode="ro") as db:
                 previous = _saved_request(db, "fill_revisions", request_id, digest)
             if previous:
                 return previous
@@ -300,7 +336,7 @@ class ManualPositionLedger:
             if source and source["symbol"] != symbol:
                 raise ValueError("成交标的与关联信号不一致。")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.path)) as db, db:
+        with _connect(self.path, mode="rwc") as db, db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE IF NOT EXISTS positions (position_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS fill_revisions (sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -355,7 +391,7 @@ class ManualPositionLedger:
         note = _note(payload.get("note", ""))
         if payload.get("confirmed") != "yes":
             raise ValueError("请确认这些信息对应当前已记录的持仓；不知道的字段请留空。")
-        with closing(sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True)) as db, db:
+        with _connect(self.path, mode="rw") as db, db:
             db.execute("BEGIN IMMEDIATE")
             if _has_state_table(db):
                 previous = _saved_request(db, "position_state_revisions", request_id, digest)
@@ -388,7 +424,7 @@ class ManualPositionLedger:
             value = payload.get(name, "")
             parameters[name] = _number(_decimal(value, label)) if value else None
         note = _note(payload.get("note", ""))
-        with closing(sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True)) as db, db:
+        with _connect(self.path, mode="rw") as db, db:
             db.execute("BEGIN IMMEDIATE")
             if _has_management_table(db):
                 previous = _saved_request(db, "position_management_revisions", request_id, digest)

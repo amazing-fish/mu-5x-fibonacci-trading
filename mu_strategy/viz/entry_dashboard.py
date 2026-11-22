@@ -336,21 +336,35 @@ def write_entry_dashboard(
     return output_path
 
 
-def latest_payload_from_jsonl(log_path: Path) -> dict[str, Any]:
-    latest: dict[str, Any] | None = None
-    for line in Path(log_path).read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text:
-            continue
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            latest = value
-    if latest is None:
-        raise ValueError(f"no valid JSON object found in {log_path}")
-    return latest
+def latest_payload_from_jsonl(log_path: Path, *, chunk_size: int = 65_536) -> dict[str, Any]:
+    path = Path(log_path)
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        pos = handle.tell()
+        remainder = b""
+        while pos > 0:
+            read_size = min(chunk_size, pos)
+            pos -= read_size
+            handle.seek(pos)
+            buffer = handle.read(read_size) + remainder
+            parts = buffer.split(b"\n")
+            if pos > 0:
+                remainder = parts[0]
+                lines = parts[1:]
+            else:
+                remainder = b""
+                lines = parts
+            for raw_line in reversed(lines):
+                text = raw_line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    value = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    return value
+    raise ValueError(f"no valid JSON object found in {log_path}")
 
 
 def _orders_section(
@@ -661,6 +675,7 @@ def _exit_observation_card(observation: dict[str, Any]) -> str:
         evaluation_html = '<div class="notice">假设评估不可用，当前没有可展示的出场数值。</div>'
     else:
         evaluation_html = _exit_evaluation_details(observation, evaluation)
+    decision_status = _e(observation.get("decision_status") or "unknown")
     return f"""
     <div class="status {state_class}">
       <div class="headline">
@@ -670,7 +685,7 @@ def _exit_observation_card(observation: dict[str, Any]) -> str:
       <div class="subtle">symbol={_e(observation.get("symbol"))} · 持仓数量={_e(_fmt_number(observation.get("position_size")))} · 持仓均价={_e(_fmt_number(observation.get("average_entry_price")))}</div>
       <div class="instruction">
         <strong>这是降级估计，不是权威判断</strong>
-        <span>decision_status=unknown：缺少真实止损、成交明细和加仓阶段，因此没有权威的实时出场判断。</span>
+        <span>decision_status={decision_status}：缺少真实止损、成交明细和加仓阶段，因此没有权威的实时出场判断。</span>
       </div>
       {evaluation_html}
       {_stop_bias_notice(observation, evaluation)}
@@ -927,18 +942,21 @@ def _scope_label(universe: list[dict[str, Any]], scans: list[dict[str, Any]]) ->
 
 
 def _wait_bars(scan: dict[str, Any] | None) -> int:
+    raw = scan.get("second_pullback_wait_bars") if isinstance(scan, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return 8
     try:
-        return max(1, int((scan or {}).get("second_pullback_wait_bars") or 8))
-    except Exception:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
         return 8
 
 
 def _expiry_instruction(signal_time_ms: Any, wait_bars: int) -> str:
+    if signal_time_ms is None or isinstance(signal_time_ms, bool):
+        return f"时间失效点：signal_time 缺失，无法计算 + {wait_bars} 根 15m K"
     try:
-        if signal_time_ms is None:
-            raise ValueError
         expiry_ms = int(signal_time_ms) + wait_bars * 15 * 60 * 1000
-    except Exception:
+    except (TypeError, ValueError):
         return f"时间失效点：signal_time 缺失，无法计算 + {wait_bars} 根 15m K"
     return (
         f"时间失效点：{_format_time_ms(signal_time_ms)} + {wait_bars} 根 15m K = "
@@ -1021,29 +1039,29 @@ def _action_rank(value: Any) -> int:
 
 
 def _format_time_ms(value: Any) -> str:
+    if value is None:
+        return "-"
     try:
-        if value is None:
-            return "-"
         return datetime.fromtimestamp(int(value) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
+    except (TypeError, ValueError, OverflowError, OSError):
         return str(value)
 
 
 def _fmt_pct(value: Any) -> str:
+    if value is None:
+        return "-"
     try:
-        if value is None:
-            return "-"
         return f"{float(value):.2%}"
-    except Exception:
+    except (TypeError, ValueError):
         return _fmt(value)
 
 
 def _fmt_number(value: Any) -> str:
+    if value is None:
+        return "-"
     try:
-        if value is None:
-            return "-"
         number = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return _fmt(value)
     if abs(number) >= 100:
         return f"{number:.2f}".rstrip("0").rstrip(".")

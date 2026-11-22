@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
-from mu_strategy.core.trading_calendar import LEGACY_CALENDAR, calendar_sha256, evaluate_trading_window
 
+from mu_strategy.core.trading_calendar import LEGACY_CALENDAR, calendar_sha256, is_trading_window_allowed
 from mu_strategy.models import (
     Candle,
     EntryDecisionCode,
@@ -77,14 +76,13 @@ class StrategyConfig:
     green_wide_stop_buffer_pct: float = 0.01
     allowed_regimes: tuple[str, ...] = ("green", "yellow")
     full_size_regime: str = "green"
-    trading_windows_bjt: tuple[tuple[str, str], ...] = field(
-        default_factory=lambda: (("21:45", "23:30"), ("02:30", "03:45"))
-    )
     trading_windows_et: tuple[tuple[str, str], ...] = field(
         default_factory=lambda: (("09:45", "11:30"), ("14:30", "15:45"))
     )
     trading_calendar_id: str = LEGACY_CALENDAR
     trading_calendar_sha256: str | None = None
+    max_account_drawdown_pct: float | None = None
+    daily_loss_limit_pct: float | None = None
 
     def __post_init__(self) -> None:
         digest = calendar_sha256(self.trading_calendar_id)
@@ -96,6 +94,10 @@ class StrategyConfig:
         object.__setattr__(self, "fee_profile", profile)
         if self.fee_rate is None:
             object.__setattr__(self, "fee_rate", fee_rate_for_profile(profile))
+        if self.max_account_drawdown_pct is not None and not (0.0 < self.max_account_drawdown_pct <= 1.0):
+            raise ValueError("max_account_drawdown_pct must be in (0, 1]")
+        if self.daily_loss_limit_pct is not None and not (0.0 < self.daily_loss_limit_pct <= 1.0):
+            raise ValueError("daily_loss_limit_pct must be in (0, 1]")
 
 
 def normalize_fee_profile(fee_profile: str) -> str:
@@ -117,23 +119,6 @@ def fee_profile_label(config_or_profile: StrategyConfig | str) -> str:
 def with_fee_profile(config: StrategyConfig, fee_profile: str) -> StrategyConfig:
     profile = normalize_fee_profile(fee_profile)
     return replace(config, fee_profile=profile, fee_rate=fee_rate_for_profile(profile))
-
-
-from mu_strategy.strategies.registry import (
-    StrategyGroup,
-    baseline_green_wide_strategy_group,
-    baseline_half_green_wide_strategy_group,
-    baseline_half_protect_strategy_group,
-    baseline_strategy_group,
-    baseline_yellow_green_wide_strategy_group,
-    baseline_yellow_wide_strategy_group,
-    default_strategy_groups,
-    direct_next_open_strategy_group,
-    legacy_break_high_strategy_group,
-    optimized_strategy_group,
-    second_pullback_strategy_group,
-    selected_strategy_groups,
-)
 
 
 def fibonacci_levels(low: float, high: float) -> dict[str, float]:
@@ -279,17 +264,26 @@ def should_execute_entry(
 
 
 def recent_swing(candles: list[Candle], end_index: int, lookback: int) -> tuple[float, float] | None:
-    if end_index <= 0:
+    if end_index <= 0 or lookback <= 0:
         return None
     start = max(0, end_index - lookback)
-    sample = candles[start:end_index]
-    if len(sample) < 2:
+    if end_index - start < 2:
         return None
-    low = min(bar.low for bar in sample)
-    high = max(bar.high for bar in sample)
-    if high <= low:
+    low_index = start
+    low_value = candles[start].low
+    high_index = start
+    high_value = candles[start].high
+    for idx in range(start + 1, end_index):
+        bar = candles[idx]
+        if bar.low < low_value:
+            low_value = bar.low
+            low_index = idx
+        if bar.high > high_value:
+            high_value = bar.high
+            high_index = idx
+    if low_index >= high_index or high_value <= low_value:
         return None
-    return low, high
+    return low_value, high_value
 
 
 def nearest_fib_retest_level(candles: list[Candle], index: int, config: StrategyConfig) -> float | None:
@@ -297,13 +291,19 @@ def nearest_fib_retest_level(candles: list[Candle], index: int, config: Strategy
     if swing is None:
         return None
     low, high = swing
-    levels = fibonacci_levels(low, high)
+    span = high - low
     candle = candles[index]
-    candidates = [levels["0.382"], levels["0.5"], levels["0.618"]]
-    viable = [level for level in candidates if candle.low <= level * (1 + config.fib_tolerance_pct) <= candle.high]
-    if not viable:
-        return None
-    return min(viable, key=lambda level: abs(candle.close - level))
+    tol_factor = 1.0 + config.fib_tolerance_pct
+    best_level: float | None = None
+    best_distance = float("inf")
+    for ratio in (0.382, 0.5, 0.618):
+        level = round(high - span * ratio, 8)
+        if candle.low <= level * tol_factor and candle.close >= level:
+            distance = abs(candle.close - level)
+            if distance < best_distance:
+                best_distance = distance
+                best_level = level
+    return best_level
 
 
 def reverse_fibonacci_resistance_level(
@@ -319,42 +319,73 @@ def reverse_fibonacci_resistance_level(
         return None
     high, low = swing
     span = high - low
-    levels = [low + span * ratio for ratio in (0.382, 0.5, 0.618)]
     tolerance = entry_price * config.reverse_fib_tolerance_pct
-    candidates = [level for level in levels if abs(entry_price - level) <= tolerance]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda level: abs(entry_price - level))
+    best_level: float | None = None
+    best_distance = float("inf")
+    for ratio in (0.382, 0.5, 0.618):
+        level = low + span * ratio
+        distance = abs(entry_price - level)
+        if distance <= tolerance and distance < best_distance:
+            best_distance = distance
+            best_level = level
+    return best_level
 
 
 def recent_down_swing(candles: list[Candle], end_index: int, lookback: int) -> tuple[float, float] | None:
-    if end_index <= 0:
+    if end_index <= 0 or lookback <= 0:
         return None
     start = max(0, end_index - lookback)
-    sample = candles[start:end_index]
-    if len(sample) < 2:
+    if end_index - start < 2:
         return None
-    high_index, high_candle = max(enumerate(sample), key=lambda item: item[1].high)
-    low_index, low_candle = min(enumerate(sample), key=lambda item: item[1].low)
-    if high_index >= low_index:
+    high_index = start
+    high_value = candles[start].high
+    low_index = start
+    low_value = candles[start].low
+    for idx in range(start + 1, end_index):
+        bar = candles[idx]
+        if bar.high > high_value:
+            high_value = bar.high
+            high_index = idx
+        if bar.low < low_value:
+            low_value = bar.low
+            low_index = idx
+    if high_index >= low_index or high_value <= low_value:
         return None
-    if high_candle.high <= low_candle.low:
-        return None
-    return high_candle.high, low_candle.low
+    return high_value, low_value
 
 
 def recent_higher_low(candles: list[Candle], index: int, lookback: int = 8) -> float | None:
-    start = max(0, index - lookback)
-    sample = candles[start:index]
-    if len(sample) < 3:
+    if index <= 0 or lookback <= 0:
         return None
-    return min(bar.low for bar in sample[-4:])
+    start = max(0, index - lookback)
+    count = index - start
+    if count < 3:
+        return None
+
+    lows = [candles[i].low for i in range(start, index)]
+    # Check for the latest unbroken structural swing/pivot low strictly above an earlier low.
+    prefix_min = lows[0]
+    latest_pivot: float | None = None
+    for j in range(1, count - 1):
+        curr = lows[j]
+        is_pivot = curr <= lows[j - 1] and curr <= lows[j + 1] and (curr < lows[j - 1] or curr < lows[j + 1])
+        if is_pivot and curr > prefix_min:
+            # Pivot remains valid only if no subsequent bar in the lookback broke below it.
+            if all(later >= curr for later in lows[j + 1 :]):
+                latest_pivot = curr
+        if curr < prefix_min:
+            prefix_min = curr
+    if latest_pivot is not None:
+        return latest_pivot
+
+    # Fallback for monotonic rising lows with no interior pivot: require later half's low > earlier half's low.
+    mid = count // 2
+    earlier_low = min(lows[:mid])
+    recent_low = min(lows[mid:])
+    if recent_low > earlier_low:
+        return recent_low
+    return None
 
 
 def is_preferred_us_cash_window(open_time_ms: int, config: StrategyConfig) -> bool:
-    return evaluate_trading_window(open_time_ms, config).allowed
-
-
-def _parse_hhmm(value: str) -> int:
-    hour, minute = value.split(":", 1)
-    return int(hour) * 60 + int(minute)
+    return is_trading_window_allowed(open_time_ms, config)

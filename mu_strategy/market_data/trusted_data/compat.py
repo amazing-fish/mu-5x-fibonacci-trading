@@ -6,8 +6,11 @@ from typing import Any
 
 from mu_strategy.market_data.symbols import ResolvedSymbol
 from mu_strategy.market_data.trusted_data.contracts import (
+    AvailabilityState,
     DatasetHealth,
+    FreshnessState,
     HealthReason,
+    IntegrityState,
     TrustDecision,
     TrustedBundle,
     TrustedLoadContext,
@@ -155,7 +158,11 @@ def trusted_bundle_error(bundle: CandleBundle, *, requested_intervals: tuple[str
 
 
 def data_status_from_health(health: DatasetHealth) -> DataStatus:
-    payload = health.to_dict()
+    reason = health.primary_reason
+    if reason == HealthReason.OK and health.freshness == FreshnessState.UNKNOWN:
+        reason = HealthReason.FRESHNESS_UNKNOWN
+    elif reason == HealthReason.OK and health.freshness == FreshnessState.STALE:
+        reason = HealthReason.STALE_BY_CLOCK
     return DataStatus(
         symbol=health.key.symbol,
         interval=health.key.interval,
@@ -164,9 +171,9 @@ def data_status_from_health(health: DatasetHealth) -> DataStatus:
         last_timestamp_ms=health.last_timestamp_ms,
         updated_at_ms=health.updated_at_ms,
         source_file=health.source_file,
-        is_valid=bool(payload["is_valid"]),
-        is_stale=bool(payload["is_stale"]),
-        reason=str(payload["reason"]),
+        is_valid=health.integrity == IntegrityState.VALID and health.availability == AvailabilityState.AVAILABLE,
+        is_stale=health.freshness != FreshnessState.FRESH,
+        reason=reason.value,
         error_type=health.error_type,
         message=health.message,
         warnings=health.warnings,

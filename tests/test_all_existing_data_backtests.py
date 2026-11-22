@@ -1,11 +1,14 @@
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from mu_strategy.commands import all_existing_data_backtests
 from mu_strategy.commands.all_existing_data_backtests import (
     LocalDataset,
     audit_candles,
+    discover_datasets,
     duration_label,
     render_summary_html,
     render_summary_markdown,
@@ -144,6 +147,44 @@ class AllExistingDataBacktestsTest(unittest.TestCase):
 
         self.assertIn("## Robustness", report)
         self.assertIn("- buy-and-hold benchmark (1x): 10.00%", report)
+
+    def test_discovers_trusted_generations_in_data_live_and_parent_data_dir(self):
+        root = Path(__file__).resolve().parents[1]
+        from_live = discover_datasets(root / "data/live")
+        from_data = discover_datasets(root / "data")
+
+        self.assertGreaterEqual(len(from_live), 2)
+        self.assertIn("0114f8334f2e40d6ba5b5030faf6007b", {item.generation_id for item in from_live})
+        self.assertIn("e702be27d2de4b2d92b12bf01c70d02d", {item.generation_id for item in from_live})
+        self.assertTrue(all(item.symbol == "MU-USDT-SWAP" for item in from_live))
+        self.assertIn("0114f8334f2e40d6ba5b5030faf6007b", {item.generation_id for item in from_data})
+
+    def test_zero_datasets_fails_loudly_and_never_emits_vacuous_pass(self):
+        empty_markdown = render_summary_markdown([], generated_at="1970-01-01T00:00:00+00:00")
+        self.assertIn("FAIL: no datasets audited", empty_markdown)
+        self.assertNotIn("PASS:", empty_markdown)
+
+        with TemporaryDirectory() as tmp:
+            empty_data = Path(tmp) / "empty_data"
+            empty_data.mkdir()
+            report_dir = Path(tmp) / "reports"
+            with self.assertRaises(FileNotFoundError):
+                run_all_existing_data_backtests(
+                    data_dir=empty_data,
+                    report_dir=report_dir,
+                    strategy="baseline",
+                )
+
+            stderr = io.StringIO()
+            with patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    all_existing_data_backtests.main([
+                        "--data-dir", str(empty_data),
+                        "--report-dir", str(report_dir),
+                    ])
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("no local datasets found", stderr.getvalue())
+            self.assertFalse((report_dir / "mu_all_existing_data_backtests.md").exists())
 
 
 if __name__ == "__main__":

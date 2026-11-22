@@ -1,4 +1,3 @@
-import io
 import json
 import unittest
 from datetime import datetime, timezone
@@ -7,9 +6,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
+from mu_strategy.market_data.http_pool import close_pooled_connections
 from mu_strategy.market_data.providers.okx import fetch_okx_listing_time
-from mu_strategy.market_data.trusted_data.refresh import OKXMarketDataProvider
-from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+from mu_strategy.market_data.trusted_data.refresh import (
+    OKXMarketDataProvider,
+    RefreshTrustedMarketData,
+    RefreshTrustedMarketDataRequest,
+)
 from mu_strategy.market_data.trusted_data.store import SegmentCorrectionError, TrustedDataStore
 from mu_strategy.models import Candle
 
@@ -18,20 +21,65 @@ SYMBOL = "MU-USDT-SWAP"
 LISTING = 1772608500000
 
 
+class _FakeResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+        self.status = 200
+        self.reason = "OK"
+        self.will_close = False
+        self.headers = {}
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _FakeConnection:
+    def __init__(self, scheme, host, port, timeout, payload_bytes: bytes | BaseException):
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self._payload = payload_bytes
+        self.target: str | None = None
+        self.headers: dict[str, str] = {}
+
+    def request(self, method: str, target: str, headers: dict[str, str] | None = None):
+        self.target = target
+        self.headers = dict(headers or {})
+
+    def getresponse(self):
+        if isinstance(self._payload, BaseException):
+            raise self._payload
+        return _FakeResponse(self._payload)
+
+    def close(self):
+        pass
+
+
 class OkxListingTimeTests(unittest.TestCase):
+    def tearDown(self):
+        close_pooled_connections()
+
     def fetch_payload(self, payload):
-        response = io.BytesIO(json.dumps(payload).encode())
-        with patch("mu_strategy.market_data.providers.okx.urllib.request.urlopen", return_value=response) as request:
+        close_pooled_connections()
+        captured: list[_FakeConnection] = []
+
+        def fake_conn(scheme, host, port, timeout):
+            conn = _FakeConnection(scheme, host, port, timeout, json.dumps(payload).encode())
+            captured.append(conn)
+            return conn
+
+        with patch("mu_strategy.market_data.http_pool._new_connection", side_effect=fake_conn):
             result = fetch_okx_listing_time(SYMBOL)
-        return result, request
+        return result, captured[0]
 
     def test_reads_matching_instrument_from_public_endpoint(self):
-        result, request = self.fetch_payload({"code": "0", "data": [{"instId": SYMBOL, "listTime": str(LISTING)}]})
+        result, conn = self.fetch_payload({"code": "0", "data": [{"instId": SYMBOL, "listTime": str(LISTING)}]})
         self.assertEqual(LISTING, result)
-        url = urlsplit(request.call_args.args[0].full_url)
+        url = urlsplit(f"{conn.scheme}://{conn.host}{conn.target}")
         self.assertEqual(("https", "www.okx.com", "/api/v5/public/instruments"), (url.scheme, url.netloc, url.path))
         self.assertEqual({"instType": ["SWAP"], "instId": [SYMBOL]}, parse_qs(url.query))
-        self.assertEqual(20, request.call_args.kwargs["timeout"])
+        self.assertEqual(20.0, conn.timeout)
 
     def test_missing_ambiguous_wrong_or_malformed_metadata_is_rejected(self):
         valid = {"instId": SYMBOL, "listTime": str(LISTING)}
@@ -46,7 +94,10 @@ class OkxListingTimeTests(unittest.TestCase):
                 self.fetch_payload(payload)
 
     def test_transport_failure_is_not_interpreted_as_an_available_start(self):
-        with patch("mu_strategy.market_data.providers.okx.urllib.request.urlopen", side_effect=TimeoutError), self.assertRaises(TimeoutError):
+        def fake_conn(scheme, host, port, timeout):
+            return _FakeConnection(scheme, host, port, timeout, TimeoutError("timeout"))
+
+        with patch("mu_strategy.market_data.http_pool._new_connection", side_effect=fake_conn), self.assertRaises(TimeoutError):
             fetch_okx_listing_time(SYMBOL)
 
     def test_custom_history_requires_explicit_matching_boundary_provider(self):
@@ -71,9 +122,8 @@ class OkxListingTimeTests(unittest.TestCase):
                     b'{"code":"500","data":[]}', b'{broken json']
         for payload in payloads:
             with self.subTest(payload=payload), TemporaryDirectory() as tmp:
+                close_pooled_connections()
                 store = TrustedDataStore(data_dir=Path(tmp))
-                # An unrelated valid generation is allowed to remain current;
-                # an unavailable proof must not replace it with a failed run.
                 initial = OKXMarketDataProvider(history_fetcher=lambda *a, **k: rows)
                 RefreshTrustedMarketData(store, initial).execute(
                     RefreshTrustedMarketDataRequest(requested_intervals=("5m",), symbols=("BTC-USDT-SWAP",),
@@ -82,7 +132,10 @@ class OkxListingTimeTests(unittest.TestCase):
                 pointer = store.current_path.read_bytes()
                 provider = OKXMarketDataProvider(history_fetcher=lambda *a, **k: rows,
                                                  listing_time_fetcher=fetch_okx_listing_time)
-                with patch("mu_strategy.market_data.providers.okx.urllib.request.urlopen", return_value=io.BytesIO(payload)):
+                with patch(
+                    "mu_strategy.market_data.http_pool._new_connection",
+                    side_effect=lambda s, h, p, t, raw=payload: _FakeConnection(s, h, p, t, raw),
+                ):
                     with self.assertRaises(SegmentCorrectionError):
                         RefreshTrustedMarketData(store, provider).execute(
                             RefreshTrustedMarketDataRequest(requested_intervals=("5m",), symbols=(SYMBOL,),

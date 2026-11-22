@@ -8,7 +8,7 @@
 
 - 名称、规则身份、默认集合、可选状态和兼容别名唯一来自 [registry](../mu_strategy/strategies/registry.py)；`second_pullback_limit_8` 是 baseline 的兼容别名。
 - [strategy.py](../mu_strategy/strategy.py) 持有配置与基础规则；[position_rules.py](../mu_strategy/strategies/position_rules.py) 持有共享加仓和止损判断。
-- 查看当前可选策略使用 `python -B -m mu_strategy.cli --help`，避免在多处维护容易失真的完整名单。
+- 查看当前可选策略使用 `python -B -m mu_strategy.cli --list-strategies`，避免在多处维护容易失真的完整名单。
 - 1h regime 只能在该 K 线收盘后被 15m 消费。普通 walk-forward/Fibonacci 分区使用完整输入的因果指标上下文，不能把报告分区当指标重置点；release cold-start 协议另有定义。
 - [Fibonacci 参数记录](fibonacci-preferred-parameters.md) 是历史实验来源，当前可执行值以配置为准；早期研究文字不覆盖现行 baseline。
 
@@ -23,7 +23,7 @@
 ```powershell
 python -B -m mu_strategy.cli --days 180 --strategy baseline --report reports/live/mu_okx_backtest.md
 python -B -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports/live/mu_okx_backtest.html
-python -B -m mu_strategy.walk_forward --window-days 14 --windows 2 --report reports/live/wf.md --html-report reports/live/wf.html
+python -B -m mu_strategy.experiments.walk_forward --window-days 14 --windows 2 --report reports/live/wf.md --html-report reports/live/wf.html
 python -B -m mu_strategy.experiments.fibonacci_pullback --days 60 --report reports/live/fib.md
 python -B -m mu_strategy.experiments.strategy_ladder --window-days 14 --windows 2 --report reports/live/ladder.md --html-report reports/live/ladder.html --conclusion-index reports/live/ladder.json
 ```
@@ -43,11 +43,11 @@ python -B -m mu_strategy.experiments.strategy_ladder --generation-id $generation
 
 历史模式经 [research.historical_data](../mu_strategy/research/historical_data.py) 唯一 reader 读取指定快照，不读 `current.json`，不按本轮时钟判断历史过期。未知 ID、路径、manifest/hash、时序、未收盘数据或覆盖错误仍失败。schema-v3 flat 与 v4 segmented 都保留严格验证；不会联网补数据或回退 current。
 
-窗口结束于有效周期共同覆盖的最后一个完整小时，采用结束时间不包含的区间。`--days` 须被完整覆盖；ladder 另需 8 天输入历史供最长 169 小时动量预热。因此历史窗口终点可能早于 current 模式的最后一根 15m K 线，不能据此推断规则发生变化。
+窗口结束于有效周期共同覆盖的最后一个完整小时，采用结束时间不包含的区间。普通 `cli` / `visualize` 历史回放在指定 `--days` 大于该 generation 可用完整天数时，默认与 cache-only 模式一致使用全部可用完整历史（并在 provenance 中标注 `coverage_state=partial_available_history`、`requested_days` 与 `effective_days`）；传入 `--strict-coverage` 时按严格完整覆盖 fail-closed。`strategy_ladder` 另需 8 天输入历史供最长 169 小时动量预热。因此历史窗口终点可能早于 current 模式的最后一根 15m K 线，不能据此推断规则发生变化。
 
 `historical_replay` provenance 记录 generation、原始与选中数据的 hash、发布时间、历史 freshness、窗口和完整配置。`code_sha256` 绑定当前 `mu_strategy/**/*.py` 内容（路径稳定、换行统一 LF），不是 Git commit ID；`configuration_sha256` 绑定完整配置。相同输入的产物不含运行时钟和本机目录，可作字节重放比较。
 
-普通 walk-forward/Fibonacci CLI 尚未提供这个历史参数；release 实验已有另一套明确的 cold-start 协议，见[发布溯源](strategy-release-provenance.md)。Demo/scanner 不接受历史回放参数，历史结论不代表当前行情可交易。
+普通 walk-forward/Fibonacci CLI 尚未提供这个历史参数；配置规范化编码与溯源契约见[发布溯源](strategy-release-provenance.md)。Demo/scanner 不接受历史回放参数，历史结论不代表当前行情可交易。
 
 ## 收益、成本和比较口径
 
@@ -86,6 +86,6 @@ python -B -m mu_strategy.cli --days 180 --strategy baseline --fee-profile limit 
 
 加仓必须遵循[信息、候选、计划与成交的时间契约](pyramid-execution-timing.md)：信号根只产生收盘候选，紧接下一根才可执行；跳空、未触价、失效、时段和风险优先级均有明确处理。旧的同根加仓报告必须重跑，不能直接删掉审计中“不满足上一根指标”的交易；固定 generation 的收益影响、完整首个分歧与复利说明见[配对验证记录](pyramid-execution-validation.md)。
 
-严格候选、SCM 审批快照和 exact-ID release resolver 已实现，但当前仓库未保存已批准策略 release。第一阶段研究无需靠发布 release 才能开展；第二阶段执行前置由 [#100](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/100) 承接，详见[产品路线](product-roadmap.md)。不得用 mock release、自动挑最高收益或宽松 resolver 接通执行。
+当前仓库保留轻量规范配置编解码（`mu_strategy/research/strategy_releases.py` 中的 `StrategyConfigPayloadV1` / `V2`），未保存已批准策略 release；早期未接入运行的候选构建、SCM 审批发布与 Stage 30-B intent/store 脚手架已随仓库精简移除。第一阶段研究无需靠发布 release 才能开展；第二阶段执行前置由 [#100](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/100) 承接，详见[产品路线](product-roadmap.md)。不得用 mock release、自动挑最高收益或宽松 resolver 接通执行。
 
 新建 registry 配置采用[标的交易日历](trading-calendar.md)，美股参考日历目前覆盖 2025–2028。新增日历会改变休市/提前收盘期间的入场、加仓和非时段风险判定，须按新配置身份重新评估；旧 V1 实验与持仓配置保留旧语义，不混合比较为同一 baseline。

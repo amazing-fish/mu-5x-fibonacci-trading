@@ -136,7 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_CONCURRENCY,
         help=(
             "Maximum concurrent symbol/interval fetches. Must be positive; "
-            f"defaults to the conservative value {DEFAULT_MAX_CONCURRENCY}."
+            f"defaults to {DEFAULT_MAX_CONCURRENCY}."
         ),
     )
     parser.add_argument(
@@ -176,7 +176,7 @@ def _write_dashboard_or_warning(manifest: dict[str, Any], html_output: Path | No
         return ()
     try:
         write_data_health_dashboard(manifest, html_output)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         return (f"dashboard_write_failed: {exc}",)
     return ()
 

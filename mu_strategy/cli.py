@@ -16,10 +16,33 @@ from mu_strategy.research.historical_data import (
 )
 from mu_strategy.research.strategy_releases import StrategyConfigPayloadV2
 from mu_strategy.reporting import candle_sample_summary, render_markdown_report
-from mu_strategy.strategies.registry import selected_strategy_groups
+from mu_strategy.strategies.registry import selected_strategy_groups, strategy_group_registrations
 from mu_strategy.strategy import FEE_PROFILE_CHOICES, with_fee_profile
 
 TRUSTED_REQUESTED_INTERVALS = ("15m", "1h")
+
+
+def format_strategy_list() -> str:
+    lines: list[str] = []
+    for registration in strategy_group_registrations():
+        if not registration.selectable:
+            continue
+        tags: list[str] = []
+        if registration.is_default:
+            tags.append("default")
+        if registration.aliases:
+            tags.append(f"aliases: {', '.join(registration.aliases)}")
+        suffix = f" ({'; '.join(tags)})" if tags else ""
+        lines.append(f"{registration.name}{suffix} - {registration.label}")
+    return "\n".join(lines)
+
+
+def _available_strategy_names() -> str:
+    return ", ".join(
+        registration.name
+        for registration in strategy_group_registrations()
+        if registration.selectable
+    )
 
 
 def main() -> None:
@@ -27,9 +50,23 @@ def main() -> None:
     parser.add_argument("--symbol", default="MU-USDT-SWAP")
     parser.add_argument("--generation-id", help="Explicit trusted historical generation; research replay only.")
     parser.add_argument("--days", type=int, default=14)
+    parser.add_argument(
+        "--strict-coverage",
+        action="store_true",
+        help="Fail closed when --generation-id has fewer complete days than --days instead of replaying partial available history.",
+    )
     parser.add_argument("--data-dir", type=Path, help="Trusted data store directory. Defaults to data/live.")
     parser.add_argument("--report", type=Path, default=Path("reports/live/mu_okx_backtest.md"))
-    parser.add_argument("--strategy", default="baseline", help="Single strategy group name to backtest.")
+    parser.add_argument(
+        "--strategy",
+        default="baseline",
+        help="Single strategy group name to backtest (use --list-strategies to inspect registered names).",
+    )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="List all registered selectable strategy names and exit.",
+    )
     parser.add_argument(
         "--fee-profile",
         choices=FEE_PROFILE_CHOICES,
@@ -38,10 +75,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.list_strategies:
+        print(format_strategy_list())
+        return
+
     try:
         groups = selected_strategy_groups(args.symbol, [args.strategy])
     except ValueError as exc:
-        parser.error(str(exc))
+        parser.error(f"{exc}. Available strategies: {_available_strategy_names()} (use --list-strategies for details)")
     if len(groups) != 1:
         parser.error("--strategy must resolve to exactly one strategy group")
     config = with_fee_profile(groups[0].config, args.fee_profile)
@@ -55,6 +96,7 @@ def main() -> None:
                 generation_id=args.generation_id,
                 symbol=resolve_okx_swap_symbol(args.symbol).inst_id,
                 days=args.days,
+                allow_partial=not args.strict_coverage,
             )
             provenance = window.provenance({
                 "strategy": args.strategy,

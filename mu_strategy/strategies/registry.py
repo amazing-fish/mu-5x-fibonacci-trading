@@ -3,13 +3,14 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from mu_strategy.strategies.components import StrategyComponents
+from mu_strategy.strategies.instruments import instrument_calendar
 from mu_strategy.strategies.presets.fibonacci import preferred_fib_lookback
+from mu_strategy.strategy import StrategyConfig
 
-if TYPE_CHECKING:
-    from mu_strategy.strategy import StrategyConfig
+
+_SUPPORTED_ORDER_TYPES = frozenset({"limit", "stop", "market"})
 
 
 @dataclass(frozen=True)
@@ -30,15 +31,17 @@ class StrategyRuleDescriptor:
             raise ValueError("strategy_rule_id must be a versioned canonical identity")
         if not self.strategy_name:
             raise ValueError("strategy_name is required")
-        if self.side != "buy" or self.order_type != "limit":
-            raise ValueError("R0 rule descriptors must describe the long-only limit-entry shape")
+        if self.side != "buy" or self.order_type not in _SUPPORTED_ORDER_TYPES:
+            raise ValueError(
+                "rule descriptors must describe a long-only buy shape with limit, stop, or market order_type"
+            )
 
 
 @dataclass(frozen=True)
 class StrategyGroup:
     name: str
     label: str
-    config: "StrategyConfig"
+    config: StrategyConfig
     components: StrategyComponents = field(default_factory=StrategyComponents)
 
     @property
@@ -50,7 +53,7 @@ class StrategyGroup:
 class StrategyGroupRegistration:
     descriptor: StrategyRuleDescriptor
     label: str
-    config_factory: Callable[[str], "StrategyConfig"]
+    config_factory: Callable[[str], StrategyConfig]
     components: StrategyComponents = field(default_factory=StrategyComponents)
     selectable: bool = True
     is_default: bool = False
@@ -88,15 +91,12 @@ def validate_strategy_rule_descriptors(descriptors: tuple[StrategyRuleDescriptor
         raise ValueError("strategy_name values must be unique")
 
 
-def _config(**kwargs) -> "StrategyConfig":
-    from mu_strategy.strategy import StrategyConfig
-    from mu_strategy.strategies.instruments import instrument_calendar
-
+def _config(**kwargs) -> StrategyConfig:
     kwargs.setdefault("trading_calendar_id", instrument_calendar(kwargs.get("symbol", "MUUSDT")))
     return StrategyConfig(**kwargs)
 
 
-def _baseline_config(symbol: str = "MUUSDT", **kwargs) -> "StrategyConfig":
+def _baseline_config(symbol: str = "MUUSDT", **kwargs) -> StrategyConfig:
     return _config(
         symbol=symbol,
         entry_execution="second_pullback",
@@ -109,11 +109,11 @@ def _baseline_config(symbol: str = "MUUSDT", **kwargs) -> "StrategyConfig":
 _STRATEGY_GROUP_REGISTRATIONS = (
     StrategyGroupRegistration(
         descriptor=StrategyRuleDescriptor(
-            "mu.legacy_break_high.long_limit.v1",
+            "mu.legacy_break_high.long_stop.v1",
             "legacy_break_high",
             1,
             "buy",
-            "limit",
+            "stop",
         ),
         label="旧突破前高baseline备用",
         config_factory=lambda symbol: _config(symbol=symbol),
@@ -135,11 +135,11 @@ _STRATEGY_GROUP_REGISTRATIONS = (
     ),
     StrategyGroupRegistration(
         descriptor=StrategyRuleDescriptor(
-            "mu.direct_next_open.long_limit.v1",
+            "mu.direct_next_open.long_market.v1",
             "direct_next_open",
             1,
             "buy",
-            "limit",
+            "market",
         ),
         label="回踩确认后下一根开盘买入",
         config_factory=lambda symbol: _config(
@@ -347,11 +347,11 @@ _STRATEGY_GROUP_REGISTRATIONS = (
     ),
     StrategyGroupRegistration(
         descriptor=StrategyRuleDescriptor(
-            "mu.optimized.long_limit.v2",
+            "mu.optimized.long_stop.v2",
             "optimized_v2",
             2,
             "buy",
-            "limit",
+            "stop",
         ),
         label="优化策略 v2",
         config_factory=lambda symbol: _config(
@@ -426,92 +426,15 @@ def strategy_rule_descriptor(strategy_name: str) -> StrategyRuleDescriptor:
         raise ValueError(f"strategy has no registered rule identity: {strategy_name}") from exc
 
 
-def _build_registered_strategy_group(
-    strategy_name: str,
-    symbol: str,
-) -> StrategyGroup:
-    return _REGISTRATION_BY_CANONICAL_NAME[strategy_name].build(symbol)
+def strategy_group(strategy_name: str, symbol: str = "MUUSDT") -> StrategyGroup:
+    registration = _REGISTRATION_BY_SELECTION_NAME.get(strategy_name)
+    if registration is None or not registration.selectable:
+        raise ValueError(f"unknown strategy group: {strategy_name}")
+    return registration.build(symbol)
 
 
 def baseline_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline", symbol)
-
-
-def legacy_break_high_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("legacy_break_high", symbol)
-
-
-def direct_next_open_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("direct_next_open", symbol)
-
-
-def second_pullback_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    baseline = baseline_strategy_group(symbol)
-    return StrategyGroup(
-        name="second_pullback_limit_8",
-        label="回踩确认后等待二次回踩买入",
-        config=baseline.config,
-        components=baseline.components,
-    )
-
-
-def baseline_half_protect_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_half_protect", symbol)
-
-
-def baseline_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_green_wide", symbol)
-
-
-def baseline_green_only_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_green_only_wide", symbol)
-
-
-def baseline_yellow_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_yellow_wide", symbol)
-
-
-def baseline_yellow_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_yellow_green_wide", symbol)
-
-
-def baseline_half_green_wide_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_half_green_wide", symbol)
-
-
-def baseline_delayed_tighten_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("baseline_delayed_tighten", symbol)
-
-
-def baseline_delayed_tighten_slow_start_strategy_group(
-    symbol: str = "MUUSDT",
-) -> StrategyGroup:
-    return _build_registered_strategy_group(
-        "baseline_delayed_tighten_slow_start",
-        symbol,
-    )
-
-
-def baseline_delayed_tighten_fast_start_strategy_group(
-    symbol: str = "MUUSDT",
-) -> StrategyGroup:
-    return _build_registered_strategy_group(
-        "baseline_delayed_tighten_fast_start",
-        symbol,
-    )
-
-
-def baseline_delayed_tighten_smooth_strategy_group(
-    symbol: str = "MUUSDT",
-) -> StrategyGroup:
-    return _build_registered_strategy_group(
-        "baseline_delayed_tighten_smooth",
-        symbol,
-    )
-
-
-def optimized_strategy_group(symbol: str = "MUUSDT") -> StrategyGroup:
-    return _build_registered_strategy_group("optimized_v2", symbol)
+    return _REGISTRATION_BY_CANONICAL_NAME["baseline"].build(symbol)
 
 
 def default_strategy_groups(symbol: str = "MUUSDT") -> list[StrategyGroup]:

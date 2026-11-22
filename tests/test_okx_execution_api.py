@@ -1,16 +1,24 @@
+import io
 import json
+import ssl
 import tempfile
+import threading
 import unittest
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import mu_strategy.live.okx as okx_module
 from mu_strategy.live.okx import (
     DemoOrderRequest,
     OKXCredentials,
+    OKXHTTPError,
     OKXInstrumentSpec,
     OKXRestClient,
     ShadowExecutionEvent,
     ShadowExecutionLedger,
+    _PooledHTTPTransport,
     build_shadow_event,
 )
 
@@ -33,16 +41,39 @@ class RecordingTransport:
 
 
 class OKXRestClientTests(unittest.TestCase):
-    def test_credentials_auto_source_prefers_windows_user_env_over_stale_process_env(self):
+    def test_credentials_auto_source_prioritizes_process_env_over_windows_registry(self):
         process_env = {
-            "OKX_API_KEY": "stale-process-key",
-            "OKX_SECRET_KEY": "stale-process-secret",
-            "OKX_PASSPHRASE": "shared-passphrase",
+            "OKX_API_KEY": "process-key",
+            "OKX_SECRET_KEY": "process-secret",
+            "OKX_PASSPHRASE": "process-passphrase",
         }
         user_env = {
-            "OKX_API_KEY": "fresh-user-key",
-            "OKX_SECRET_KEY": "fresh-user-secret",
-            "OKX_PASSPHRASE": "shared-passphrase",
+            "OKX_API_KEY": "registry-user-key",
+            "OKX_SECRET_KEY": "registry-user-secret",
+            "OKX_PASSPHRASE": "registry-passphrase",
+        }
+
+        with patch.dict("os.environ", process_env, clear=True):
+            with patch("mu_strategy.live.okx.os.name", "nt"):
+                with patch(
+                    "mu_strategy.live.okx._read_windows_environment",
+                    return_value=user_env,
+                ) as read_winreg:
+                    credentials = OKXCredentials.from_env()
+
+        self.assertEqual("process-key", credentials.api_key)
+        self.assertEqual("process-secret", credentials.secret_key)
+        self.assertEqual("process-passphrase", credentials.passphrase)
+        read_winreg.assert_not_called()
+
+    def test_credentials_auto_source_falls_back_to_windows_registry_when_process_env_is_incomplete(self):
+        process_env = {
+            "OKX_API_KEY": "only-partial-key",
+        }
+        user_env = {
+            "OKX_API_KEY": "registry-user-key",
+            "OKX_SECRET_KEY": "registry-user-secret",
+            "OKX_PASSPHRASE": "registry-passphrase",
         }
 
         def read_windows_environment(prefix, scope):
@@ -53,13 +84,12 @@ class OKXRestClientTests(unittest.TestCase):
                 with patch(
                     "mu_strategy.live.okx._read_windows_environment",
                     side_effect=read_windows_environment,
-                    create=True,
                 ):
                     credentials = OKXCredentials.from_env()
 
-        self.assertEqual("fresh-user-key", credentials.api_key)
-        self.assertEqual("fresh-user-secret", credentials.secret_key)
-        self.assertEqual("shared-passphrase", credentials.passphrase)
+        self.assertEqual("registry-user-key", credentials.api_key)
+        self.assertEqual("registry-user-secret", credentials.secret_key)
+        self.assertEqual("registry-passphrase", credentials.passphrase)
 
     def test_credentials_process_source_keeps_explicit_process_override(self):
         process_env = {
@@ -461,6 +491,339 @@ class DemoOrderGuardTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PermissionError, "demo"):
             client.prepare_demo_order(DemoOrderRequest(inst_id="MU-USDT-SWAP", side="buy", size="1"))
+
+    def test_dead_floor_to_step_removed(self):
+        self.assertFalse(hasattr(okx_module, "_floor_to_step"))
+
+
+class PooledHTTPTransportTests(unittest.TestCase):
+    def _start_server(self, handler_cls):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_keep_alive_reuses_single_tcp_connection_and_decodes_http_errors(self):
+        connections = []
+        requests_seen = []
+
+        class KeepAliveHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                requests_seen.append(self.path)
+                if "fail400" in self.path:
+                    payload = json.dumps({"code": "51001", "msg": "Instrument does not exist", "data": []}).encode()
+                    self.send_response(400)
+                else:
+                    payload = json.dumps({"code": "0", "data": [{"ok": len(requests_seen)}], "msg": ""}).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        base_url = self._start_server(KeepAliveHandler)
+        transport = _PooledHTTPTransport(max_get_attempts=3, backoff_seconds=0.0, sleeper=lambda _s: None)
+        self.addCleanup(transport.close)
+        client = OKXRestClient(credentials=None, demo=True, base_url=base_url, transport=transport)
+
+        first = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+        second = client.get_instruments(inst_type="SWAP", inst_id="BTC-USDT-SWAP")
+        self.assertEqual("0", first["code"])
+        self.assertEqual("0", second["code"])
+        self.assertEqual(1, len(connections), "expected HTTP keep-alive to reuse one TCP socket")
+
+        with self.assertRaises(OKXHTTPError) as raised:
+            client.get_instruments(inst_type="SWAP", inst_id="fail400")
+        self.assertEqual(400, raised.exception.status)
+        self.assertEqual("51001", raised.exception.code)
+        self.assertEqual("Instrument does not exist", raised.exception.msg)
+        self.assertEqual({"code": "51001", "msg": "Instrument does not exist", "data": []}, raised.exception.payload)
+        self.assertIn("51001", str(raised.exception))
+        # Non-retryable 400 must not be retried.
+        self.assertEqual(3, len(requests_seen))
+
+    def test_idempotent_get_retries_transient_503_and_429_but_post_never_retries(self):
+        get_attempts = 0
+        post_attempts = 0
+        sleeps = []
+
+        class TransientErrorHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                nonlocal get_attempts
+                get_attempts += 1
+                if get_attempts == 1:
+                    body = json.dumps({"code": "50011", "msg": "Too Many Requests", "data": []}).encode()
+                    self.send_response(429)
+                    self.send_header("Retry-After", "0.05")
+                elif get_attempts == 2:
+                    body = b"temporary gateway error"
+                    self.send_response(503)
+                else:
+                    body = json.dumps({"code": "0", "data": [{"recovered": True}], "msg": ""}).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                nonlocal post_attempts
+                post_attempts += 1
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                body = json.dumps({"code": "50001", "msg": "Service temporarily unavailable", "data": []}).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        base_url = self._start_server(TransientErrorHandler)
+        transport = _PooledHTTPTransport(max_get_attempts=3, backoff_seconds=0.1, sleeper=sleeps.append)
+        self.addCleanup(transport.close)
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            base_url=base_url,
+            transport=transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+
+        result = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+        self.assertEqual("0", result["code"])
+        self.assertEqual(3, get_attempts)
+        self.assertEqual([0.05, 0.2], sleeps)
+
+        # Non-idempotent POST order placement must NEVER retry on 503.
+        with self.assertRaises(OKXHTTPError) as raised:
+            client.place_demo_order(
+                DemoOrderRequest(inst_id="MU-USDT-SWAP", side="buy", size="1", order_type="market", client_order_id="NORE1"),
+                confirm_demo_order=True,
+            )
+        self.assertEqual(1, post_attempts)
+        self.assertEqual(503, raised.exception.status)
+        self.assertEqual("50001", raised.exception.code)
+
+    def test_urllib_http_error_from_custom_transport_preserves_okx_json_payload(self):
+        def failing_transport(method, url, *, headers, body, timeout):
+            fp = io.BytesIO(json.dumps({"code": "50111", "msg": "Invalid OK-ACCESS-KEY", "data": []}).encode())
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, fp)
+
+        client = OKXRestClient(
+            credentials=OKXCredentials("key", "secret", "passphrase"),
+            demo=True,
+            transport=failing_transport,
+            timestamp_factory=lambda: "2026-06-17T00:00:00.000Z",
+        )
+        with self.assertRaises(OKXHTTPError) as raised:
+            client.get_balance(ccy="USDT")
+        self.assertEqual(401, raised.exception.status)
+        self.assertEqual("50111", raised.exception.code)
+        self.assertEqual("Invalid OK-ACCESS-KEY", raised.exception.msg)
+
+    def test_stale_keep_alive_socket_reconnects_automatically_on_get(self):
+        calls = 0
+
+        class DropAfterFirstHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                nonlocal calls
+                calls += 1
+                payload = json.dumps({"code": "0", "data": [{"call": calls}], "msg": ""}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+                if calls == 1:
+                    # Force-close the server side without a Connection: close header so the
+                    # client sees a stale keep-alive socket on its next request.
+                    self.close_connection = True
+
+        base_url = self._start_server(DropAfterFirstHandler)
+        with OKXRestClient(credentials=None, demo=True, base_url=base_url) as client:
+            first = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+            second = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+        self.assertEqual(1, first["data"][0]["call"])
+        self.assertEqual(2, second["data"][0]["call"])
+
+    def test_https_transport_caches_and_reuses_default_ssl_context(self):
+        fake_context = MagicMock(spec=ssl.SSLContext)
+        seen_contexts = []
+
+        def fake_https_connection(host, port, *, timeout=None, context=None):
+            seen_contexts.append((host, port, timeout, context))
+            conn = MagicMock()
+            conn.sock = None
+            return conn
+
+        transport = _PooledHTTPTransport()
+        self.addCleanup(transport.close)
+        with patch.object(okx_module, "_DEFAULT_SSL_CONTEXT", None):
+            with patch("mu_strategy.live.okx.ssl.create_default_context", return_value=fake_context) as create_ctx:
+                with patch("mu_strategy.live.okx.http.client.HTTPSConnection", side_effect=fake_https_connection):
+                    transport._acquire(("https", "www.okx.com", 443, 20))
+                    transport._acquire(("https", "aws.okx.com", 443, 20))
+
+        create_ctx.assert_called_once_with()
+        self.assertEqual(2, len(seen_contexts))
+        self.assertIs(fake_context, seen_contexts[0][3])
+        self.assertIs(fake_context, seen_contexts[1][3])
+
+    def test_https_transport_uses_custom_ssl_context_when_supplied(self):
+        custom_context = MagicMock(spec=ssl.SSLContext)
+        captured = {}
+
+        def fake_https_connection(host, port, *, timeout=None, context=None):
+            captured["context"] = context
+            conn = MagicMock()
+            conn.sock = None
+            return conn
+
+        client = OKXRestClient(credentials=None, demo=True, ssl_context=custom_context)
+        self.addCleanup(client.close)
+        with patch.object(okx_module, "_DEFAULT_SSL_CONTEXT", None):
+            with patch("mu_strategy.live.okx.ssl.create_default_context", side_effect=AssertionError("default ctx must not be created")):
+                with patch("mu_strategy.live.okx.http.client.HTTPSConnection", side_effect=fake_https_connection):
+                    client._owned_transport._acquire(("https", "www.okx.com", 443, 20))
+
+        self.assertIs(custom_context, captured["context"])
+
+    def test_https_transport_honors_configured_proxy_and_bypass(self):
+        fake_context = MagicMock(spec=ssl.SSLContext)
+        created = []
+
+        def fake_https_connection(host, port, *, timeout=None, context=None):
+            conn = MagicMock()
+            conn.sock = None
+            created.append((host, port, timeout, context, conn))
+            return conn
+
+        transport = _PooledHTTPTransport(ssl_context=fake_context)
+        self.addCleanup(transport.close)
+        with patch("mu_strategy.live.okx.http.client.HTTPSConnection", side_effect=fake_https_connection):
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://u:p@proxy.local:8443"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+            ):
+                transport._acquire(("https", "www.okx.com", 443, 20))
+
+            host, port, timeout, ctx, conn = created[-1]
+            self.assertEqual(("proxy.local", 8443, 20), (host, port, timeout))
+            self.assertIs(fake_context, ctx)
+            conn.set_tunnel.assert_called_once()
+            self.assertEqual(("www.okx.com",), conn.set_tunnel.call_args.args)
+            self.assertEqual(443, conn.set_tunnel.call_args.kwargs["port"])
+            self.assertIn("Proxy-Authorization", conn.set_tunnel.call_args.kwargs["headers"])
+
+            with (
+                patch(
+                    "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                    return_value={"https": "http://proxy.local:8443"},
+                ),
+                patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=True),
+            ):
+                transport._acquire(("https", "aws.okx.com", 443, 20))
+
+            host, port, _timeout, _ctx, conn = created[-1]
+            self.assertEqual(("aws.okx.com", 443), (host, port))
+            conn.set_tunnel.assert_not_called()
+
+    def test_http_proxy_routes_client_requests_with_keep_alive(self):
+        connections = []
+        seen_paths = []
+
+        class ProxyHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                super().setup()
+                connections.append(self.client_address)
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                seen_paths.append((self.path, self.headers.get("Host")))
+                payload = json.dumps({"code": "0", "data": [{"ok": len(seen_paths)}], "msg": ""}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        proxy_url = self._start_server(ProxyHandler)
+        with (
+            patch("mu_strategy.market_data.http_pool.urllib.request.getproxies", return_value={"http": proxy_url}),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            with OKXRestClient(credentials=None, demo=True, base_url="http://okx.invalid") as client:
+                first = client.get_instruments(inst_type="SWAP", inst_id="MU-USDT-SWAP")
+                second = client.get_instruments(inst_type="SWAP", inst_id="BTC-USDT-SWAP")
+
+        self.assertEqual("0", first["code"])
+        self.assertEqual("0", second["code"])
+        self.assertEqual(1, len(connections))
+        self.assertEqual(
+            [
+                ("http://okx.invalid/api/v5/public/instruments?instType=SWAP&instId=MU-USDT-SWAP", "okx.invalid"),
+                ("http://okx.invalid/api/v5/public/instruments?instType=SWAP&instId=BTC-USDT-SWAP", "okx.invalid"),
+            ],
+            seen_paths,
+        )
+
+    def test_transport_rejects_https_proxy_for_https_target_and_socks_proxy_before_io(self):
+        transport = _PooledHTTPTransport(max_get_attempts=3, backoff_seconds=0.0, sleeper=lambda _s: None)
+        self.addCleanup(transport.close)
+        with (
+            patch(
+                "mu_strategy.live.okx.http.client.HTTPSConnection",
+                side_effect=AssertionError("must fail closed before opening socket"),
+            ),
+            patch("mu_strategy.market_data.http_pool.urllib.request.proxy_bypass", return_value=False),
+        ):
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"https": "https://user:s3cr3t@proxy.local:443"},
+            ):
+                with self.assertRaisesRegex(ValueError, "TLS-in-TLS") as raised:
+                    transport("GET", "https://www.okx.com/api/v5/public/time", headers={}, body=None, timeout=10)
+                self.assertNotIn("s3cr3t", str(raised.exception))
+                self.assertNotIn("user", str(raised.exception))
+
+            with patch(
+                "mu_strategy.market_data.http_pool.urllib.request.getproxies",
+                return_value={"all": "socks5://127.0.0.1:1080"},
+            ):
+                with self.assertRaisesRegex(ValueError, "unsupported proxy scheme 'socks5'"):
+                    transport("GET", "https://www.okx.com/api/v5/public/time", headers={}, body=None, timeout=10)
 
 
 if __name__ == "__main__":

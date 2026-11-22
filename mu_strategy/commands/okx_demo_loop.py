@@ -47,42 +47,60 @@ def main(
         max_open_positions=args.max_open_positions,
         leverage=args.leverage,
         dry_run=dry_run,
+        fetch_instrument_specs=args.fetch_instrument_sizing,
         watchlist_symbols=_watchlist_symbols(args),
         observation_log_path=(args.observation_log or DEFAULT_STAGE0_OBSERVATION_LOG) if dry_run else None,
     )
-    broker = _build_broker(dry_run=dry_run, credential_source=args.credential_source)
+    broker = _build_broker(
+        dry_run=dry_run,
+        credential_source=args.credential_source,
+        fetch_instrument_sizing=args.fetch_instrument_sizing,
+    )
 
-    if args.once:
-        payload = runner(config, broker=broker)
-        stdout.write(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
-        stdout.write("\n")
-        _write_dashboard_safely(
-            payload,
+    try:
+        if args.once:
+            payload = runner(config, broker=broker)
+            stdout.write(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True))
+            stdout.write("\n")
+            _write_dashboard_safely(
+                payload,
+                dashboard_output=args.dashboard_output,
+                dashboard_refresh_seconds=args.dashboard_refresh_seconds,
+                dashboard_writer=dashboard_writer,
+                stderr=sys.stderr,
+            )
+            return 0
+
+        _run_forever(
+            config,
+            broker=broker,
+            interval_seconds=args.interval_seconds,
+            runner=runner,
+            stdout=stdout,
+            stderr=sys.stderr,
             dashboard_output=args.dashboard_output,
             dashboard_refresh_seconds=args.dashboard_refresh_seconds,
             dashboard_writer=dashboard_writer,
-            stderr=sys.stderr,
         )
         return 0
-
-    _run_forever(
-        config,
-        broker=broker,
-        interval_seconds=args.interval_seconds,
-        runner=runner,
-        stdout=stdout,
-        stderr=sys.stderr,
-        dashboard_output=args.dashboard_output,
-        dashboard_refresh_seconds=args.dashboard_refresh_seconds,
-        dashboard_writer=dashboard_writer,
-    )
-    return 0
+    finally:
+        if broker is not None and hasattr(broker, "close"):
+            broker.close()
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scan trusted manifest universe symbols and place guarded demo limit orders.")
     parser.add_argument("--once", action="store_true", help="Run one scan cycle and exit.")
-    parser.add_argument("--dry-run", action="store_true", help="Plan orders without private account calls or placement.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan orders offline without private account calls, public network sizing lookups, or placement.",
+    )
+    parser.add_argument(
+        "--fetch-instrument-sizing",
+        action="store_true",
+        help="Opt in to live public OKX instrument lookups during --dry-run order sizing (makes public HTTPS requests).",
+    )
     parser.add_argument("--confirm-demo-orders", action="store_true", help="Allow real OKX demo trading order placement.")
     parser.add_argument("--interval-seconds", type=int, default=300)
     parser.add_argument(
@@ -137,7 +155,14 @@ def _watchlist_symbols(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(symbols)
 
 
-def _build_broker(*, dry_run: bool, credential_source: str | None) -> OKXRestClient:
+def _build_broker(
+    *,
+    dry_run: bool,
+    credential_source: str | None,
+    fetch_instrument_sizing: bool = False,
+) -> OKXRestClient | None:
+    if dry_run and not fetch_instrument_sizing:
+        return None
     credentials = None if dry_run else OKXCredentials.from_env(source=credential_source)
     return OKXRestClient(credentials=credentials, demo=True)
 
@@ -145,7 +170,7 @@ def _build_broker(*, dry_run: bool, credential_source: str | None) -> OKXRestCli
 def _run_forever(
     config: DemoTradingConfig,
     *,
-    broker: OKXRestClient,
+    broker: OKXRestClient | None,
     interval_seconds: int,
     runner: Runner,
     stdout: TextIO,

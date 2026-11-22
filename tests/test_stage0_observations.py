@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from mu_strategy.canonical import canonical_json, canonical_sha256
 from mu_strategy.entry.scanner import EntryScanResult
+from mu_strategy.file_locks import FileLockBusyError
 from mu_strategy.market_data.trusted_data.contracts import HealthReason
 from mu_strategy.models import EntryDecisionCode, EntryDecisionStage, EntryDisposition
 from mu_strategy.observations import (
@@ -230,30 +232,450 @@ class Stage0ObservationContractTests(unittest.TestCase):
                 with self.assertRaises((TypeError, ValueError)):
                     Stage0ScanResult.from_dict(malformed)
 
-    def test_fsync_failure_leaves_marker_that_prevents_consuming_visible_bytes(self):
+    def test_fsync_failure_rolls_back_uncommitted_bytes_without_poisoning_prior_cycles(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
-            with patch("mu_strategy.observations.os.fsync", side_effect=OSError("disk failure")):
-                with self.assertRaises(ObservationWriteError):
-                    repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            real_fsync = __import__("os").fsync
+            calls = []
+
+            def fail_append_then_sync_rollback(fd):
+                calls.append(fd)
+                if len(calls) == 1:
+                    raise OSError("disk failure")
+                return real_fsync(fd)
+
+            with patch("mu_strategy.observations.os.fsync", side_effect=fail_append_then_sync_rollback):
+                with self.assertRaisesRegex(ObservationWriteError, "disk failure"):
+                    repository.append_cycle(_cycle("cycle-b", "obs-b"))
+
+            self.assertEqual(2, len(calls), "rollback must fsync the truncated file before releasing the fence")
+            self.assertFalse(repository.invalid_marker_path.exists())
+            self.assertEqual((first,), JsonlObservationRepository(path).read_cycles())
+
+    def test_rollback_fsync_failure_quarantines_log_until_repair(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            with patch("mu_strategy.observations.os.fsync", side_effect=OSError("persistent disk failure")):
+                with self.assertRaisesRegex(ObservationWriteError, "persistent disk failure"):
+                    repository.append_cycle(_cycle("cycle-b", "obs-b"))
 
             self.assertTrue(repository.invalid_marker_path.exists())
+            with self.assertRaisesRegex(ObservationWriteError, "invalid marker"):
+                repository.append_cycle(_cycle("cycle-c", "obs-c"))
             with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
-                JsonlObservationRepository(path).read_cycles()
+                repository.read_cycles()
 
-    def test_append_fsyncs_parent_directory_for_marker_log_creation_and_marker_removal(self):
+    def test_terminated_writer_before_commit_boundary_is_rejected_by_readers_and_repaired_before_append(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            third = _cycle("cycle-c", "obs-c")
+            repository.append_cycle(first)
+            _, cursor_a = repository.read_batch()
+            committed_log_size = path.stat().st_size
+            committed_index_size = repository.index_path.stat().st_size
+
+            # Simulate SIGKILL after writing complete cycle B + index entry before commit advancement.
+            with path.open("ab") as handle:
+                handle.write((second.to_json() + "\n").encode("utf-8"))
+            with repository.index_path.open("ab") as idx_handle:
+                idx_handle.write(b"\x00" * 80)
+
+            with self.assertRaisesRegex(ObservationCorruptionError, "uncommitted"):
+                repository.read_batch(offset=cursor_a[0], anchor_start=cursor_a[1], anchor_sha256=cursor_a[2])
+            with self.assertRaisesRegex(ObservationCorruptionError, "uncommitted"):
+                repository.read_cycles()
+            with self.assertRaisesRegex(ObservationCorruptionError, "uncommitted"):
+                repository.read_tail(limit=5)
+
+            # Supported explicit repair truncates & fsyncs both log and index, keeping cursor_a valid.
+            real_fsync = __import__("os").fsync
+            sync_fds: list[int] = []
+            with patch("mu_strategy.observations.os.fsync", side_effect=lambda fd: (sync_fds.append(fd), real_fsync(fd))[1]):
+                repaired = repository.repair_uncommitted_tail()
+            self.assertTrue(repaired)
+            self.assertEqual(2, len(sync_fds), "repair must fsync both truncated log and index")
+            self.assertEqual(committed_log_size, path.stat().st_size)
+            self.assertEqual(committed_index_size, repository.index_path.stat().st_size)
+            self.assertEqual(((), cursor_a), repository.read_batch(
+                offset=cursor_a[0], anchor_start=cursor_a[1], anchor_sha256=cursor_a[2]
+            ))
+            self.assertEqual((first,), repository.read_cycles())
+
+            # A subsequent crash before commit is also repaired automatically before the next append.
+            with path.open("ab") as handle:
+                handle.write((second.to_json() + "\n").encode("utf-8"))
+            with repository.index_path.open("ab") as idx_handle:
+                idx_handle.write(b"\x00" * 80)
+            repository.append_cycle(third)
+            self.assertEqual((first, third), repository.read_cycles())
+            delivered, _ = repository.read_batch(
+                offset=cursor_a[0], anchor_start=cursor_a[1], anchor_sha256=cursor_a[2]
+            )
+            self.assertEqual((third,), delivered)
+
+            # Truncation BEFORE the durable commit boundary must still fail closed.
+            path.write_bytes(path.read_bytes()[: committed_log_size - 5])
+            with self.assertRaisesRegex(ObservationWriteError, "truncated"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "truncated"):
+                repository.append_cycle(_cycle("cycle-d", "obs-d"))
+
+    def test_unreadable_newest_commit_slot_refuses_truncation_and_preserves_acknowledged_cycles(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            third = _cycle("cycle-c", "obs-c")
+            repository.append_cycle(first)
+            repository.append_cycle(second)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            commit_bytes = bytearray(repository.commit_path.read_bytes())
+
+            # Damage newest slot (slot 0, seq=2) while leaving older slot 1 (seq=1) valid.
+            commit_bytes[0:10] = b"CORRUPTED!"
+            repository.commit_path.write_bytes(bytes(commit_bytes))
+
+            older_state, has_unreadable = repository.inspect_commit_slots()
+            self.assertEqual(1, older_state.seq)
+            self.assertTrue(has_unreadable)
+
+            # Neither repair_uncommitted_tail() nor append_cycle() may delete acknowledged cycle-b!
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(third)
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
+        # Also verify exact 160-byte truncation (losing slot 1 after seq=3) fails closed without truncating cycle 3!
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            repository.append_cycle(_cycle("cycle-1", "obs-1"))
+            repository.append_cycle(_cycle("cycle-2", "obs-2"))
+            repository.append_cycle(_cycle("cycle-3", "obs-3"))
+            self.assertEqual(320, repository.commit_path.stat().st_size)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            repository.commit_path.write_bytes(repository.commit_path.read_bytes()[:160])
+
+            slot0_state, has_unreadable = repository.inspect_commit_slots()
+            self.assertEqual(2, slot0_state.seq)
+            self.assertTrue(has_unreadable)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-4", "obs-4"))
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
+        # Also verify a torn short write of slot 1 (between 160 and 320 bytes) fails closed without truncating.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            acknowledged_log = path.read_bytes()
+            acknowledged_index = repository.index_path.read_bytes()
+            raw_commit = repository.commit_path.read_bytes()
+            repository.commit_path.write_bytes(raw_commit[:200])
+
+            _, has_unreadable = repository.inspect_commit_slots()
+            self.assertTrue(has_unreadable)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.repair_uncommitted_tail()
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-b", "obs-b"))
+            self.assertEqual(acknowledged_log, path.read_bytes())
+            self.assertEqual(acknowledged_index, repository.index_path.read_bytes())
+
+    def test_failed_initial_commit_slot_write_recovers_cleanly_while_corrupt_commit_rejected(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+
+            with patch("mu_strategy.observations.os.fsync", side_effect=OSError("initial commit fsync failed")):
+                with self.assertRaisesRegex(ObservationWriteError, "initial commit fsync failed"):
+                    repository.append_cycle(first)
+
+            self.assertFalse(repository.commit_path.exists())
+            self.assertFalse(path.exists())
+            self.assertEqual((), repository.read_cycles())
+
+            # Retry after I/O fault clears succeeds cleanly.
+            repository.append_cycle(first)
+            self.assertEqual((first,), repository.read_cycles())
+
+            # Damaged commit slot on an existing log is still strictly rejected.
+            repository.commit_path.write_bytes(b"corrupted-commit-slot")
+            with self.assertRaisesRegex(ObservationCorruptionError, "commit boundary"):
+                repository.read_commit_state()
+            with self.assertRaisesRegex(ObservationCorruptionError, "commit boundary"):
+                repository.read_cycles()
+            with self.assertRaisesRegex(ObservationWriteError, "commit boundary"):
+                repository.append_cycle(_cycle("cycle-b", "obs-b"))
+
+    def test_empty_log_with_legacy_single_slot_commit_upgrades_and_accepts_first_cycle(self):
+        from mu_strategy.observations import ObservationCommitState, _ZERO_CHAIN_SHA256, _encode_commit_slot
+
+        initial_slot = _encode_commit_slot(
+            ObservationCommitState(
+                seq=0,
+                offset=0,
+                index_offset=0,
+                prefix_max_created_at_ms=-1,
+                chain_sha256=_ZERO_CHAIN_SHA256,
+            )
+        )
+        self.assertEqual(160, len(initial_slot))
+
+        # Clean 160-byte seq=0/offset=0 commit left on an empty repo upgrades to 320 bytes and accepts first cycle.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            repository.commit_path.write_bytes(initial_slot)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            self.assertEqual(320, repository.commit_path.stat().st_size)
+            self.assertEqual((first,), repository.read_cycles())
+
+        # Non-empty index or torn 200-byte commit on an empty log still fails closed.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            repository.commit_path.write_bytes(initial_slot + b"X" * 40)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-a", "obs-a"))
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            repository.commit_path.write_bytes(initial_slot)
+            repository.index_path.write_bytes(b"\x00" * 80)
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(_cycle("cycle-a", "obs-a"))
+
+    def test_missing_index_with_ambiguous_commit_keeps_staging_marker_until_commit_restored(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            c1 = _cycle("cycle-1", "obs-1")
+            c2 = _cycle("cycle-2", "obs-2")
+            c3 = _cycle("cycle-3", "obs-3")
+            repository.append_cycle(c1)
+            repository.append_cycle(c2)
+            valid_commit_bytes = repository.commit_path.read_bytes()
+            acknowledged_log = path.read_bytes()
+
+            # Corrupt newest slot (slot 0, seq=2), remove index, and leave active migration marker.
+            corrupt_commit = bytearray(valid_commit_bytes)
+            corrupt_commit[0:10] = b"CORRUPTED!"
+            repository.commit_path.write_bytes(bytes(corrupt_commit))
+            repository.index_path.unlink()
+            staging = Path(f"{path}.commit.staging")
+            staging.write_bytes(b"migrating\n")
+
+            with self.assertRaisesRegex(ObservationWriteError, "unreadable slot"):
+                repository.append_cycle(c3)
+            # Sidecars and log MUST stay untouched so retry can rebuild after commit restoration.
+            self.assertTrue(staging.exists())
+            self.assertEqual(b"migrating\n", staging.read_bytes())
+            self.assertFalse(repository.index_path.exists())
+            self.assertEqual(acknowledged_log, path.read_bytes())
+
+            # Restore valid commit -> retry rebuilds index to seq=2, retires marker, and appends c3 cleanly.
+            repository.commit_path.write_bytes(valid_commit_bytes)
+            JsonlObservationRepository(path).append_cycle(c3)
+            self.assertFalse(staging.exists())
+            self.assertEqual((c1, c2, c3), JsonlObservationRepository(path).read_cycles())
+
+    def test_interrupted_legacy_migration_is_retryable_without_mutating_legacy_log(self):
+        from mu_strategy.observations import _decode_commit_slot
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            third = _cycle("cycle-c", "obs-c")
+            legacy_bytes = (first.to_json() + "\n").encode("utf-8")
+            path.write_bytes(legacy_bytes)
+            repository = JsonlObservationRepository(path)
+
+            # Fault 1: I/O failure while writing/fsyncing staged index leaves legacy log untouched and retryable.
+            with patch("mu_strategy.observations.os.fsync", side_effect=OSError("legacy index fsync failed")):
+                with self.assertRaisesRegex(ObservationWriteError, "legacy index fsync failed"):
+                    repository.append_cycle(second)
+            self.assertEqual(legacy_bytes, path.read_bytes())
+            self.assertFalse(repository.index_path.exists())
+            self.assertFalse(repository.commit_path.exists())
+
+            # Fault 2: Parent directory MUST be fsynced after writing .commit.staging and BEFORE publishing
+            # either final sidecar; crash between publishing .index and .commit stays retryable.
+            real_replace = __import__("os").replace
+            events: list[tuple[str, str]] = []
+
+            def record_dir_fsync(directory):
+                events.append(("dir_fsync", str(directory)))
+                self.assertTrue(Path(f"{path}.commit.staging").exists())
+
+            def fail_final_commit_rename(src, dst):
+                events.append(("replace", Path(dst).name))
+                if Path(dst) == repository.commit_path:
+                    raise OSError("final commit rename failed")
+                return real_replace(src, dst)
+
+            with patch("mu_strategy.observations._fsync_directory", side_effect=record_dir_fsync), patch(
+                "mu_strategy.observations.os.replace", side_effect=fail_final_commit_rename
+            ):
+                with self.assertRaisesRegex(ObservationWriteError, "final commit rename failed"):
+                    repository.append_cycle(second)
+            self.assertEqual(
+                [("dir_fsync", str(path.parent)), ("replace", repository.index_path.name), ("replace", repository.commit_path.name)],
+                events,
+            )
+            self.assertEqual(legacy_bytes, path.read_bytes())
+            self.assertTrue(repository.index_path.exists())
+            self.assertFalse(repository.commit_path.exists())
+            self.assertTrue(Path(f"{path}.commit.staging").exists())
+
+            # Fault 3: Failure syncing marker retirement leaves marker on disk so a NEW repository instance
+            # retries directory sync + durable marker retirement before allowing append to proceed.
+            real_fsync = __import__("os").fsync
+            staging_path = Path(f"{path}.commit.staging")
+
+            def fail_marker_retire_fsync(fd):
+                if (
+                    repository.commit_path.exists()
+                    and staging_path.exists()
+                    and staging_path.read_bytes() == b"complete\n"
+                ):
+                    raise OSError("retire marker fsync failed")
+                return real_fsync(fd)
+
+            with patch("mu_strategy.observations.os.fsync", side_effect=fail_marker_retire_fsync):
+                with self.assertRaisesRegex(ObservationWriteError, "retire marker fsync failed"):
+                    repository.append_cycle(second)
+            self.assertTrue(staging_path.exists())
+            self.assertTrue(repository.index_path.exists())
+            self.assertTrue(repository.commit_path.exists())
+            self.assertEqual(legacy_bytes, path.read_bytes())
+
+            # Retry with a fresh repository instance completes cleanup (dir sync + marker retire/unlink) then appends.
+            retry_dir_syncs: list[Path] = []
+            with patch(
+                "mu_strategy.observations._fsync_directory",
+                side_effect=lambda directory: retry_dir_syncs.append(directory),
+            ):
+                JsonlObservationRepository(path).append_cycle(second)
+            self.assertEqual([path.parent], retry_dir_syncs)
+            self.assertFalse(Path(f"{path}.commit.staging").exists())
+            self.assertEqual(320, repository.commit_path.stat().st_size)
+            self.assertEqual((first, second), JsonlObservationRepository(path).read_cycles())
+
+            # Symmetric partial state (commit exists, index missing, active staging marker present) MUST
+            # rebuild .index strictly up to existing .commit WITHOUT committing uncommitted trailing bytes!
+            uncommitted_extra = _cycle("cycle-uncommitted", "obs-uncommitted")
+            with path.open("ab") as handle:
+                handle.write((uncommitted_extra.to_json() + "\n").encode("utf-8"))
+            repository.index_path.unlink()
+            Path(f"{path}.commit.staging").write_bytes(b"migrating\n")
+            repository.append_cycle(third)
+            self.assertFalse(Path(f"{path}.commit.staging").exists())
+            # Uncommitted extra cycle was truncated by normal repair, never promoted into commit!
+            self.assertEqual((first, second, third), repository.read_cycles())
+
+            # Simulated power loss reviving a retired ("complete\n") marker when one OR both sidecars are
+            # missing MUST NOT be treated as an active migration or legacy bootstrap (fails closed!).
+            repository.index_path.unlink()
+            Path(f"{path}.commit.staging").write_bytes(b"complete\n")
+            with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
+                JsonlObservationRepository(path).append_cycle(_cycle("cycle-d", "obs-d"))
+            repository.commit_path.unlink()
+            with self.assertRaisesRegex(ObservationWriteError, "missing for non-empty log"):
+                JsonlObservationRepository(path).append_cycle(_cycle("cycle-d", "obs-d"))
+            self.assertFalse(repository.commit_path.exists())
+            self.assertFalse(repository.index_path.exists())
+            Path(f"{path}.commit.staging").unlink()
+
+        # Even-count (2-cycle) legacy fixture: verify BOTH commit slots decode to the migration state
+        # (seq=2) BEFORE the first new cycle writes its commit slot, and preserve post-append coverage.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            c1 = _cycle("cycle-1", "obs-1")
+            c2 = _cycle("cycle-2", "obs-2")
+            c3 = _cycle("cycle-3", "obs-3")
+            path.write_bytes((c1.to_json() + "\n" + c2.to_json() + "\n").encode("utf-8"))
+            repo = JsonlObservationRepository(path)
+
+            pre_append_commit_bytes: list[bytes] = []
+            original_repair = repo._repair_uncommitted_tail_locked
+
+            def capture_migrated_commit(commit, *, has_unreadable_slot):
+                pre_append_commit_bytes.append(repo.commit_path.read_bytes())
+                return original_repair(commit, has_unreadable_slot=has_unreadable_slot)
+
+            with patch.object(repo, "_repair_uncommitted_tail_locked", side_effect=capture_migrated_commit):
+                repo.append_cycle(c3)
+
+            self.assertEqual(1, len(pre_append_commit_bytes))
+            migrated_raw = pre_append_commit_bytes[0]
+            self.assertEqual(320, len(migrated_raw))
+            slot0 = _decode_commit_slot(migrated_raw[:160])
+            slot1 = _decode_commit_slot(migrated_raw[160:320])
+            self.assertIsNotNone(slot0)
+            self.assertEqual(slot0, slot1)
+            self.assertEqual(2, slot0.seq)
+            # Post-append state has seq=2 in slot 0 and seq=3 in slot 1.
+            post_raw = repo.commit_path.read_bytes()
+            self.assertEqual(2, _decode_commit_slot(post_raw[:160]).seq)
+            self.assertEqual(3, _decode_commit_slot(post_raw[160:320]).seq)
+            self.assertEqual((c1, c2, c3), repo.read_cycles())
+
+    def test_oversized_cycle_rejected_before_writing_and_limit_boundary_matches_readers(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            repository.append_cycle(first)
+            exact_size = len((second.to_json() + "\n").encode("utf-8"))
+
+            with patch("mu_strategy.observations._MAX_RECORD_BYTES", exact_size - 1):
+                with self.assertRaisesRegex(ObservationWriteError, "maximum record size"):
+                    repository.append_cycle(second)
+            self.assertEqual((first,), repository.read_cycles())
+
+            with patch("mu_strategy.observations._MAX_RECORD_BYTES", exact_size):
+                repository.append_cycle(second)
+                self.assertEqual((first, second), repository.read_batch()[0])
+                self.assertEqual((first, second), repository.read_tail(limit=5))
+
+    def test_append_fsyncs_parent_directory_only_on_initial_log_creation(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
             with patch.object(repository, "_fsync_parent_directory", create=True) as fsync_parent:
                 repository.append_cycle(_cycle("cycle-a", "obs-a"))
-                self.assertEqual(3, fsync_parent.call_count)
+                self.assertEqual(1, fsync_parent.call_count)
+                self.assertFalse(repository.invalid_marker_path.exists())
 
                 repository.append_cycle(_cycle("cycle-b", "obs-b"))
-                self.assertEqual(5, fsync_parent.call_count)
+                self.assertEqual(1, fsync_parent.call_count)
+                self.assertFalse(repository.invalid_marker_path.exists())
 
-    def test_first_append_fsyncs_each_new_directory_entry_bottom_up_and_restarts(self):
+    def test_first_append_fsyncs_each_new_directory_entry_and_new_log_without_marker(self):
         with TemporaryDirectory() as tmp:
             existing_root = Path(tmp)
             path = existing_root / "data" / "observations" / "stage0.jsonl"
@@ -265,17 +687,16 @@ class Stage0ObservationContractTests(unittest.TestCase):
             flushed_directories = [invocation.args[0] for invocation in fsync_directory.call_args_list]
             self.assertEqual(
                 [
-                    path.parent,
                     path.parent.parent,
                     existing_root,
-                    path.parent,
                     path.parent,
                 ],
                 flushed_directories,
             )
+            self.assertFalse(JsonlObservationRepository(path).invalid_marker_path.exists())
             self.assertEqual((cycle,), JsonlObservationRepository(path).read_cycles())
 
-    def test_new_parent_directory_fsync_failure_leaves_fail_closed_marker(self):
+    def test_new_parent_directory_fsync_failure_writes_no_log_and_allows_clean_retry(self):
         with TemporaryDirectory() as tmp:
             existing_root = Path(tmp)
             path = existing_root / "data" / "observations" / "stage0.jsonl"
@@ -291,33 +712,293 @@ class Stage0ObservationContractTests(unittest.TestCase):
                 with self.assertRaises(ObservationWriteError):
                     repository.append_cycle(_cycle("cycle-a", "obs-a"))
 
-            self.assertEqual([path.parent, path.parent.parent], flushed_directories)
-            self.assertTrue(repository.invalid_marker_path.exists())
+            self.assertEqual([path.parent.parent], flushed_directories)
+            self.assertFalse(repository.invalid_marker_path.exists())
             self.assertFalse(path.exists())
-            with self.assertRaises(ObservationWriteError):
-                repository.append_cycle(_cycle("cycle-b", "obs-b"))
-            self.assertTrue(repository.invalid_marker_path.exists())
-            self.assertFalse(path.exists())
-            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
-                JsonlObservationRepository(path).read_cycles()
+            cycle_b = _cycle("cycle-b", "obs-b")
+            repository.append_cycle(cycle_b)
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
 
-    def test_marker_removal_directory_fsync_failure_restores_failed_write_marker(self):
+    def test_retry_repairs_unsynced_directory_entries_and_concurrent_writer_verifies_ancestors(self):
+        # Case 1: Failed ancestor dir fsync leaves durable .dirsync -> fresh repository repairs all entries on retry.
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+
+            def fail_once(directory):
+                if directory == path.parent.parent:
+                    raise OSError("dir fsync failed")
+
+            with patch("mu_strategy.observations._fsync_directory", side_effect=fail_once):
+                with self.assertRaises(ObservationWriteError):
+                    JsonlObservationRepository(path).append_cycle(_cycle("cycle-a", "obs-a"))
+
+            self.assertTrue(path.parent.exists())
+            with patch("mu_strategy.observations._fsync_directory") as retry_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                JsonlObservationRepository(path).append_cycle(cycle_b)
+
+            self.assertEqual(
+                [path.parent.parent, existing_root, path.parent],
+                [call.args[0] for call in retry_fsync.call_args_list],
+            )
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
+
+        # Case 2: Writer A pauses right after staging directories visible; Writer B MUST still sync ancestor entries.
+        with TemporaryDirectory() as tmp:
+            existing_root = Path(tmp)
+            path = existing_root / "data" / "observations" / "stage0.jsonl"
+            writer_a = JsonlObservationRepository(path)
+            writer_a._ensure_parent_directories_staged()
+            self.assertTrue(path.parent.exists())
+            self.assertTrue(writer_a.dirsync_path.exists())
+
+            with patch("mu_strategy.observations._fsync_directory") as writer_b_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                JsonlObservationRepository(path).append_cycle(cycle_b)
+
+            self.assertEqual(
+                [path.parent.parent, existing_root, path.parent],
+                [call.args[0] for call in writer_b_fsync.call_args_list],
+            )
+            self.assertFalse(writer_a.dirsync_path.exists())
+            self.assertEqual((cycle_b,), JsonlObservationRepository(path).read_cycles())
+
+        # Case 3: Initial log creation parent-directory fsync fails -> zero records written and retry syncs parent.
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "observations.jsonl"
             repository = JsonlObservationRepository(path)
-            directory_fsyncs = (None, None, OSError("directory fsync failed"), None)
-            with patch.object(
-                repository,
-                "_fsync_parent_directory",
-                create=True,
-                side_effect=directory_fsyncs,
-            ):
+            with patch("mu_strategy.observations._fsync_directory", side_effect=OSError("parent sync failed")):
                 with self.assertRaises(ObservationWriteError):
                     repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            self.assertFalse(repository.invalid_marker_path.exists())
+            self.assertEqual((), repository.read_cycles())
+            with patch("mu_strategy.observations._fsync_directory") as retry_fsync:
+                cycle_b = _cycle("cycle-b", "obs-b")
+                repository.append_cycle(cycle_b)
+            self.assertEqual([path.parent], [call.args[0] for call in retry_fsync.call_args_list])
+            self.assertEqual((cycle_b,), repository.read_cycles())
+
+    def test_readers_excluded_during_uncommitted_append_and_rollback_while_concurrent_readers_share_lock(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            second = _cycle("cycle-b", "obs-b")
+            repository.append_cycle(first)
+            _, cursor_after_first = repository.read_batch()
+
+            # Concurrent readers must not block each other.
+            with repository.read_fence(wait=False) as locked_1:
+                self.assertTrue(locked_1)
+                with repository.read_fence(wait=False) as locked_2:
+                    self.assertTrue(locked_2)
+                with self.assertRaises(FileLockBusyError):
+                    with repository.publication_fence(wait=False):
+                        self.fail("exclusive writer fence must block while shared reader holds lock")
+
+            real_fsync = __import__("os").fsync
+            in_fsync = threading.Event()
+            release_fsync = threading.Event()
+            fsync_calls = 0
+            writer_errors: list[Exception] = []
+            reader_results: dict[str, object] = {}
+
+            def paused_failing_fsync(fd):
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    in_fsync.set()
+                    release_fsync.wait()
+                    raise OSError("fsync failed after write")
+                return real_fsync(fd)
+
+            def run_writer():
+                try:
+                    with patch("mu_strategy.observations.os.fsync", side_effect=paused_failing_fsync):
+                        repository.append_cycle(second)
+                except Exception as exc:  # noqa: BLE001
+                    writer_errors.append(exc)
+
+            # Record when each public reader actually reaches read_fence() before releasing writer.
+            contending_count = 0
+            contending_lock = threading.Lock()
+            all_contending = threading.Event()
+            original_lock_file = __import__("mu_strategy.file_locks", fromlist=["lock_file"]).lock_file
+
+            def observed_lock_file(stream, **kwargs):
+                nonlocal contending_count
+                if kwargs.get("shared") and kwargs.get("wait", False):
+                    with contending_lock:
+                        contending_count += 1
+                        if contending_count == 3:
+                            all_contending.set()
+                return original_lock_file(stream, **kwargs)
+
+            writer = threading.Thread(target=run_writer)
+            writer.start()
+            try:
+                self.assertTrue(in_fsync.wait(timeout=5), "writer did not reach fsync")
+                with self.assertRaises(FileLockBusyError):
+                    with repository.read_fence(wait=False):
+                        self.fail("reader acquired lock while writer was mid-append")
+
+                with patch("mu_strategy.file_locks.lock_file", side_effect=observed_lock_file):
+                    t_batch = threading.Thread(
+                        target=lambda: reader_results.__setitem__(
+                            "batch",
+                            repository.read_batch(
+                                offset=cursor_after_first[0],
+                                anchor_start=cursor_after_first[1],
+                                anchor_sha256=cursor_after_first[2],
+                            ),
+                        )
+                    )
+                    t_all = threading.Thread(target=lambda: reader_results.__setitem__("all", repository.read_cycles()))
+                    t_tail = threading.Thread(target=lambda: reader_results.__setitem__("tail", repository.read_tail(limit=5)))
+                    for reader in (t_batch, t_all, t_tail):
+                        reader.start()
+                    self.assertTrue(all_contending.wait(timeout=5), "all three public readers must contend on read_fence")
+                    self.assertTrue(all(reader.is_alive() for reader in (t_batch, t_all, t_tail)))
+                    release_fsync.set()
+                    for reader in (t_batch, t_all, t_tail):
+                        reader.join(timeout=5)
+            finally:
+                release_fsync.set()
+                writer.join(timeout=5)
+
+            self.assertEqual(1, len(writer_errors))
+            self.assertIsInstance(writer_errors[0], ObservationWriteError)
+            self.assertEqual(((), cursor_after_first), reader_results["batch"])
+            self.assertEqual((first,), reader_results["all"])
+            self.assertEqual((first,), reader_results["tail"])
+
+    def test_rollback_truncate_failure_quarantines_log_and_blocks_appends_and_reads(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            first = _cycle("cycle-a", "obs-a")
+            repository.append_cycle(first)
+            original_open = Path.open
+
+            class FailingTruncateHandle:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __enter__(self):
+                    self._inner.__enter__()
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self._inner.__exit__(exc_type, exc, tb)
+
+                def fileno(self):
+                    return self._inner.fileno()
+
+                def write(self, data):
+                    # Write only half the record then fail to simulate partial write.
+                    raw = bytes(data)
+                    self._inner.write(raw[: max(1, len(raw) // 2)])
+                    raise OSError("partial write failed")
+
+                def truncate(self, size):
+                    raise OSError("truncate rollback failed")
+
+            def intercept_open(target, mode="r", *args, **kwargs):
+                handle = original_open(target, mode, *args, **kwargs)
+                if target == path and "a" in mode:
+                    return FailingTruncateHandle(handle)
+                return handle
+
+            with patch.object(Path, "open", new=intercept_open):
+                with self.assertRaises(ObservationWriteError):
+                    repository.append_cycle(_cycle("cycle-b", "obs-b"))
 
             self.assertTrue(repository.invalid_marker_path.exists())
+            with self.assertRaisesRegex(ObservationWriteError, "invalid marker"):
+                repository.append_cycle(_cycle("cycle-c", "obs-c"))
             with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
                 repository.read_cycles()
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_batch()
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_tail(limit=5)
+
+    def test_read_tail_with_min_created_at_ms_skips_out_of_order_older_cycles(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            c2000 = Stage0ObservationCycle(
+                cycle_id="cycle-2000",
+                created_at_ms=2_000,
+                observations=(_observation(cycle_id="cycle-2000", observation_id="obs-2000", created_at_ms=2_000),),
+            )
+            c1000 = Stage0ObservationCycle(
+                cycle_id="cycle-1000",
+                created_at_ms=1_000,
+                observations=(_observation(cycle_id="cycle-1000", observation_id="obs-1000", created_at_ms=1_000),),
+            )
+            c1800 = Stage0ObservationCycle(
+                cycle_id="cycle-1800",
+                created_at_ms=1_800,
+                observations=(_observation(cycle_id="cycle-1800", observation_id="obs-1800", created_at_ms=1_800),),
+            )
+            repository.append_cycle(c2000)
+            repository.append_cycle(c1000)
+            self.assertEqual((c2000,), repository.read_tail(limit=10, min_created_at_ms=1_500))
+            repository.append_cycle(c1800)
+            self.assertEqual((c2000, c1800), repository.read_tail(limit=10, min_created_at_ms=1_500))
+
+    def test_read_tail_and_iter_tail_cycles_reverse_scan_across_chunk_boundaries(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            self.assertEqual((), repository.read_tail(limit=5))
+            cycles = tuple(
+                Stage0ObservationCycle(
+                    cycle_id=f"cycle-{idx}",
+                    created_at_ms=1_000 + idx * 100,
+                    observations=(_observation(cycle_id=f"cycle-{idx}", observation_id=f"obs-{idx}", created_at_ms=1_000 + idx * 100),),
+                )
+                for idx in range(6)
+            )
+            for item in cycles:
+                repository.append_cycle(item)
+
+            for chunk_size in (17, 64, 512, 65_536):
+                with self.subTest(chunk_size=chunk_size):
+                    self.assertEqual(cycles[-3:], repository.read_tail(limit=3, chunk_size=chunk_size))
+                    self.assertEqual(cycles, repository.read_tail(limit=10, chunk_size=chunk_size))
+                    self.assertEqual(
+                        cycles[3:],
+                        repository.read_tail(limit=10, min_created_at_ms=1_300, chunk_size=chunk_size),
+                    )
+                    self.assertEqual(
+                        tuple(reversed(cycles[-2:])),
+                        tuple(repository.iter_tail_cycles(max_cycles=2, chunk_size=chunk_size)),
+                    )
+
+    def test_read_tail_handles_empty_file_and_fails_closed_on_corruption_or_legacy_marker(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "observations.jsonl"
+            repository = JsonlObservationRepository(path)
+            path.write_bytes(b"")
+            self.assertEqual((), repository.read_tail(limit=5))
+
+            repository.append_cycle(_cycle("cycle-a", "obs-a"))
+            repository.invalid_marker_path.write_text("legacy", encoding="utf-8")
+            with self.assertRaisesRegex(ObservationCorruptionError, "failed-write marker"):
+                repository.read_tail(limit=5)
+            repository.invalid_marker_path.unlink()
+
+            original = path.read_bytes()
+            path.write_bytes(original + b'{"incomplete":true')
+            with self.assertRaises(ObservationCorruptionError):
+                repository.read_tail(limit=5)
+
+            path.write_bytes(original.replace(b'"schema_version":2', b'"schema_version":2,"schema_version":2', 1))
+            with self.assertRaisesRegex(ObservationCorruptionError, "duplicate"):
+                repository.read_tail(limit=5)
 
     def test_reader_rejects_decision_metadata_that_disagrees_with_catalog(self):
         payload = _observation(result=_scan(EntryDecisionCode.SECOND_PULLBACK_LIMIT_READY)).to_dict()

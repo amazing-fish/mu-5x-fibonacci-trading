@@ -7,7 +7,7 @@ from mu_strategy.demo_trading import DemoTradingConfig, run_once
 from mu_strategy.entry.scanner import EntryScanResult
 from mu_strategy.market_data.service import CandleBundle
 from mu_strategy.market_data.symbols import ResolvedSymbol
-from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.trusted_data.compat import DataStatus
 from mu_strategy.market_data.universe import OKXSwapTicker
 from mu_strategy.models import Candle
 

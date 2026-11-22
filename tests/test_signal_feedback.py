@@ -43,8 +43,11 @@ class SignalFeedbackTests(unittest.TestCase):
 
     def test_read_creates_no_files_and_save_survives_reopening_without_changing_evidence(self):
         def evidence():
-            return {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in self.fixture.health.root.rglob("*") if p.is_file()}
+            return {
+                str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in self.fixture.health.root.rglob("*")
+                if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+            }
         before = evidence()
         self.assertEqual({}, self.store.read())
         self.assertFalse(self.store.path.parent.exists())
@@ -56,6 +59,25 @@ class SignalFeedbackTests(unittest.TestCase):
         self.assertEqual(1, len(reopened.read()))
         self.assertEqual("", reopened.read()[self.entry.event_id]["note"])
         self.assertEqual(before, evidence())
+
+    def test_feedback_store_enables_wal_and_handles_concurrent_readers_and_writers(self):
+        import sqlite3
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.store.save(self.entry.event_id, "seen", "init", now_ms=fixtures.NOW)
+        with sqlite3.connect(self.store.path) as db:
+            mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual("wal", mode.lower())
+
+        def worker(index: int):
+            if index % 2 == 0:
+                self.store.save(self.entry.event_id, "traded", f"note-{index}", now_ms=fixtures.NOW + index)
+            else:
+                self.store.read()
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(worker, range(24)))
+        self.assertIn(self.entry.event_id, self.store.read())
 
     def test_bad_requests_and_other_event_kinds_cannot_write_feedback(self):
         valid = {"event_id": self.entry.event_id, "status": "seen", "note": ""}

@@ -230,7 +230,7 @@ class Stage0ObservationIntegrationTests(unittest.TestCase):
                 end_ms=end_ms,
                 run_id="strict-run",
             )
-            with patch("mu_strategy.market_data.service.cached_historical") as legacy_fetch:
+            with patch("socket.create_connection", side_effect=AssertionError("no network")) as network:
                 with patch("mu_strategy.market_data.trusted_data.refresh.refresh_with_okx_provider") as refresh:
                     payload = run_once(
                         DemoTradingConfig(
@@ -247,7 +247,7 @@ class Stage0ObservationIntegrationTests(unittest.TestCase):
 
             cycles = JsonlObservationRepository(observation_path).read_cycles()
 
-        legacy_fetch.assert_not_called()
+        network.assert_not_called()
         refresh.assert_not_called()
         self.assertEqual("strict-run", payload["run_id"])
         observation = cycles[0].observations[0]

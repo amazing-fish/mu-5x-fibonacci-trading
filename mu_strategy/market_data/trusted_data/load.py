@@ -21,9 +21,21 @@ from mu_strategy.market_data.trusted_data.contracts import (
     TrustedLoadContext,
     ValidationReport,
 )
-from mu_strategy.market_data.trusted_data.evaluate import DatasetEvaluationSeed, VALIDATION_FAILURE_REASONS, evaluate_candle_bundle
-from mu_strategy.market_data.trusted_data.policy import FreshnessPolicy, IntervalDependencyPlanner, TrustPolicy, research_strict_policy
+from mu_strategy.market_data.trusted_data.evaluate import (
+    DatasetEvaluationSeed,
+    VALIDATION_FAILURE_REASONS,
+    coverage_warning,
+    evaluate_candle_bundle,
+)
+from mu_strategy.market_data.trusted_data.policy import (
+    FreshnessPolicy,
+    IntervalDependencyPlanner,
+    TrustPolicy,
+    research_strict_policy,
+)
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
+from mu_strategy.market_data.trusted_data.windowing import assess_requested_coverage_bounds
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -76,7 +88,10 @@ class LoadTrustedBundle:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={interval: [] for interval in plan.requested_intervals},
-                    files_by_interval={interval: self._unpublished_dataset_path(resolved.inst_id, interval) for interval in plan.requested_intervals},
+                    files_by_interval={
+                        interval: self._unpublished_dataset_path(resolved.inst_id, interval)
+                        for interval in plan.requested_intervals
+                    },
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(
@@ -89,7 +104,6 @@ class LoadTrustedBundle:
         manifest = context.manifest
         published_health_by_interval: dict[str, DatasetHealth] = {}
         path_by_interval: dict[str, Path] = {}
-        seeds_by_interval: dict[str, DatasetEvaluationSeed] = {}
         for interval in plan.effective_intervals:
             manifest_health = manifest.datasets.get((resolved.inst_id, interval))
             try:
@@ -98,7 +112,10 @@ class LoadTrustedBundle:
                 return TrustedBundle(
                     symbol=resolved.inst_id,
                     candles_by_interval={requested: [] for requested in plan.requested_intervals},
-                    files_by_interval={requested: self._default_dataset_path(resolved.inst_id, requested, context) for requested in plan.requested_intervals},
+                    files_by_interval={
+                        requested: self._default_dataset_path(resolved.inst_id, requested, context)
+                        for requested in plan.requested_intervals
+                    },
                     days=query.days,
                     health_by_interval={},
                     trust_decision=TrustDecision(False, HealthReason.MALFORMED_MANIFEST, str(exc)),
@@ -107,6 +124,40 @@ class LoadTrustedBundle:
                     load_context=context,
                 )
             path_by_interval[interval] = path
+            if manifest_health is not None:
+                published_health_by_interval[interval] = manifest_health
+
+        # When 5m was not requested and both 5m and all requested native intervals are already
+        # published and cross-validated in the manifest, cryptographically verify the 5m disk
+        # bytes against the manifest SHA-256 directly without parsing 5m Candle objects or
+        # re-aggregating 5m->15m/1h; fall back to full 5m load on any mismatch or read error.
+        skip_base_disk_load = self._can_skip_base_disk_load(
+            plan.requested_intervals,
+            plan.effective_intervals,
+            published_health_by_interval,
+        )
+        verified_base_hash: str | None = None
+        if skip_base_disk_load:
+            verified_base_hash = self.store.verify_generation_dataset_bytes(
+                manifest,
+                symbol=resolved.inst_id,
+                interval="5m",
+                generation_root=context.generation_root,
+                generation_id=context.generation_id,
+            )
+            if verified_base_hash is None:
+                skip_base_disk_load = False
+        load_intervals = (
+            self.planner.plan(query.intervals, include_base_for_validation=False).effective_intervals
+            if skip_base_disk_load
+            else plan.effective_intervals
+        )
+
+        seeds_by_interval: dict[str, DatasetEvaluationSeed] = {}
+        precomputed_hashes: dict[str, str | None] = {}
+        for interval in load_intervals:
+            path = path_by_interval[interval]
+            manifest_health = published_health_by_interval.get(interval)
             if manifest_health is None:
                 seeds_by_interval[interval] = DatasetEvaluationSeed(
                     key=DatasetKey(resolved.inst_id, interval),
@@ -117,15 +168,15 @@ class LoadTrustedBundle:
                     prefailed_freshness=FreshnessState.UNKNOWN,
                 )
                 continue
-            published_health_by_interval[interval] = manifest_health
             try:
-                candles = self.store.read_generation_dataset(
+                candles, content_hash = self.store.read_generation_dataset_with_hash(
                     manifest,
                     symbol=resolved.inst_id,
                     interval=interval,
                     generation_root=context.generation_root,
                     generation_id=context.generation_id,
                     verify_logical=False,
+                    compute_hash=manifest_health.integrity == IntegrityState.VALID,
                 )
             except Exception as exc:
                 seeds_by_interval[interval] = DatasetEvaluationSeed(
@@ -139,6 +190,7 @@ class LoadTrustedBundle:
                     message=str(exc),
                 )
                 continue
+            precomputed_hashes[interval] = content_hash
             seeds_by_interval[interval] = DatasetEvaluationSeed(
                 key=DatasetKey(resolved.inst_id, interval),
                 source_file=path,
@@ -146,27 +198,57 @@ class LoadTrustedBundle:
                 empty_validation_reason=HealthReason.CACHE_MISSING,
             )
 
-        def merge_published_health(interval: str, health: DatasetHealth, candles: list[Candle], raw_candles: list[Candle]) -> DatasetHealth:
+        def merge_published_health(
+            interval: str,
+            health: DatasetHealth,
+            candles: list[Candle],
+            raw_candles: list[Candle],
+        ) -> DatasetHealth:
             manifest_health = published_health_by_interval.get(interval)
-            health = _verify_manifest_bound_content(health, manifest_health, raw_candles)
+            health = _verify_manifest_bound_content(
+                health,
+                manifest_health,
+                raw_candles,
+                precomputed_hash=precomputed_hashes.get(interval),
+            )
             return _merge_manifest_health(health, manifest_health)
+
+        window_anchor_bounds_ms: tuple[int, int] | None = None
+        synthesized_base_health: DatasetHealth | None = None
+        if skip_base_disk_load:
+            manifest_five = published_health_by_interval["5m"]
+            assert manifest_five.first_timestamp_ms is not None and manifest_five.last_timestamp_ms is not None
+            assert verified_base_hash is not None
+            window_anchor_bounds_ms = (manifest_five.first_timestamp_ms, manifest_five.last_timestamp_ms)
+            synthesized_base_health = self._health_from_manifest_base(
+                manifest_five,
+                source_file=path_by_interval["5m"],
+                days=query.days,
+                now_ms=context.observed_at_ms,
+                verified_content_sha256=verified_base_hash,
+            )
 
         evaluation = evaluate_candle_bundle(
             symbol=resolved.inst_id,
-            intervals=plan.effective_intervals,
+            intervals=load_intervals,
             seeds_by_interval=seeds_by_interval,
             days=query.days,
             now_ms=context.observed_at_ms,
             freshness_policy=self.freshness_policy,
             post_process_health=merge_published_health,
+            validate_physical=False,
+            window_anchor_bounds_ms=window_anchor_bounds_ms,
         )
-        health_by_interval = {
-            interval: evaluation.health_by_key[(resolved.inst_id, interval)]
-            for interval in plan.effective_intervals
-        }
+
+        health_by_interval: dict[str, DatasetHealth] = {}
+        for interval in plan.effective_intervals:
+            if interval == "5m" and synthesized_base_health is not None:
+                health_by_interval["5m"] = synthesized_base_health
+            else:
+                health_by_interval[interval] = evaluation.health_by_key[(resolved.inst_id, interval)]
         candles_by_interval = {
             interval: evaluation.candles_by_key.get((resolved.inst_id, interval), [])
-            for interval in plan.effective_intervals
+            for interval in load_intervals
         }
         decision = policy.decide(
             context=context,
@@ -192,6 +274,93 @@ class LoadTrustedBundle:
             run_id=manifest.run_id,
             universe_snapshot=manifest.universe_snapshot,
             load_context=context,
+        )
+
+    def _can_skip_base_disk_load(
+        self,
+        requested_intervals: tuple[str, ...],
+        effective_intervals: tuple[str, ...],
+        published_health_by_interval: dict[str, DatasetHealth],
+    ) -> bool:
+        if "5m" in requested_intervals or "5m" not in effective_intervals:
+            return False
+        manifest_five = published_health_by_interval.get("5m")
+        if (
+            manifest_five is None
+            or manifest_five.availability != AvailabilityState.AVAILABLE
+            or manifest_five.integrity != IntegrityState.VALID
+            or not manifest_five.content_sha256
+            or manifest_five.rows <= 0
+            or manifest_five.first_timestamp_ms is None
+            or manifest_five.last_timestamp_ms is None
+        ):
+            return False
+        for interval in requested_intervals:
+            health = published_health_by_interval.get(interval)
+            if (
+                health is None
+                or health.availability != AvailabilityState.AVAILABLE
+                or health.integrity != IntegrityState.VALID
+                or not health.content_sha256
+                or health.validation is None
+                or not health.validation.ok
+            ):
+                return False
+        return True
+
+    def _health_from_manifest_base(
+        self,
+        manifest_five: DatasetHealth,
+        *,
+        source_file: Path,
+        days: int,
+        now_ms: int,
+        verified_content_sha256: str,
+    ) -> DatasetHealth:
+        assert manifest_five.first_timestamp_ms is not None and manifest_five.last_timestamp_ms is not None
+        assert verified_content_sha256 == manifest_five.content_sha256
+        step_ms = interval_to_ms("5m")
+        window_end_ms = manifest_five.last_timestamp_ms
+        window_start_ms = window_end_ms - (days * DAY_MS)
+        rem = window_start_ms % step_ms
+        aligned_start_ms = window_start_ms if rem == 0 else window_start_ms + (step_ms - rem)
+        actual_start_ms = max(manifest_five.first_timestamp_ms, aligned_start_ms)
+        pruned_rows = min(manifest_five.rows, ((window_end_ms - actual_start_ms) // step_ms) + 1)
+
+        freshness = self.freshness_policy.assess(
+            now_ms=now_ms,
+            interval="5m",
+            last_confirmed_open_time_ms=window_end_ms,
+        )
+        local_health = DatasetHealth(
+            key=manifest_five.key,
+            availability=AvailabilityState.AVAILABLE,
+            integrity=IntegrityState.VALID,
+            freshness=freshness.state,
+            reasons=(freshness.reason,),
+            rows=pruned_rows,
+            first_timestamp_ms=actual_start_ms,
+            last_timestamp_ms=window_end_ms,
+            updated_at_ms=now_ms,
+            source_file=source_file,
+            validation=manifest_five.validation or ValidationReport(True, HealthReason.OK),
+            content_sha256=verified_content_sha256,
+        )
+        merged = _merge_manifest_health(local_health, manifest_five)
+        coverage = assess_requested_coverage_bounds(
+            actual_start_ms,
+            window_end_ms,
+            interval="5m",
+            requested_days=days,
+            window_end_time_ms=window_end_ms,
+        )
+        warning = coverage_warning(coverage)
+        return replace(
+            merged,
+            requested_days=coverage.requested_days,
+            effective_days=coverage.effective_days,
+            coverage_state=coverage.coverage_state,
+            warnings=(*merged.warnings, warning) if warning and warning not in merged.warnings else merged.warnings,
         )
 
     def _open_context_result(
@@ -243,6 +412,7 @@ class LoadTrustedBundle:
     def _unpublished_dataset_path(self, symbol: str, interval: str) -> Path:
         return self.store.generations_dir / "unpublished" / self.store.generation_source_file(symbol, interval)
 
+
 def _merge_manifest_health(cache_health: DatasetHealth, manifest_health: DatasetHealth | None) -> DatasetHealth:
     if manifest_health is None:
         return _ensure_validation_report_consistency(cache_health)
@@ -265,13 +435,15 @@ def _verify_manifest_bound_content(
     cache_health: DatasetHealth,
     manifest_health: DatasetHealth | None,
     cached_candles: list[Candle],
+    *,
+    precomputed_hash: str | None = None,
 ) -> DatasetHealth:
     expected_hash = manifest_health.content_sha256 if manifest_health is not None else None
     if manifest_health is None or cache_health.integrity != IntegrityState.VALID or not cached_candles:
         return cache_health
     if manifest_health.integrity != IntegrityState.VALID:
         return cache_health
-    actual_hash = candles_content_sha256(cached_candles)
+    actual_hash = precomputed_hash if precomputed_hash is not None else candles_content_sha256(cached_candles)
     if len(cached_candles) != manifest_health.rows:
         return replace(
             cache_health,
@@ -280,6 +452,18 @@ def _verify_manifest_bound_content(
             reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
             content_sha256=actual_hash,
             message="manifest dataset row count does not match cached candles",
+        )
+    if (
+        cached_candles[0].open_time_ms != manifest_health.first_timestamp_ms
+        or cached_candles[-1].open_time_ms != manifest_health.last_timestamp_ms
+    ):
+        return replace(
+            cache_health,
+            integrity=IntegrityState.INVALID,
+            freshness=FreshnessState.STALE,
+            reasons=(HealthReason.CACHE_CONTENT_MISMATCH,),
+            content_sha256=actual_hash,
+            message="manifest dataset timestamp bounds do not match cached candles",
         )
     if not expected_hash:
         return replace(

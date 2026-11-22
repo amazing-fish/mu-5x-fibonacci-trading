@@ -1,8 +1,13 @@
+import io
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from mu_strategy.experiments import portfolio_research
 from mu_strategy.experiments.portfolio_research import (
-    SignalSpec, build_targets, daily_equity, combine_equity, select_portfolio,
+    SignalSpec, build_targets, daily_equity, combine_equity, render_html, select_portfolio,
 )
 from mu_strategy.experiments.strategy_ladder import CandidateDefinition, DEFAULT_MU_INSTRUMENT, run_long_only_candidate
 from mu_strategy.models import BacktestResult, Candle
@@ -74,3 +79,77 @@ class PortfolioResearchTests(unittest.TestCase):
     def row(self,name,family,train,validation):
         return {"name":name,"family":family,"periods":[{"daily_equity":train,"trade_count":4},
             {"daily_equity":validation,"trade_count":4},{"daily_equity":[10000,10000,10000],"trade_count":4}]}
+
+    def test_cli_supports_days_flag_and_clamps_default_to_available_generation_span(self):
+        root = Path(__file__).resolve().parents[1]
+        data_dir = root / "data/live"
+        generation_id = "0114f8334f2e40d6ba5b5030faf6007b"
+        calls = []
+
+        def fake_load_window(**kwargs):
+            calls.append(kwargs)
+            raise ValueError("stop-after-load")
+
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            with patch("mu_strategy.experiments.portfolio_research.load_historical_window", side_effect=fake_load_window):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as exc:
+                        portfolio_research.main([
+                            "--data-dir", str(data_dir),
+                            "--generation-id", generation_id,
+                            "--output-dir", str(out_dir),
+                        ])
+            self.assertEqual(2, exc.exception.code)
+            self.assertEqual(179, calls[0]["days"])
+            self.assertTrue(calls[0]["allow_partial"])
+
+            with patch("mu_strategy.experiments.portfolio_research.load_historical_window", side_effect=fake_load_window):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as exc:
+                        portfolio_research.main([
+                            "--data-dir", str(data_dir),
+                            "--generation-id", generation_id,
+                            "--days", "140",
+                            "--output-dir", str(out_dir),
+                        ])
+            self.assertEqual(2, exc.exception.code)
+            self.assertEqual(140, calls[1]["days"])
+            self.assertFalse(calls[1]["allow_partial"])
+
+    def test_render_html_reflects_actual_window_and_final_segment_days(self):
+        day = 86_400_000
+        start = 8 * day
+        periods = [
+            {"start_ms": start, "end_ms": start + 60 * day},
+            {"start_ms": start + 60 * day, "end_ms": start + 120 * day},
+            {"start_ms": start + 120 * day, "end_ms": start + 134 * day},
+        ]
+        curve = [10_000.0] * 15
+        strat_row = {
+            "name": "baseline",
+            "family": "fibonacci",
+            "full": {"return_pct": 0.1, "daily_max_drawdown_pct": -0.05, "trade_count": 10, "daily_equity": curve},
+            "periods": [{"return_pct": 0.03, "daily_max_drawdown_pct": -0.02, "daily_equity": curve}] * 3,
+            "stress_periods": [{"return_pct": 0.02, "daily_max_drawdown_pct": -0.02, "daily_equity": curve}] * 3,
+        }
+        report = {
+            "periods": periods,
+            "strategies": [strat_row],
+            "selection": {"family_winners": {"fibonacci": "baseline"}, "allocations": [{"weights": {"baseline": 1.0}}]},
+            "portfolio": {
+                "weights": {"baseline": 1.0},
+                "periods": [{"return_pct": 0.03, "daily_max_drawdown_pct": -0.02, "daily_equity": curve}] * 3,
+                "stress_periods": [{"return_pct": 0.02, "daily_max_drawdown_pct": -0.02, "daily_equity": curve}] * 3,
+            },
+            "frontier": [],
+            "correlations": {"baseline": {"baseline": 1.0}},
+            "phase_contributions": {
+                "selected_portfolio": {"up": 0.05, "down": -0.01, "sideways": 0.01},
+                "baseline": {"up": 0.05, "down": -0.01, "sideways": 0.01},
+                "buy_hold": {"up": 0.06, "down": -0.02, "sideways": 0.00},
+            },
+        }
+        rendered = render_html(report)
+        self.assertIn("同一份 142 天行情", rendered)
+        self.assertIn("最后 14 天只检验", rendered)

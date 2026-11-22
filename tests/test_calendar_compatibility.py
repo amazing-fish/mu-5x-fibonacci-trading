@@ -7,13 +7,12 @@ from mu_strategy.core.trading_calendar import LEGACY_CALENDAR, US_EQUITIES_CALEN
 from mu_strategy.observations import Stage0ObservationCycle, ObservationSchemaError
 from mu_strategy.research.strategy_releases import (
     StrategyConfigPayloadV1, StrategyConfigPayloadV2, StrategyReleaseSchemaError,
-    StrategyReleaseCandidateV1, parse_strategy_config_payload,
+    parse_strategy_config_payload,
 )
 from mu_strategy.strategies.registry import baseline_strategy_group
 from mu_strategy.strategy import StrategyConfig
 from tests import test_signal_review as review
 from tests import test_position_management as positions
-from tests.test_strategy_release_provenance import _candidate
 
 
 def legacy_config():
@@ -42,8 +41,6 @@ class CalendarCompatibilityTests(unittest.TestCase):
         self.assertEqual(original, restored)
         self.assertEqual(LEGACY_CALENDAR, restored.to_strategy_config().trading_calendar_id)
         self.assertEqual(original.to_dict(), StrategyConfigPayloadV1.from_config(restored.to_strategy_config()).to_dict())
-        candidate = _candidate(config=original)
-        self.assertEqual(candidate, StrategyReleaseCandidateV1.from_dict(candidate.to_dict()))
 
     def test_v2_binds_calendar_and_cannot_be_downgraded_or_malformed(self):
         config = baseline_strategy_group('MU-USDT-SWAP').config
@@ -62,6 +59,20 @@ class CalendarCompatibilityTests(unittest.TestCase):
                 parse_strategy_config_payload({**payload.to_dict(), 'schema_version': version})
         changed = replace(config, trading_calendar_id=LEGACY_CALENDAR, trading_calendar_sha256=None)
         self.assertNotEqual(payload.strategy_config_sha256, StrategyConfigPayloadV2.from_config(changed).strategy_config_sha256)
+
+    def test_saved_v2_us_equities_digest_and_pre_risk_limit_fields_remain_replayable(self):
+        config = baseline_strategy_group('MU-USDT-SWAP').config
+        wire = StrategyConfigPayloadV2.from_config(config).to_dict()
+        # Frozen historical us_equities_2025_2028_v1 digest must never silently drift.
+        self.assertEqual(
+            '0fc82fba68f3dea507d8d20c83fb3f0a72fe700182b3d66b9004eab1a3d1b2c5',
+            wire['fields']['trading_calendar_sha256'],
+        )
+        wire['fields'].pop('max_account_drawdown_pct', None)
+        wire['fields'].pop('daily_loss_limit_pct', None)
+        restored = parse_strategy_config_payload(wire)
+        self.assertEqual(config, restored.to_strategy_config())
+        self.assertEqual(wire, restored.to_dict())
 
     def test_old_observation_round_trips_without_inventing_candle_time(self):
         wire = legacy_cycle()

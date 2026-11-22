@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mu_strategy.market_data.symbols import resolve_okx_swap_symbol
+
 
 DEFAULT_FIB_LOOKBACK_BARS = 32
 
@@ -58,20 +60,12 @@ PREFERRED_FIBONACCI_PARAMETERS: tuple[PreferredFibonacciParameter, ...] = (
 
 
 _BY_SYMBOL = {parameter.symbol: parameter for parameter in PREFERRED_FIBONACCI_PARAMETERS}
-_ALIASES = {
-    "MU": "MU-USDT-SWAP",
-    "MUUSDT": "MU-USDT-SWAP",
-    "SPACEX": "SPCX-USDT-SWAP",
-    "SPCX": "SPCX-USDT-SWAP",
-    "META": "META-USDT-SWAP",
-    "BTC": "BTC-USDT-SWAP",
-    "BTCUSDT": "BTC-USDT-SWAP",
-}
 
 
 def preferred_fibonacci_parameter(symbol_or_asset: str) -> PreferredFibonacciParameter | None:
-    key = symbol_or_asset.strip().upper()
-    symbol = _ALIASES.get(key, key)
+    if not symbol_or_asset or not symbol_or_asset.strip():
+        return None
+    symbol = resolve_okx_swap_symbol(symbol_or_asset).inst_id
     return _BY_SYMBOL.get(symbol)
 
 

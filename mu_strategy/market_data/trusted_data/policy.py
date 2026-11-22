@@ -19,8 +19,15 @@ from mu_strategy.market_data.utils import interval_to_ms
 
 
 class IntervalDependencyPlanner:
-    def plan(self, requested_intervals: tuple[str, ...]) -> IntervalPlan:
+    def plan(
+        self,
+        requested_intervals: tuple[str, ...],
+        *,
+        include_base_for_validation: bool = True,
+    ) -> IntervalPlan:
         requested = tuple(dict.fromkeys(requested_intervals))
+        if not include_base_for_validation:
+            return IntervalPlan(requested_intervals=requested, effective_intervals=requested)
         effective: list[str] = []
         needs_base = any(interval in {"15m", "1h"} for interval in requested)
         if needs_base:
@@ -74,7 +81,11 @@ class TrustPolicy:
                 return TrustDecision(False, HealthReason.RUN_FAILED)
             if context.manifest.snapshot_usability == SnapshotUsability.INVALID:
                 return TrustDecision(False, HealthReason.MANIFEST_INVALID)
-            if context.manifest.snapshot_usability == SnapshotUsability.STALE and freshness_intervals is None:
+            if (
+                self.require_fresh
+                and context.manifest.snapshot_usability == SnapshotUsability.STALE
+                and freshness_intervals is None
+            ):
                 return TrustDecision(False, HealthReason.MANIFEST_STALE)
         for interval in required_intervals:
             health = health_by_interval.get(interval)
@@ -84,12 +95,13 @@ class TrustPolicy:
                 return TrustDecision(False, health.primary_reason)
             if health.integrity != IntegrityState.VALID and not self.allow_invalid:
                 return TrustDecision(False, health.primary_reason)
-        for interval in required_freshness_intervals:
-            health = health_by_interval.get(interval)
-            if health is None:
-                return TrustDecision(False, HealthReason.CACHE_MISSING)
-            if health.freshness != FreshnessState.FRESH and self.require_fresh:
-                return TrustDecision(False, _freshness_block_reason(health))
+        if self.require_fresh:
+            for interval in required_freshness_intervals:
+                health = health_by_interval.get(interval)
+                if health is None:
+                    return TrustDecision(False, HealthReason.CACHE_MISSING)
+                if health.freshness != FreshnessState.FRESH:
+                    return TrustDecision(False, _freshness_block_reason(health))
         return TrustDecision(True, HealthReason.OK)
 
 
@@ -98,7 +110,7 @@ def trading_strict_policy() -> TrustPolicy:
 
 
 def research_strict_policy() -> TrustPolicy:
-    return TrustPolicy(name="research_strict", require_manifest_success=True, require_fresh=True)
+    return TrustPolicy(name="research_strict", require_manifest_success=True, require_fresh=False)
 
 
 def observe_only_policy() -> TrustPolicy:

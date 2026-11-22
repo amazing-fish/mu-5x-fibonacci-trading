@@ -1,10 +1,14 @@
+import io
+import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from mu_strategy.backtest import run_backtest
 from mu_strategy.core.market_context import build_hourly_context
+from mu_strategy.experiments import trend_exit
 from mu_strategy.experiments.trend_exit import candidate_configs, retention_failures, run_experiment, split_periods
 from mu_strategy.models import Candle, EntryDecisionCode
 from mu_strategy.research.historical_data import load_historical_window
@@ -86,3 +90,64 @@ class TrendExitExperimentTests(unittest.TestCase):
         return {"full": {"return_pct": profit, "max_drawdown_pct": drawdown, "trade_count": 30},
                 "double_fee": {"return_pct": .2},
                 "periods": [{"return_pct": value} for value in periods]}
+
+    def test_cli_writes_compact_summary_json_by_default_and_includes_series_only_when_opted_in(self):
+        root = Path(__file__).resolve().parents[1]
+        data_dir = root / "data/live"
+        generation_id = "e702be27d2de4b2d92b12bf01c70d02d"
+
+        with TemporaryDirectory() as tmp:
+            compact_dir = Path(tmp) / "compact"
+            with patch("sys.stdout", new_callable=io.StringIO):
+                trend_exit.main([
+                    "--data-dir", str(data_dir),
+                    "--generation-id", generation_id,
+                    "--days", "3",
+                    "--output-dir", str(compact_dir),
+                ])
+            compact_payload = json.loads((compact_dir / "experiment.json").read_text(encoding="utf-8"))
+            self.assertFalse(compact_payload["series_included"])
+            self.assertNotIn("equity_curve", compact_payload["strategies"][0])
+            self.assertNotIn("trades", compact_payload["strategies"][0])
+            self.assertGreater(compact_payload["strategies"][0]["equity_curve_points"], 0)
+
+            full_dir = Path(tmp) / "full"
+            with patch("sys.stdout", new_callable=io.StringIO):
+                trend_exit.main([
+                    "--data-dir", str(data_dir),
+                    "--generation-id", generation_id,
+                    "--days", "3",
+                    "--include-series",
+                    "--output-dir", str(full_dir),
+                ])
+            full_payload = json.loads((full_dir / "experiment.json").read_text(encoding="utf-8"))
+            self.assertTrue(full_payload["series_included"])
+            self.assertIn("equity_curve", full_payload["strategies"][0])
+            self.assertIn("trades", full_payload["strategies"][0])
+            self.assertGreater(
+                (full_dir / "experiment.json").stat().st_size,
+                (compact_dir / "experiment.json").stat().st_size,
+            )
+
+    def test_cli_default_days_clamps_to_available_generation_coverage(self):
+        root = Path(__file__).resolve().parents[1]
+        data_dir = root / "data/live"
+        generation_id = "0114f8334f2e40d6ba5b5030faf6007b"
+        calls = []
+
+        def spy_load(**kwargs):
+            calls.append(kwargs)
+            raise ValueError("stop-after-load")
+
+        with TemporaryDirectory() as tmp:
+            with patch("mu_strategy.experiments.trend_exit.load_historical_window", side_effect=spy_load):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as exc:
+                        trend_exit.main([
+                            "--data-dir", str(data_dir),
+                            "--generation-id", generation_id,
+                            "--output-dir", str(Path(tmp) / "out"),
+                        ])
+        self.assertEqual(2, exc.exception.code)
+        self.assertEqual(179, calls[0]["days"])
+        self.assertTrue(calls[0]["allow_partial"])

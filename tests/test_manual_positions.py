@@ -48,8 +48,11 @@ class ManualPositionTests(ManualPositionTestCase):
         self.assertIn("尚无成交记录。这不代表账户空仓", render_signal_review(self.fixture.read()))
 
     def test_manual_facts_survive_reopen_and_leave_source_evidence_unchanged(self):
-        before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                  for p in self.fixture.health.root.rglob("*") if p.is_file()}
+        before = {
+            str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in self.fixture.health.root.rglob("*")
+            if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+        }
         payload = self.payload(price="101.23", stage="2", stop_price="95")
         self.save(payload)
         position = ManualPositionLedger(self.fixture.data_dir).read()[0]
@@ -62,8 +65,33 @@ class ManualPositionTests(ManualPositionTestCase):
         self.assertEqual(self.entry.event_id, position["signal_source"]["event_id"])
         self.assertEqual("manual_confirmation", position["source"])
         self.assertLess(position["fills"][0]["time_ms"], position["fills"][0]["recorded_at_ms"])
-        self.assertEqual(before, {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                                  for p in self.fixture.health.root.rglob("*") if p.is_file()})
+        self.assertEqual(
+            before,
+            {
+                str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in self.fixture.health.root.rglob("*")
+                if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+            },
+        )
+
+    def test_ledger_uses_wal_and_supports_concurrent_reads_and_writes(self):
+        import sqlite3
+        from concurrent.futures import ThreadPoolExecutor
+
+        identity = self.save(self.payload())
+        with sqlite3.connect(self.ledger.path) as db:
+            mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual("wal", mode.lower())
+
+        def worker(index: int):
+            if index % 3 == 0:
+                self.save(self.payload(command="append", position_id=identity, quantity="1", price="101"))
+            else:
+                self.assertTrue(self.ledger.view()["available"])
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(worker, range(18)))
+        self.assertEqual(7, len(self.ledger.read()[0]["fills"]))
 
     def test_retries_are_idempotent_but_two_identical_fills_are_distinct(self):
         first = self.payload()

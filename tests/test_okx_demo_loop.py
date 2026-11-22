@@ -131,7 +131,7 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual(["positions"], source_calls)
         self.assertEqual(1, len(result["exit_observations"]))
-        self.assertEqual("unknown", result["exit_observations"][0]["decision_status"])
+        self.assertEqual("hold", result["exit_observations"][0]["decision_status"])
         self.assertEqual("degraded", result["exit_observations"][0]["state_quality"])
         self.assertEqual("injected", result["exit_observation_status"]["source"])
 
@@ -182,7 +182,7 @@ class OKXDemoLoopTests(unittest.TestCase):
             broker.calls,
         )
         self.assertEqual(1, len(result["exit_observations"]))
-        self.assertEqual("unknown", result["exit_observations"][0]["decision_status"])
+        self.assertEqual("hold", result["exit_observations"][0]["decision_status"])
         self.assertEqual("broker", result["exit_observation_status"]["source"])
 
     def test_run_once_exit_observation_uses_active_demo_leverage(self):
@@ -192,8 +192,9 @@ class OKXDemoLoopTests(unittest.TestCase):
         bundle = CandleBundle(
             symbol=ResolvedSymbol(requested="MU-USDT-SWAP", inst_id="MU-USDT-SWAP", source="okx"),
             candles_by_interval={
-                "15m": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
-                "1h": [Candle(weekend_ms, 110, 111, 90, 100, 1000)],
+                # Gap down below 10x liquidation (99.0) while remaining above 5x liquidation (88.0).
+                "15m": [Candle(weekend_ms, 98, 101, 90, 100, 1000)],
+                "1h": [Candle(weekend_ms, 98, 101, 90, 100, 1000)],
             },
             files_by_interval={},
             days=1,
@@ -923,7 +924,96 @@ class OKXDemoLoopTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         output = json.loads(stdout.getvalue())
-        self.assertEqual({"broker": True, "limit": 1, "mode": "dry_run"}, output)
+        self.assertEqual({"broker": False, "limit": 1, "mode": "dry_run"}, output)
+
+    def test_cli_once_dry_run_fetch_instrument_sizing_opts_in_to_public_broker(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        stdout = io.StringIO()
+
+        exit_code = main(
+            ["--once", "--dry-run", "--fetch-instrument-sizing", "--limit", "1"],
+            stdout=stdout,
+            runner=lambda config, broker: {
+                "mode": "dry_run",
+                "fetch_instrument_specs": config.fetch_instrument_specs,
+                "broker": broker is not None,
+                "has_credentials": broker.credentials is not None if broker is not None else None,
+            },
+        )
+
+        self.assertEqual(0, exit_code)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(
+            {"broker": True, "fetch_instrument_specs": True, "has_credentials": False, "mode": "dry_run"},
+            output,
+        )
+
+    def test_cli_once_dry_run_with_active_entry_signal_makes_zero_outbound_network_calls(self):
+        from mu_strategy.commands.okx_demo_loop import main
+
+        stdout = io.StringIO()
+        with TemporaryDirectory() as tmp:
+            obs_log = Path(tmp) / "stage0.jsonl"
+            with patch("socket.create_connection", side_effect=AssertionError("outbound network forbidden in dry-run")):
+                with patch("http.client.HTTPSConnection", side_effect=AssertionError("HTTPS forbidden in dry-run")):
+                    exit_code = main(
+                        [
+                            "--once",
+                            "--dry-run",
+                            "--limit",
+                            "1",
+                            "--no-default-watchlist",
+                            "--observation-log",
+                            str(obs_log),
+                        ],
+                        stdout=stdout,
+                        runner=lambda config, broker: run_once(
+                            config,
+                            broker=broker,
+                            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+                            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+                        ),
+                    )
+
+        self.assertEqual(0, exit_code)
+        output = json.loads(stdout.getvalue())
+        self.assertEqual("dry_run", output["mode"])
+        self.assertEqual(1, len(output["orders"]))
+        self.assertEqual("planned", output["orders"][0]["status"])
+        self.assertEqual("100.19", output["orders"][0]["limit_price"])
+        self.assertIsNone(output["orders"][0]["size"])
+
+    def test_run_once_dry_run_skips_live_okx_client_sizing_unless_opted_in_but_keeps_mock_broker_sizing(self):
+        from mu_strategy.live.okx import OKXRestClient
+
+        with OKXRestClient(credentials=None, demo=True) as live_client:
+            with patch("socket.create_connection", side_effect=AssertionError("live HTTPS must not run in offline dry-run")):
+                with patch("http.client.HTTPSConnection", side_effect=AssertionError("live HTTPS must not run in offline dry-run")):
+                    offline_result = run_once(
+                        DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
+                        broker=live_client,
+                        universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+                        candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+                        scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+                    )
+
+        self.assertEqual("planned", offline_result["orders"][0]["status"])
+        self.assertEqual("100.19", offline_result["orders"][0]["limit_price"])
+        self.assertIsNone(offline_result["orders"][0]["size"])
+
+        mock_broker = StubBroker()
+        mock_result = run_once(
+            DemoTradingConfig(universe_limit=1, dry_run=True, watchlist_symbols=()),
+            broker=mock_broker,
+            universe_provider=lambda limit: [OKXSwapTicker("BTC-USDT-SWAP", 101.0, 1000.0)],
+            candle_loader=lambda symbol, **kwargs: _bundle(symbol),
+            scanner=lambda symbol, candles_15m, candles_1h, **kwargs: _entry(symbol, trigger_price=100.19),
+        )
+        self.assertEqual("100.1", mock_result["orders"][0]["limit_price"])
+        self.assertEqual("9.99", mock_result["orders"][0]["size"])
+        self.assertEqual([("get_instruments", "SWAP", "BTC-USDT-SWAP")], mock_broker.calls)
 
     def test_cli_confirm_mode_requires_credentials_before_running(self):
         from mu_strategy.commands.okx_demo_loop import main
@@ -1107,6 +1197,72 @@ class OKXDemoLoopTests(unittest.TestCase):
         self.assertIn("dashboard_render_failed", stderr.getvalue())
         self.assertIn("disk full", stderr.getvalue())
 
+    def test_okx_response_failed_rejects_missing_or_empty_code_and_scode(self):
+        from mu_strategy.demo_trading import _account_context_error, _okx_response_failed
+
+        self.assertTrue(_okx_response_failed({}))
+        self.assertTrue(_okx_response_failed({"code": ""}))
+        self.assertTrue(_okx_response_failed({"code": None}))
+        self.assertTrue(_okx_response_failed(None))
+        self.assertTrue(_okx_response_failed({"code": "0", "data": [{"sCode": ""}]}))
+        self.assertTrue(_okx_response_failed({"code": "0", "data": [{"sCode": None}]}))
+        self.assertFalse(_okx_response_failed({"code": "0", "data": [{"sCode": "0"}]}))
+        self.assertIsNotNone(_account_context_error({"positions": {}}))
+        self.assertIsNotNone(_account_context_error({"positions": {"code": ""}}))
+        self.assertIsNone(_account_context_error({"positions": {"code": "0", "data": []}}))
+
+    def test_decimal_raises_on_corrupt_numeric_payloads_instead_of_silent_zero(self):
+        from decimal import Decimal
+        from mu_strategy.demo_trading import _decimal
+
+        self.assertEqual(Decimal("0"), _decimal("", allow_empty=True))
+        self.assertEqual(Decimal("0"), _decimal(None, allow_empty=True))
+        self.assertEqual(Decimal("12.5"), _decimal("12.5"))
+        for bad in ("not-a-number", "NaN", "Infinity", "-Infinity", True, {}, []):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _decimal(bad)
+                with self.assertRaises(ValueError):
+                    _decimal(bad, allow_empty=True)
+        with self.assertRaises(ValueError):
+            _decimal("")
+        with self.assertRaises(ValueError):
+            _decimal(None)
+
+        class CorruptPositionBroker(StubBroker):
+            def get_positions(self, *, inst_type=None, inst_id=None):
+                return {"code": "0", "data": [{"instId": "MU-USDT-SWAP", "pos": "corrupt"}], "msg": ""}
+
+        with self.assertRaises(ValueError):
+            run_once(
+                DemoTradingConfig(universe_limit=0, dry_run=False, watchlist_symbols=()),
+                broker=CorruptPositionBroker(),
+            )
+
+    def test_instrument_spec_is_cached_within_cycle_and_failed_response_is_rejected(self):
+        from mu_strategy.demo_trading import _attach_order_sizing
+
+        broker = StubBroker()
+        cache = {}
+        entry = _entry("BTC-USDT-SWAP", trigger_price=100.19)
+        plan_a = {"notional_usdt": 10.0}
+        plan_b = {"notional_usdt": 20.0}
+        _attach_order_sizing(plan_a, broker, entry, instrument_cache=cache)
+        _attach_order_sizing(plan_b, broker, entry, instrument_cache=cache)
+
+        instrument_calls = [call for call in broker.calls if call[0] == "get_instruments"]
+        self.assertEqual(1, len(instrument_calls))
+        self.assertEqual("100.1", plan_a["limit_price"])
+        self.assertEqual("100.1", plan_b["limit_price"])
+
+        class FailingInstrumentBroker(StubBroker):
+            def get_instruments(self, *, inst_type, inst_id):
+                return {}
+
+        failed_plan = {"notional_usdt": 10.0}
+        _attach_order_sizing(failed_plan, FailingInstrumentBroker(), entry, instrument_cache={})
+        self.assertEqual("instrument_spec_unavailable", failed_plan["reason"])
+
 
 def _bundle(symbol: str) -> CandleBundle:
     bundle = trusted_scan_bundle(symbol=symbol)
@@ -1120,7 +1276,7 @@ def _bundle(symbol: str) -> CandleBundle:
 
 
 def _stale_bundle(symbol: str) -> CandleBundle:
-    from mu_strategy.market_data.trusted import DataStatus
+    from mu_strategy.market_data.trusted_data.compat import DataStatus
 
     statuses = {
         interval: DataStatus(

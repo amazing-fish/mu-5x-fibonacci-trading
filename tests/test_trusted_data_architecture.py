@@ -237,7 +237,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
                 self.assertEqual(reason, bundle.trust_decision.reason)
 
     def test_manifest_validation_and_local_validation_precedence_are_preserved(self):
-        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.data import write_csv
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import observe_only_policy
@@ -275,7 +275,7 @@ class TrustedDataStoreLoadTests(unittest.TestCase):
             self.assertEqual(HealthReason.TIMESTAMP_MISALIGNED, bundle.health_by_interval["15m"].validation.reason)
 
     def test_canonical_csv_content_hash_binding_is_strict(self):
-        from mu_strategy.market_data.cache import write_csv
+        from mu_strategy.data import write_csv
         from mu_strategy.market_data.trusted_data.contracts import HealthReason
         from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
         from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
@@ -542,21 +542,9 @@ class TrustedDataRefreshTests(unittest.TestCase):
             for interval in ("5m", "15m", "1h"):
                 persisted = manifest["symbols"]["BTC-USDT-SWAP"]["intervals"][interval]
                 first_reference = persisted["storage"]["segments"][0]
-                expected_name = (
-                    f"{first_reference['segment_id']}.partial-{first_reference['first_timestamp_ms']}.csv"
-                )
+                expected_name = f"{first_reference['segment_id']}.csv"
                 self.assertEqual(expected_name, Path(first_reference["source_file"]).name)
                 self.assertTrue((data_dir / first_reference["source_file"]).is_file())
-                self.assertFalse(
-                    (
-                        data_dir
-                        / "segments"
-                        / "okx"
-                        / "BTC-USDT-SWAP"
-                        / interval
-                        / f"{first_reference['segment_id']}.csv"
-                    ).exists()
-                )
 
         self.assertEqual(RefreshAttemptStatus.SUCCESS, run.attempt_status)
         self.assertEqual(SnapshotUsability.USABLE, run.snapshot_usability)
@@ -1045,11 +1033,194 @@ class TrustedDataRefreshTests(unittest.TestCase):
         segment = run.refresh_segments[0]
         self.assertEqual(RefreshAttemptStatus.FAILED, run.attempt_status)
         self.assertEqual(SnapshotUsability.INVALID, run.snapshot_usability)
-        self.assertEqual(HealthReason.CACHE_READ_FAILED, health.primary_reason)
-        self.assertEqual("cache_read_failed", segment.fetch_mode)
-        self.assertEqual("cache_read_failed", segment.fetch_reason.value)
-        self.assertEqual("cache_read_failed", segment.health_reason.value)
+        self.assertEqual(HealthReason.REFRESH_FAILED, health.primary_reason)
+        self.assertEqual("TimeoutError", health.error_type)
+        self.assertIn("history offline", health.message)
+        self.assertIn("disk offline", health.message)
+        self.assertEqual("prior_read_and_history_failed", segment.fetch_mode)
+        self.assertEqual("refresh_failed", segment.fetch_reason.value)
+        self.assertEqual("refresh_failed", segment.health_reason.value)
         self.assertEqual(0, segment.output_rows)
+        self.assertEqual(1, len(run.provider_failures))
+        self.assertEqual("TimeoutError", run.provider_failures[0]["error_type"])
+
+    def test_loader_skips_5m_disk_read_when_15m_and_1h_are_directly_valid(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy, trading_strict_policy
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        end_ms = 20 * DAY_MS
+        with TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            write_generation_publication(data_dir, symbol="MU-USDT-SWAP", start_ms=end_ms - 2 * DAY_MS, end_ms=end_ms)
+            store = TrustedDataStore(data_dir=data_dir)
+            read_intervals: list[str] = []
+            verified_intervals: list[str] = []
+            orig = store.read_generation_dataset_with_hash
+            orig_verify = store.verify_generation_dataset_bytes
+
+            def spy(snapshot, *, symbol, interval, **kwargs):
+                read_intervals.append(interval)
+                return orig(snapshot, symbol=symbol, interval=interval, **kwargs)
+
+            def verify_spy(snapshot, *, symbol, interval, **kwargs):
+                verified_intervals.append(interval)
+                return orig_verify(snapshot, symbol=symbol, interval=interval, **kwargs)
+
+            with (
+                patch.object(store, "read_generation_dataset_with_hash", side_effect=spy),
+                patch.object(store, "verify_generation_dataset_bytes", side_effect=verify_spy),
+            ):
+                research_bundle = LoadTrustedBundle(store).execute(
+                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=end_ms + 30 * DAY_MS),
+                    research_strict_policy(),
+                )
+                trading_bundle = LoadTrustedBundle(store).execute(
+                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=end_ms + 30 * DAY_MS),
+                    trading_strict_policy(),
+                )
+
+        self.assertEqual(["15m", "1h", "15m", "1h"], read_intervals)
+        self.assertEqual(["5m", "5m"], verified_intervals)
+        self.assertTrue(research_bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.OK, research_bundle.trust_decision.reason)
+        self.assertFalse(trading_bundle.trust_decision.allowed)
+        self.assertEqual(HealthReason.STALE_BY_CLOCK, trading_bundle.trust_decision.reason)
+        self.assertEqual(("5m", "15m", "1h"), tuple(research_bundle.health_by_interval))
+        self.assertIsNotNone(research_bundle.health_by_interval["5m"].content_sha256)
+        self.assertEqual("complete", research_bundle.health_by_interval["5m"].coverage_state)
+
+    def test_loader_rejects_strict_15m_1h_load_when_5m_segment_is_missing_or_tampered(self):
+        from mu_strategy.market_data.trusted_data.contracts import (
+            AvailabilityState,
+            HealthReason,
+            IntegrityState,
+            TrustedStorageLayout,
+        )
+        from mu_strategy.market_data.trusted_data.load import LoadTrustedBundle, LoadTrustedBundleQuery
+        from mu_strategy.market_data.trusted_data.policy import research_strict_policy, trading_strict_policy
+        from mu_strategy.market_data.trusted_data.refresh import RefreshTrustedMarketData, RefreshTrustedMarketDataRequest
+        from mu_strategy.market_data.trusted_data.store import TrustedDataStore
+        from mu_strategy.market_data.utils import DAY_MS
+
+        from mu_strategy.market_data.trusted_data.validation import aggregate_candles
+
+        end_ms = 20 * DAY_MS
+
+        def locate_five_csv(store: TrustedDataStore) -> tuple[Path, int]:
+            res = store.read_manifest()
+            assert res.ok and res.snapshot is not None
+            storage = res.snapshot.storage_by_dataset[("MU-USDT-SWAP", "5m")]
+            if storage.layout is TrustedStorageLayout.SEGMENTED_CSV_V1:
+                first_ref = storage.segments[0]
+                return store.data_dir / first_ref.source_file, first_ref.start_row
+            health = res.snapshot.datasets[("MU-USDT-SWAP", "5m")]
+            assert res.generation_root is not None and res.generation_id is not None
+            return (
+                store.resolve_source_file(
+                    health.source_file,
+                    generation_root=res.generation_root,
+                    generation_id=res.generation_id,
+                ),
+                0,
+            )
+
+        for layout_kind in ("v3_flat", "v4_segmented"):
+            with TemporaryDirectory() as tmp:
+                data_dir = Path(tmp)
+                store = TrustedDataStore(data_dir=data_dir)
+                if layout_kind == "v3_flat":
+                    write_generation_publication(data_dir, symbol="MU-USDT-SWAP", start_ms=end_ms - 2 * DAY_MS, end_ms=end_ms)
+                else:
+                    five_rows = range_candles(0, end_ms, step_ms=300_000)
+                    rows_by_interval = {
+                        "5m": five_rows,
+                        "15m": aggregate_candles(five_rows, interval="15m"),
+                        "1h": aggregate_candles(five_rows, interval="1h"),
+                    }
+                    provider = RecordingProvider(
+                        history_fetcher=lambda _sym, iv, *, days: rows_by_interval[iv]
+                    )
+                    run = RefreshTrustedMarketData(store, provider).execute(
+                        RefreshTrustedMarketDataRequest(
+                            symbols=("MU-USDT-SWAP",),
+                            requested_intervals=("5m", "15m", "1h"),
+                            days=1,
+                            now_ms=end_ms,
+                            run_id="run-v4-5m-check",
+                        )
+                    )
+                    self.assertEqual("success", run.attempt_status.value)
+
+                five_file, start_row = locate_five_csv(store)
+                original_bytes = five_file.read_bytes()
+
+                # 1. Tampering referenced 5m bytes after publication must invalidate 5m and reject strict 15m/1h loads.
+                tampered_lines = original_bytes.decode("utf-8").splitlines()
+                target_line = 1 + start_row
+                parts = tampered_lines[target_line].split(",")
+                parts[5] = f"{float(parts[5]) + 1.0:.8f}"
+                tampered_lines[target_line] = ",".join(parts)
+                five_file.write_text("\n".join(tampered_lines) + "\n", encoding="utf-8")
+
+                for policy in (research_strict_policy(), trading_strict_policy()):
+                    with self.subTest(layout=layout_kind, case="tampered", policy=policy.name):
+                        bundle = LoadTrustedBundle(store).execute(
+                            LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=end_ms),
+                            policy,
+                        )
+                        self.assertFalse(bundle.trust_decision.allowed)
+                        self.assertEqual(IntegrityState.INVALID, bundle.health_by_interval["5m"].integrity)
+
+                # 2. Removing the 5m file must report 5m MISSING and reject strict 15m/1h loads.
+                five_file.unlink()
+                for policy in (research_strict_policy(), trading_strict_policy()):
+                    with self.subTest(layout=layout_kind, case="missing", policy=policy.name):
+                        bundle = LoadTrustedBundle(store).execute(
+                            LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=1, now_ms=end_ms),
+                            policy,
+                        )
+                        self.assertFalse(bundle.trust_decision.allowed)
+                        self.assertEqual(AvailabilityState.MISSING, bundle.health_by_interval["5m"].availability)
+                        self.assertEqual(HealthReason.CACHE_READ_FAILED, bundle.health_by_interval["5m"].primary_reason)
+
+                # 3. Shifting manifest 5m first_timestamp_ms without touching CSV bytes must fail byte verification.
+                five_file.write_bytes(original_bytes)
+                res = store.read_manifest()
+                assert res.ok and res.manifest_path is not None and res.payload is not None
+                shifted = json.loads(res.manifest_path.read_text(encoding="utf-8"))
+                five_meta = shifted["symbols"]["MU-USDT-SWAP"]["intervals"]["5m"]
+                five_meta["first_timestamp_ms"] += 3_600_000
+                if layout_kind == "v4_segmented":
+                    five_meta["storage"]["segments"][0]["first_timestamp_ms"] += 3_600_000
+                res.manifest_path.write_text(json.dumps(shifted, sort_keys=True), encoding="utf-8")
+
+                shifted_res = store.read_manifest()
+                assert shifted_res.ok and shifted_res.snapshot is not None
+                assert shifted_res.generation_root is not None and shifted_res.generation_id is not None
+                self.assertIsNone(
+                    store.verify_generation_dataset_bytes(
+                        shifted_res.snapshot,
+                        symbol="MU-USDT-SWAP",
+                        interval="5m",
+                        generation_root=shifted_res.generation_root,
+                        generation_id=shifted_res.generation_id,
+                    )
+                )
+                bundle = LoadTrustedBundle(store).execute(
+                    LoadTrustedBundleQuery("MU-USDT-SWAP", intervals=("15m", "1h"), days=2, now_ms=end_ms),
+                    research_strict_policy(),
+                )
+                self.assertFalse(bundle.trust_decision.allowed)
+                self.assertEqual(IntegrityState.INVALID, bundle.health_by_interval["5m"].integrity)
+                expected_reason = (
+                    HealthReason.CACHE_READ_FAILED
+                    if layout_kind == "v4_segmented"
+                    else HealthReason.CACHE_CONTENT_MISMATCH
+                )
+                self.assertEqual(expected_reason, bundle.health_by_interval["5m"].primary_reason)
 
 
 class TrustedDemoConsumerTests(unittest.TestCase):

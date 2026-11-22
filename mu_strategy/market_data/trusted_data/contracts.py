@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from mu_strategy.market_data.utils import interval_to_ms
+from mu_strategy.market_data.utils import day_utc_month_id, interval_to_ms
 from mu_strategy.models import Candle
 
 
@@ -243,7 +242,7 @@ class DatasetHealth:
             "availability": self.availability.value,
             "integrity": self.integrity.value,
             "freshness": self.freshness.value,
-            "reasons": [reason.value for reason in self.reasons],
+            "reasons": [r.value for r in self.reasons],
             "rows": self.rows,
             "first_timestamp_ms": self.first_timestamp_ms,
             "last_timestamp_ms": self.last_timestamp_ms,
@@ -437,7 +436,6 @@ class RefreshRun:
     warnings: tuple[str, ...] = ()
     cycle_error: dict[str, str] | None = None
     refresh_segments: tuple[RefreshSegmentDiagnostics, ...] = ()
-    imported_from_run_id: str | None = None
 
     def to_manifest(self) -> dict[str, Any]:
         symbols: dict[str, dict[str, Any]] = {}
@@ -476,8 +474,6 @@ class RefreshRun:
             "warnings": list(self.warnings),
             "cycle_error": self.cycle_error,
         }
-        if self.imported_from_run_id is not None:
-            payload["imported_from_run_id"] = self.imported_from_run_id
         diagnostics = refresh_run_diagnostics_payload(self)
         if diagnostics:
             payload["diagnostics"] = diagnostics
@@ -656,7 +652,7 @@ def health_reason(value: Any, *, strict: bool = False) -> HealthReason:
         return value
     try:
         return HealthReason(str(value))
-    except Exception:
+    except ValueError:
         if strict:
             raise ManifestSchemaError(f"unknown health reason: {value}") from None
         return HealthReason.REFRESH_FAILED
@@ -710,7 +706,6 @@ def _datasets_from_symbols(symbols: dict[str, Any], *, strict: bool = True) -> d
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UTC_MONTH_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
-_UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _SEGMENT_REFERENCE_FIELDS = frozenset(
     {
         "segment_id",
@@ -729,12 +724,51 @@ _DATASET_STORAGE_FIELDS = frozenset({"layout", "source_root", "segments"})
 def utc_month_segment_id(open_time_ms: int) -> str:
     if not _is_int(open_time_ms):
         raise ValueError("open_time_ms must be an integer")
-    seconds, milliseconds = divmod(open_time_ms, 1000)
+    seconds = open_time_ms // 1000
+    utc_day = seconds // 86_400
     try:
-        instant = _UTC_EPOCH + timedelta(seconds=seconds, milliseconds=milliseconds)
+        return day_utc_month_id(utc_day)
     except (OverflowError, ValueError) as exc:
         raise ValueError("open_time_ms is outside the supported UTC datetime range") from exc
-    return f"{instant.year:04d}-{instant.month:02d}"
+
+
+def is_allowed_segment_source(
+    source_file: str | Path,
+    *,
+    symbol: str,
+    interval: str,
+    segment_id: str,
+    run_id: str,
+    imported_from_run_id: str | None,
+    first_reference: bool,
+    start_row: int,
+    first_timestamp_ms: int,
+) -> bool:
+    """Validate canonical UTC-month path or retained first-segment compatibility paths."""
+    if isinstance(source_file, Path):
+        source_value = source_file.as_posix()
+    elif isinstance(source_file, str):
+        source_value = source_file
+    else:
+        return False
+    canonical = f"segments/okx/{symbol}/{interval}/{segment_id}.csv"
+    if source_value == canonical:
+        return True
+    if not first_reference:
+        return False
+    if imported_from_run_id is not None:
+        imported = f"segments/okx/{symbol}/{interval}/{segment_id}.import-{run_id}.csv"
+        if source_value == imported:
+            return True
+    try:
+        partial_start_ms = int(first_timestamp_ms) - (int(start_row) * interval_to_ms(interval))
+        partial_segment_id = utc_month_segment_id(partial_start_ms)
+    except (IndexError, TypeError, ValueError):
+        return False
+    if partial_segment_id != segment_id:
+        return False
+    partial = f"segments/okx/{symbol}/{interval}/{segment_id}.partial-{partial_start_ms}.csv"
+    return source_value == partial
 
 
 def _segmented_datasets_from_symbols(
@@ -853,27 +887,21 @@ def _segment_reference_from_dict(
         raise ManifestSchemaError(str(exc)) from exc
     if first_segment_id != segment_id or last_segment_id != segment_id:
         raise ManifestSchemaError("schema-v4 segment timestamp bounds must belong to segment_id")
-    expected_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.csv"
-    imported_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.import-{run_id}.csv"
     try:
-        partial_start_ms = int(first_timestamp_ms) - (int(start_row) * interval_to_ms(interval))
-        partial_segment_id = utc_month_segment_id(partial_start_ms)
+        interval_to_ms(interval)
     except (IndexError, TypeError, ValueError) as exc:
         raise ManifestSchemaError(f"schema-v4 segment interval is invalid: {interval}") from exc
-    partial_source_value = f"segments/okx/{symbol}/{interval}/{segment_id}.partial-{partial_start_ms}.csv"
     source_file_value = payload.get("source_file")
-    if not isinstance(source_file_value, str) or not (
-        source_file_value == expected_source_value
-        or (
-            imported_from_run_id is not None
-            and first_reference
-            and source_file_value == imported_source_value
-        )
-        or (
-            first_reference
-            and partial_segment_id == segment_id
-            and source_file_value == partial_source_value
-        )
+    if not isinstance(source_file_value, str) or not is_allowed_segment_source(
+        source_file_value,
+        symbol=symbol,
+        interval=interval,
+        segment_id=segment_id,
+        run_id=run_id,
+        imported_from_run_id=imported_from_run_id,
+        first_reference=first_reference,
+        start_row=int(start_row),
+        first_timestamp_ms=int(first_timestamp_ms),
     ):
         raise ManifestSchemaError(
             "schema-v4 segment source_file must equal the canonical month path or an allowed exact compatibility path"

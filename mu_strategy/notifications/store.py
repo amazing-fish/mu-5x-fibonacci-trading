@@ -48,26 +48,33 @@ class NotificationStore:
 
     def initialize(self) -> None:
         self.health.prepare()
-        with self.connection() as db, self.transaction(db):
-            version = db.execute("PRAGMA user_version").fetchone()[0]
-            definitions = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
-            if version == 0:
-                if definitions:
-                    raise NotificationError("unknown email database schema")
-                for statement in SCHEMA:
-                    db.execute(statement)
-                db.execute("PRAGMA user_version = 1")
-                self.set_meta(db, "data_dir", str(self.health.data_dir))
-            self.validate(db)
-        fsync_directory(self.path.parent)
+        db_existed = self.path.exists()
+        with self.connection() as db:
+            db.execute("PRAGMA journal_mode = WAL")
+            with self.transaction(db):
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0:
+                    existing = db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+                    ).fetchone()
+                    if existing is not None:
+                        raise NotificationError("unknown email database schema")
+                    for statement in SCHEMA:
+                        db.execute(statement)
+                    db.execute("PRAGMA user_version = 1")
+                    self.set_meta(db, "data_dir", str(self.health.data_dir))
+                self.validate(db)
+        if not db_existed:
+            fsync_directory(self.path.parent)
 
     def validate(self, db) -> None:
         if db.execute("PRAGMA user_version").fetchone()[0] != 1:
             raise NotificationError("unsupported email database schema")
-        actual = [row[0] for row in db.execute("SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")]
-        if sorted(actual) != sorted(SCHEMA):
-            raise NotificationError("email database schema changed")
-        if self.get_meta(db, "data_dir") != str(self.health.data_dir):
+        try:
+            stored_dir = self.get_meta(db, "data_dir")
+        except sqlite3.Error as exc:
+            raise NotificationError("email database metadata table unavailable") from exc
+        if stored_dir != str(self.health.data_dir):
             raise NotificationError("email database belongs to another data directory")
 
     @contextmanager
@@ -76,9 +83,10 @@ class NotificationStore:
         db = sqlite3.connect(target, uri=readonly, timeout=5, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("PRAGMA busy_timeout = 5000")
             db.execute("PRAGMA foreign_keys = ON")
             if not readonly:
-                db.execute("PRAGMA synchronous = FULL")
+                db.execute("PRAGMA synchronous = NORMAL")
             yield db
         finally:
             db.close()
@@ -119,14 +127,13 @@ class NotificationStore:
         db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
                    (name, canonical_json(value)))
 
-    def stream(self, db, symbol: str) -> dict:
-        row = db.execute("SELECT value FROM streams WHERE symbol=?", (symbol,)).fetchone()
-        if row is None:
-            return {"counter": 0, "created_at_ms": 0, "observed_at_ms": 0,
-                    "active_event_id": None, "signal_key": None, "last_seen_ms": 0, "last_result": None,
-                    "service_run_id": None, "collection_run_id": None}
-        result = decode(row[0])
-        if not isinstance(result, dict) or set(result) != {"counter", "created_at_ms", "observed_at_ms", "active_event_id", "signal_key", "last_seen_ms", "last_result", "service_run_id", "collection_run_id"}:
+    @staticmethod
+    def _validate_stream(result: object) -> dict:
+        expected_keys = {
+            "counter", "created_at_ms", "observed_at_ms", "active_event_id",
+            "signal_key", "last_seen_ms", "last_result", "service_run_id", "collection_run_id",
+        }
+        if not isinstance(result, dict) or set(result) != expected_keys:
             raise NotificationError("invalid signal stream")
         for key in ("service_run_id", "collection_run_id"):
             if result[key] is not None and (not isinstance(result[key], str) or not result[key]):
@@ -140,10 +147,18 @@ class NotificationStore:
             raise NotificationError("inconsistent signal stream")
         return result
 
+    def stream(self, db, symbol: str) -> dict:
+        row = db.execute("SELECT value FROM streams WHERE symbol=?", (symbol,)).fetchone()
+        if row is None:
+            return {"counter": 0, "created_at_ms": 0, "observed_at_ms": 0,
+                    "active_event_id": None, "signal_key": None, "last_seen_ms": 0, "last_result": None,
+                    "service_run_id": None, "collection_run_id": None}
+        return self._validate_stream(decode(row[0]))
+
     def save_stream(self, db, symbol: str, value: dict) -> None:
+        validated = self._validate_stream(value)
         db.execute("INSERT INTO streams VALUES (?,?) ON CONFLICT(symbol) DO UPDATE SET value=excluded.value",
-                   (symbol, canonical_json(value)))
-        self.stream(db, symbol)
+                   (symbol, canonical_json(validated)))
 
     def symbols(self, db) -> tuple[str, ...]:
         return tuple(row[0] for row in db.execute("SELECT symbol FROM streams ORDER BY symbol"))
@@ -156,21 +171,19 @@ class NotificationStore:
         db.execute("INSERT INTO consumed_cycles VALUES (?,?)", (cycle_id, digest(content_sha256)))
 
     def enqueue(self, db, event: AlertEvent, *, now_ms: int, suppressed_reason: str | None = None) -> None:
-        canonical = AlertEvent.from_json(event.to_json())
+        if not isinstance(event, AlertEvent):
+            raise NotificationError("invalid alert event")
         existing = self.record(db, event.event_id)
         if existing is not None:
-            if existing.event != canonical:
+            if existing.event != event:
                 raise NotificationError("event identity reused with different evidence")
             return
         db.execute("INSERT INTO outbox VALUES (?,?,'pending',0,?,0,?)",
-                   (event.event_id, canonical.to_json(), integer(now_ms), suppressed_reason))
+                   (event.event_id, event.to_json(), integer(now_ms), suppressed_reason))
         self.history(db, event.event_id, now_ms, "recorded", suppressed_reason or "pending")
 
-    def record(self, db, event_id: str) -> DeliveryRecord | None:
-        digest(event_id)
-        row = db.execute("SELECT * FROM outbox WHERE event_id=?", (event_id,)).fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> DeliveryRecord:
         event = AlertEvent.from_json(row["payload"])
         if event.event_id != row["event_id"] or row["retryable"] not in (0, 1):
             raise NotificationError("invalid persisted delivery")
@@ -186,6 +199,11 @@ class NotificationStore:
             raise NotificationError("invalid delivery suppression")
         return result
 
+    def record(self, db, event_id: str) -> DeliveryRecord | None:
+        digest(event_id)
+        row = db.execute("SELECT * FROM outbox WHERE event_id=?", (event_id,)).fetchone()
+        return None if row is None else self._row_to_record(row)
+
     def history(self, db, event_id: str, now_ms: int, action: str, result: str) -> None:
         db.execute("INSERT INTO delivery_history(event_id,at_ms,action,result) VALUES (?,?,?,?)",
                    (event_id, integer(now_ms), action, result))
@@ -199,15 +217,22 @@ class NotificationStore:
             self.history(db, event_id, now_ms, "suppressed", reason)
 
     def claim(self, db, *, now_ms: int, max_attempts: int = 3) -> DeliveryRecord | None:
-        row = db.execute("SELECT event_id FROM outbox WHERE suppressed_reason IS NULL AND attempts < ? "
+        row = db.execute("SELECT * FROM outbox WHERE suppressed_reason IS NULL AND attempts < ? "
                          "AND next_attempt_ms <= ? AND (state='pending' OR (state='failed' AND retryable=1)) "
                          "ORDER BY rowid LIMIT 1", (max_attempts, integer(now_ms))).fetchone()
         if row is None:
             return None
-        record = self.record(db, row[0])
-        db.execute("UPDATE outbox SET state='unknown', attempts=attempts+1, retryable=0 WHERE event_id=?", (row[0],))
-        self.history(db, row[0], now_ms, "attempt_started", "unknown")
-        return self.record(db, record.event.event_id)
+        record = self._row_to_record(row)
+        db.execute("UPDATE outbox SET state='unknown', attempts=attempts+1, retryable=0 WHERE event_id=?", (record.event.event_id,))
+        self.history(db, record.event.event_id, now_ms, "attempt_started", "unknown")
+        return DeliveryRecord(
+            record.event,
+            DeliveryState.UNKNOWN,
+            record.attempts + 1,
+            record.next_attempt_ms,
+            False,
+            record.suppressed_reason,
+        )
 
     def finish(self, db, event_id: str, *, state: DeliveryState, now_ms: int, code: str, retryable: bool = False) -> None:
         record = self.record(db, event_id)
@@ -257,7 +282,7 @@ class NotificationStore:
                     raise NotificationError("unknown event id")
                 rows = [record]
             else:
-                rows = [self.record(db, row[0]) for row in db.execute("SELECT event_id FROM outbox ORDER BY rowid DESC LIMIT ?", (integer(limit, minimum=1),))]
+                rows = [self._row_to_record(row) for row in db.execute("SELECT * FROM outbox ORDER BY rowid DESC LIMIT ?", (integer(limit, minimum=1),))]
             result = {"initialized": True, "position_alerts": "unavailable_until_issue_85",
                       "last_collection_ms": self.get_meta(db, "last_collection_ms"),
                       "out_of_order_observations": self.get_meta(db, "out_of_order_observations", 0),
@@ -286,8 +311,8 @@ class NotificationStore:
             selected = deque(maxlen=limit)
             counts, all_counts = Counter(), Counter()
             total = suppressed = 0
-            for row in db.execute("SELECT event_id FROM outbox ORDER BY rowid"):
-                record = self.record(db, row[0])
+            for row in db.execute("SELECT * FROM outbox ORDER BY rowid"):
+                record = self._row_to_record(row)
                 all_counts[record.state.value] += 1
                 if not start_ms <= record.event.occurred_at_ms < end_ms:
                     continue
@@ -296,11 +321,20 @@ class NotificationStore:
                 suppressed += record.suppressed_reason is not None
                 selected.append({**record.summary(), "event": record.event.to_dict(), "history": []})
             retained = {record["event_id"]: record for record in selected}
-            # Batch the displayed events' persisted history without rebuilding
-            # the sender's lifecycle or auditing cross-event completeness.
-            for item in db.execute("SELECT sequence,event_id,at_ms,action,result FROM delivery_history ORDER BY sequence"):
-                if item["event_id"] in retained:
-                    retained[item["event_id"]]["history"].append({key: item[key] for key in ("sequence", "at_ms", "action", "result")})
+            if retained:
+                # Query persisted history only for retained events in bounded chunks (SQLite 999-param safety).
+                retained_ids = list(retained)
+                for index in range(0, len(retained_ids), 500):
+                    chunk = retained_ids[index:index + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    for item in db.execute(
+                        f"SELECT sequence,event_id,at_ms,action,result FROM delivery_history "
+                        f"WHERE event_id IN ({placeholders}) ORDER BY sequence",
+                        chunk,
+                    ):
+                        retained[item["event_id"]]["history"].append(
+                            {key: item[key] for key in ("sequence", "at_ms", "action", "result")}
+                        )
             return {
                 "records": list(selected), "counts": dict(counts), "all_counts": dict(all_counts),
                 "total": total, "suppressed": suppressed, "display_limit": limit,

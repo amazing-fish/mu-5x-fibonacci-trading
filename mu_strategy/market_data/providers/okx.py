@@ -1,28 +1,30 @@
 from __future__ import annotations
 
-import json
 import time
 import urllib.parse
-import urllib.error
-import urllib.request
 
+from mu_strategy.market_data.http_pool import get_json
 from mu_strategy.market_data.utils import DAY_MS, dedupe_candles
 from mu_strategy.models import Candle
 
 
 OKX_BASE_URL = "https://www.okx.com/api/v5/market/history-candles"
 OKX_INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments"
+_OKX_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+}
 
 
 def fetch_okx_listing_time(symbol: str) -> int:
     """Read the exchange's start boundary, never inferring it from a short page."""
     params = urllib.parse.urlencode({"instType": "SWAP", "instId": symbol})
-    request = urllib.request.Request(
+    payload = get_json(
         f"{OKX_INSTRUMENTS_URL}?{params}",
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        headers=_OKX_HEADERS,
+        timeout=20.0,
+        retries=1,
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict) or payload.get("code") != "0":
         raise ValueError("OKX listing metadata request failed")
     rows = payload.get("data")
@@ -76,30 +78,18 @@ def fetch_okx_candles(
     if after is not None:
         params["after"] = after
     url = f"{OKX_BASE_URL}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(
+    payload = get_json(
         url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json",
-        },
+        headers=_OKX_HEADERS,
+        timeout=20.0,
+        retries=retries,
+        retry_backoff_base=0.25,
+        retry_backoff_cap=2.0,
     )
-    last_error: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            break
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last_error = exc
-            if attempt >= retries:
-                raise
-            time.sleep(0.5 * attempt)
-    else:
-        raise RuntimeError(f"OKX request failed after {retries} retries: {last_error}")
     if payload.get("code") != "0":
         raise RuntimeError(f"OKX request failed: {payload.get('msg') or payload.get('code')}")
-    candles = [okx_row_to_candle(row) for row in payload.get("data", [])]
-    return dedupe_candles([candle for candle in candles if candle is not None])
+    candles = [candle for row in payload.get("data", []) if (candle := okx_row_to_candle(row)) is not None]
+    return dedupe_candles(candles)
 
 
 def fetch_okx_historical(
@@ -113,21 +103,28 @@ def fetch_okx_historical(
     output: list[Candle] = []
     after: int | None = end_time_ms
     latest_confirmed_time_ms: int | None = None
+    oldest_confirmed_time_ms: int | None = None
     required_start_time_ms: int | None = None
     while True:
         batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:
             break
-        output.extend(batch)
-        confirmed = [bar for bar in output if bar.open_time_ms <= end_time_ms]
-        if not confirmed:
+        batch_oldest = batch[0].open_time_ms
+        for bar in batch:
+            ts = bar.open_time_ms
+            if ts < batch_oldest:
+                batch_oldest = ts
+            if ts <= end_time_ms:
+                output.append(bar)
+                if latest_confirmed_time_ms is None or ts > latest_confirmed_time_ms:
+                    latest_confirmed_time_ms = ts
+                if oldest_confirmed_time_ms is None or ts < oldest_confirmed_time_ms:
+                    oldest_confirmed_time_ms = ts
+        if latest_confirmed_time_ms is None or oldest_confirmed_time_ms is None:
             break
-        latest_confirmed_time_ms = max(bar.open_time_ms for bar in confirmed)
         required_start_time_ms = latest_confirmed_time_ms - (days * DAY_MS)
-        oldest_confirmed = min(bar.open_time_ms for bar in confirmed)
-        if oldest_confirmed <= required_start_time_ms:
+        if oldest_confirmed_time_ms <= required_start_time_ms:
             break
-        batch_oldest = min(bar.open_time_ms for bar in batch)
         if after == batch_oldest:
             break
         after = batch_oldest
@@ -148,8 +145,13 @@ def fetch_okx_incremental(
         batch = fetch_okx_candles(symbol, interval, after=after)
         if not batch:
             break
-        output.extend(bar for bar in batch if bar.open_time_ms >= since_time_ms)
-        oldest = min(bar.open_time_ms for bar in batch)
+        oldest = batch[0].open_time_ms
+        for bar in batch:
+            ts = bar.open_time_ms
+            if ts < oldest:
+                oldest = ts
+            if ts >= since_time_ms:
+                output.append(bar)
         if oldest <= since_time_ms:
             break
         if after == oldest:

@@ -26,6 +26,10 @@ def bar(index, open_=100, high=101, low=99, close=100):
     return Candle(START + index * STEP, open_, high, low, close, 1000)
 
 
+def sig(index, open_=100, high=101, low=98, close=100):
+    return Candle(START + index * STEP, open_, high, low, close, 1000)
+
+
 class TerminalBacktestTests(unittest.TestCase):
     def config(self, name="baseline", **overrides):
         config = selected_strategy_groups("MU-USDT-SWAP", [name])[0].config
@@ -73,7 +77,7 @@ class TerminalBacktestTests(unittest.TestCase):
         terminal = bar(3, 100, 106, 90, 105)
         self.assertTrue(is_preferred_us_cash_window(terminal.open_time_ms, config))
         self.assertGreater(terminal.low, 100 * (1 - 1 / config.leverage))
-        bars = [bar(0), bar(1), bar(2), terminal]
+        bars = [bar(0), sig(1), bar(2), terminal]
         short = self.replay(bars, config=config)
         extended = self.replay(bars + [bar(4, 105, 106, 104, 105)], config=config)
         for result in (short, extended):
@@ -85,43 +89,48 @@ class TerminalBacktestTests(unittest.TestCase):
         terminal = bar(3, 95, 106, 90, 105)
         for fee in (0, 0.0005):
             with self.subTest(fee=fee):
-                result = self.replay([bar(0), bar(1), bar(2), terminal], config=self.config(fee_rate=fee))
+                result = self.replay([bar(0), sig(1), bar(2), terminal], config=self.config(fee_rate=fee))
                 self.assert_single_exit(result, entry_index=2, exit_bar=terminal,
                                         price=95, reason="stop", fee_rate=fee)
 
     def test_terminal_stop_charges_entry_and_exit_fee_once(self):
         terminal = bar(3, 100, 106, 90, 105)
-        result = self.replay([bar(0), bar(1), bar(2), terminal], config=self.config(fee_rate=0.0005))
+        result = self.replay([bar(0), sig(1), bar(2), terminal], config=self.config(fee_rate=0.0005))
         self.assert_single_exit(result, entry_index=2, exit_bar=terminal,
                                 price=98, reason="stop", fee_rate=0.0005)
 
     def test_survivor_receives_one_end_of_data_settlement(self):
         terminal = bar(3, 100, 101, 99, 101)
-        result = self.replay([bar(0), bar(1), bar(2), terminal], config=self.config(fee_rate=0.0005))
+        result = self.replay([bar(0), sig(1), bar(2), terminal], config=self.config(fee_rate=0.0005))
         self.assert_single_exit(result, entry_index=2, exit_bar=terminal,
                                 price=101, reason="end_of_data", fee_rate=0.0005)
 
     def test_exit_before_terminal_is_not_repeated(self):
         stopped = bar(3, 100, 106, 90, 105)
-        result = self.replay([bar(0), bar(1), bar(2), stopped, bar(4)],
+        result = self.replay([bar(0), sig(1), bar(2), stopped, bar(4)],
                              config=self.config(fee_rate=0.0005))
         self.assert_single_exit(result, entry_index=2, exit_bar=stopped,
                                 price=98, reason="stop", fee_rate=0.0005)
 
-    def test_terminal_non_session_risk_retains_priority_over_stop(self):
-        terminal = replace(bar(3, 100, 106, 70, 105), open_time_ms=START + 27 * STEP)
+    def test_terminal_non_session_gap_liquidation_vs_continuous_stop(self):
         config = self.config()
-        self.assertFalse(is_preferred_us_cash_window(terminal.open_time_ms, config))
-        result = self.replay([bar(0), bar(1), bar(2), terminal], config=config)
-        self.assert_single_exit(result, entry_index=2, exit_bar=terminal,
+        gapped_terminal = replace(bar(3, 80, 106, 70, 105), open_time_ms=START + 27 * STEP)
+        self.assertFalse(is_preferred_us_cash_window(gapped_terminal.open_time_ms, config))
+        gapped = self.replay([bar(0), sig(1), bar(2), gapped_terminal], config=config)
+        self.assert_single_exit(gapped, entry_index=2, exit_bar=gapped_terminal,
                                 price=80, reason="non_session_liquidation_risk")
+
+        continuous_terminal = replace(bar(3, 100, 106, 70, 105), open_time_ms=START + 27 * STEP)
+        continuous = self.replay([bar(0), sig(1), bar(2), continuous_terminal], config=config)
+        self.assert_single_exit(continuous, entry_index=2, exit_bar=continuous_terminal,
+                                price=98, reason="stop")
 
     def test_entry_on_terminal_checks_risk_once_for_each_execution_mode(self):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             for fee in (0, 0.0005):
                 with self.subTest(strategy=name, fee=fee):
                     terminal = bar(3, 100, 106, 90, 105)
-                    bars = [bar(0), bar(1), bar(2, 100, 100, 99, 100), terminal]
+                    bars = [bar(0), bar(1), sig(2, 100, 100, 98, 100), terminal]
                     config = self.config(name, fee_rate=fee)
                     short = self.replay(bars, signals=(2,), config=config)
                     extended = self.replay(bars + [bar(4)], signals=(2,), config=config)
@@ -134,13 +143,13 @@ class TerminalBacktestTests(unittest.TestCase):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             with self.subTest(strategy=name):
                 terminal = bar(3, 100, 101, 99, 101)
-                bars = [bar(0), bar(1), bar(2, 100, 100, 99, 100), terminal]
+                bars = [bar(0), bar(1), sig(2, 100, 100, 98, 100), terminal]
                 result = self.replay(bars, signals=(2,), config=self.config(name, fee_rate=0.0005))
                 self.assert_single_exit(result, entry_index=3, exit_bar=terminal,
                                         price=101, reason="end_of_data", fee_rate=0.0005)
 
     def test_pending_is_fillable_on_inclusive_expiry_at_terminal(self):
-        bars = [bar(0), bar(1), bar(2, 101, 102, 100.5, 101),
+        bars = [bar(0), sig(1), bar(2, 101, 102, 100.5, 101),
                 bar(3, 101, 102, 100.5, 101), bar(4)]
         for wait in (3, 8):
             with self.subTest(wait=wait):
@@ -149,7 +158,7 @@ class TerminalBacktestTests(unittest.TestCase):
                                         price=100, reason="end_of_data")
 
     def test_pending_expired_before_terminal_cannot_fill(self):
-        bars = [bar(0), bar(1), bar(2, 101, 102, 100.5, 101),
+        bars = [bar(0), sig(1), bar(2, 101, 102, 100.5, 101),
                 bar(3, 101, 102, 100.5, 101), bar(4)]
         result = self.replay(bars, config=self.config(second_pullback_wait_bars=2))
         self.assertEqual([], result.trades)
@@ -159,7 +168,7 @@ class TerminalBacktestTests(unittest.TestCase):
         for terminal in (bar(3, 101, 102, 100.1, 101),
                          replace(bar(3), open_time_ms=START + 27 * STEP)):
             with self.subTest(terminal=terminal):
-                bars = [bar(0), bar(1), bar(2, 101, 102, 100.5, 101), terminal]
+                bars = [bar(0), sig(1), bar(2, 101, 102, 100.5, 101), terminal]
                 result = self.replay(bars)
                 self.assertEqual([], result.trades)
                 self.assertEqual(10_000, result.ending_equity)
@@ -167,7 +176,7 @@ class TerminalBacktestTests(unittest.TestCase):
     def test_final_signal_requires_a_real_later_candle(self):
         for name in ("baseline", "direct_next_open", "legacy_break_high"):
             with self.subTest(strategy=name):
-                bars = [bar(0), bar(1), bar(2), bar(3, 100, 100, 99, 100)]
+                bars = [bar(0), bar(1), bar(2), sig(3, 100, 100, 98, 100)]
                 config = self.config(name)
                 short = self.replay(bars, signals=(3,), config=config)
                 self.assertEqual([], short.trades)
@@ -190,7 +199,7 @@ class TerminalBacktestTests(unittest.TestCase):
         # A real preceding close now creates the plan; the terminal risk and
         # no-retroactive-stop assertions from #118 remain unchanged.
         terminal = bar(4, 100, 103, 99, 102)
-        bars = [bar(0), bar(1), bar(2), bar(3, 101, 103, 100, 102), terminal]
+        bars = [bar(0), sig(1), bar(2), bar(3, 101, 103, 100, 102), terminal]
         result = self.replay(bars)
         self.assertEqual(1, result.trade_count)
         trade = result.trades[0]

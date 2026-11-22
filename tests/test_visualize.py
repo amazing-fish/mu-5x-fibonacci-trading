@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from mu_strategy.market_data.trusted import DataStatus
+from mu_strategy.market_data.trusted_data.compat import DataStatus
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
 from mu_strategy.strategies.components import StrategyComponents
 from mu_strategy.strategy import StrategyConfig
@@ -493,6 +493,63 @@ class VisualizationTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
 
         self.assertNotEqual(0, raised.exception.code)
+
+    def test_visualize_list_strategies_and_unknown_strategy_hint(self):
+        from mu_strategy import visualize
+
+        stdout = io.StringIO()
+        with patch("sys.argv", ["mu_strategy.visualize", "--list-strategies"]):
+            with patch("mu_strategy.viz.backtest.refresh_trusted_candle_bundle", side_effect=AssertionError("must not load")):
+                with patch("sys.stdout", stdout):
+                    visualize.main()
+        self.assertIn("baseline", stdout.getvalue())
+        self.assertIn("optimized_v2", stdout.getvalue())
+
+        stderr = io.StringIO()
+        with patch("sys.argv", ["mu_strategy.visualize", "--strategy", "unknown_xyz"]):
+            with patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    visualize.main()
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("Available strategies:", stderr.getvalue())
+        self.assertIn("baseline", stderr.getvalue())
+
+    def test_visualize_generation_id_aligns_partial_coverage_by_default_and_strict_coverage_fails_closed(self):
+        from mu_strategy import visualize
+
+        root = Path(__file__).resolve().parents[1]
+        data_dir = root / "data/live"
+        generation_id = "0114f8334f2e40d6ba5b5030faf6007b"
+
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "partial.html"
+            argv = [
+                "mu_strategy.visualize",
+                "--data-dir",
+                str(data_dir),
+                "--generation-id",
+                generation_id,
+                "--days",
+                "180",
+                "--output",
+                str(output_path),
+            ]
+            with patch("sys.argv", argv), patch("sys.stdout", new_callable=io.StringIO):
+                visualize.main()
+
+            text = output_path.read_text(encoding="utf-8")
+            self.assertIn("partial_available_history", text)
+            self.assertIn("&quot;effective_days&quot;: 142", text)
+
+            strict_output = Path(tmp) / "strict.html"
+            strict_argv = [*argv[:-2], "--strict-coverage", "--output", str(strict_output)]
+            stderr = io.StringIO()
+            with patch("sys.argv", strict_argv), patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    visualize.main()
+            self.assertEqual(2, raised.exception.code)
+            self.assertIn("insufficient_coverage", stderr.getvalue())
+            self.assertFalse(strict_output.exists())
 
 
 def _candle(open_time_ms: int, close: float) -> Candle:

@@ -55,32 +55,51 @@ class RefreshHealth:
     snapshot_usability: SnapshotUsability | None = None
     exit_code: int | None = None
     error_code: str | None = None
+    error_detail: str | None = None
+
+    def validate(self) -> RefreshHealth:
+        if not isinstance(self.status, StepStatus):
+            raise HealthStateError("invalid refresh status")
+        _optional_text(self.run_id)
+        if self.attempt_status is not None and not isinstance(self.attempt_status, RefreshAttemptStatus):
+            raise HealthStateError("invalid refresh attempt_status")
+        if self.snapshot_usability is not None and not isinstance(self.snapshot_usability, SnapshotUsability):
+            raise HealthStateError("invalid refresh snapshot_usability")
+        if self.exit_code is not None:
+            _integer(self.exit_code, minimum=-2**31)
+        _optional_text(self.error_code)
+        _optional_text(self.error_detail)
+        if self.status in {StepStatus.SUCCEEDED, StepStatus.DEGRADED}:
+            expected = (RefreshAttemptStatus.SUCCESS, 0) if self.status is StepStatus.SUCCEEDED else (RefreshAttemptStatus.DEGRADED, 2)
+            if (self.attempt_status, self.exit_code) != expected or self.snapshot_usability is not SnapshotUsability.USABLE or not self.run_id:
+                raise HealthStateError("refresh success requires a matching usable publication")
+        if self.status is StepStatus.SUCCEEDED and (self.error_code is not None or self.error_detail is not None):
+            raise HealthStateError("successful refresh cannot claim an error")
+        return self
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status.value, "run_id": self.run_id,
             "attempt_status": self.attempt_status.value if self.attempt_status else None,
             "snapshot_usability": self.snapshot_usability.value if self.snapshot_usability else None,
             "exit_code": self.exit_code, "error_code": self.error_code,
         }
+        if self.error_detail is not None:
+            payload["error_detail"] = self.error_detail
+        return payload
 
     @classmethod
     def from_dict(cls, value: Any) -> RefreshHealth:
-        value = _object(value, cls)
+        value = _object(value, cls, optional=_OPTIONAL_DETAIL)
         result = cls(
             StepStatus(value["status"]), _optional_text(value["run_id"]),
             RefreshAttemptStatus(value["attempt_status"]) if value["attempt_status"] is not None else None,
             SnapshotUsability(value["snapshot_usability"]) if value["snapshot_usability"] is not None else None,
             _integer(value["exit_code"], minimum=-2**31) if value["exit_code"] is not None else None,
             _optional_text(value["error_code"]),
+            _optional_text(value.get("error_detail")),
         )
-        if result.status in {StepStatus.SUCCEEDED, StepStatus.DEGRADED}:
-            expected = (RefreshAttemptStatus.SUCCESS, 0) if result.status is StepStatus.SUCCEEDED else (RefreshAttemptStatus.DEGRADED, 2)
-            if (result.attempt_status, result.exit_code) != expected or result.snapshot_usability is not SnapshotUsability.USABLE or not result.run_id:
-                raise HealthStateError("refresh success requires a matching usable publication")
-        if result.status is StepStatus.SUCCEEDED and result.error_code is not None:
-            raise HealthStateError("successful refresh cannot claim an error")
-        return result
+        return result.validate()
 
 
 @dataclass(frozen=True)
@@ -89,30 +108,44 @@ class ScanHealth:
     cycle: Stage0ObservationCycle | None = None
     persistence: StepStatus = StepStatus.NOT_RUN
     error_code: str | None = None
+    error_detail: str | None = None
+
+    def validate(self) -> ScanHealth:
+        if not isinstance(self.status, StepStatus) or not isinstance(self.persistence, StepStatus):
+            raise HealthStateError("invalid scan status")
+        if self.cycle is not None and not isinstance(self.cycle, Stage0ObservationCycle):
+            raise HealthStateError("invalid scan cycle")
+        _optional_text(self.error_code)
+        _optional_text(self.error_detail)
+        if self.status is StepStatus.SUCCEEDED:
+            if self.cycle is None or self.persistence not in {StepStatus.SUCCEEDED, StepStatus.FAILED}:
+                raise HealthStateError("completed scan requires a cycle and a persistence result")
+        elif self.cycle is not None or self.persistence is not StepStatus.NOT_RUN:
+            raise HealthStateError("incomplete scan cannot claim cycle or persistence evidence")
+        if self.status is StepStatus.DEGRADED:
+            raise HealthStateError("scan completion has no degraded state")
+        if self.status is StepStatus.SUCCEEDED and self.persistence is StepStatus.SUCCEEDED and (self.error_code is not None or self.error_detail is not None):
+            raise HealthStateError("completed persisted scan cannot claim a process error")
+        return self
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status.value, "cycle": self.cycle.to_dict() if self.cycle else None,
             "persistence": self.persistence.value, "error_code": self.error_code,
         }
+        if self.error_detail is not None:
+            payload["error_detail"] = self.error_detail
+        return payload
 
     @classmethod
     def from_dict(cls, value: Any) -> ScanHealth:
-        value = _object(value, cls)
+        value = _object(value, cls, optional=_OPTIONAL_DETAIL)
         result = cls(
             StepStatus(value["status"]), Stage0ObservationCycle.from_dict(value["cycle"]) if value["cycle"] is not None else None,
             StepStatus(value["persistence"]), _optional_text(value["error_code"]),
+            _optional_text(value.get("error_detail")),
         )
-        if result.status is StepStatus.SUCCEEDED:
-            if result.cycle is None or result.persistence not in {StepStatus.SUCCEEDED, StepStatus.FAILED}:
-                raise HealthStateError("completed scan requires a cycle and a persistence result")
-        elif result.cycle is not None or result.persistence is not StepStatus.NOT_RUN:
-            raise HealthStateError("incomplete scan cannot claim cycle or persistence evidence")
-        if result.status is StepStatus.DEGRADED:
-            raise HealthStateError("scan completion has no degraded state")
-        if result.status is StepStatus.SUCCEEDED and result.persistence is StepStatus.SUCCEEDED and result.error_code is not None:
-            raise HealthStateError("completed persisted scan cannot claim a process error")
-        return result
+        return result.validate()
 
 
 @dataclass(frozen=True)
@@ -123,6 +156,19 @@ class CycleHealth:
     completed_at_ms: int
     refresh: RefreshHealth
     scan: ScanHealth
+
+    def validate(self) -> CycleHealth:
+        _integer(self.number, minimum=1)
+        _text(self.service_run_id)
+        _integer(self.started_at_ms)
+        _integer(self.completed_at_ms)
+        if not isinstance(self.refresh, RefreshHealth) or not isinstance(self.scan, ScanHealth):
+            raise HealthStateError("invalid cycle sub-health")
+        self.refresh.validate()
+        self.scan.validate()
+        if self.completed_at_ms < self.started_at_ms:
+            raise HealthStateError("cycle completion precedes start")
+        return self
 
     def problems(self) -> tuple[str, ...]:
         problems = []
@@ -154,9 +200,18 @@ class CycleHealth:
         value = _object(value, cls)
         result = cls(_integer(value["number"], minimum=1), _text(value["service_run_id"]), _integer(value["started_at_ms"]),
                      _integer(value["completed_at_ms"]), RefreshHealth.from_dict(value["refresh"]), ScanHealth.from_dict(value["scan"]))
-        if result.completed_at_ms < result.started_at_ms:
-            raise HealthStateError("cycle completion precedes start")
-        return result
+        return result.validate()
+
+
+_VALID_EVENT_KINDS = frozenset({
+    "started",
+    "restarted",
+    "fault",
+    "recovered",
+    "stopped",
+    "interruption_acknowledged",
+    "interruption_recovered",
+})
 
 
 @dataclass(frozen=True)
@@ -166,16 +221,26 @@ class HealthEvent:
     kind: str
     problems: tuple[str, ...]
 
+    def validate(self) -> HealthEvent:
+        _integer(self.sequence, minimum=1)
+        _integer(self.at_ms)
+        kind = _text(self.kind)
+        if kind not in _VALID_EVENT_KINDS:
+            raise HealthStateError("unknown health event kind")
+        if not isinstance(self.problems, tuple):
+            raise HealthStateError("expected problem tuple")
+        for item in self.problems:
+            _text(item)
+        return self
+
     def to_dict(self) -> dict[str, Any]:
         return {"sequence": self.sequence, "at_ms": self.at_ms, "kind": self.kind, "problems": list(self.problems)}
 
     @classmethod
     def from_dict(cls, value: Any) -> HealthEvent:
         value = _object(value, cls)
-        kind = _text(value["kind"])
-        if kind not in {"started", "restarted", "fault", "recovered", "stopped", "interruption_acknowledged"}:
-            raise HealthStateError("unknown health event kind")
-        return cls(_integer(value["sequence"], minimum=1), _integer(value["at_ms"]), kind, _texts(value["problems"]))
+        result = cls(_integer(value["sequence"], minimum=1), _integer(value["at_ms"]), _text(value["kind"]), _texts(value["problems"]))
+        return result.validate()
 
 
 @dataclass(frozen=True)
@@ -193,6 +258,46 @@ class ServiceState:
     events: tuple[HealthEvent, ...]
     event_sequence: int
     schema_version: int = SCHEMA_VERSION
+
+    def validate(self) -> ServiceState:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise HealthStateError("unsupported health schema")
+        _text(self.data_dir)
+        if not isinstance(self.symbols, tuple) or not self.symbols or len(set(self.symbols)) != len(self.symbols):
+            raise HealthStateError("service symbols must be nonempty and unique")
+        for symbol in self.symbols:
+            _text(symbol)
+        _text(self.run_id)
+        if type(self.running) is not bool or not isinstance(self.phase, Phase):
+            raise HealthStateError("invalid running/phase type")
+        _integer(self.started_at_ms)
+        _integer(self.updated_at_ms)
+        _integer(self.deadline_ms)
+        _integer(self.consecutive_failures)
+        _integer(self.event_sequence)
+        if self.started_at_ms > self.updated_at_ms or self.deadline_ms < self.updated_at_ms or (not self.running and self.phase is not Phase.IDLE):
+            raise HealthStateError("invalid service phase/deadline")
+        if not isinstance(self.events, tuple) or len(self.events) > EVENT_LIMIT:
+            raise HealthStateError("health event retention exceeded")
+        for event in self.events:
+            if not isinstance(event, HealthEvent):
+                raise HealthStateError("invalid health event")
+            event.validate()
+        expected = list(range(self.event_sequence - len(self.events) + 1, self.event_sequence + 1))
+        if [event.sequence for event in self.events] != expected or bool(self.events) != bool(self.event_sequence):
+            raise HealthStateError("non-contiguous event sequence")
+        if self.last_cycle is not None:
+            if not isinstance(self.last_cycle, CycleHealth):
+                raise HealthStateError("invalid last_cycle")
+            self.last_cycle.validate()
+            if self.last_cycle.service_run_id == self.run_id and self.last_cycle.completed_at_ms > self.updated_at_ms:
+                raise HealthStateError("last cycle is newer than service state")
+            if self.last_cycle.service_run_id == self.run_id and self.last_cycle.started_at_ms < self.started_at_ms:
+                raise HealthStateError("current run cycle precedes service start")
+            cycle = self.last_cycle.scan.cycle
+            if cycle is not None and sorted(item.symbol for item in cycle.observations) != sorted(self.symbols):
+                raise HealthStateError("scan cycle must cover each configured symbol exactly once")
+        return self
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,24 +324,7 @@ class ServiceState:
             _integer(value["consecutive_failures"]), tuple(HealthEvent.from_dict(item) for item in value["events"]),
             _integer(value["event_sequence"]),
         )
-        if not result.symbols or len(set(result.symbols)) != len(result.symbols):
-            raise HealthStateError("service symbols must be nonempty and unique")
-        if result.started_at_ms > result.updated_at_ms or result.deadline_ms < result.updated_at_ms or (not result.running and result.phase is not Phase.IDLE):
-            raise HealthStateError("invalid service phase/deadline")
-        if len(result.events) > EVENT_LIMIT:
-            raise HealthStateError("health event retention exceeded")
-        expected = list(range(result.event_sequence - len(result.events) + 1, result.event_sequence + 1))
-        if [event.sequence for event in result.events] != expected or bool(result.events) != bool(result.event_sequence):
-            raise HealthStateError("non-contiguous event sequence")
-        if result.last_cycle is not None:
-            if result.last_cycle.service_run_id == result.run_id and result.last_cycle.completed_at_ms > result.updated_at_ms:
-                raise HealthStateError("last cycle is newer than service state")
-            if result.last_cycle.service_run_id == result.run_id and result.last_cycle.started_at_ms < result.started_at_ms:
-                raise HealthStateError("current run cycle precedes service start")
-            cycle = result.last_cycle.scan.cycle
-            if cycle is not None and sorted(item.symbol for item in cycle.observations) != sorted(result.symbols):
-                raise HealthStateError("scan cycle must cover each configured symbol exactly once")
-        return result
+        return result.validate()
 
     def events_since(self, sequence: int) -> tuple[HealthEvent, ...]:
         _integer(sequence)
@@ -255,9 +343,12 @@ class HealthStore:
         self.path = self.root / "health.json"
         self.lock_path = self.root / "service.lock"
         self.liveness_path = self.root / "supervisor.lock"
-        self.publication_lock_path = self.root / "observations.jsonl.lock"
+        self.health_lock_path = self.root / "health.json.lock"
+        self.publication_lock_path = self.health_lock_path
 
     def prepare(self) -> None:
+        if self.root.exists():
+            return
         missing = []
         directory = self.root
         while not directory.exists():
@@ -288,23 +379,32 @@ class HealthStore:
         return state
 
     def write(self, state: ServiceState) -> None:
-        canonical = ServiceState.from_dict(state.to_dict())
-        if canonical.data_dir != str(self.data_dir):
+        self._write(state, durable=True)
+
+    def write_ephemeral(self, state: ServiceState) -> None:
+        """Atomically publish a transient phase heartbeat without forcing disk fsyncs."""
+        self._write(state, durable=False)
+
+    def _write(self, state: ServiceState, *, durable: bool) -> None:
+        state.validate()
+        if state.data_dir != str(self.data_dir):
             raise HealthStateError("health state belongs to another data directory")
-        raw = canonical_json(canonical.to_dict()).encode("utf-8") + b"\n"
+        raw = canonical_json(state.to_dict()).encode("utf-8") + b"\n"
         if len(raw) > MAX_STATE_BYTES:
             raise HealthStateError("health state exceeds size limit")
         temporary = None
         self.prepare()
-        with locked_file(self.publication_lock_path):
+        with locked_file(self.health_lock_path):
             try:
                 with tempfile.NamedTemporaryFile(dir=self.root, prefix="health-", suffix=".tmp", delete=False) as stream:
                     temporary = Path(stream.name)
                     stream.write(raw)
                     stream.flush()
-                    os.fsync(stream.fileno())
+                    if durable:
+                        os.fsync(stream.fileno())
                 os.replace(temporary, self.path)
-                fsync_directory(self.root)
+                if durable:
+                    fsync_directory(self.root)
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
@@ -410,8 +510,16 @@ def decode_health_json(raw: str | bytes) -> Any:
 
 
 
-def _object(value: Any, cls) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != {item.name for item in fields(cls)}:
+_OPTIONAL_DETAIL = frozenset({"error_detail"})
+
+
+def _object(value: Any, cls, *, optional: frozenset[str] = frozenset()) -> dict[str, Any]:
+    all_fields = {item.name for item in fields(cls)}
+    required = all_fields - optional
+    if type(value) is not dict:
+        raise HealthStateError(f"invalid {cls.__name__} fields")
+    keys = set(value)
+    if not (required <= keys <= all_fields):
         raise HealthStateError(f"invalid {cls.__name__} fields")
     return value
 

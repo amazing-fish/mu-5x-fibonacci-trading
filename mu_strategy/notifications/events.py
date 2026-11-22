@@ -83,9 +83,8 @@ class AlertEvent:
         ):
             raise NotificationError("invalid health problem")
         if self.kind in {AlertKind.ENTRY_REVIEW, AlertKind.SIGNAL_INVALIDATED}:
-            if self.observation is None or self.problems:
+            if not isinstance(self.observation, Stage0Observation) or self.problems:
                 raise NotificationError("signal reminder requires an observation")
-            Stage0Observation.from_dict(self.observation.to_dict())
             if self.kind is AlertKind.ENTRY_REVIEW:
                 result = self.observation.scan_result
                 if (self.observation.outcome is not ObservationOutcome.READY_FOR_REVIEW or result is None

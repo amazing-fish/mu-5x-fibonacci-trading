@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 
+from mu_strategy.core.risk import (
+    equity_floor_exit_price,
+    evaluate_risk_exit,
+    has_non_session_liquidation_risk,
+    liquidation_risk_price,
+    resolve_initial_stop,
+    sell_stop_fill_price,
+)
+from mu_strategy.core.trading_calendar import eastern_date
 from mu_strategy.indicators import macd, rsi
 from mu_strategy.models import BacktestResult, Candle, Fill, Trade
-from mu_strategy.strategy import (
-    StrategyConfig,
-    is_preferred_us_cash_window,
-    nearest_fib_retest_level,
-    should_enter_long,
-    should_execute_entry,
-)
 from mu_strategy.strategies.position_rules import (
     PositionFillSnapshot,
     PositionStateSnapshot,
     PyramidAddDecision,
     decide_pyramid_add,
     tighten_stop,
+)
+from mu_strategy.strategy import (
+    StrategyConfig,
+    is_preferred_us_cash_window,
+    nearest_fib_retest_level,
+    should_enter_long,
+    should_execute_entry,
 )
 
 
@@ -30,26 +40,59 @@ class OpenPosition:
     stop_transition_fill_count: int = 0
     stop_transition_start: float = 0.0
     pending_add: PendingPyramidAdd | None = None
+    _cache_len: int = field(default=-1, init=False, repr=False, compare=False)
+    _cached_units: float = field(default=0.0, init=False, repr=False, compare=False)
+    _cached_cost_basis: float = field(default=0.0, init=False, repr=False, compare=False)
+    _cached_fees: float = field(default=0.0, init=False, repr=False, compare=False)
+    _cached_fill_snapshots: tuple[PositionFillSnapshot, ...] = field(default=(), init=False, repr=False, compare=False)
+
+    def _sync_fill_cache(self) -> None:
+        n = len(self.fills)
+        if n == self._cache_len:
+            return
+        total_units = 0.0
+        total_cost = 0.0
+        total_fees = 0.0
+        snapshots: list[PositionFillSnapshot] = []
+        for fill in self.fills:
+            total_units += fill.units
+            total_cost += fill.price * fill.units
+            total_fees += fill.fee
+            snapshots.append(PositionFillSnapshot(time_ms=fill.time_ms, price=fill.price, units=fill.units))
+        self._cached_units = total_units
+        self._cached_cost_basis = total_cost
+        self._cached_fees = total_fees
+        self._cached_fill_snapshots = tuple(snapshots)
+        self._cache_len = n
 
     @property
     def units(self) -> float:
-        return sum(fill.units for fill in self.fills)
+        self._sync_fill_cache()
+        return self._cached_units
 
     @property
     def entry_price(self) -> float:
-        if not self.units:
+        self._sync_fill_cache()
+        if not self._cached_units:
             return 0.0
-        return sum(fill.price * fill.units for fill in self.fills) / self.units
+        return self._cached_cost_basis / self._cached_units
 
     @property
     def fees(self) -> float:
-        return sum(fill.fee for fill in self.fills)
+        self._sync_fill_cache()
+        return self._cached_fees
+
+    @property
+    def fill_snapshots(self) -> tuple[PositionFillSnapshot, ...]:
+        self._sync_fill_cache()
+        return self._cached_fill_snapshots
 
 
 @dataclass
 class PendingEntry:
     fib_level: float
     expires_index: int
+    stop_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -68,7 +111,7 @@ def run_backtest(
     starting_equity: float = 10_000.0,
 ) -> BacktestResult:
     config = config or StrategyConfig()
-    if len(candles_15m) < 4:
+    if len(candles_15m) < 4 or starting_equity <= 0:
         return BacktestResult(starting_equity, starting_equity, [], [])
 
     closes = [bar.close for bar in candles_15m]
@@ -79,39 +122,112 @@ def run_backtest(
     # affect measurements only; debiting this budget would change later fills
     # and charge the same entry fees again at settlement. It is not free margin.
     equity = starting_equity
+    peak_equity = starting_equity
+    track_drawdown = config.max_account_drawdown_pct is not None
+    track_daily = config.daily_loss_limit_pct is not None
+    account_drawdown_halted = False
+    current_day: date | None = None
+    day_start_equity = starting_equity
+    daily_loss_halted = False
+
     equity_curve: list[tuple[int, float]] = [(candles_15m[0].open_time_ms, equity)]
     trades: list[Trade] = []
     position: OpenPosition | None = None
     pending_entry: PendingEntry | None = None
 
+    def _sync_trading_day(candle: Candle) -> None:
+        nonlocal current_day, day_start_equity, daily_loss_halted
+        if not track_daily:
+            return
+        bar_day = eastern_date(candle.open_time_ms)
+        if bar_day != current_day:
+            current_day = bar_day
+            day_start_equity = _marked_equity(equity, position, candle.open)
+            daily_loss_halted = False
+
+    def _can_trade() -> bool:
+        return equity > 0.0 and not account_drawdown_halted and not daily_loss_halted
+
+    def _record_equity(time_ms: int, value: float) -> None:
+        nonlocal peak_equity
+        if track_drawdown and value > peak_equity:
+            peak_equity = value
+        equity_curve.append((time_ms, value))
+
     def record_close(candle: Candle) -> None:
         # All timestamps label the 15m bar, not an exact intrabar instant.
         # Preserve list order: executed events, observed close, final settlement.
-        equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, candle.close)))
+        _record_equity(candle.open_time_ms, _marked_equity(equity, position, candle.close))
 
     def _exit_on_risk(candle: Candle, *, stop_reason: str) -> bool:
         # Called only with an open position. Own risk settlement and its event
         # sample here; callers retain their distinct close/continue boundaries.
-        nonlocal equity, position
-        decision = _risk_exit(candle, position, config, stop_reason=stop_reason)
+        nonlocal equity, position, account_drawdown_halted, daily_loss_halted
+        dd_stop_price: float | None = None
+        if track_drawdown and peak_equity > 0.0:
+            dd_floor = peak_equity * (1.0 - config.max_account_drawdown_pct)
+            dd_stop_price = equity_floor_exit_price(
+                equity_floor=dd_floor,
+                settled_equity=equity,
+                entry_price=position.entry_price,
+                units=position.units,
+                entry_fees=position.fees,
+                fee_rate=config.fee_rate,
+            )
+        daily_stop_price: float | None = None
+        if track_daily and day_start_equity > 0.0:
+            daily_floor = day_start_equity * (1.0 - config.daily_loss_limit_pct)
+            daily_stop_price = equity_floor_exit_price(
+                equity_floor=daily_floor,
+                settled_equity=equity,
+                entry_price=position.entry_price,
+                units=position.units,
+                entry_fees=position.fees,
+                fee_rate=config.fee_rate,
+            )
+        decision = _risk_exit(
+            candle,
+            position,
+            config,
+            stop_reason=stop_reason,
+            drawdown_stop_price=dd_stop_price,
+            daily_loss_stop_price=daily_stop_price,
+        )
         if decision is None:
             return False
         exit_price, reason = decision
         equity, trade = _close_position(position, candle, exit_price, equity, reason, config)
         trades.append(trade)
         position = None
-        equity_curve.append((candle.open_time_ms, equity))
+        _record_equity(candle.open_time_ms, equity)
+        if track_drawdown and (
+            reason == "account_drawdown_stop"
+            or (peak_equity > 0.0 and equity <= peak_equity * (1.0 - config.max_account_drawdown_pct) + 1e-9)
+        ):
+            account_drawdown_halted = True
+        if track_daily and (
+            reason == "daily_loss_stop"
+            or (day_start_equity > 0.0 and equity <= day_start_equity * (1.0 - config.daily_loss_limit_pct) + 1e-9)
+        ):
+            daily_loss_halted = True
         return True
 
     index = 1
     while index < len(candles_15m):
         candle = candles_15m[index]
+        _sync_trading_day(candle)
 
         if position is None:
+            if not _can_trade():
+                pending_entry = None
+                record_close(candle)
+                index += 1
+                continue
+
             if config.entry_execution == "second_pullback" and pending_entry is not None:
                 if index > pending_entry.expires_index:
                     pending_entry = None
-                elif candle.low <= pending_entry.fib_level * (1 + config.fib_tolerance_pct):
+                elif candle.low <= pending_entry.fib_level:
                     if not is_preferred_us_cash_window(candle.open_time_ms, config):
                         record_close(candle)
                         index += 1
@@ -122,10 +238,10 @@ def run_backtest(
                         index += 1
                         continue
                     fill = _make_fill(candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
-                    stop_price = entry_price * (1 - config.initial_stop_pct)
+                    stop_price = resolve_initial_stop(entry_price, pending_entry.stop_price, config)
                     position = OpenPosition([fill], stop_price, entry_price, stop_price)
                     pending_entry = None
-                    equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, entry_price)))
+                    _record_equity(candle.open_time_ms, _marked_equity(equity, position, entry_price))
                     _exit_on_risk(candle, stop_reason="initial_stop")
                     record_close(candle)
                     index += 1
@@ -169,6 +285,7 @@ def run_backtest(
                 pending_entry = PendingEntry(
                     fib_level=fib_level,
                     expires_index=index + config.second_pullback_wait_bars,
+                    stop_price=signal.stop_price,
                 )
                 record_close(candle)
                 index += 1
@@ -188,11 +305,12 @@ def run_backtest(
             # This branch creates a future fill early in control flow. Sample
             # the signal close before that fill (or its exit) changes state.
             record_close(candle)
+            _sync_trading_day(next_candle)
             entry_price = execution.entry_price
             fill = _make_fill(next_candle.open_time_ms, entry_price, config.margin_steps[0], equity, config)
-            stop_price = entry_price * (1 - config.initial_stop_pct)
+            stop_price = resolve_initial_stop(entry_price, signal.stop_price, config)
             position = OpenPosition([fill], stop_price, entry_price, stop_price)
-            equity_curve.append((next_candle.open_time_ms, _marked_equity(equity, position, entry_price)))
+            _record_equity(next_candle.open_time_ms, _marked_equity(equity, position, entry_price))
             _exit_on_risk(next_candle, stop_reason="initial_stop")
             index += 1
             continue
@@ -206,11 +324,25 @@ def run_backtest(
             continue
 
         fill_count = len(position.fills)
-        _execute_pyramid_add(position, candle, index, candles_15m, hourly_context, hist_values, rsi_values, equity, config)
-        if len(position.fills) > fill_count:
-            equity_curve.append((candle.open_time_ms, _marked_equity(equity, position, position.fills[-1].price)))
+        if _can_trade():
+            _execute_pyramid_add(
+                position,
+                candle,
+                index,
+                candles_15m,
+                hourly_context,
+                hist_values,
+                rsi_values,
+                equity,
+                config,
+            )
+            if len(position.fills) > fill_count:
+                _record_equity(candle.open_time_ms, _marked_equity(equity, position, position.fills[-1].price))
+        else:
+            position.pending_add = None
         _tighten_stop(position, candle, index, candles_15m, hourly_context.get(candle.open_time_ms, "yellow"), config)
-        _plan_pyramid_add(position, candle, index, hourly_context, hist_values, rsi_values, config)
+        if _can_trade():
+            _plan_pyramid_add(position, candle, index, hourly_context, hist_values, rsi_values, config)
         record_close(candle)
         index += 1
 
@@ -225,12 +357,16 @@ def run_backtest(
             config,
         )
         trades.append(trade)
-        equity_curve.append((final.open_time_ms, equity))
+        _record_equity(final.open_time_ms, equity)
 
     return BacktestResult(starting_equity, equity, trades, equity_curve)
 
 
 def _make_fill(time_ms: int, price: float, margin_fraction: float, equity: float, config: StrategyConfig) -> Fill:
+    if equity <= 0.0:
+        raise ValueError("equity must be positive to size a fill")
+    if price <= 0.0:
+        raise ValueError("fill price must be positive")
     notional = equity * margin_fraction * config.leverage
     units = notional / price
     fee = notional * config.fee_rate
@@ -254,12 +390,7 @@ def _buy_limit_fill_price(candle: Candle, limit_price: float) -> float | None:
     return limit_price
 
 
-def _sell_stop_fill_price(candle: Candle, stop_price: float) -> float | None:
-    if candle.low > stop_price:
-        return None
-    if candle.open < stop_price:
-        return candle.open
-    return stop_price
+_sell_stop_fill_price = sell_stop_fill_price
 
 
 def _risk_exit(
@@ -268,30 +399,30 @@ def _risk_exit(
     config: StrategyConfig,
     *,
     stop_reason: str,
+    drawdown_stop_price: float | None = None,
+    daily_loss_stop_price: float | None = None,
 ) -> tuple[float, str] | None:
-    """Resolve existing risk priority and gap pricing; caller names stop context."""
-    if _has_non_session_liquidation_risk(candle, position, config):
-        threshold = _liquidation_risk_price(position, config)
-        reason = "non_session_liquidation_risk"
-    elif candle.low <= position.stop_price:
-        threshold = position.stop_price
-        reason = stop_reason
-    else:
+    """Resolve stop, equity-floor, and non-session liquidation exits via shared core risk helper."""
+    decision = evaluate_risk_exit(
+        candle,
+        entry_price=position.entry_price,
+        stop_price=position.stop_price,
+        config=config,
+        stop_reason=stop_reason,
+        drawdown_stop_price=drawdown_stop_price,
+        daily_loss_stop_price=daily_loss_stop_price,
+    )
+    if decision is None:
         return None
-    exit_price = _sell_stop_fill_price(candle, threshold)
-    return (exit_price if exit_price is not None else threshold), reason
+    return decision.exit_price, decision.reason
 
 
 def _has_non_session_liquidation_risk(candle: Candle, position: OpenPosition, config: StrategyConfig) -> bool:
-    if is_preferred_us_cash_window(candle.open_time_ms, config):
-        return False
-    return candle.low <= _liquidation_risk_price(position, config)
+    return has_non_session_liquidation_risk(candle, position.entry_price, position.stop_price, config)
 
 
 def _liquidation_risk_price(position: OpenPosition, config: StrategyConfig) -> float:
-    if config.leverage <= 0:
-        raise ValueError("leverage must be positive")
-    return position.entry_price * max(0.0, 1 - (1 / config.leverage))
+    return liquidation_risk_price(position.entry_price, config.leverage)
 
 
 def _execute_pyramid_add(
@@ -309,12 +440,14 @@ def _execute_pyramid_add(
     # discards its plan too. Never use this execution bar's close indicators.
     plan = position.pending_add
     position.pending_add = None
-    if plan is None:
+    if plan is None or equity <= 0.0:
         return
     candidate = plan.candidate
-    if (index != plan.signal_index + 1
-            or candle.open_time_ms != candidate.available_at_ms
-            or position.max_stage + 1 != candidate.stage):
+    if (
+        index != plan.signal_index + 1
+        or candle.open_time_ms != candidate.available_at_ms
+        or position.max_stage + 1 != candidate.stage
+    ):
         return
     if not is_preferred_us_cash_window(candle.open_time_ms, config):
         return
@@ -356,10 +489,13 @@ def _plan_pyramid_add(
     config: StrategyConfig,
 ) -> None:
     candidate = decide_pyramid_add(
-        _position_snapshot(position), candle,
-        rsi_value=rsi_values[index], macd_hist=hist_values[index],
+        _position_snapshot(position),
+        candle,
+        rsi_value=rsi_values[index],
+        macd_hist=hist_values[index],
         previous_macd_hist=hist_values[index - 1],
-        regime=hourly_context.get(candle.open_time_ms, "yellow"), config=config,
+        regime=hourly_context.get(candle.open_time_ms, "yellow"),
+        config=config,
     )
     position.pending_add = PendingPyramidAdd(candidate, index) if candidate.should_add else None
 
@@ -393,14 +529,7 @@ def _tighten_stop(
 
 def _position_snapshot(position: OpenPosition) -> PositionStateSnapshot:
     return PositionStateSnapshot(
-        fills=tuple(
-            PositionFillSnapshot(
-                time_ms=fill.time_ms,
-                price=fill.price,
-                units=fill.units,
-            )
-            for fill in position.fills
-        ),
+        fills=position.fill_snapshots,
         stop_price=position.stop_price,
         entry_anchor=position.entry_anchor,
         initial_stop_price=position.initial_stop_price,
@@ -418,8 +547,9 @@ def _marked_equity(equity: float, position: OpenPosition | None, mark_price: flo
     """
     if position is None:
         return equity
-    unrealized = sum((mark_price - fill.price) * fill.units for fill in position.fills)
-    return equity + unrealized - position.fees
+    position._sync_fill_cache()
+    unrealized = (mark_price * position._cached_units) - position._cached_cost_basis
+    return equity + unrealized - position._cached_fees
 
 
 def _close_position(

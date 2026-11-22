@@ -39,11 +39,11 @@ python -B -m unittest discover -s tests
 # 刷新可信数据（消费前必须先跑）
 python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-output reports\live\data_health.html
 
-# 回测 / 可视化
+# 回测 / 可视化（可用 --list-strategies 列出已注册策略）
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\live\mu_okx_backtest.md
 python -m mu_strategy.visualize --days 180 --strategy baseline --output reports\live\mu_backtest.html
 
-# Demo 扫描 dry-run（不读私钥、不下单）
+# Demo 扫描 dry-run（纯离线：不读私钥、不联网、不下单；仅在显式加 --fetch-instrument-sizing 时查公开合约规格）
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live
 ```
 

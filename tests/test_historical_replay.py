@@ -35,7 +35,11 @@ class HistoricalReplayTests(unittest.TestCase):
         for interval, bars in window.candles_by_interval.items():
             self.assertEqual(candles_content_sha256(list(bars)), first['input_content_sha256_by_interval'][interval])
 
-    def test_default_cli_still_blocks_stale_data_and_demo_rejects_replay_flag(self):
+    def test_default_cli_allows_stale_research_data_while_trading_policy_and_demo_stay_strict(self):
+        from mu_strategy.market_data.trusted_data.contracts import HealthReason
+        from mu_strategy.market_data.trusted_data.load import load_trusted_candle_bundle
+        from mu_strategy.market_data.trusted_data.policy import trading_strict_policy
+
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             data = copy_generation(root)
@@ -45,11 +49,19 @@ class HistoricalReplayTests(unittest.TestCase):
             }), encoding='utf-8')
             with patch('sys.argv', ['cli', '--data-dir', str(data), '--days', '2', '--report', str(root / 'report.md')]), patch(
                 'mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms', return_value=1800000000000,
-            ), redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 cli.main()
-            self.assertEqual(2, error.exception.code)
-            self.assertIn('stale', stderr.getvalue())
-            self.assertFalse((root / 'report.md').exists())
+            self.assertTrue((root / 'report.md').is_file())
+            with patch('mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms', return_value=1800000000000):
+                trading_bundle = load_trusted_candle_bundle(
+                    SYMBOL,
+                    intervals=('15m', '1h'),
+                    days=2,
+                    data_dir=data,
+                    policy=trading_strict_policy(),
+                )
+            self.assertFalse(trading_bundle.trust_decision.allowed)
+            self.assertEqual(HealthReason.STALE_BY_CLOCK, trading_bundle.trust_decision.reason)
         with patch('sys.argv', ['okx_demo_loop', '--generation-id', RUN_ID, '--dry-run', '--once']), redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit) as error:
             okx_demo_loop.main()
         self.assertEqual(2, error.exception.code)

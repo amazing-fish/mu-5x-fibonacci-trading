@@ -2,7 +2,7 @@
 
 本指南承接 API 和 Demo 操作示例。日常信号与邮件使用[信号服务](signal-service.md)和[邮件手册](email-alerts.md)；当前完整执行缺口见[架构总览](architecture.md)，未来端到端流程归 [#100](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/100)。
 
-现有 `demo_trading` 确实能够在显式确认后读取账户、设置杠杆、买入及撤销部分失效 bot 限价单。这条路径尚未接入 `OrderIntentFactory` / `SQLiteExecutionStore` 的逐 intent 持久授权、预留和恢复流程，不能视为完整自动交易系统。Production 下单未实现。
+现有 `demo_trading` 确实能够在显式确认后读取账户、设置杠杆、买入及撤销部分失效 bot 限价单。这条路径尚未接入受控的持久授权、预留与恢复闭环（完整执行闭环归 #100，早期未接入运行的 intent/store 脚手架已移除），不能视为完整自动交易系统。Production 下单未实现。
 
 行情消费保持 trusted gate；API 适配不修改研究规则。只读账户操作可能读取私有信息，密钥只从环境配置取得，不写入报告。本文命令是操作说明，不代表已经执行或得到本轮交易授权。
 
@@ -15,7 +15,7 @@ $env:OKX_PASSPHRASE="..."
 python -m mu_strategy.live.okx_cli read-only --demo --inst-type SWAP --inst-id MU-USDT-SWAP --ccy USDT
 ```
 
-Windows 上默认会优先读取持久化的 User/Machine 环境变量，避免 Codex 等长驻进程沿用旧的进程环境；如需强制使用当前 shell 的临时变量，设置 `$env:OKX_ENV_SOURCE="process"`。
+默认 `auto` 模式会优先读取当前进程的环境变量，仅在当前进程凭据不完整时才在 Windows 上回退读取持久化的 User / Machine 注册表环境变量；如需显式指定来源，可设置 `$env:OKX_ENV_SOURCE="process|user|machine|auto"`。
 也可以在需要凭据的 CLI 命令上显式传入 `--credential-source auto|process|user|machine`。未传 `--credential-source` 时，CLI 会先尊重 `OKX_ENV_SOURCE`，再回到自动选择。`read-only` 输出会保留 OKX 原始响应，并额外给出 `status` 与 `warnings`；例如 demo positions 对单合约返回业务错误时会进入 warning，而不会被误判为认证失败。
 
 ## Shadow 记录
@@ -43,7 +43,7 @@ python -m mu_strategy.live.okx_cli demo-order --inst-id BTC-USDT-SWAP --side buy
 
 ## 扫描与看板
 
-运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，不读取私有凭证，不发订单。默认从 current generation manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist。默认 trusted-manifest 模式下，`--limit N` 表示最多 N 个 crypto universe symbols，加最多 N 个 stock-token universe symbols；`--limit 0` 表示 watchlist-only，不读取动态 universe；`--limit` 必须非负：
+运行 OKX Demo 5 分钟扫描 loop 的单次 dry-run，默认纯离线运行：不读取私有凭证、不发起公开合约规格网络请求（仅在显式传入 `--fetch-instrument-sizing` 时才查询 OKX 公开合约规格）、不发订单。默认从 current generation manifest 的 universe snapshot 读取候选标的，并固定加入 `MU-USDT-SWAP` 作为 watchlist。默认 trusted-manifest 模式下，`--limit N` 表示最多 N 个 crypto universe symbols，加最多 N 个 stock-token universe symbols；`--limit 0` 表示 watchlist-only，不读取动态 universe；`--limit` 必须非负：
 
 ```powershell
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live --dashboard-output reports\live\okx_entry_dashboard.html

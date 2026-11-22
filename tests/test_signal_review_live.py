@@ -2,6 +2,8 @@ import hashlib
 import http.client
 import threading
 import unittest
+from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from mu_strategy.signal_review_server import make_review_server
 from mu_strategy.viz.signal_review import group_scan_records
@@ -100,15 +102,68 @@ class ReviewLiveServerTests(unittest.TestCase):
 
     def test_readonly_routes_and_loopback_host_boundary(self):
         def files():
-            return {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
-                    for p in self.fixture.root.rglob("*") if p.is_file()}
+            return {
+                str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in self.fixture.root.rglob("*")
+                if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+            }
         before = files()
+        before_db = fixtures.sqlite_logical_snapshot(self.fixture.root)
         self.assertEqual(200, self.request()[0])
         self.assertEqual(404, self.request("/observations.jsonl")[0])
         self.assertEqual(405, self.request("/", method="POST")[0])
         self.assertEqual(403, self.request(headers={"Host": "attacker.example"})[0])
         self.assertEqual(403, self.request(headers={"Origin": "https://attacker.example"})[0])
         self.assertEqual(before, files())
+        self.assertEqual(before_db, fixtures.sqlite_logical_snapshot(self.fixture.root))
+
+    def test_server_uses_threading_http_server_and_serves_concurrent_requests(self):
+        self.assertIsInstance(self.server, ThreadingHTTPServer)
+        self.assertTrue(self.server.daemon_threads)
+        entered = threading.Event()
+        release = threading.Event()
+        call_lock = threading.Lock()
+        original_read = fixtures.read_signal_review
+        calls = 0
+
+        def slow_first_read(*args, **kwargs):
+            nonlocal calls
+            with call_lock:
+                calls += 1
+                is_first = calls == 1
+            if is_first:
+                entered.set()
+                release.wait()
+            return original_read(*args, **kwargs)
+
+        results = {}
+        with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=slow_first_read):
+            t1 = threading.Thread(target=lambda: results.__setitem__("first", self.request("/report")[0]))
+            t1.start()
+            try:
+                self.assertTrue(entered.wait(timeout=2), "first request did not reach handler")
+                # Second concurrent request must finish while the first read remains blocked.
+                second_status = self.request("/report")[0]
+                self.assertTrue(t1.is_alive(), "first request must remain blocked until explicitly released")
+            finally:
+                release.set()
+                t1.join(timeout=3)
+        self.assertFalse(t1.is_alive(), "first request thread did not finish after release")
+        self.assertEqual(200, second_status)
+        self.assertEqual(200, results.get("first"))
+
+    def test_server_logs_503_operational_error_and_returns_500_on_unexpected_bug(self):
+        with self.assertLogs("mu_strategy.signal_review_server", level="WARNING") as cm:
+            with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=OSError("disk busy")):
+                status_503, _, _ = self.request("/report")
+        self.assertEqual(503, status_503)
+        self.assertTrue(any("disk busy" in line for line in cm.output))
+
+        with self.assertLogs("mu_strategy.signal_review_server", level="ERROR") as cm:
+            with patch("mu_strategy.signal_review_server.read_signal_review", side_effect=KeyError("unexpected_bug")):
+                status_500, _, _ = self.request("/report")
+        self.assertEqual(500, status_500)
+        self.assertTrue(any("unexpected_bug" in line for line in cm.output))
 
 
 if __name__ == "__main__":

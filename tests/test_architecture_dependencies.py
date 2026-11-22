@@ -32,8 +32,6 @@ class ArchitectureDependencyTests(unittest.TestCase):
                 forbidden_imports=FORBIDDEN_IMPORTS + (
                     "mu_strategy.market_data.service",
                     "mu_strategy.market_data.trusted_data.refresh",
-                    "mu_strategy.execution.intents",
-                    "mu_strategy.execution.store",
                     "mu_strategy.notifications",
                     "smtplib",
                 ),

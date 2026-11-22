@@ -11,12 +11,12 @@ from unittest.mock import patch
 
 import mu_strategy.backtest as engine
 from mu_strategy.strategies.registry import selected_strategy_groups
-from replay_net_equity import audit_result, digest
-from test_backtest_equity import bar
+from tests.replay_net_equity import audit_result, digest
+from tests.test_backtest_equity import bar
 
 
 def cases():
-    signal = bar(1, 100, 100, 99, 100)
+    signal = bar(1, 100, 100, 98, 100)
     paths = {
         "initial_stop": [bar(0), signal, bar(2, 100, 103, 97, 102), bar(3)],
         "existing_stop": [bar(0), signal, bar(2), bar(3, 100, 103, 97, 102)],
@@ -120,8 +120,8 @@ class RiskPathTests(unittest.TestCase):
             if not name.endswith("/entry_management"):
                 continue
             with self.subTest(case=name), patch.object(
-                engine, "_has_non_session_liquidation_risk",
-                wraps=engine._has_non_session_liquidation_risk,
+                engine, "_risk_exit",
+                wraps=engine._risk_exit,
             ) as risk:
                 replay(bars, config)
                 self.assertEqual([bars[2], bars[3]], [call.args[0] for call in risk.call_args_list])
