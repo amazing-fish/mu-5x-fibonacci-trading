@@ -120,12 +120,16 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(Decimal("0.02"), spec.round_price(Decimal("0.025"), rounding="nearest"))
         self.assertEqual(Decimal("0.04"), spec.round_price(Decimal("0.035"), rounding="nearest"))
 
-        # CR2-40: exact lot reconstruction is independent of caller Decimal context Emax/traps
+        # CR2-40 + CR3-01: exact lot reconstruction is independent of caller Decimal context
+        # AND does not hit CPython's 4,300-digit int->str conversion limit
         spec_int_lot = okx_swap_spec("MU-USDT-SWAP", lot_size=Decimal("1"), min_size=Decimal("1"))
         with localcontext() as ctx:
             ctx.Emax = 2
             ctx.traps[Overflow] = True
             self.assertEqual(Decimal("1000"), spec_int_lot.round_size("1000", rounding="down"))
+            huge = Decimal((0, (1,) + (0,) * 4300, 0))
+            huge_rounded = spec_int_lot.round_size(huge, rounding="down")
+            self.assertEqual(huge, huge_rounded)
             res_exp = spec.round_size("1.00", rounding="down")
             self.assertEqual(Decimal("1.00"), res_exp)
             self.assertEqual("1.00", format(res_exp, "f"))

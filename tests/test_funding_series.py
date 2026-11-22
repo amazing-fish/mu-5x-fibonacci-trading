@@ -286,6 +286,27 @@ class FundingSeriesTests(unittest.TestCase):
                 interval_hours=8,
             )
 
+        # CR3-11: identity mismatch checked even when supplied series is empty;
+        # matching empty series still synthesizes sensitivity band
+        empty_binance = FundingSeries.from_events("binance:BTCUSDT", ())
+        with self.assertRaises(ValueError):
+            require_or_sensitivity_series(
+                empty_binance,
+                instrument_id="okx:BTCUSDT",
+                start_ms=start_ms,
+                end_ms=2 * EIGHT_HOURS_MS,
+                interval_hours=8,
+            )
+        matching_empty_res = require_or_sensitivity_series(
+            empty_binance,
+            instrument_id="binance:BTCUSDT",
+            start_ms=start_ms,
+            end_ms=2 * EIGHT_HOURS_MS,
+            interval_hours=8,
+        )
+        self.assertTrue(matching_empty_res.is_sensitivity)
+        self.assertEqual("binance:BTCUSDT", matching_empty_res.scenarios[0][1].instrument_id)
+
         # CR1-10: partial historical series MUST fail closed rather than be labeled historical
         with self.assertRaises(MissingFundingHistoryError):
             require_or_sensitivity_series(
@@ -476,7 +497,7 @@ class FundingSeriesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             empty.fill_gaps_with_apr(start_ms=t0, end_ms=t0 + 24 * HOUR_MS, interval_hours=8, apr=0.15)
 
-        # CR2-04: explicit phase_ms applies to gap detection as well as gap filling (even on empty series)
+        # CR2-04 + CR3-09: explicit phase_ms checks observations strictly against the scheduled timestamps
         self.assertEqual(
             ((t0, t0 + 2 * HOUR_MS),),
             empty.coverage_gaps(t0, t0 + 2 * HOUR_MS, 8, phase_ms=1 * HOUR_MS),
@@ -490,7 +511,54 @@ class FundingSeriesTests(unittest.TestCase):
         )
         self.assertEqual([t0 + 1 * HOUR_MS], list(filled_empty_phase.timestamps_ms))
 
-        # CR2-06: out-of-window event (hour 25) must NOT hide missing hour 24 in (0h, 24h]
+        # CR3-09: off-phase events (4h, 12h, 20h) do NOT cover explicit phase_ms=0 settlements (8h, 16h)
+        off_phase = FundingSeries.from_events(
+            "okx:OFFPHASE-SWAP",
+            [
+                FundingRateEvent(t0 + 4 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 12 * HOUR_MS, 0.0001),
+                FundingRateEvent(t0 + 20 * HOUR_MS, 0.0001),
+            ],
+            settlement_interval_hours=8,
+        )
+        self.assertEqual(
+            ((t0, t0 + 20 * HOUR_MS),),
+            off_phase.coverage_gaps(t0, t0 + 20 * HOUR_MS, 8, phase_ms=0),
+        )
+        filled_off_phase = off_phase.fill_gaps_with_apr(
+            start_ms=t0,
+            end_ms=t0 + 20 * HOUR_MS,
+            interval_hours=8,
+            apr=0.15,
+            phase_ms=0,
+        )
+        self.assertIn(t0 + 8 * HOUR_MS, list(filled_off_phase.timestamps_ms))
+        self.assertIn(t0 + 16 * HOUR_MS, list(filled_off_phase.timestamps_ms))
+        self.assertEqual((), filled_off_phase.coverage_gaps(t0, t0 + 20 * HOUR_MS, 8, phase_ms=0))
+
+        # CR3-10: empty query window (8h, 10h] infers phase 1h from prior history at 1h -> fills hour 9;
+        # empty series without explicit phase_ms raises ValueError even on short window (8h, 10h]
+        prior_phase1 = FundingSeries.from_events(
+            "okx:OFFSET-SWAP",
+            [FundingRateEvent(t0 + 1 * HOUR_MS, 0.0001)],
+            settlement_interval_hours=8,
+        )
+        filled_empty_win = prior_phase1.fill_gaps_with_apr(
+            start_ms=t0 + 8 * HOUR_MS,
+            end_ms=t0 + 10 * HOUR_MS,
+            interval_hours=8,
+            apr=0.15,
+        )
+        self.assertEqual([t0 + 1 * HOUR_MS, t0 + 9 * HOUR_MS], list(filled_empty_win.timestamps_ms))
+        with self.assertRaises(ValueError):
+            empty.fill_gaps_with_apr(
+                start_ms=t0 + 8 * HOUR_MS,
+                end_ms=t0 + 10 * HOUR_MS,
+                interval_hours=8,
+                apr=0.15,
+            )
+
+        # CR2-06 + CR3-19: out-of-window event (hour 25) must NOT hide missing hour 24 in (0h, 24h]
         with_out_of_window = FundingSeries.from_events(
             "okx:MU-USDT-SWAP",
             [
@@ -504,7 +572,7 @@ class FundingSeriesTests(unittest.TestCase):
             ((t0 + 2 * EIGHT_HOURS_MS, t0 + 3 * EIGHT_HOURS_MS),),
             with_out_of_window.coverage_gaps(t0, t0 + 3 * EIGHT_HOURS_MS, 8, tolerance=1.5),
         )
-        # Ambiguous in-window phases must NOT falsely report complete coverage over edges >= 1 interval
+        # Ambiguous in-window phases must explicitly report the trailing gap (16h, 24h)
         ambiguous_in_window = FundingSeries.from_events(
             "okx:MU-USDT-SWAP",
             [
@@ -514,7 +582,8 @@ class FundingSeriesTests(unittest.TestCase):
             ],
             settlement_interval_hours=8,
         )
-        self.assertNotEqual((), ambiguous_in_window.coverage_gaps(t0, t0 + 24 * HOUR_MS, 8, tolerance=1.5))
+        ambiguous_gaps = ambiguous_in_window.coverage_gaps(t0, t0 + 24 * HOUR_MS, 8, tolerance=1.5)
+        self.assertIn((t0 + 16 * HOUR_MS, t0 + 24 * HOUR_MS), ambiguous_gaps)
 
         # Validation failures
         with self.assertRaises(ValueError):

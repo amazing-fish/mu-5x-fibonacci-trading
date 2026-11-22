@@ -433,6 +433,63 @@ class ProtocolContractsTests(unittest.TestCase):
         self.assertTrue(ctx_tt.require_touch_through)
         self.assertFalse(ctx_ok.require_touch_through)
 
+        # CR3-13: Empty iterators for excluded_price_bands normalize to () BEFORE reduce_only rejection!
+        ro_empty_iter = OrderIntent(
+            "ro_iter_ok",
+            "MU",
+            "sell",
+            "stop_market",
+            "close_all",
+            0.0,
+            stop_price=95.0,
+            reduce_only=True,
+            excluded_price_bands=iter(()),  # type: ignore[arg-type]
+        )
+        self.assertEqual((), ro_empty_iter.excluded_price_bands)
+        with self.assertRaises(ValueError):
+            OrderIntent(
+                "ro_iter_bad",
+                "MU",
+                "sell",
+                "stop_market",
+                "close_all",
+                0.0,
+                stop_price=95.0,
+                reduce_only=True,
+                excluded_price_bands=iter([band]),  # type: ignore[arg-type]
+            )
+        entry_iter_band = OrderIntent(
+            "entry_iter_ok",
+            "MU",
+            "buy",
+            "market",
+            "equity_fraction",
+            1.0,
+            excluded_price_bands=iter([band]),  # type: ignore[arg-type]
+        )
+        self.assertEqual((band,), entry_iter_band.excluded_price_bands)
+
+        # CR3-14: Cyclic diagnostics raise clear ValueError (never RecursionError); shared acyclic containers remain valid!
+        cyclic_dict: dict[str, object] = {}
+        cyclic_dict["self"] = cyclic_dict
+        with self.assertRaises(ValueError):
+            StrategyOutput(diagnostics=cyclic_dict)
+        cyclic_list: list[object] = []
+        cyclic_list.append(cyclic_list)
+        with self.assertRaises(ValueError):
+            StrategyOutput(diagnostics={"loop": cyclic_list})
+        shared_list = [1, 2]
+        shared_dict = {"x": 10}
+        out_shared = StrategyOutput(
+            diagnostics={"a": shared_list, "b": shared_list, "d1": shared_dict, "d2": shared_dict}
+        )
+        shared_list.append(99)
+        shared_dict["x"] = -1
+        self.assertEqual((1, 2), out_shared.diagnostics["a"])
+        self.assertEqual((1, 2), out_shared.diagnostics["b"])
+        self.assertEqual(10, out_shared.diagnostics["d1"]["x"])
+        self.assertEqual(10, out_shared.diagnostics["d2"]["x"])
+
 
 class FeatureCacheTests(unittest.TestCase):
     def test_ema_rsi_macd_exact_match_with_legacy_indicators(self) -> None:
@@ -703,6 +760,29 @@ class FeatureCacheTests(unittest.TestCase):
         z_ext_full = fc_ext.zscore(s_future_extreme, 2)
         self.assertTrue(math.isfinite(z_ext_full[256]))
         self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_ext_full[257], places=12)
+
+        # CR3-12: Jump from tiny scale (1e-200, negative scale_exp) to huge close (1e200) resyncs BEFORE _ldexp overflow,
+        # while representable small-scale rolling updates remain on the rolling path!
+        s_scale_jump = BarSeries.from_candles(
+            "Z_SCALE_JUMP",
+            "1h",
+            [
+                Candle(1_700_000_000_000 + i * 3_600_000, c, c, c, c, 100.0)
+                for i, c in enumerate([1e-200, 2e-200, 3e-200, 1e200, 2e200])
+            ],
+        )
+        with patch.object(
+            features_mod,
+            "_exact_window_stats_scaled",
+            wraps=features_mod._exact_window_stats_scaled,
+        ) as scale_spy:
+            z_jump = fc.zscore(s_scale_jump, 2)
+        self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_jump[1], places=12)
+        self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_jump[2], places=12)
+        self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_jump[3], places=12)
+        self.assertAlmostEqual(1.0 / math.sqrt(2.0), z_jump[4], places=12)
+        # Initial window (bar 1) + incompatible jump (bar 3) resynced; bars 2 & 4 stayed on representable rolling updates!
+        self.assertEqual(2, scale_spy.call_count)
 
         # CR2-42: SMA remains finite when mean fits (1e308) even though raw sum overflows.
         s_sma_huge = BarSeries.from_candles(

@@ -99,7 +99,7 @@ def _exact_mul_units_step(units: int, step: Decimal) -> Decimal:
     if prod == 0:
         return Decimal("0")
     sign = (1 if units < 0 else 0) ^ tup.sign
-    digits = tuple(int(ch) for ch in str(prod))
+    digits = Decimal(prod).as_tuple().digits
     return Decimal((sign, digits, tup.exponent))
 
 

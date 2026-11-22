@@ -285,7 +285,15 @@ def _scale_intent_size(intent: OrderIntent, factor: float) -> OrderIntent:
 
 @runtime_checkable
 class RiskOverlay(Protocol):
-    """Composable risk filter applied to StrategyOutput before order queuing."""
+    """Composable risk filter applied to StrategyOutput before order queuing.
+
+    Callback lifetime contract (CR3-08):
+      - Overlays without ``supports_ephemeral_context = True`` (explicit Boolean
+        ``True``) always receive point-in-time immutable ``BarContext`` snapshots
+        even when the paired ``Strategy`` opts into ephemeral context reuse.
+      - Overlays that explicitly set ``supports_ephemeral_context = True`` MUST NOT
+        retain ``ctx``, ``ctx.market``, or ``ctx.portfolio`` across ``filter()`` calls.
+    """
 
     def reset(self) -> None: ...
 
@@ -315,6 +323,8 @@ class VolTargetOverlay:
     regimes cannot produce unbounded leverage. Uses strictly causal closed bars
     from ``ctx.market`` (zero look-ahead).
     """
+
+    supports_ephemeral_context: bool = True
 
     def __init__(
         self,
@@ -570,6 +580,8 @@ class DrawdownCircuitBreaker:
     and resuming normal sizing.
     """
 
+    supports_ephemeral_context: bool = True
+
     def __init__(
         self,
         max_drawdown_pct: float,
@@ -664,6 +676,8 @@ class DrawdownCircuitBreaker:
 class DailyLossLimitOverlay:
     """Flattens and blocks new entries for the rest of the calendar day once daily loss breaches cap."""
 
+    supports_ephemeral_context: bool = True
+
     def __init__(self, max_daily_loss_pct: float, reset_tz: str = "UTC") -> None:
         self.max_daily_loss_pct = _require_fraction_01("max_daily_loss_pct", max_daily_loss_pct)
         if not isinstance(reset_tz, str) or not reset_tz.strip():
@@ -738,6 +752,8 @@ class DailyLossLimitOverlay:
 
 class ExposureCapOverlay:
     """Clamps signed target weights and risk-increasing order sizes to hard exposure limits."""
+
+    supports_ephemeral_context: bool = True
 
     def __init__(self, max_gross_leverage: float, max_single_weight: float) -> None:
         self.max_gross_leverage = _require_positive_finite("max_gross_leverage", max_gross_leverage)
@@ -866,27 +882,41 @@ class ExposureCapOverlay:
                 elif allowed_targeted_gross <= 1e-12:
                     clamped_targets = [replace(t, target_weight=0.0) for t in clamped_targets]
 
-        # 4. Seed conservative reachable weight interval [lo_w, hi_w] per symbol across
-        #    existing positions, resting open orders, clamped targets, and emitted intents.
+        # 4. Seed conservative reachable weight state per symbol, separating absolute target
+        #    bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
+        #    Reachable exposure is [base_lo - add_sell, base_hi + add_buy].
         #    This guarantees:
+        #      - CR3-22: pending buy/sell increments are reserved AFTER any new target_weight fill.
         #      - CR2-29: resting orders reserved before targets and carried into intent budget.
         #      - CR1-32: single shared exposure budget across targets + intents in the same output.
         #      - CR1-31: reducing orders never release exposure headroom before filling.
         #      - CR1-29: contract_value multiplier applied symmetrically to contracts orders.
         #      - CR1-33: unpriceable contracts orders fail closed (blocked) rather than bypassing cap.
-        lo_by_sym: dict[str, float] = {}
-        hi_by_sym: dict[str, float] = {}
+        base_lo: dict[str, float] = {}
+        base_hi: dict[str, float] = {}
+        add_buy: dict[str, float] = {}
+        add_sell: dict[str, float] = {}
+        tracked_syms: set[str] = set(all_known_syms)
         target_w_by_sym: dict[str, float] = {t.symbol: t.target_weight for t in clamped_targets}
         for sym in all_known_syms:
-            lo_s, hi_s = _post_target_envelope(sym, target_w_by_sym.get(sym))
-            lo_by_sym[sym] = lo_s
-            hi_by_sym[sym] = hi_s
+            ew = existing_weights.get(sym, 0.0)
+            w_t = target_w_by_sym.get(sym)
+            b_lo = ew if w_t is None else (w_t if w_t < ew else ew)
+            b_hi = ew if w_t is None else (w_t if w_t > ew else ew)
+            if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
+                b_lo = rest_tw_lo[sym]
+            if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
+                b_hi = rest_tw_hi[sym]
+            base_lo[sym] = b_lo
+            base_hi[sym] = b_hi
+            add_buy[sym] = rest_buy.get(sym, 0.0)
+            add_sell[sym] = rest_sell.get(sym, 0.0)
 
         def _sym_worst_abs(sym: str) -> float:
-            lo = lo_by_sym.get(sym, 0.0)
-            hi = hi_by_sym.get(sym, 0.0)
-            a_lo = -lo if lo < 0.0 else lo
-            a_hi = -hi if hi < 0.0 else hi
+            lo_s = base_lo.get(sym, 0.0) - add_sell.get(sym, 0.0)
+            hi_s = base_hi.get(sym, 0.0) + add_buy.get(sym, 0.0)
+            a_lo = -lo_s if lo_s < 0.0 else lo_s
+            a_hi = -hi_s if hi_s < 0.0 else hi_s
             return a_hi if a_hi >= a_lo else a_lo
 
         clamped_intents: list[OrderIntent] = []
@@ -897,18 +927,43 @@ class ExposureCapOverlay:
                 continue
 
             sym = intent.symbol
-            lo = lo_by_sym.get(sym, 0.0)
-            hi = hi_by_sym.get(sym, 0.0)
-            other_gross = math.fsum(_sym_worst_abs(s) for s in lo_by_sym if s != sym)
+            b_lo = base_lo.get(sym, 0.0)
+            b_hi = base_hi.get(sym, 0.0)
+            ab = add_buy.get(sym, 0.0)
+            as_ = add_sell.get(sym, 0.0)
+            lo = b_lo - as_
+            hi = b_hi + ab
+            other_gross = math.fsum(_sym_worst_abs(s) for s in tracked_syms if s != sym)
             max_abs_sym = min(single_cap, max(0.0, self.max_gross_leverage - other_gross))
 
             if intent.qty_mode == "target_weight":
-                desired = max(-max_abs_sym, min(max_abs_sym, intent.qty_value))
+                raw_w = intent.qty_value
+                if raw_w == 0.0:
+                    desired = 0.0
+                elif raw_w > 0.0:
+                    max_pos_w = max_abs_sym - ab
+                    if raw_w <= b_hi and intent.side == "sell":
+                        desired = raw_w
+                    elif max_pos_w <= 1e-12:
+                        continue
+                    else:
+                        desired = raw_w if raw_w <= max_pos_w else max_pos_w
+                else:
+                    min_neg_w = -(max_abs_sym - as_)
+                    if raw_w >= b_lo and intent.side == "buy":
+                        desired = raw_w
+                    elif min_neg_w >= -1e-12:
+                        continue
+                    else:
+                        desired = raw_w if raw_w >= min_neg_w else min_neg_w
                 if desired == 0.0:
                     desired = 0.0
                 clamped_intents.append(replace(intent, qty_value=desired))
-                lo_by_sym[sym] = desired if desired < lo else lo
-                hi_by_sym[sym] = desired if desired > hi else hi
+                tracked_syms.add(sym)
+                base_lo[sym] = desired if desired < b_lo else b_lo
+                base_hi[sym] = desired if desired > b_hi else b_hi
+                add_buy.setdefault(sym, ab)
+                add_sell.setdefault(sym, as_)
                 continue
 
             if intent.qty_mode == "equity_fraction":
@@ -916,25 +971,37 @@ class ExposureCapOverlay:
                 if intent.side == "buy":
                     if hi + w <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
-                        hi_by_sym[sym] = hi + w
-                        lo_by_sym.setdefault(sym, lo)
+                        tracked_syms.add(sym)
+                        add_buy[sym] = ab + w
+                        base_lo.setdefault(sym, b_lo)
+                        base_hi.setdefault(sym, b_hi)
+                        add_sell.setdefault(sym, as_)
                     else:
                         allowed_w = max_abs_sym - hi
                         if allowed_w > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_w))
-                            hi_by_sym[sym] = hi + allowed_w
-                            lo_by_sym.setdefault(sym, lo)
+                            tracked_syms.add(sym)
+                            add_buy[sym] = ab + allowed_w
+                            base_lo.setdefault(sym, b_lo)
+                            base_hi.setdefault(sym, b_hi)
+                            add_sell.setdefault(sym, as_)
                 else:
                     if -(lo - w) <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
-                        lo_by_sym[sym] = lo - w
-                        hi_by_sym.setdefault(sym, hi)
+                        tracked_syms.add(sym)
+                        add_sell[sym] = as_ + w
+                        base_lo.setdefault(sym, b_lo)
+                        base_hi.setdefault(sym, b_hi)
+                        add_buy.setdefault(sym, ab)
                     else:
                         allowed_w = max_abs_sym + lo
                         if allowed_w > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_w))
-                            lo_by_sym[sym] = lo - allowed_w
-                            hi_by_sym.setdefault(sym, hi)
+                            tracked_syms.add(sym)
+                            add_sell[sym] = as_ + allowed_w
+                            base_lo.setdefault(sym, b_lo)
+                            base_hi.setdefault(sym, b_hi)
+                            add_buy.setdefault(sym, ab)
                 continue
 
             if intent.qty_mode == "contracts":
@@ -947,27 +1014,39 @@ class ExposureCapOverlay:
                 if intent.side == "buy":
                     if hi + order_weight <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
-                        hi_by_sym[sym] = hi + order_weight
-                        lo_by_sym.setdefault(sym, lo)
+                        tracked_syms.add(sym)
+                        add_buy[sym] = ab + order_weight
+                        base_lo.setdefault(sym, b_lo)
+                        base_hi.setdefault(sym, b_hi)
+                        add_sell.setdefault(sym, as_)
                     else:
                         allowed_weight = max_abs_sym - hi
                         allowed_qty = (allowed_weight * equity) / (mult * ref_px)
                         if allowed_qty > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_qty))
-                            hi_by_sym[sym] = hi + allowed_weight
-                            lo_by_sym.setdefault(sym, lo)
+                            tracked_syms.add(sym)
+                            add_buy[sym] = ab + allowed_weight
+                            base_lo.setdefault(sym, b_lo)
+                            base_hi.setdefault(sym, b_hi)
+                            add_sell.setdefault(sym, as_)
                 else:
                     if -(lo - order_weight) <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
-                        lo_by_sym[sym] = lo - order_weight
-                        hi_by_sym.setdefault(sym, hi)
+                        tracked_syms.add(sym)
+                        add_sell[sym] = as_ + order_weight
+                        base_lo.setdefault(sym, b_lo)
+                        base_hi.setdefault(sym, b_hi)
+                        add_buy.setdefault(sym, ab)
                     else:
                         allowed_weight = max_abs_sym + lo
                         allowed_qty = (allowed_weight * equity) / (mult * ref_px)
                         if allowed_qty > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_qty))
-                            lo_by_sym[sym] = lo - allowed_weight
-                            hi_by_sym.setdefault(sym, hi)
+                            tracked_syms.add(sym)
+                            add_sell[sym] = as_ + allowed_weight
+                            base_lo.setdefault(sym, b_lo)
+                            base_hi.setdefault(sym, b_hi)
+                            add_buy.setdefault(sym, ab)
 
         return StrategyOutput(
             intents=tuple(clamped_intents),
@@ -996,6 +1075,8 @@ class SessionWindowOverlay:
     risk-reducing exits and protective stops. Optionally flattens open positions outside
     the session when ``flatten_outside_session=True``.
     """
+
+    supports_ephemeral_context: bool = True
 
     def __init__(
         self,

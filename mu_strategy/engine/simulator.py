@@ -459,11 +459,15 @@ class SimulatorConfig:
     ``reuse_bar_context`` controls the ``BarContext`` lifetime contract:
       - ``None`` (default): pass stable immutable snapshots to standard strategies;
         use callback-scoped ephemeral context reuse only when
-        ``getattr(strategy, "supports_ephemeral_context", False)`` is ``True``.
+        ``getattr(strategy, "supports_ephemeral_context", False) is True`` (explicit
+        Boolean ``True``). Overlays receive ephemeral contexts ONLY when every
+        overlay also explicitly sets ``supports_ephemeral_context = True``; otherwise
+        overlays always receive fresh immutable snapshots.
       - ``False``: always pass stable immutable per-bar snapshots.
-      - ``True``: requires ``strategy.supports_ephemeral_context = True`` and
-        raises ``ValueError`` for unmarked strategies so the default snapshot
-        retention guarantee is never silently broken.
+      - ``True``: requires ``strategy.supports_ephemeral_context is True`` (validated
+        before resetting components or handling empty runs) and raises ``ValueError``
+        for unmarked strategies so the default snapshot retention guarantee is never
+        silently broken.
     """
 
     starting_equity: float = 10_000.0
@@ -1098,7 +1102,8 @@ class _SimAccount:
         side = intent.side
         reason = intent.tag or otype
         is_reduce = intent.reduce_only or intent.qty_mode == "close_all"
-        excluded_bands = () if is_reduce else intent.excluded_price_bands
+        # CR3-04: Preserve caller-supplied exclusion bands on non-reduce_only close_all intents.
+        excluded_bands = () if intent.reduce_only else intent.excluded_price_bands
 
         if is_reduce:
             pos_q = self.pos_qty
@@ -1106,8 +1111,6 @@ class _SimAccount:
                 return None, False
 
         if otype == "market":
-            if excluded_bands and any(b.excludes(bar_open) for b in excluded_bands):
-                return None, False
             # Open fill: price strictly from pre-open data (CR1-40).
             est_notional = (
                 (eq_basis * intent.qty_value)
@@ -1135,20 +1138,21 @@ class _SimAccount:
             qty_abs = self.size_intent_qty(intent, ref_px, exec_px, eq_basis)
             if qty_abs <= 1e-12:
                 return None, False
-            return (
-                execution.fill_market(
-                    side,
-                    qty_abs,
-                    bar_open=bar_open,
-                    bar_high=pre_high,
-                    bar_low=pre_low,
-                    bar_close=pre_close,
-                    bar_volume=pre_volume,
-                    bar_atr=pre_atr,
-                    reason=reason,
-                ),
-                True,
+            quote = execution.fill_market(
+                side,
+                qty_abs,
+                bar_open=bar_open,
+                bar_high=pre_high,
+                bar_low=pre_low,
+                bar_close=pre_close,
+                bar_volume=pre_volume,
+                bar_atr=pre_atr,
+                reason=reason,
             )
+            # CR3-04: Enforce exclusion bands against the final execution price before recording fill.
+            if excluded_bands and any(b.excludes(quote.exec_price) for b in excluded_bands):
+                return None, False
+            return quote, True
 
         if otype == "limit":
             assert intent.limit_price is not None
@@ -1199,8 +1203,6 @@ class _SimAccount:
             )
             if ref_px is None:
                 return None, False
-            if excluded_bands and any(b.excludes(ref_px) for b in excluded_bands):
-                return None, False
             triggered_at_open = (bar_open >= intent.stop_price) if side == "buy" else (bar_open <= intent.stop_price)
             p_high = pre_high if triggered_at_open else bar_high
             p_low = pre_low if triggered_at_open else bar_low
@@ -1246,34 +1248,37 @@ class _SimAccount:
                 )
                 adverse_exact = (ref_px * execution._half_spread_rate) + slip_exact
                 exec_exact = (ref_px + adverse_exact) if side == "buy" else max(execution.min_price, ref_px - adverse_exact)
-                return (
-                    execution._make_quote(
-                        side=side,
-                        order_type="stop_market",
-                        ref_price=ref_px,
-                        exec_price=exec_exact,
-                        qty=qty_abs,
-                        fee_rate=execution._taker_fee_rate,
-                        liquidity="taker",
-                        reason=reason,
-                    ),
-                    True,
-                )
-            return (
-                execution.try_fill_stop_market(
-                    side,
-                    qty_abs,
-                    intent.stop_price,
-                    bar_open=bar_open,
-                    bar_high=bar_high,
-                    bar_low=bar_low,
-                    bar_close=bar_close,
-                    bar_volume=bar_volume,
-                    bar_atr=bar_atr,
+                quote = execution._make_quote(
+                    side=side,
+                    order_type="stop_market",
+                    ref_price=ref_px,
+                    exec_price=exec_exact,
+                    qty=qty_abs,
+                    fee_rate=execution._taker_fee_rate,
+                    liquidity="taker",
                     reason=reason,
-                ),
-                False,
+                )
+                # CR3-04: Enforce exclusion bands against final execution price before recording fill.
+                if excluded_bands and any(b.excludes(quote.exec_price) for b in excluded_bands):
+                    return None, False
+                return quote, True
+            quote = execution.try_fill_stop_market(
+                side,
+                qty_abs,
+                intent.stop_price,
+                bar_open=bar_open,
+                bar_high=bar_high,
+                bar_low=bar_low,
+                bar_close=bar_close,
+                bar_volume=bar_volume,
+                bar_atr=bar_atr,
+                reason=reason,
             )
+            if quote is None:
+                return None, False
+            if excluded_bands and any(b.excludes(quote.exec_price) for b in excluded_bands):
+                return None, False
+            return quote, False
 
         # order_type == "stop_limit" (CR1-42 / CR2-15 / CR2-18 / CR2-22).
         assert intent.stop_price is not None and intent.limit_price is not None
@@ -1320,15 +1325,15 @@ class _SimAccount:
         if ref_px is None:
             return None, False
         triggered_at_open = (bar_open >= intent.stop_price) if side == "buy" else (bar_open <= intent.stop_price)
+        # CR3-05: Record stop activation BEFORE price-band fill checks so an excluded trigger fill
+        # still leaves the stop-limit active as a resting limit on subsequent bars.
+        if qo is not None:
+            qo.activated = True
+            qo.activated_bar = bar_idx
+            qo.activated_at_open = triggered_at_open
         if triggered_at_open:
             within_limit = (bar_open <= intent.limit_price) if side == "buy" else (bar_open >= intent.limit_price)
             if within_limit:
-                if excluded_bands and any(b.excludes(bar_open) for b in excluded_bands):
-                    return None, False
-                if qo is not None:
-                    qo.activated = True
-                    qo.activated_bar = bar_idx
-                    qo.activated_at_open = True
                 qty_abs = self.size_intent_qty(intent, bar_open, bar_open, eq_basis)
                 if qty_abs <= 1e-12:
                     return None, False
@@ -1348,6 +1353,8 @@ class _SimAccount:
                     exec_px = raw_exec if raw_exec <= intent.limit_price else intent.limit_price
                 else:
                     exec_px = raw_exec if raw_exec >= intent.limit_price else intent.limit_price
+                if excluded_bands and any(b.excludes(exec_px) for b in excluded_bands):
+                    return None, False
                 return (
                     execution._make_quote(
                         side=side,
@@ -1362,10 +1369,6 @@ class _SimAccount:
                     True,
                 )
             # Triggered at open past limit_price: activates as a passive resting limit for this bar.
-            if qo is not None:
-                qo.activated = True
-                qo.activated_bar = bar_idx
-                qo.activated_at_open = True
             if side == "buy":
                 reached = (bar_low < intent.limit_price) if execution.require_touch_through else (bar_low <= intent.limit_price)
             else:
@@ -1393,12 +1396,6 @@ class _SimAccount:
 
         # Triggered strictly intrabar at ref_px == intent.stop_price.
         within_limit = (ref_px <= intent.limit_price) if side == "buy" else (ref_px >= intent.limit_price)
-        if within_limit and excluded_bands and any(b.excludes(ref_px) for b in excluded_bands):
-            return None, False
-        if qo is not None:
-            qo.activated = True
-            qo.activated_bar = bar_idx
-            qo.activated_at_open = False
         if not within_limit:
             return None, False
         qty_abs = self.size_intent_qty(intent, ref_px, ref_px, eq_basis)
@@ -1418,6 +1415,10 @@ class _SimAccount:
             bar_atr=bar_atr,
             reason=reason,
         )
+        if quote is None:
+            return None, False
+        if excluded_bands and any(b.excludes(quote.exec_price) for b in excluded_bands):
+            return None, False
         return quote, False
 
     def try_execute_intent(
@@ -1577,6 +1578,8 @@ class _SimAccount:
                 it = qo.intent
                 if it.side != close_side:
                     continue
+                if it.session_gate is not None and not it.session_gate.is_allowed(bar_open_ms):
+                    continue
                 if it.order_type == "stop_market" and it.stop_price is not None and _is_stop_valid_for_fresh(it.stop_price):
                     if (is_long and bar_open <= it.stop_price) or ((not is_long) and bar_open >= it.stop_price):
                         open_stops.append(qo)
@@ -1614,8 +1617,8 @@ class _SimAccount:
                             exited_any = True
                             adverse_stop_filled = True
                     else:
-                        # Protective stop_limit triggered AT OPEN (CR1-45 / CR2-18 / CR2-22):
-                        # activate with at-open provenance and price strictly from pre-open data.
+                        # Protective stop_limit triggered AT OPEN (CR1-45 / CR2-18 / CR2-22 / CR3-04 / CR3-05):
+                        # activate with at-open provenance before any price-band check, price strictly from pre-open data.
                         assert it.limit_price is not None and it.stop_price is not None
                         qo.activated = True
                         qo.activated_bar = i
@@ -1640,20 +1643,22 @@ class _SimAccount:
                                     exec_px = raw_exec if raw_exec <= it.limit_price else it.limit_price
                                 else:
                                     exec_px = raw_exec if raw_exec >= it.limit_price else it.limit_price
-                                quote = execution._make_quote(
-                                    side=close_side,
-                                    order_type="stop_limit",
-                                    ref_price=bar_open,
-                                    exec_price=exec_px,
-                                    qty=qty_abs,
-                                    fee_rate=execution._taker_fee_rate,
-                                    liquidity="taker",
-                                    reason=it.tag or "stop_limit",
-                                )
-                                self.apply_fill(quote, bar_open_ms, i)
-                                consumed_ids.add(id(qo))
-                                exited_any = True
-                                adverse_stop_filled = True
+                                sl_bands = () if it.reduce_only else it.excluded_price_bands
+                                if not (sl_bands and any(b.excludes(exec_px) for b in sl_bands)):
+                                    quote = execution._make_quote(
+                                        side=close_side,
+                                        order_type="stop_limit",
+                                        ref_price=bar_open,
+                                        exec_price=exec_px,
+                                        qty=qty_abs,
+                                        fee_rate=execution._taker_fee_rate,
+                                        liquidity="taker",
+                                        reason=it.tag or "stop_limit",
+                                    )
+                                    self.apply_fill(quote, bar_open_ms, i)
+                                    consumed_ids.add(id(qo))
+                                    exited_any = True
+                                    adverse_stop_filled = True
                         # Else: bar_open gapped past limit_price; qo stays activated=True (at_open) for intrabar reach!
                 if consumed_ids and self.pos_qty != 0.0:
                     self.pending_reduce_orders = [q for q in self.pending_reduce_orders if id(q) not in consumed_ids]
@@ -1690,6 +1695,8 @@ class _SimAccount:
                     it = qo.intent
                     if it.side != close_side or it.limit_price is None:
                         continue
+                    if it.session_gate is not None and not it.session_gate.is_allowed(bar_open_ms):
+                        continue
                     is_resting_lim = (it.order_type == "limit") or (
                         it.order_type == "stop_limit" and qo.activated and qo.activated_bar < i
                     )
@@ -1712,6 +1719,9 @@ class _SimAccount:
                         if self.pos_qty == 0.0:
                             break
                         it = qo.intent
+                        lim_bands = () if it.reduce_only else it.excluded_price_bands
+                        if lim_bands and any(b.excludes(bar_open) for b in lim_bands):
+                            continue
                         qty_abs = self.size_intent_qty(it, bar_open, bar_open, _eq_basis())
                         if qty_abs > 1e-12:
                             lq = execution._make_quote(
@@ -1747,6 +1757,8 @@ class _SimAccount:
         for qo in self.pending_reduce_orders:
             it = qo.intent
             if it.side != close_side or it.stop_price is None or not _is_stop_valid_for_fresh(it.stop_price):
+                continue
+            if it.session_gate is not None and not it.session_gate.is_allowed(bar_open_ms):
                 continue
             if it.order_type == "stop_market" or (it.order_type == "stop_limit" and not qo.activated):
                 sp = it.stop_price
@@ -1863,6 +1875,8 @@ class _SimAccount:
                 it = qo.intent
                 if it.side != close_side or it.limit_price is None:
                     continue
+                if it.session_gate is not None and not it.session_gate.is_allowed(bar_open_ms):
+                    continue
                 if it.order_type == "limit":
                     if getattr(it, "time_in_force", "gtc") == "open_only":
                         continue  # open_only never fills intrabar
@@ -1896,13 +1910,14 @@ class _SimAccount:
                             return True
                     elif qo is not None:
                         it = qo.intent
+                        tp_bands = () if it.reduce_only else it.excluded_price_bands
                         if kind == "stop_limit_open":
                             # Activated at bar_open past limit_price: fills ONLY on intrabar return to limit_price (never at bar_open).
                             if close_side == "sell":
                                 reached = (bar_high > lp) if execution.require_touch_through else (bar_high >= lp)
                             else:
                                 reached = (bar_low < lp) if execution.require_touch_through else (bar_low <= lp)
-                            if reached:
+                            if reached and not (tp_bands and any(b.excludes(lp) for b in tp_bands)):
                                 qty_abs = self.size_intent_qty(it, lp, lp, _eq_basis())
                                 if qty_abs > 1e-12:
                                     tq = execution._make_quote(
@@ -1926,7 +1941,7 @@ class _SimAccount:
                             bar_high=bar_high,
                             bar_low=bar_low,
                         )
-                        if fill_px is not None:
+                        if fill_px is not None and not (tp_bands and any(b.excludes(fill_px) for b in tp_bands)):
                             qty_abs = self.size_intent_qty(it, fill_px, fill_px, _eq_basis())
                             if qty_abs > 1e-12:
                                 tq = execution.try_fill_limit(
@@ -2033,6 +2048,10 @@ class _SimAccount:
                 if self.pos_qty == 0.0:
                     break
                 if qo.intent.order_type == "market":
+                    # CR3-20: Enforce caller-supplied session_gate on queued close_all at fill bar open.
+                    if qo.intent.session_gate is not None and not qo.intent.session_gate.is_allowed(bar_open_ms):
+                        kept_reduce.append(qo)
+                        continue
                     eq_basis = (
                         self.settled_equity
                         if self.sizing_settled
@@ -2060,7 +2079,7 @@ class _SimAccount:
                         if self.pos_qty == 0.0:
                             exited_existing_this_bar = True
                         continue
-                    # Drop unfillable same-side market reduce_only rather than keeping it forever.
+                    # Drop unfillable market reduce_only rather than keeping it forever.
                     continue
                 kept_reduce.append(qo)
             if self.pos_qty != 0.0:
@@ -2226,7 +2245,19 @@ class _SimAccount:
                                 self.liquidations += 1
                             exited_existing_this_bar = True
 
-        # 1.6 Resting entry / scale-in OrderIntents (CR1-38/39/40/42/46 + CR2-19/20).
+        # CR3-21: Expire eligible open_only protective orders that missed the bar open BEFORE Step 1.6
+        # runs, so a later intrabar entry cannot match a stale open_only reduction against bar_open.
+        if self.pending_reduce_orders:
+            self.pending_reduce_orders = [
+                qo
+                for qo in self.pending_reduce_orders
+                if not (
+                    getattr(qo.intent, "time_in_force", "gtc") == "open_only"
+                    and (qo.intent.session_gate is None or qo.intent.session_gate.is_allowed(bar_open_ms))
+                )
+            ]
+
+        # 1.6 Resting entry / scale-in OrderIntents (CR1-38/39/40/42/46 + CR2-19/20 + CR3-06).
         if self.pending_entries:
             if self.is_halted_by_overlay():
                 # Loss overlay halted trading: cancel all queued risk-increasing entries (CR1-38).
@@ -2368,6 +2399,10 @@ class _SimAccount:
                                 or ((not is_long_cur) and check_hi >= liq_cur)
                             ):
                                 liqs_before = self.liquidations
+                                qty_before_prot = self.pos_qty
+                                cash_before_prot = self.cash
+                                avg_before_prot = self.avg_exec_price
+                                settled_before_prot = self.settled_equity
                                 if self.pending_reduce_orders:
                                     self.process_protective_exits_with_orders(
                                         i,
@@ -2422,12 +2457,21 @@ class _SimAccount:
                                     pos_anchor = None
                                     pos_has_open_exposure = False
                                     break
-                                if self.pos_qty == 0.0:
-                                    exited_existing_this_bar = True
-                                    pos_anchor = None
-                                    pos_has_open_exposure = False
-                                    if qo.created_while_open:
-                                        continue
+                                # CR3-06: Requote whenever an intervening protective exit changed ANY sizing state
+                                # (including partial exits that leave the account non-flat).
+                                prot_changed_acct = (
+                                    self.pos_qty != qty_before_prot
+                                    or self.cash != cash_before_prot
+                                    or self.avg_exec_price != avg_before_prot
+                                    or self.settled_equity != settled_before_prot
+                                )
+                                if prot_changed_acct:
+                                    if self.pos_qty == 0.0:
+                                        exited_existing_this_bar = True
+                                        pos_anchor = None
+                                        pos_has_open_exposure = False
+                                        if qo.created_while_open:
+                                            continue
                                     eq_basis = (
                                         self.settled_equity
                                         if self.sizing_settled
@@ -2435,8 +2479,8 @@ class _SimAccount:
                                     )
                                     if eq_basis <= 0.0:
                                         continue
-                                    prev_qty = 0.0
-                                    prev_abs = 0.0
+                                    prev_qty = self.pos_qty
+                                    prev_abs = prev_qty if prev_qty > 0.0 else -prev_qty
                                     qo.activated = was_act
                                     qo.activated_bar = was_act_bar
                                     qo.activated_at_open = was_act_open
@@ -2623,11 +2667,12 @@ class _SimAccount:
                                 if scale_exit.order_type == "liquidation":
                                     self.liquidations += 1
 
-        # Decrement TTL and expire missed open_only orders on surviving resting reduce_only orders (CR2-19).
+        # Decrement TTL and expire missed eligible open_only orders on surviving resting reduce_only orders (CR2-19, CR3-20).
         if self.pending_reduce_orders:
             surviving_reduce: list[_QueuedOrder] = []
             for qo in self.pending_reduce_orders:
-                if getattr(qo.intent, "time_in_force", "gtc") == "open_only":
+                gate_open = qo.intent.session_gate is None or qo.intent.session_gate.is_allowed(bar_open_ms)
+                if getattr(qo.intent, "time_in_force", "gtc") == "open_only" and gate_open:
                     continue
                 if qo.bars_left is not None:
                     rem = qo.bars_left - 1
@@ -3370,6 +3415,15 @@ class Simulator:
                 run_diagnostics["funding_coverage_ratio"] = coverage
                 run_diagnostics["funding_gap_count"] = len(gaps)
 
+        # CR3-07 & CR3-15: Require explicit Boolean opt-in and validate forced context reuse
+        # BEFORE resetting components or taking the empty-series early return.
+        strategy_supports_ephemeral = getattr(strategy, "supports_ephemeral_context", False) is True
+        if self.config.reuse_bar_context is True and not strategy_supports_ephemeral:
+            raise ValueError(
+                "SimulatorConfig(reuse_bar_context=True) requires strategy.supports_ephemeral_context = True "
+                "so the default immutable BarContext snapshot contract is never silently broken"
+            )
+
         if reset_components:
             strategy.reset()
             for overlay in overlays:
@@ -3417,19 +3471,16 @@ class Simulator:
         enforce_max_lev = self.config.enforce_instrument_max_leverage
         deadband_w = self.config.rebalance_deadband_weight
         rebalance_on_change = self.config.target_rebalance_mode == "on_change"
-        supports_ephemeral = bool(getattr(strategy, "supports_ephemeral_context", False))
+        # CR3-07 & CR3-08: Strategy and overlay context reuse opt-ins are evaluated independently
+        # with explicit Boolean identity (`is True`); overlays receive snapshots unless all opt in.
         if self.config.reuse_bar_context is None:
-            reuse_ctx = supports_ephemeral
-        elif self.config.reuse_bar_context:
-            if not supports_ephemeral:
-                raise ValueError(
-                    "SimulatorConfig(reuse_bar_context=True) requires strategy.supports_ephemeral_context = True "
-                    "so the default immutable BarContext snapshot contract is never silently broken"
-                )
-            reuse_ctx = True
+            reuse_ctx = strategy_supports_ephemeral
         else:
-            reuse_ctx = False
+            reuse_ctx = self.config.reuse_bar_context
         has_overlays = bool(overlays)
+        overlays_reuse_ctx = reuse_ctx and all(
+            getattr(ov, "supports_ephemeral_context", False) is True for ov in overlays
+        )
         fast_ctx_mode = reuse_ctx and (not has_overlays)
         on_bar_fn = strategy.on_bar
 
@@ -4108,13 +4159,24 @@ class Simulator:
 
                 eq_append(close_equity)
 
-                if reuse_ctx:
+                if reuse_ctx and overlays_reuse_ctx:
                     acct.bar_idx = i
                     acct.callback_active = True
                     try:
                         output = apply_risk_overlays(overlays, live_ctx, on_bar_fn(live_ctx))
                     finally:
                         acct.callback_active = False
+                elif reuse_ctx:
+                    # CR3-08: Strategy opted in, but at least one overlay did not — pass live_ctx
+                    # to strategy and a fresh immutable BarContext snapshot to overlays.
+                    acct.bar_idx = i
+                    acct.callback_active = True
+                    try:
+                        raw_output = on_bar_fn(live_ctx)
+                    finally:
+                        acct.callback_active = False
+                    ov_ctx = acct.build_immutable_ctx(i, close_equity, peak_equity, daily_start_equity)
+                    output = apply_risk_overlays(overlays, ov_ctx, raw_output)
                 else:
                     ctx = acct.build_immutable_ctx(i, close_equity, peak_equity, daily_start_equity)
                     output = on_bar_fn(ctx)

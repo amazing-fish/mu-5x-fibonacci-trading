@@ -316,16 +316,21 @@ class OrderIntent:
             if self.reduce_only:
                 raise ValueError("session_gate is not allowed on reduce_only protective exits")
 
-        if self.excluded_price_bands:
-            if type(self.excluded_price_bands) is not tuple:
-                object.__setattr__(self, "excluded_price_bands", tuple(self.excluded_price_bands))
-            for band in self.excluded_price_bands:
+        bands = self.excluded_price_bands
+        if type(bands) is not tuple:
+            if isinstance(bands, (str, bytes)):
+                raise ValueError("excluded_price_bands must be an iterable of PriceExclusionBand instances")
+            try:
+                bands = tuple(bands)
+            except TypeError as exc:
+                raise ValueError("excluded_price_bands must be an iterable of PriceExclusionBand instances") from exc
+            object.__setattr__(self, "excluded_price_bands", bands)
+        if bands:
+            for band in bands:
                 if not isinstance(band, PriceExclusionBand):
                     raise ValueError("excluded_price_bands entries must be PriceExclusionBand instances")
             if self.reduce_only:
                 raise ValueError("excluded_price_bands is not allowed on reduce_only protective exits")
-        elif type(self.excluded_price_bands) is not tuple:
-            object.__setattr__(self, "excluded_price_bands", ())
 
         if self.expires_after_bars is not None:
             if (
@@ -483,16 +488,39 @@ class TargetPosition:
             raise ValueError("reason must be a string")
 
 
-def _freeze_diagnostic_value(value: Any) -> Any:
-    """Recursively freeze standard mutable containers in ``StrategyOutput.diagnostics``."""
+def _freeze_diagnostic_value(value: Any, active: set[int]) -> Any:
+    """Recursively freeze standard mutable containers in ``StrategyOutput.diagnostics``.
+
+    Tracks active container identities on the current recursion path and raises
+    ``ValueError`` on reference cycles while preserving shared acyclic containers.
+    """
     if isinstance(value, Mapping):
-        return _MappingProxyType({k: _freeze_diagnostic_value(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze_diagnostic_value(v) for v in value)
-    if isinstance(value, tuple):
-        return tuple(_freeze_diagnostic_value(v) for v in value)
+        obj_id = id(value)
+        if obj_id in active:
+            raise ValueError("diagnostics cannot contain cyclic references")
+        active.add(obj_id)
+        try:
+            return _MappingProxyType({k: _freeze_diagnostic_value(v, active) for k, v in value.items()})
+        finally:
+            active.discard(obj_id)
+    if isinstance(value, (list, tuple)):
+        obj_id = id(value)
+        if obj_id in active:
+            raise ValueError("diagnostics cannot contain cyclic references")
+        active.add(obj_id)
+        try:
+            return tuple(_freeze_diagnostic_value(v, active) for v in value)
+        finally:
+            active.discard(obj_id)
     if isinstance(value, set):
-        return frozenset(_freeze_diagnostic_value(v) for v in value)
+        obj_id = id(value)
+        if obj_id in active:
+            raise ValueError("diagnostics cannot contain cyclic references")
+        active.add(obj_id)
+        try:
+            return frozenset(_freeze_diagnostic_value(v, active) for v in value)
+        finally:
+            active.discard(obj_id)
     if isinstance(value, bytearray):
         return bytes(value)
     return value
@@ -505,6 +533,8 @@ class StrategyOutput:
     ``diagnostics`` copies caller-owned mappings and recursively freezes standard
     nested containers (``Mapping``, ``list``, ``tuple``, ``set``, ``bytearray``)
     so later caller mutations to those containers cannot alter earlier outputs.
+    Cyclic container references are rejected with ``ValueError``; shared acyclic
+    container references remain valid.
     """
 
     intents: tuple[OrderIntent, ...] = ()
@@ -520,11 +550,7 @@ class StrategyOutput:
         if diag is not EMPTY_MAPPING:
             if not isinstance(diag, Mapping):
                 raise ValueError("diagnostics must be a mapping")
-            object.__setattr__(
-                self,
-                "diagnostics",
-                _MappingProxyType({k: _freeze_diagnostic_value(v) for k, v in diag.items()}),
-            )
+            object.__setattr__(self, "diagnostics", _freeze_diagnostic_value(diag, set()))
 
     @classmethod
     def empty(cls, diagnostics: Mapping[str, Any] | None = None) -> StrategyOutput:
@@ -821,21 +847,24 @@ class Strategy(Protocol):
     """Single-source protocol driving backtest, walk-forward, shadow, and live.
 
     Callback lifetime contract:
-      - Standard strategies (without ``supports_ephemeral_context = True``) always receive
-        point-in-time immutable ``BarContext``, ``PortfolioView``, and ``BarSeriesSlice``
-        snapshots that remain valid even if retained across bars.
-      - Strategies that explicitly set class attribute ``supports_ephemeral_context = True``
-        opt in to callback-scoped live context / ``FastCursor`` reuse and MUST NOT retain
-        ``ctx``, ``ctx.market``, or ``ctx.portfolio`` across ``on_bar`` invocations.
-        Returned ``BarSeriesSlice`` objects from ``closed_bars()`` always retain fixed bounds.
+      - Standard strategies (where ``getattr(strategy, "supports_ephemeral_context", False) is not True``)
+        always receive point-in-time immutable ``BarContext``, ``PortfolioView``, and
+        ``BarSeriesSlice`` snapshots that remain valid even if retained across bars.
+      - Strategies that explicitly set Boolean ``supports_ephemeral_context = True``
+        (strict ``is True``, not arbitrary truthy values) opt in to callback-scoped live
+        context / ``FastCursor`` reuse and MUST NOT retain ``ctx``, ``ctx.market``, or
+        ``ctx.portfolio`` across ``on_bar`` invocations. Returned ``BarSeriesSlice`` objects
+        from ``closed_bars()`` always retain fixed bounds.
+      - ``RiskOverlay`` instances opt in independently via ``supports_ephemeral_context = True``;
+        a strategy's opt-in never grants permission to pass a mutable context to an unmarked overlay.
       - Engine ``reuse_bar_context`` contract:
         * ``reuse_bar_context=None`` (default): pass stable immutable snapshots to standard
-          strategies; use callback-scoped live context only when ``supports_ephemeral_context``
-          is ``True``.
+          strategies; use callback-scoped live context only when ``supports_ephemeral_context is True``.
         * ``reuse_bar_context=False``: always pass stable immutable snapshots.
-        * ``reuse_bar_context=True``: requires ``strategy.supports_ephemeral_context = True``
-          and raises ``ValueError`` for unmarked strategies so the default snapshot guarantee
-          is never silently broken.
+        * ``reuse_bar_context=True``: requires ``strategy.supports_ephemeral_context is True``
+          and is validated before resetting strategy/overlay state or returning early on empty
+          series, raising ``ValueError`` for unmarked strategies while allowing valid empty
+          runs to return metrics.
     """
 
     strategy_id: str

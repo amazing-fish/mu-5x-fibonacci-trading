@@ -975,9 +975,10 @@ class RiskOverlayTests(unittest.TestCase):
         self.assertEqual(1, len(res_cross.targets))
         self.assertAlmostEqual(0.5, res_cross.targets[0].target_weight, places=9)
 
-        # Case 3: Resting reduce_only order does NOT consume entry headroom.
+        # Case 3 (CR3-16): Resting reduce_only contracts sell (NOT close_all!) worth 1x at limit_price
+        # MUST NOT consume entry headroom for a -1.5x short target (if reserved, target would shrink to -0.5x).
         resting_ro = OrderIntent(
-            "rest_ro", sym, "sell", "stop_market", "close_all", 0.0, stop_price=90.0, reduce_only=True
+            "rest_ro", sym, "sell", "limit", "contracts", 100.0, limit_price=100.0, reduce_only=True
         )
         pf_ro = PortfolioView(
             equity=10_000.0,
@@ -988,8 +989,82 @@ class RiskOverlayTests(unittest.TestCase):
             daily_start_equity=10_000.0,
         )
         ctx_ro = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_ro, instrument=inst)
-        res_ro = ov.filter(ctx_ro, StrategyOutput(targets=(TargetPosition(sym, 1.5),)))
-        self.assertAlmostEqual(1.5, res_ro.targets[0].target_weight, places=9)
+        res_ro = ov.filter(ctx_ro, StrategyOutput(targets=(TargetPosition(sym, -1.5),)))
+        self.assertAlmostEqual(-1.5, res_ro.targets[0].target_weight, places=9)
+
+    def test_exposure_cap_reserves_pending_additions_after_target_weight_intent_cr3_22(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu}, now_ms=t0)
+        inst = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov = ExposureCapOverlay(max_gross_leverage=1.0, max_single_weight=1.0)
+
+        # 1. With 1x cap and resting 0.6x buy limit, new 1x buy market target_weight MUST clamp to 0.4x!
+        resting_buy = OrderIntent("rb60", sym, "buy", "limit", "equity_fraction", 0.6, limit_price=95.0)
+        pf_rb = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_buy,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_rb = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_rb, instrument=inst)
+        tw_buy = OrderIntent("tw1", sym, "buy", "market", "target_weight", 1.0)
+        res_rb = ov.filter(ctx_rb, StrategyOutput(intents=(tw_buy,)))
+        self.assertEqual(1, len(res_rb.intents))
+        self.assertAlmostEqual(0.4, res_rb.intents[0].qty_value, places=9)
+
+        # 2. Resting 1.0x buy limit leaves zero room -> new 1x buy target_weight is rejected!
+        resting_full = OrderIntent("rb100", sym, "buy", "limit", "equity_fraction", 1.0, limit_price=95.0)
+        pf_full = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_full,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_full = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_full, instrument=inst)
+        res_full = ov.filter(ctx_full, StrategyOutput(intents=(tw_buy,)))
+        self.assertEqual((), res_full.intents)
+
+        # 3. Same-output incremental buy + target_weight buy respects the combined 1x cap!
+        pf_empty = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_empty = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_empty, instrument=inst)
+        res_seq = ov.filter(ctx_empty, StrategyOutput(intents=(resting_buy, tw_buy)))
+        self.assertEqual(2, len(res_seq.intents))
+        self.assertAlmostEqual(0.6, res_seq.intents[0].qty_value, places=9)
+        self.assertAlmostEqual(0.4, res_seq.intents[1].qty_value, places=9)
+
+        # 4. Short mirror: resting 0.6x sell limit clamps new -1x sell target_weight to -0.4x!
+        resting_sell = OrderIntent("rs60", sym, "sell", "limit", "equity_fraction", 0.6, limit_price=105.0)
+        pf_rs = PortfolioView(
+            equity=10_000.0,
+            cash=10_000.0,
+            positions={},
+            open_orders=(resting_sell,),
+            peak_equity=10_000.0,
+            daily_start_equity=10_000.0,
+        )
+        ctx_rs = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_rs, instrument=inst)
+        tw_sell = OrderIntent("tw_s1", sym, "sell", "market", "target_weight", -1.0)
+        res_rs = ov.filter(ctx_rs, StrategyOutput(intents=(tw_sell,)))
+        self.assertEqual(1, len(res_rs.intents))
+        self.assertAlmostEqual(-0.4, res_rs.intents[0].qty_value, places=9)
+
+        # 5. Without pending additions, 1x target_weight still passes unchanged!
+        res_clean = ov.filter(ctx_empty, StrategyOutput(intents=(tw_buy,)))
+        self.assertEqual(1, len(res_clean.intents))
+        self.assertAlmostEqual(1.0, res_clean.intents[0].qty_value, places=9)
 
 
 if __name__ == "__main__":

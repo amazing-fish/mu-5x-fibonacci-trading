@@ -422,17 +422,36 @@ class FundingSeries:
         if end == start:
             return ()
 
-        threshold_ms = float(step_ms) * tol
-        edge_slack_ms = float(step_ms) * (tol - 1.0)
         ts_arr = self._timestamps_buf
         lo, hi = self.between_indices(start, end)
+
+        if explicit_phase is not None:
+            first_due = _first_expected_after(start, step_ms, explicit_phase)
+            last_due = _last_expected_at_or_before(end, step_ms, explicit_phase)
+            if first_due > end:
+                return ()
+            aligned = [int(ts_arr[i]) for i in range(lo, hi) if int(ts_arr[i]) % step_ms == explicit_phase]
+            if not aligned:
+                return ((start, end),)
+            sched_gaps: list[tuple[int, int]] = []
+            if aligned[0] > first_due:
+                sched_gaps.append((start, aligned[0]))
+            prev_aligned = aligned[0]
+            for ts in aligned[1:]:
+                if (ts - prev_aligned) > step_ms:
+                    sched_gaps.append((prev_aligned, ts))
+                prev_aligned = ts
+            if prev_aligned < last_due:
+                sched_gaps.append((prev_aligned, end))
+            return tuple(sched_gaps)
+
+        threshold_ms = float(step_ms) * tol
+        edge_slack_ms = float(step_ms) * (tol - 1.0)
 
         if lo >= hi:
             if (end - start) > threshold_ms:
                 return ((start, end),)
-            if explicit_phase is not None:
-                check_phase = explicit_phase
-            elif lo > 0 and int(ts_arr[lo - 1]) == start:
+            if lo > 0 and int(ts_arr[lo - 1]) == start:
                 check_phase = int(ts_arr[lo - 1]) % step_ms
             else:
                 check_phase = 0
@@ -440,11 +459,7 @@ class FundingSeries:
                 return ((start, end),)
             return ()
 
-        in_window_phase = (
-            explicit_phase
-            if explicit_phase is not None
-            else _infer_settlement_phase_ms(ts_arr, step_ms, start_idx=lo, end_idx=hi)
-        )
+        in_window_phase = _infer_settlement_phase_ms(ts_arr, step_ms, start_idx=lo, end_idx=hi)
 
         gaps: list[tuple[int, int]] = []
         first_ts = int(ts_arr[lo])
@@ -513,6 +528,11 @@ class FundingSeries:
         ``ValueError`` if gaps exist and the settlement phase cannot be uniquely
         determined.
         """
+        start = _validate_int_ts(start_ms, "start_ms")
+        end = _validate_int_ts(end_ms, "end_ms")
+        if end < start:
+            raise ValueError("end_ms must be >= start_ms")
+        _validate_rate(apr, "apr")
         hours = _validate_interval_hours(
             self._settlement_interval_hours if interval_hours is None else interval_hours,
             "interval_hours",
@@ -521,20 +541,12 @@ class FundingSeries:
             raise ValueError("interval_hours is required when settlement_interval_hours is None")
         step_ms = hours * _HOUR_MS
 
-        explicit_phase: int | None = None
         if phase_ms is not None:
-            explicit_phase = _validate_int_ts(phase_ms, "phase_ms")
-            if explicit_phase >= step_ms:
-                raise ValueError(f"phase_ms ({explicit_phase}) must be < interval_ms ({step_ms})")
-
-        gaps = self.coverage_gaps(start_ms, end_ms, hours, tolerance, phase_ms=explicit_phase)
-        if not gaps:
-            return self
-
-        if explicit_phase is not None:
-            resolved_phase = explicit_phase
+            resolved_phase = _validate_int_ts(phase_ms, "phase_ms")
+            if resolved_phase >= step_ms:
+                raise ValueError(f"phase_ms ({resolved_phase}) must be < interval_ms ({step_ms})")
         else:
-            lo, hi = self.between_indices(start_ms, end_ms)
+            lo, hi = self.between_indices(start, end)
             inferred_phase = (
                 _infer_settlement_phase_ms(self._timestamps_buf, step_ms, start_idx=lo, end_idx=hi)
                 if lo < hi
@@ -546,6 +558,10 @@ class FundingSeries:
                     "determined from existing events (provide explicit phase_ms or align history)"
                 )
             resolved_phase = inferred_phase
+
+        gaps = self.coverage_gaps(start, end, hours, tolerance, phase_ms=resolved_phase)
+        if not gaps:
+            return self
 
         by_ts: dict[int, float] = {
             int(self._timestamps_buf[i]): float(self._rates_buf[i])
@@ -873,12 +889,12 @@ def require_or_sensitivity_series(
       ``0.0`` series: ``apr_band`` must contain at least 2 distinct APR points including
       at least one non-zero APR (default ``(0.0, 0.15, 0.30)``).
     """
+    if series is not None and instrument_id is not None and series.instrument_id != instrument_id:
+        raise ValueError(
+            f"funding series instrument_id {series.instrument_id!r} does not match "
+            f"requested instrument_id {instrument_id!r}"
+        )
     if series is not None and len(series) > 0:
-        if instrument_id is not None and series.instrument_id != instrument_id:
-            raise ValueError(
-                f"funding series instrument_id {series.instrument_id!r} does not match "
-                f"requested instrument_id {instrument_id!r}"
-            )
         resolved_hours = _validate_interval_hours(
             interval_hours if interval_hours is not None else series.settlement_interval_hours,
             "interval_hours",

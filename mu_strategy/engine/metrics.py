@@ -680,7 +680,9 @@ def _extract_bar_arrays(
         and hasattr(bars, "closes")
     ):
         # BarSeries or BarSeriesSlice (BarSeriesSlice columns are already bounded views!)
-        base = getattr(bars, "_series", None) or getattr(bars, "series", None)
+        base = getattr(bars, "_series", None)
+        if base is None:
+            base = getattr(bars, "series", None)
         resolved_iv_ms = int(interval_ms or getattr(bars, "interval_ms", getattr(base, "interval_ms", _DEFAULT_INTERVAL_MS)))
         vols = bars.volumes if hasattr(bars, "volumes") else [0.0] * len(bars.closes)
         return (
@@ -773,7 +775,11 @@ def compute_buy_and_hold_benchmark(
         inferred_interval,
     ) = _extract_bar_arrays(bars, interval_ms)
 
-    # Validate instrument against bar symbol metadata before applying costs or funding (CR2-32).
+    # Validate explicit symbol and instrument against bar symbol metadata (CR2-32, CR3-02).
+    if symbol and inferred_symbol and symbol != inferred_symbol:
+        raise ValueError(
+            f"benchmark symbol {symbol!r} does not match bars symbol {inferred_symbol!r}"
+        )
     if instrument is not None:
         if inferred_symbol and inferred_symbol != instrument.symbol:
             raise ValueError(
@@ -955,13 +961,27 @@ def compute_buy_and_hold_benchmark(
     if ref_entry <= 0.0:
         raise ValueError(f"benchmark entry open price must be positive, got {ref_entry}")
 
+    def _prior_closed_index(idx: int, fill_open_ms: int) -> int | None:
+        """Select the latest bar strictly closed at or before ``fill_open_ms`` (CR3-03)."""
+        if idx <= 0:
+            return None
+        if int(close_times[idx - 1]) <= fill_open_ms:
+            return idx - 1
+        j = idx - 2
+        while j >= 0 and int(close_times[j]) > fill_open_ms:
+            j -= 1
+        return j if j >= 0 else None
+
+    entry_open_ms = int(open_times[start_idx])
+    entry_prior_idx = _prior_closed_index(start_idx, entry_open_ms)
+
     if execution is not None:
-        # Strictly pre-open estimates: fall back to 0.0 volume / None ATR when no prior bar exists (CR2-30).
-        pre_close = float(closes[start_idx - 1]) if start_idx > 0 else ref_entry
-        pre_vol = float(volumes[start_idx - 1]) if start_idx > 0 else 0.0
-        pre_high = float(highs[start_idx - 1]) if start_idx > 0 else ref_entry
-        pre_low = float(lows[start_idx - 1]) if start_idx > 0 else ref_entry
-        pre_atr = float(atr_arr[start_idx - 1]) if (atr_arr is not None and start_idx > 0) else None
+        # Strictly causal pre-open estimates selected by close time <= fill open (CR2-30, CR3-03).
+        pre_close = float(closes[entry_prior_idx]) if entry_prior_idx is not None else ref_entry
+        pre_vol = float(volumes[entry_prior_idx]) if entry_prior_idx is not None else 0.0
+        pre_high = float(highs[entry_prior_idx]) if entry_prior_idx is not None else ref_entry
+        pre_low = float(lows[entry_prior_idx]) if entry_prior_idx is not None else ref_entry
+        pre_atr = float(atr_arr[entry_prior_idx]) if (atr_arr is not None and entry_prior_idx is not None) else None
         qty_abs = (starting_equity * leverage) / ref_entry
         entry_quote = execution.fill_market(
             entry_side,
@@ -994,8 +1014,8 @@ def compute_buy_and_hold_benchmark(
     bars_in_market = 0
     liquidations = 0
     is_open = True
-    prev_close_ms = int(open_times[start_idx])
-    prev_close_px = float(closes[start_idx - 1]) if start_idx > 0 else ref_entry
+    prev_close_ms = entry_open_ms
+    prev_close_px = float(closes[entry_prior_idx]) if entry_prior_idx is not None else ref_entry
 
     def _compute_bench_liq_price(curr_cash: float) -> float | None:
         if asset_class in ("spot", "equity") and side == "long":
@@ -1040,11 +1060,12 @@ def compute_buy_and_hold_benchmark(
                 gapped_liq = (bar_open <= liq_price) if side == "long" else (bar_open >= liq_price)
                 if execution is not None:
                     if gapped_liq:
-                        p_high_l = float(highs[i - 1]) if i > 0 else bar_open
-                        p_low_l = float(lows[i - 1]) if i > 0 else bar_open
-                        p_close_l = float(closes[i - 1]) if i > 0 else bar_open
-                        p_vol_l = float(volumes[i - 1]) if i > 0 else 0.0
-                        p_atr_l = float(atr_arr[i - 1]) if (atr_arr is not None and i > 0) else None
+                        gap_prior_idx = _prior_closed_index(i, bar_open_ms)
+                        p_high_l = float(highs[gap_prior_idx]) if gap_prior_idx is not None else bar_open
+                        p_low_l = float(lows[gap_prior_idx]) if gap_prior_idx is not None else bar_open
+                        p_close_l = float(closes[gap_prior_idx]) if gap_prior_idx is not None else bar_open
+                        p_vol_l = float(volumes[gap_prior_idx]) if gap_prior_idx is not None else 0.0
+                        p_atr_l = float(atr_arr[gap_prior_idx]) if (atr_arr is not None and gap_prior_idx is not None) else None
                         slip_l = execution.compute_slippage_price(
                             bar_open,
                             order_notional=bar_open * qty_abs,

@@ -590,19 +590,38 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
     for i in range(period, n):
         old_v = closes[i - period]
         new_v = closes[i]
+        scale_incompatible = False
+        old_s = 0.0
+        new_s = 0.0
         if _isfinite(old_v):
-            old_s = old_v if scale_exp == 0 else _ldexp(old_v, -scale_exp)
-            d_old = old_s - anchor
-            sum_d -= d_old
-            sum_d2 -= d_old * d_old
+            if scale_exp == 0 or old_v == 0.0:
+                old_s = old_v
+            else:
+                _, old_exp = _frexp(old_v)
+                if old_exp - scale_exp > 500:
+                    scale_incompatible = True
+                else:
+                    old_s = _ldexp(old_v, -scale_exp)
+            if not scale_incompatible:
+                d_old = old_s - anchor
+                sum_d -= d_old
+                sum_d2 -= d_old * d_old
         else:
             bad_count -= 1
 
         if _isfinite(new_v):
-            new_s = new_v if scale_exp == 0 else _ldexp(new_v, -scale_exp)
-            d_new = new_s - anchor
-            sum_d += d_new
-            sum_d2 += d_new * d_new
+            if scale_exp == 0 or new_v == 0.0:
+                new_s = new_v
+            else:
+                _, new_exp = _frexp(new_v)
+                if new_exp - scale_exp > 500:
+                    scale_incompatible = True
+                else:
+                    new_s = _ldexp(new_v, -scale_exp)
+            if not scale_incompatible:
+                d_new = new_s - anchor
+                sum_d += d_new
+                sum_d2 += d_new * d_new
             if run_len > 0 and new_v == last_val:
                 run_len += 1
             else:
@@ -612,6 +631,10 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
             bad_count += 1
             run_len = 0
             last_val = _NAN
+
+        if scale_incompatible:
+            sum_d = _NAN
+            sum_d2 = _NAN
 
         since_resync += 1
         if bad_count != 0:
@@ -629,7 +652,8 @@ def compute_zscore(closes: Sequence[float], period: int = 20) -> array:
 
         ssd = sum_d2 - (sum_d * sum_d) * inv_period
         if (
-            since_resync >= resync_every
+            scale_incompatible
+            or since_resync >= resync_every
             or not (_isfinite(sum_d) and _isfinite(sum_d2) and _isfinite(ssd))
             or ssd <= 1e-12 * sum_d2
             or ssd < 0.0
