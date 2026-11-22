@@ -1019,6 +1019,8 @@ def compute_buy_and_hold_benchmark(
     liquidations = 0
     is_open = True
     settled_until_ms = entry_open_ms
+    liq_history: list[tuple[int, float | None]] = []
+    recent_flushed: list[tuple[int, int, float, float]] = []
 
     def _compute_bench_liq_price(curr_cash: float) -> float | None:
         if asset_class in ("spot", "equity") and side == "long":
@@ -1086,8 +1088,68 @@ def compute_buy_and_hold_benchmark(
                     delta = -signed_qty * ev_mark * float(rate)
                     cash += delta
                     accrued_funding += delta
-                liq_price = _compute_bench_liq_price(cash)
+                    liq_price = _compute_bench_liq_price(cash)
+                    liq_history.append((ev_ts, liq_price))
             settled_until_ms = end_ms
+
+    def _effective_intrabar_liq(
+        p_open_ms: int,
+        p_open: float,
+        p_low: float,
+        p_high: float,
+        open_liq_price: float | None,
+        live_liq: float,
+    ) -> float | None:
+        """Compute the causal intrabar liquidation threshold for bar ``p_idx`` (CR8-02 / CR8-03 / CR4-07).
+
+        Explicit overlap policy:
+          - Compute the maximal prefix ``[p_open_ms, covered_until]`` covered by already-flushed
+            overlapping bars whose OHLC strictly excludes this bar's extreme wick (``f_low > p_low``
+            for longs; ``f_high < p_high`` for shorts). Because the bar's own open occurred at
+            ``p_open_ms``, a bar whose open already equals/breaches ``p_low``/``p_high`` (or
+            ``live_liq``) keeps ``covered_until = p_open_ms`` (preventing retroactive liquidation
+            of pre-debit opens such as CR4-07).
+          - The wick is guaranteed to have occurred in ``(covered_until, p_close_ms]``.
+          - Take the most lenient (non-retroactive) threshold active at or after ``covered_until``
+            (``min`` for longs, ``max`` for shorts). Thus:
+              * If overlapping bars prove the wick occurred strictly after a funding debit
+                (``covered_until >= debit_ts``), the post-debit threshold applies!
+              * If OHLC order vs a later debit is genuinely ambiguous (``covered_until < debit_ts``),
+                the pre-debit threshold is preserved (never retroactively liquidating an earlier wick).
+        """
+        covered_until = p_open_ms
+        open_breached = (p_open <= live_liq) if side == "long" else (p_open >= live_liq)
+        open_at_extreme = (p_open <= p_low) if side == "long" else (p_open >= p_high)
+        if recent_flushed and not open_breached and not open_at_extreme:
+            covering = [
+                (o_ms, c_ms)
+                for o_ms, c_ms, f_low, f_high in recent_flushed
+                if c_ms > p_open_ms and ((f_low > p_low) if side == "long" else (f_high < p_high))
+            ]
+            if covering:
+                covering.sort()
+                for o_ms, c_ms in covering:
+                    if o_ms > covered_until:
+                        break
+                    if c_ms > covered_until:
+                        covered_until = c_ms
+
+        # Advance open_liq_price through every funding event settled at or before covered_until.
+        liq_at_covered = open_liq_price
+        after_vals: list[float | None] = []
+        for ev_ts, ev_liq in liq_history:
+            if ev_ts <= p_open_ms:
+                continue
+            if ev_ts <= covered_until:
+                liq_at_covered = ev_liq
+            else:
+                after_vals.append(ev_liq)
+
+        candidates: list[float | None] = [liq_at_covered, *after_vals, live_liq]
+        if any(c is None for c in candidates):
+            return None
+        non_none = [c for c in candidates if c is not None]
+        return min(non_none) if side == "long" else max(non_none)
 
     def _liquidate_bench(
         *,
@@ -1096,6 +1158,7 @@ def compute_buy_and_hold_benchmark(
         liq_threshold: float,
         gapped_open: bool,
         use_prior_open_slip: bool,
+        include_exit_bar: bool = False,
         b_open: float,
         b_high: float,
         b_low: float,
@@ -1174,7 +1237,8 @@ def compute_buy_and_hold_benchmark(
         net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
         cash = starting_equity + net_pnl
         total_traded_notional += exit_notional
-        bars_in_market += max(0, exit_bar_idx - entry_bar_idx)
+        span_bars = (exit_bar_idx - entry_bar_idx) + (1 if include_exit_bar else 0)
+        bars_in_market += max(0, span_bars)
         trades.append(
             TradeRecord(
                 entry_time_ms=int(open_times[start_idx]),
@@ -1209,34 +1273,44 @@ def compute_buy_and_hold_benchmark(
         p_atr = float(atr_arr[p_idx]) if atr_arr is not None else None
 
         # 1. Non-gap intrabar OHLC MMR liquidation check deferred to bar close so a later overlapping
-        #    bar's intrabar wick cannot preempt an earlier bar's close or funding (CR7-03), while
-        #    preserving pre-funding intrabar ordering on non-overlapping bars and avoiding false
-        #    retroactive liquidation when subsequent funding raises liq_price past an earlier open (CR4-07).
-        if is_open and open_liq_price is not None and liq_price is not None:
-            eff_intrabar_liq = (
-                min(open_liq_price, liq_price) if side == "long" else max(open_liq_price, liq_price)
+        #    bar's intrabar wick cannot preempt an earlier bar's close or funding (CR7-03), using the
+        #    explicit causal overlap policy (CR8-02 / CR8-03 / CR4-07):
+        #    - When funding worsened liq_price after bar open, use live liq_price iff already-flushed
+        #      overlapping bars prove the wick occurred strictly after the debit; otherwise preserve
+        #      the non-retroactive open_liq_price threshold.
+        #    - Always pass eff_intrabar_liq consistently as both liq_threshold and gapped_open bound.
+        if is_open and liq_price is not None:
+            eff_intrabar_liq = _effective_intrabar_liq(
+                int(open_times[p_idx]),
+                p_open,
+                p_low,
+                p_high,
+                open_liq_price,
+                liq_price,
             )
-            intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
-            if intrabar_hit:
-                _liquidate_bench(
-                    exit_bar_idx=p_idx,
-                    exit_time_ms=p_close_ms,
-                    liq_threshold=liq_price,
-                    gapped_open=((p_open <= liq_price) if side == "long" else (p_open >= liq_price)),
-                    use_prior_open_slip=False,
-                    b_open=p_open,
-                    b_high=p_high,
-                    b_low=p_low,
-                    b_close=p_close,
-                    b_vol=p_vol,
-                    b_atr=p_atr,
-                )
+            if eff_intrabar_liq is not None:
+                intrabar_hit = (p_low <= eff_intrabar_liq) if side == "long" else (p_high >= eff_intrabar_liq)
+                if intrabar_hit:
+                    _liquidate_bench(
+                        exit_bar_idx=p_idx,
+                        exit_time_ms=p_close_ms,
+                        liq_threshold=eff_intrabar_liq,
+                        gapped_open=((p_open <= eff_intrabar_liq) if side == "long" else (p_open >= eff_intrabar_liq)),
+                        use_prior_open_slip=False,
+                        include_exit_bar=False,
+                        b_open=p_open,
+                        b_high=p_high,
+                        b_low=p_low,
+                        b_close=p_close,
+                        b_vol=p_vol,
+                        b_atr=p_atr,
+                    )
 
         # 2. Settle all funding up to this bar's close timestamp strictly causally (CR6-01 / CR6-02).
         _settle_funding_up_to(p_close_ms)
 
         if is_open:
-            # 3. Post-close-funding maintenance-margin liquidation check before recording the close (CR7-02).
+            # 3. Post-close-funding maintenance-margin liquidation check before recording the close (CR7-02 / CR8-01).
             if liq_price is not None and (
                 (p_close <= liq_price) if side == "long" else (p_close >= liq_price)
             ):
@@ -1246,6 +1320,7 @@ def compute_buy_and_hold_benchmark(
                     liq_threshold=liq_price,
                     gapped_open=True,
                     use_prior_open_slip=False,
+                    include_exit_bar=True,
                     b_open=p_close,
                     b_high=p_close,
                     b_low=p_close,
@@ -1254,6 +1329,7 @@ def compute_buy_and_hold_benchmark(
                     b_atr=p_atr,
                 )
                 equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(cash))
+                recent_flushed.append((int(open_times[p_idx]), p_close_ms, p_low, p_high))
                 return
 
             unrealized = signed_qty * (p_close - exec_entry)
@@ -1290,7 +1366,7 @@ def compute_buy_and_hold_benchmark(
                 net_pnl = fsum((gross_pnl, -total_fees, -total_slip, accrued_funding))
                 cash = starting_equity + net_pnl
                 total_traded_notional += exit_notional
-                bars_in_market += max(0, p_idx - entry_bar_idx)
+                bars_in_market += max(0, (p_idx - entry_bar_idx) + 1)
                 trades.append(
                     TradeRecord(
                         entry_time_ms=int(open_times[start_idx]),
@@ -1319,10 +1395,11 @@ def compute_buy_and_hold_benchmark(
                 equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(marked_equity))
         else:
             equity_curve_slots[p_idx - start_idx] = (p_close_ms, _clean_zero(cash))
+        recent_flushed.append((int(open_times[p_idx]), p_close_ms, p_low, p_high))
 
     liq_price = _compute_bench_liq_price(cash)
 
-    # Monotonic timestamp-ordered timeline over bar opens and closes (CR4-07 / CR5-01 / CR5-02 / CR6-01 / CR6-02 / CR7-01..03).
+    # Monotonic timestamp-ordered timeline over bar opens and closes (CR4-07 / CR5-01 / CR5-02 / CR6-01 / CR6-02 / CR7-01..03 / CR8-01..03).
     # On contiguous/gapped bars, pending_closes flushes bar i-1 immediately before bar i opens (zero drift).
     # On overlapping bars, gap-at-open liquidations execute at bar_open_ms while non-gap intrabar breaches
     # and close-time funding/MMR liquidation checks flush in ascending close_time_ms order on one live cash state.
@@ -1334,6 +1411,11 @@ def compute_buy_and_hold_benchmark(
         while pending_closes and pending_closes[0][0] <= bar_open_ms:
             p_close_ms, p_idx, p_open_liq = heappop(pending_closes)
             _flush_pending_close(p_close_ms, p_idx, p_open_liq)
+        if not pending_closes:
+            if recent_flushed:
+                recent_flushed.clear()
+            if liq_history:
+                liq_history.clear()
 
         # 1b. Settle all funding events in (settled_until_ms, bar_open_ms] BEFORE bar i's open/gap-liquidation check.
         _settle_funding_up_to(bar_open_ms)

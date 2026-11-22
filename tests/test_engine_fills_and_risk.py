@@ -1537,6 +1537,76 @@ class RiskOverlayTests(unittest.TestCase):
         res_t_marked = ov_m.filter(ctx_12k, StrategyOutput(targets=(TargetPosition(sym, 1.0),)))
         self.assertAlmostEqual(1.0, res_t_marked.targets[0].target_weight, places=9)
 
+    def test_exposure_cap_phase_aware_post_target_protective_and_resting_ef_cr8_04_cr8_05(self) -> None:
+        sym = "MU-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu}, now_ms=t0)
+        inst_5x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        inst_1x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=1.0)
+
+        # CR8-04: 80 long @ 75 -> mark=100, settled=8_000, marked=10_000, 1x cap, settled_equity.
+        # TargetPosition(+0.625) reduces 80 -> 50 (+750 realized -> settled=8_750), then reduce_only 0.5 limit sell @ 100
+        # sells 43.75 contracts (leaving 6.25) -> 110-contract market sell MUST clamp to 106.25 (exact -1.0x!).
+        pos_80_p = {sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+        pf_8k = PortfolioView(10_000.0, 8_000.0, pos_80_p, (), 10_000.0, 10_000.0)
+        ctx_8k = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k, instrument=inst_5x)
+        ov_s = ExposureCapOverlay(1.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+
+        ro_lim05 = OrderIntent("rol05", sym, "sell", "limit", "equity_fraction", 0.5, limit_price=100.0, reduce_only=True)
+        ro_mkt05 = OrderIntent("rom05", sym, "sell", "market", "equity_fraction", 0.5, reduce_only=True)
+        mkt_110 = OrderIntent("m110", sym, "sell", "market", "contracts", 110.0)
+        mkt_150 = OrderIntent("m150", sym, "sell", "market", "contracts", 150.0)
+
+        res_post_tgt = ov_s.filter(
+            ctx_8k,
+            StrategyOutput(targets=(TargetPosition(sym, 0.625),), intents=(ro_lim05, mkt_110)),
+        )
+        self.assertAlmostEqual(106.25, res_post_tgt.intents[1].qty_value, places=9)
+
+        # Without a profit-realizing target, the 0.5 limit sell preserves exact 40-contract reservation (80-40=40 -> max sell 140)!
+        res_no_tgt = ov_s.filter(ctx_8k, StrategyOutput(intents=(ro_lim05, mkt_150)))
+        self.assertAlmostEqual(140.0, res_no_tgt.intents[1].qty_value, places=9)
+
+        # A Step 1.3 MARKET reduce_only sell runs BEFORE targets at settled=8_000 (40 contracts), so without target still 140!
+        res_mkt_only = ov_s.filter(ctx_8k, StrategyOutput(intents=(ro_mkt05, mkt_150)))
+        self.assertAlmostEqual(140.0, res_mkt_only.intents[1].qty_value, places=9)
+
+        # CR8-05: 80 long @ 75 -> mark=100, settled=8_000, marked=10_000, cap=1x, resting 1.75 sell limit @ 100.
+        # TargetPosition(+0.5) would leave 40 long and raise settled to 9_000, making resting 1.75 sell 157.5 (-117.5 = -1.175x!).
+        # Overlay MUST pull target up to (12/23) / 0.8 = 0.6521739... (so net = -100.0 = exact -1.0x!).
+        rest_sell_175 = OrderIntent("rs175", sym, "sell", "limit", "equity_fraction", 1.75, limit_price=100.0)
+        pf_8k_rest = PortfolioView(10_000.0, 8_000.0, pos_80_p, (rest_sell_175,), 10_000.0, 10_000.0)
+        ctx_rest_5x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k_rest, instrument=inst_5x)
+        res_rest_5x = ov_s.filter(ctx_rest_5x, StrategyOutput(targets=(TargetPosition(sym, 0.5),)))
+        self.assertAlmostEqual((12.0 / 23.0) / 0.8, res_rest_5x.targets[0].target_weight, places=9)
+
+        # With instrument max_leverage=1.0 enforced, resting 1.75 clamps to 1.0 (90 contracts on 9k settled -> -50 = -0.5x),
+        # so TargetPosition(+0.5) fits cleanly and is admitted unchanged!
+        ctx_rest_1x = BarContext(now_ms=t0, symbol=sym, market=mv, portfolio=pf_8k_rest, instrument=inst_1x)
+        res_rest_1x = ov_s.filter(ctx_rest_1x, StrategyOutput(targets=(TargetPosition(sym, 0.5),)))
+        self.assertAlmostEqual(0.5, res_rest_1x.targets[0].target_weight, places=9)
+
+        # Step 4 target_weight intent with resting 1.75 sell limit is ALSO pulled up to (12/23) / 0.8!
+        res_rest_tw = ov_s.filter(
+            ctx_rest_5x,
+            StrategyOutput(intents=(OrderIntent("tw05", sym, "sell", "market", "target_weight", 0.5),)),
+        )
+        self.assertAlmostEqual((12.0 / 23.0) / 0.8, res_rest_tw.intents[0].qty_value, places=9)
+
+        # Short mirror of CR8-05: -80 short @ 125, resting 1.75 buy limit @ 100 + TargetPosition(-0.5) -> -(12/23) / 0.8!
+        pos_m80_p = {sym: PositionView(sym, qty=-80.0, avg_entry_price=125.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8)}
+        rest_buy_175 = OrderIntent("rb175", sym, "buy", "limit", "equity_fraction", 1.75, limit_price=100.0)
+        ctx_mrest_5x = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_m80_p, (rest_buy_175,), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_mrest_5x = ov_s.filter(ctx_mrest_5x, StrategyOutput(targets=(TargetPosition(sym, -0.5),)))
+        self.assertAlmostEqual(-(12.0 / 23.0) / 0.8, res_mrest_5x.targets[0].target_weight, places=9)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4329,6 +4329,307 @@ class SimulatorCoreTests(unittest.TestCase):
             self.assertAlmostEqual(1.0, obs_710[2], places=6)
             _assert_accounting_invariants(self, res_710)
 
+    def test_benchmark_close_exit_span_and_overlap_wick_threshold_policy_cr8_01_to_cr8_03(self) -> None:
+        inst = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=10.0)
+        t0 = 1_735_689_600_000
+
+        # CR8-01: 1-bar close-time MMR liquidation MUST count the held bar (time_in_market_pct == 1.0 == 100%),
+        # matching end-of-data, while open-time gap exits keep the exclusive boundary.
+        cost_mmr5 = CostModel(
+            maker_fee_bps=0.0,
+            taker_fee_bps=0.0,
+            half_spread_bps=0.0,
+            slippage_model=FixedTicks(0.0),
+            stop_slippage_multiplier=1.0,
+            maintenance_margin_rate=0.05,
+            liquidation_fee_bps=0.0,
+        )
+        f_close1 = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 3_600_000, rate=0.01)],
+        )
+        b_1bar_close = BarSeries.from_candles("MU-USDT-SWAP", "1h", [Candle(t0, 100.0, 100.0, 85.0, 85.0, 1000.0)])
+        res_1bar = compute_buy_and_hold_benchmark(
+            b_1bar_close,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=cost_mmr5,
+            funding=f_close1,
+            close_on_end=True,
+        )
+        self.assertEqual(1, res_1bar.liquidations)
+        self.assertEqual("liquidation", res_1bar.trades[0].reason)
+        self.assertAlmostEqual(1.0, res_1bar.time_in_market_pct, places=6)
+        _assert_accounting_invariants(self, res_1bar)
+
+        # CR8-02 (Proven post-debit breach, LONG):
+        # Bar 0 [00:00..01:00] flat 100; Bar 1 [00:30..01:30] open=100, low=81, close=95.
+        # +2% debit at 00:45 raises liq 80 -> 82. Bar 0 proves low=81 occurred strictly after 00:45 -> LIQUIDATES @ 82!
+        f_0045_2pct = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 2_700_000, rate=0.02)],
+        )
+        b_proven_long = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 100.0, 100.0, 81.0, 95.0, 1000.0),
+            ],
+        )
+        res_pl = compute_buy_and_hold_benchmark(
+            b_proven_long,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0045_2pct,
+        )
+        self.assertEqual(1, res_pl.liquidations)
+        self.assertEqual("liquidation", res_pl.trades[0].reason)
+        self.assertAlmostEqual(82.0, res_pl.trades[0].exit_price, places=6)
+        self.assertAlmostEqual(0.0, res_pl.ending_equity, places=6)
+        _assert_accounting_invariants(self, res_pl)
+
+        # CR8-02 (Proven post-debit breach, SHORT mirror):
+        # 5x short @ 100 (liq=120), Bar 0 flat 100, Bar 1 open=100, high=119, close=105, -2% debit at 00:45 -> liq=118!
+        f_0045_m2pct = FundingSeries.from_events(
+            inst.instrument_id,
+            [FundingRateEvent(ts_ms=t0 + 2_700_000, rate=-0.02)],
+        )
+        b_proven_short = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 100.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 100.0, 119.0, 100.0, 105.0, 1000.0),
+            ],
+        )
+        res_ps = compute_buy_and_hold_benchmark(
+            b_proven_short,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            side="short",
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0045_m2pct,
+        )
+        self.assertEqual(1, res_ps.liquidations)
+        self.assertAlmostEqual(118.0, res_ps.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_ps)
+
+        # CR8-02 (Ambiguous overlap — Bar 0 also touched 81, so OHLC cannot prove 81 followed 00:45 debit):
+        # Non-retroactive policy preserves open_liq_price=80.0 -> NO false retroactive liquidation!
+        b_ambig = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 81.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 100.0, 100.0, 81.0, 95.0, 1000.0),
+            ],
+        )
+        res_ambig = compute_buy_and_hold_benchmark(
+            b_ambig,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0045_2pct,
+        )
+        self.assertEqual(0, res_ambig.liquidations)
+        _assert_accounting_invariants(self, res_ambig)
+
+        # CR8-03: Fill uses eff_intrabar_liq consistently for BOTH threshold and gapped_open!
+        # Bar 1 opens at 81.0 (> open_liq=80.0) and drops to 75.0 (<= 80.0), while 00:45 funding raised live liq to 81.62.
+        # Because eff_intrabar_liq=80.0 triggered the wick breach, fill MUST be 80.0 (NOT gapped at open=81.0!).
+        b_cr803 = BarSeries.from_candles(
+            "MU-USDT-SWAP",
+            "1h",
+            [
+                Candle(t0, 100.0, 100.0, 81.0, 100.0, 1000.0),
+                Candle(t0 + 1_800_000, 81.0, 95.0, 75.0, 95.0, 1000.0),
+            ],
+        )
+        res_cr803 = compute_buy_and_hold_benchmark(
+            b_cr803,
+            starting_equity=10_000.0,
+            leverage=5.0,
+            instrument=inst,
+            cost_model=CostModel.zero_cost(),
+            funding=f_0045_2pct,
+        )
+        self.assertEqual(1, res_cr803.liquidations)
+        self.assertAlmostEqual(80.0, res_cr803.trades[0].exit_price, places=6)
+        _assert_accounting_invariants(self, res_cr803)
+
+    def test_phase_aware_overlay_e2e_and_step1_6_gtc_open_reduce_match_cr8_04_to_cr8_06(self) -> None:
+        inst_5x = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=5.0)
+        inst_1x = okx_swap_spec("MU-USDT-SWAP", tick_size=Decimal("0.01"), max_leverage=1.0)
+
+        # 1. CR8-04 E2E: 80 long @ 75 -> rallies to 100 (settled=8k, marked=10k).
+        #    Bar 1 emits TargetPosition(+0.625) + reduce_only 0.5 limit sell @ 100 + 110-contract market sell under 1x cap.
+        #    Target reduces 80 -> 50 (settled -> 8_750), limit sells 43.75 -> residual 6.25 -> market sell clamped to 106.25 -> exact -100 (-1.0x!).
+        bars_804 = _make_series(
+            [
+                (75.0, 75.0, 75.0, 75.0, 1000.0),
+                (75.0, 100.0, 75.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        obs_804_qty: list[float] = []
+        obs_804_lev: list[float] = []
+
+        class _Obs804(_ScriptedStrategy):
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                pos = ctx.portfolio.positions.get(ctx.symbol)
+                obs_804_qty.append(pos.qty if pos is not None else 0.0)
+                obs_804_lev.append(pos.leverage if pos is not None else 0.0)
+                return super().on_bar(ctx)
+
+        sim_804 = Simulator(
+            inst_5x,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=8_000.0, sizing_basis="settled_equity", allow_missing_funding_for_perp=True),
+        )
+        res_804 = sim_804.run(
+            _Obs804(
+                {
+                    0: StrategyOutput(intents=(OrderIntent("e80", "MU-USDT-SWAP", "buy", "market", "contracts", 80.0),)),
+                    1: StrategyOutput(
+                        targets=(TargetPosition("MU-USDT-SWAP", 0.625),),
+                        intents=(
+                            OrderIntent("rol05", "MU-USDT-SWAP", "sell", "limit", "equity_fraction", 0.5, limit_price=100.0, reduce_only=True),
+                            OrderIntent("m110", "MU-USDT-SWAP", "sell", "market", "contracts", 110.0),
+                        ),
+                    ),
+                },
+                warmup=0,
+            ),
+            bars_804,
+            overlays=(ExposureCapOverlay(1.0, 1.0),),
+        )
+        self.assertAlmostEqual(-100.0, obs_804_qty[2], places=6)
+        self.assertLessEqual(max(obs_804_lev), 1.0 + 1e-9)
+        self.assertAlmostEqual(1.0, obs_804_lev[2], places=6)
+        _assert_accounting_invariants(self, res_804)
+
+        # 2. CR8-05 E2E: Resting 1.75 sell limit @ 100 placed on Bar 1 stays resting through Bar 2 (touch-through),
+        #    Bar 2 close (exact mark=100, settled=8k, marked=10k) emits TargetPosition(+0.5);
+        #    Bar 3 (100/100.01/100/100) fills TargetPosition @ 100 and resting sell @ 100 -> exact -100 (-1.0x) under inst_5x,
+        #    and exact -50 (-0.5x) under inst_1x with enforce_instrument_max_leverage=True!
+        bars_805 = _make_series(
+            [
+                (75.0, 75.0, 75.0, 75.0, 1000.0),
+                (75.0, 100.0, 75.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.01, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        for inst_case, exp_qty in ((inst_5x, -100.0), (inst_1x, -50.0)):
+            obs_805_qty: list[float] = []
+            obs_805_lev: list[float] = []
+
+            class _Obs805(_ScriptedStrategy):
+                def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                    pos = ctx.portfolio.positions.get(ctx.symbol)
+                    obs_805_qty.append(pos.qty if pos is not None else 0.0)
+                    obs_805_lev.append(pos.leverage if pos is not None else 0.0)
+                    return super().on_bar(ctx)
+
+            sim_805 = Simulator(
+                inst_case,
+                CostModel.zero_cost(),
+                SimulatorConfig(
+                    starting_equity=8_000.0,
+                    sizing_basis="settled_equity",
+                    enforce_instrument_max_leverage=True,
+                    require_touch_through=True,
+                    allow_missing_funding_for_perp=True,
+                ),
+            )
+            res_805 = sim_805.run(
+                _Obs805(
+                    {
+                        0: StrategyOutput(intents=(OrderIntent("e80", "MU-USDT-SWAP", "buy", "market", "contracts", 80.0),)),
+                        1: StrategyOutput(intents=(OrderIntent("rs175", "MU-USDT-SWAP", "sell", "limit", "equity_fraction", 1.75, limit_price=100.0),)),
+                        2: StrategyOutput(targets=(TargetPosition("MU-USDT-SWAP", 0.5),)),
+                    },
+                    warmup=0,
+                ),
+                bars_805,
+                overlays=(ExposureCapOverlay(1.0, 1.0),),
+            )
+            self.assertAlmostEqual(exp_qty, obs_805_qty[3], places=6)
+            self.assertLessEqual(max(obs_805_lev), 1.0 + 1e-9)
+            _assert_accounting_invariants(self, res_805)
+
+        # 3. CR8-06 E2E: From flat, queue market buy 10, buy limit 10 @ 90, and GTC reduce_only close_all sell limit @ 95.
+        #    On bar 1 (100/100/89/91): market buy fills 10 @ 100 -> GTC sell limit @ 95 matches immediately at open 100
+        #    (closing trade #1 @ 100) -> buy limit fills 10 @ 90 -> bar 1 ends long 10 @ 90 (closed at EOD 91)!
+        bars_806 = _make_series(
+            [
+                (100.0, 100.0, 100.0, 100.0, 1000.0),
+                (100.0, 100.0, 89.0, 91.0, 1000.0),
+                (91.0, 91.0, 91.0, 91.0, 1000.0),
+            ],
+            symbol="MU-USDT-SWAP",
+        )
+        obs_806_qty: list[float] = []
+
+        class _Obs806(_ScriptedStrategy):
+            def on_bar(self, ctx: BarContext) -> StrategyOutput:
+                pos = ctx.portfolio.positions.get(ctx.symbol)
+                obs_806_qty.append(pos.qty if pos is not None else 0.0)
+                return super().on_bar(ctx)
+
+        sim_806 = Simulator(
+            inst_5x,
+            CostModel.zero_cost(),
+            SimulatorConfig(starting_equity=10_000.0, allow_missing_funding_for_perp=True),
+        )
+        res_806 = sim_806.run(
+            _Obs806(
+                {
+                    0: StrategyOutput(
+                        intents=(
+                            OrderIntent("mb10", "MU-USDT-SWAP", "buy", "market", "contracts", 10.0),
+                            OrderIntent("bl90", "MU-USDT-SWAP", "buy", "limit", "contracts", 10.0, limit_price=90.0),
+                            OrderIntent(
+                                "gtc_sl95",
+                                "MU-USDT-SWAP",
+                                "sell",
+                                "limit",
+                                "close_all",
+                                0.0,
+                                limit_price=95.0,
+                                reduce_only=True,
+                                time_in_force="gtc",
+                                tag="gtc_tp95",
+                            ),
+                        )
+                    )
+                },
+                warmup=0,
+            ),
+            bars_806,
+        )
+        self.assertEqual(2, res_806.trade_count)
+        self.assertEqual("gtc_tp95", res_806.trades[0].reason)
+        self.assertAlmostEqual(100.0, res_806.trades[0].entry_price, places=6)
+        self.assertAlmostEqual(100.0, res_806.trades[0].exit_price, places=6)
+        self.assertAlmostEqual(10.0, res_806.trades[0].qty, places=6)
+        self.assertEqual("end_of_data", res_806.trades[1].reason)
+        self.assertAlmostEqual(90.0, res_806.trades[1].entry_price, places=6)
+        self.assertAlmostEqual(91.0, res_806.trades[1].exit_price, places=6)
+        self.assertAlmostEqual(10.0, res_806.trades[1].qty, places=6)
+        self.assertAlmostEqual(10.0, obs_806_qty[1], places=6)
+        _assert_accounting_invariants(self, res_806)
+
 
 if __name__ == "__main__":
     unittest.main()

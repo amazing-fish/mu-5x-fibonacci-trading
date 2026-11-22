@@ -896,71 +896,97 @@ class ExposureCapOverlay:
         else:
             prot_tw_ratio = 0.0
 
-        # 1. Summarize already-resting open orders AND protective reductions BEFORE admitting targets
-        #    (CR2-29 / CR3-16 / CR5-05 / CR6-04 / CR6-05 / CR7-04 / CR7-06):
-        #    - Non-reduce-only resting orders can still fill AFTER a queued TargetPosition fills.
-        #    - Protective reduce_only / close_all orders (resting + same-output, deduplicated by intent_id)
-        #      can shrink a positive long down toward 0.0 (never negative) or a negative short up toward 0.0
-        #      (never positive) BEFORE a non-reduce-only opposing order executes!
-        rest_buy: dict[str, float] = {}
-        rest_sell: dict[str, float] = {}
-        rest_tw_lo: dict[str, float] = {}
-        rest_tw_hi: dict[str, float] = {}
-        red_sell: dict[str, float] = {}
-        red_buy: dict[str, float] = {}
-        red_sell_floor: dict[str, float] = {}
-        red_buy_ceil: dict[str, float] = {}
+        # 1. Summarize already-resting open orders AND protective reductions in their exact Simulator
+        #    execution phases BEFORE admitting targets (CR2-29 / CR3-16 / CR5-05 / CR6-04 / CR6-05 /
+        #    CR7-04 / CR7-06 / CR8-04 / CR8-05):
+        #    - Phase 1.3 (market reduce_only / close_all): runs BEFORE Step 1.4 TargetPosition.
+        #    - Phase 1.5 (non-market reduce_only / close_all + target brackets): runs AFTER Step 1.4 TargetPosition.
+        #    - Phase 1.6 (non-reduce-only resting open orders): runs AFTER Step 1.4 TargetPosition & Phase 1.5.
+        rest_buy_fixed: dict[str, float] = {}
+        rest_sell_fixed: dict[str, float] = {}
+        rest_ef_buy: dict[str, float] = {}
+        rest_ef_sell: dict[str, float] = {}
+        rest_tw_orders: list[tuple[str, float]] = []
+        mkt_red_sell: dict[str, float] = {}
+        mkt_red_buy: dict[str, float] = {}
+        mkt_red_sell_floor: dict[str, float] = {}
+        mkt_red_buy_ceil: dict[str, float] = {}
+        post_red_sell_fixed: dict[str, float] = {}
+        post_red_buy_fixed: dict[str, float] = {}
+        post_red_sell_floor: dict[str, float] = {}
+        post_red_buy_ceil: dict[str, float] = {}
+        post_prot_ef_orders: list[tuple[str, str, float]] = []
         all_known_syms: set[str] = set(existing_weights.keys())
 
-        def _apply_protective_reductions(sym: str, lo_val: float, hi_val: float) -> tuple[float, float]:
+        def _apply_red_maps(
+            sym: str,
+            lo_val: float,
+            hi_val: float,
+            r_sell: Mapping[str, float],
+            r_buy: Mapping[str, float],
+            r_s_floor: Mapping[str, float],
+            r_b_ceil: Mapping[str, float],
+        ) -> tuple[float, float]:
             # Shrink only the inner side toward 0.0 (never crossing 0.0, preserving CR3-16 & CR1-31).
             if lo_val > 0.0:
-                if sym in red_sell_floor and red_sell_floor[sym] < lo_val:
-                    lo_val = red_sell_floor[sym]
-                rs_red = red_sell.get(sym, 0.0)
+                if sym in r_s_floor and r_s_floor[sym] < lo_val:
+                    lo_val = r_s_floor[sym]
+                rs_red = r_sell.get(sym, 0.0)
                 if rs_red > 0.0:
                     lo_val = max(0.0, lo_val - rs_red)
             if hi_val < 0.0:
-                if sym in red_buy_ceil and red_buy_ceil[sym] > hi_val:
-                    hi_val = red_buy_ceil[sym]
-                rb_red = red_buy.get(sym, 0.0)
+                if sym in r_b_ceil and r_b_ceil[sym] > hi_val:
+                    hi_val = r_b_ceil[sym]
+                rb_red = r_buy.get(sym, 0.0)
                 if rb_red > 0.0:
                     hi_val = min(0.0, hi_val + rb_red)
             return lo_val, hi_val
 
-        def _prot_only_lo(sym: str) -> float:
+        def _mkt_prot_lo(sym: str) -> float:
             ew = existing_weights.get(sym, 0.0)
-            lo_v, _ = _apply_protective_reductions(sym, ew, ew)
+            lo_v, _ = _apply_red_maps(
+                sym, ew, ew, mkt_red_sell, mkt_red_buy, mkt_red_sell_floor, mkt_red_buy_ceil
+            )
             return lo_v
 
-        def _prot_only_hi(sym: str) -> float:
+        def _mkt_prot_hi(sym: str) -> float:
             ew = existing_weights.get(sym, 0.0)
-            _, hi_v = _apply_protective_reductions(sym, ew, ew)
+            _, hi_v = _apply_red_maps(
+                sym, ew, ew, mkt_red_sell, mkt_red_buy, mkt_red_sell_floor, mkt_red_buy_ceil
+            )
             return hi_v
 
-        def _record_protective_reduction(ord_obj: OrderIntent) -> None:
+        def _record_protective_reduction(ord_obj: OrderIntent, *, is_market_phase: bool) -> None:
             osym = ord_obj.symbol
             all_known_syms.add(osym)
             qm = ord_obj.qty_mode
+            r_sell = mkt_red_sell if is_market_phase else post_red_sell_fixed
+            r_buy = mkt_red_buy if is_market_phase else post_red_buy_fixed
+            r_s_floor = mkt_red_sell_floor if is_market_phase else post_red_sell_floor
+            r_b_ceil = mkt_red_buy_ceil if is_market_phase else post_red_buy_ceil
             if qm == "close_all":
                 if ord_obj.side == "sell":
-                    red_sell[osym] = math.inf
+                    r_sell[osym] = math.inf
                 else:
-                    red_buy[osym] = math.inf
+                    r_buy[osym] = math.inf
             elif qm == "equity_fraction":
-                # CR7-04: Clamp protective equity_fraction by known instrument max_leverage when enforced;
-                # size against current upper settled ratio (reflecting any prior profit-realizing reductions).
+                # CR7-04 / CR8-04: Clamp protective equity_fraction by known instrument max_leverage when
+                # enforced; Step 1.3 market orders size against pre-target settled equity, while Step 1.5/1.7
+                # non-market protective orders are deferred to post-target settled equity evaluation.
                 raw_ef = ord_obj.qty_value
                 if eff_enforce_inst_lev is True:
                     inst_ml_ef = _inst_max_leverage(osym)
                     if inst_ml_ef is not None and raw_ef > inst_ml_ef:
                         raw_ef = inst_ml_ef
-                cur_prot_ef_ratio, _ = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
-                w_red_ef = raw_ef * cur_prot_ef_ratio
-                if ord_obj.side == "sell":
-                    red_sell[osym] = red_sell.get(osym, 0.0) + w_red_ef
+                if is_market_phase:
+                    cur_prot_ef_ratio, _ = _settled_ratios_for_bounds(_mkt_prot_lo, _mkt_prot_hi)
+                    w_red_ef = raw_ef * cur_prot_ef_ratio
+                    if ord_obj.side == "sell":
+                        r_sell[osym] = r_sell.get(osym, 0.0) + w_red_ef
+                    else:
+                        r_buy[osym] = r_buy.get(osym, 0.0) + w_red_ef
                 else:
-                    red_buy[osym] = red_buy.get(osym, 0.0) + w_red_ef
+                    post_prot_ef_orders.append((osym, ord_obj.side, raw_ef))
             elif qm == "contracts":
                 ord_px = ord_obj.limit_price or ord_obj.stop_price
                 dec_px = self._reference_price(ctx, osym)
@@ -971,9 +997,9 @@ class ExposureCapOverlay:
                 else:
                     w_red = math.inf
                 if ord_obj.side == "sell":
-                    red_sell[osym] = red_sell.get(osym, 0.0) + w_red
+                    r_sell[osym] = r_sell.get(osym, 0.0) + w_red
                 else:
-                    red_buy[osym] = red_buy.get(osym, 0.0) + w_red
+                    r_buy[osym] = r_buy.get(osym, 0.0) + w_red
             elif qm == "target_weight":
                 # CR6-05: Reserve against the effective protective target AFTER instrument leverage
                 # clamping when known; reserve conservatively down to flat (0.0) when policy is unknown;
@@ -988,7 +1014,7 @@ class ExposureCapOverlay:
                         fl = max(0.0, raw_tw) * prot_tw_ratio
                     else:
                         fl = 0.0
-                    red_sell_floor[osym] = fl if osym not in red_sell_floor else min(red_sell_floor[osym], fl)
+                    r_s_floor[osym] = fl if osym not in r_s_floor else min(r_s_floor[osym], fl)
                 else:
                     if eff_enforce_inst_lev is True:
                         eff_tw = max(raw_tw, -inst_ml) if inst_ml is not None else 0.0
@@ -997,7 +1023,7 @@ class ExposureCapOverlay:
                         cl = min(0.0, raw_tw) * prot_tw_ratio
                     else:
                         cl = 0.0
-                    red_buy_ceil[osym] = cl if osym not in red_buy_ceil else max(red_buy_ceil[osym], cl)
+                    r_b_ceil[osym] = cl if osym not in r_b_ceil else max(r_b_ceil[osym], cl)
 
         same_output_reduce_ids = {
             it.intent_id
@@ -1005,108 +1031,229 @@ class ExposureCapOverlay:
             if it.reduce_only or it.qty_mode == "close_all"
         }
 
-        # Step 1a: Record all Step 1.3 protective orders BEFORE computing target conversion ratios.
+        all_prot_orders: list[OrderIntent] = []
         for open_ord in ctx.portfolio.open_orders:
             if open_ord.reduce_only or open_ord.qty_mode == "close_all":
                 if open_ord.intent_id not in same_output_reduce_ids:
-                    _record_protective_reduction(open_ord)
-
+                    all_prot_orders.append(open_ord)
         for it_pre in output.intents:
             if it_pre.reduce_only or it_pre.qty_mode == "close_all":
-                _record_protective_reduction(it_pre)
+                all_prot_orders.append(it_pre)
 
-        target_upper_ratio, target_lower_ratio = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
+        # Step 1a: Record Phase 1.3 market protective reductions BEFORE computing target conversion ratios.
+        for po in all_prot_orders:
+            if po.order_type == "market":
+                _record_protective_reduction(po, is_market_phase=True)
 
-        # Step 1b: Record target bracket protective exits (Step 1.5, after Step 1.4 targets).
+        target_upper_ratio, target_lower_ratio = _settled_ratios_for_bounds(_mkt_prot_lo, _mkt_prot_hi)
+
+        # Step 1b: Record Phase 1.5 non-market protective reductions and target bracket exits (after targets).
+        for po in all_prot_orders:
+            if po.order_type != "market":
+                _record_protective_reduction(po, is_market_phase=False)
+
         for t_pre in output.targets:
+            all_known_syms.add(t_pre.symbol)
             if t_pre.stop_price is not None or t_pre.take_profit is not None:
                 if t_pre.target_weight > 0.0:
-                    red_sell[t_pre.symbol] = math.inf
+                    post_red_sell_fixed[t_pre.symbol] = math.inf
                 elif t_pre.target_weight < 0.0:
-                    red_buy[t_pre.symbol] = math.inf
+                    post_red_buy_fixed[t_pre.symbol] = math.inf
 
-        rest_upper_ratio, rest_lower_ratio = _settled_ratios_for_bounds(_prot_only_lo, _prot_only_hi)
-
-        # Step 1c: Summarize non-reduce-only resting open orders in marked-equity units.
+        # Step 1c: Summarize non-reduce-only resting open orders (Phase 1.6, after targets & Phase 1.5).
         for open_ord in ctx.portfolio.open_orders:
             if open_ord.reduce_only or open_ord.qty_mode == "close_all":
                 continue
             osym = open_ord.symbol
             all_known_syms.add(osym)
             if open_ord.qty_mode == "target_weight":
-                w = open_ord.qty_value
-                inst_ml_r = _inst_max_leverage(osym)
-                if eff_enforce_inst_lev is True and inst_ml_r is not None:
-                    r_vals: tuple[float, ...] = (max(-inst_ml_r, min(inst_ml_r, w)),)
-                elif eff_enforce_inst_lev is False or inst_ml_r is None:
-                    r_vals = (w,)
-                else:
-                    r_cl = max(-inst_ml_r, min(inst_ml_r, w))
-                    r_vals = (w, r_cl) if r_cl != w else (w,)
-                r_cands = [v * r for v in r_vals for r in (rest_lower_ratio, rest_upper_ratio)]
-                r_lo = min(r_cands)
-                r_hi = max(r_cands)
-                rest_tw_lo[osym] = r_lo if osym not in rest_tw_lo else min(rest_tw_lo[osym], r_lo)
-                rest_tw_hi[osym] = r_hi if osym not in rest_tw_hi else max(rest_tw_hi[osym], r_hi)
+                rest_tw_orders.append((osym, open_ord.qty_value))
             elif open_ord.qty_mode == "equity_fraction":
-                w_ef = open_ord.qty_value * rest_upper_ratio
+                # CR8-05: Preserve instrument max_leverage enforcement on resting equity_fraction orders
+                # while sizing them dynamically against post-target/post-protective settled equity!
+                raw_ef_r = open_ord.qty_value
+                if eff_enforce_inst_lev is True:
+                    inst_ml_r = _inst_max_leverage(osym)
+                    if inst_ml_r is not None and raw_ef_r > inst_ml_r:
+                        raw_ef_r = inst_ml_r
                 if open_ord.side == "buy":
-                    rest_buy[osym] = rest_buy.get(osym, 0.0) + w_ef
+                    rest_ef_buy[osym] = rest_ef_buy.get(osym, 0.0) + raw_ef_r
                 else:
-                    rest_sell[osym] = rest_sell.get(osym, 0.0) + w_ef
+                    rest_ef_sell[osym] = rest_ef_sell.get(osym, 0.0) + raw_ef_r
             elif open_ord.qty_mode == "contracts":
                 ref_px = open_ord.limit_price or open_ord.stop_price or self._reference_price(ctx, osym)
                 if equity > 0.0 and ref_px is not None and ref_px > 0.0:
                     mult = _contract_multiplier(ctx, osym)
                     w = (open_ord.qty_value * mult * ref_px) / equity
                     if open_ord.side == "buy":
-                        rest_buy[osym] = rest_buy.get(osym, 0.0) + w
+                        rest_buy_fixed[osym] = rest_buy_fixed.get(osym, 0.0) + w
                     else:
-                        rest_sell[osym] = rest_sell.get(osym, 0.0) + w
+                        rest_sell_fixed[osym] = rest_sell_fixed.get(osym, 0.0) + w
 
-        def _post_target_envelope(
-            sym: str,
-            w_lo: float | None,
-            w_hi: float | None = None,
-        ) -> tuple[float, float]:
-            ew = existing_weights.get(sym, 0.0)
-            b_lo = ew
-            b_hi = ew
-            if w_lo is not None:
-                hi_val = w_lo if w_hi is None else w_hi
-                if w_lo < b_lo:
-                    b_lo = w_lo
-                if hi_val > b_hi:
-                    b_hi = hi_val
-            if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
-                b_lo = rest_tw_lo[sym]
-            if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
-                b_hi = rest_tw_hi[sym]
-            b_lo, b_hi = _apply_protective_reductions(sym, b_lo, b_hi)
-            return b_lo - rest_sell.get(sym, 0.0), b_hi + rest_buy.get(sym, 0.0)
+        def _eval_phase_15_16(
+            sym_t_lo: Mapping[str, float],
+            sym_t_hi: Mapping[str, float],
+        ) -> tuple[dict[str, float], dict[str, float], dict[str, float], dict[str, float], float, float]:
+            """Evaluate post-target Phase 1.5 protective reductions and Phase 1.6 resting orders (CR8-04 / CR8-05)."""
+            lo_15: dict[str, float] = {}
+            hi_15: dict[str, float] = {}
+            for s in all_known_syms:
+                ew = existing_weights.get(s, 0.0)
+                b_lo, b_hi = _apply_red_maps(
+                    s, ew, ew, mkt_red_sell, mkt_red_buy, mkt_red_sell_floor, mkt_red_buy_ceil
+                )
+                if s in sym_t_lo and sym_t_lo[s] < b_lo:
+                    b_lo = sym_t_lo[s]
+                if s in sym_t_hi and sym_t_hi[s] > b_hi:
+                    b_hi = sym_t_hi[s]
+                b_lo, b_hi = _apply_red_maps(
+                    s, b_lo, b_hi, post_red_sell_fixed, post_red_buy_fixed, post_red_sell_floor, post_red_buy_ceil
+                )
+                lo_15[s] = b_lo
+                hi_15[s] = b_hi
+
+            # Apply Phase 1.5 non-market equity_fraction protective orders sequentially on post-target settled equity.
+            for psym, pside, raw_ef in post_prot_ef_orders:
+                r_up_15, _ = _settled_ratios_for_bounds(
+                    lambda s: lo_15.get(s, 0.0),
+                    lambda s: hi_15.get(s, 0.0),
+                )
+                w_red = raw_ef * r_up_15
+                if pside == "sell":
+                    cur_lo = lo_15.get(psym, 0.0)
+                    if cur_lo > 0.0:
+                        lo_15[psym] = max(0.0, cur_lo - w_red)
+                else:
+                    cur_hi = hi_15.get(psym, 0.0)
+                    if cur_hi < 0.0:
+                        hi_15[psym] = min(0.0, cur_hi + w_red)
+
+            r_up_16, r_lo_16 = _settled_ratios_for_bounds(
+                lambda s: lo_15.get(s, 0.0) - rest_sell_fixed.get(s, 0.0),
+                lambda s: hi_15.get(s, 0.0) + rest_buy_fixed.get(s, 0.0),
+            )
+
+            if rest_tw_orders:
+                for osym, w_tw in rest_tw_orders:
+                    inst_ml_r = _inst_max_leverage(osym)
+                    if eff_enforce_inst_lev is True and inst_ml_r is not None:
+                        r_vals: tuple[float, ...] = (max(-inst_ml_r, min(inst_ml_r, w_tw)),)
+                    elif eff_enforce_inst_lev is False or inst_ml_r is None:
+                        r_vals = (w_tw,)
+                    else:
+                        r_cl = max(-inst_ml_r, min(inst_ml_r, w_tw))
+                        r_vals = (w_tw, r_cl) if r_cl != w_tw else (w_tw,)
+                    r_cands = [v * r for v in r_vals for r in (r_lo_16, r_up_16)]
+                    tw_lo_m, tw_hi_m = min(r_cands), max(r_cands)
+                    tw_lo_m, tw_hi_m = _apply_red_maps(
+                        osym, tw_lo_m, tw_hi_m, post_red_sell_fixed, post_red_buy_fixed, post_red_sell_floor, post_red_buy_ceil
+                    )
+                    for psym, pside, raw_ef in post_prot_ef_orders:
+                        if psym == osym:
+                            w_red = raw_ef * r_up_16
+                            if pside == "sell" and tw_lo_m > 0.0:
+                                tw_lo_m = max(0.0, tw_lo_m - w_red)
+                            elif pside == "buy" and tw_hi_m < 0.0:
+                                tw_hi_m = min(0.0, tw_hi_m + w_red)
+                    if tw_lo_m < lo_15.get(osym, 0.0):
+                        lo_15[osym] = tw_lo_m
+                    if tw_hi_m > hi_15.get(osym, 0.0):
+                        hi_15[osym] = tw_hi_m
+                r_up_16, r_lo_16 = _settled_ratios_for_bounds(
+                    lambda s: lo_15.get(s, 0.0) - rest_sell_fixed.get(s, 0.0),
+                    lambda s: hi_15.get(s, 0.0) + rest_buy_fixed.get(s, 0.0),
+                )
+
+            rb_eff = {
+                s: rest_buy_fixed.get(s, 0.0) + rest_ef_buy.get(s, 0.0) * r_up_16
+                for s in all_known_syms
+            }
+            rs_eff = {
+                s: rest_sell_fixed.get(s, 0.0) + rest_ef_sell.get(s, 0.0) * r_up_16
+                for s in all_known_syms
+            }
+            return lo_15, hi_15, rb_eff, rs_eff, r_up_16, r_lo_16
 
         # 2. Clamp individual TargetPositions in marked-equity units against single_cap AND resting orders
-        #    on that symbol, then convert capped results back to the simulator's sizing basis (CR2-29 / CR7-10).
+        #    (accounting for post-target settled equity growth on resting equity_fraction orders, CR2-29 / CR7-10 / CR8-05),
+        #    then convert capped results back to the simulator's sizing basis.
         clamped_targets: list[TargetPosition] = []
         target_marked: list[float] = []
         targeted_symbols: set[str] = set()
         for t in output.targets:
             tsym = t.symbol
-            rb = rest_buy.get(tsym, 0.0)
-            rs = rest_sell.get(tsym, 0.0)
             w_raw = t.target_weight
             w_m = w_raw * target_upper_ratio
+            ew = existing_weights.get(tsym, 0.0)
             clamped_s = False
-            if w_m > 0.0:
-                lim_pos = max(0.0, single_cap - rb)
-                if w_m > lim_pos:
-                    w_m = lim_pos
+
+            def _single_env(x_m: float, _sym: str = tsym) -> tuple[float, float]:
+                l15, h15, rbe, rse, _, _ = _eval_phase_15_16({_sym: x_m}, {_sym: x_m})
+                return l15.get(_sym, 0.0) - rse.get(_sym, 0.0), h15.get(_sym, 0.0) + rbe.get(_sym, 0.0)
+
+            e_lo, e_hi = _single_env(w_m)
+            # Same-sign clamping toward 0.0 (standard cap against single_cap + resting orders).
+            if w_m > 0.0 and e_hi > single_cap + 1e-12:
+                if _single_env(0.0)[1] <= single_cap + 1e-12:
+                    lo_b, hi_b = 0.0, w_m
+                    for _ in range(52):
+                        mid = 0.5 * (lo_b + hi_b)
+                        if _single_env(mid)[1] <= single_cap:
+                            lo_b = mid
+                        else:
+                            hi_b = mid
+                    w_m = lo_b
+                else:
+                    w_m = 0.0
+                clamped_s = True
+            elif w_m < 0.0 and -e_lo > single_cap + 1e-12:
+                if -_single_env(0.0)[0] <= single_cap + 1e-12:
+                    lo_b, hi_b = w_m, 0.0
+                    for _ in range(52):
+                        mid = 0.5 * (lo_b + hi_b)
+                        if -_single_env(mid)[0] <= single_cap:
+                            hi_b = mid
+                        else:
+                            lo_b = mid
+                    w_m = hi_b
+                else:
+                    w_m = 0.0
+                clamped_s = True
+
+            # Opposing-side check (CR8-05): reducing a profitable position can raise settled_equity and
+            # enlarge a resting opposing equity_fraction order past single_cap; pull w_m back toward ew.
+            e_lo, e_hi = _single_env(w_m)
+            if ew > 0.0 and w_m < ew and -e_lo > single_cap + 1e-12:
+                cap_hi = min(ew, single_cap) if _single_env(ew)[1] > single_cap + 1e-12 else ew
+                if cap_hi > w_m:
+                    if -_single_env(cap_hi)[0] <= single_cap + 1e-12:
+                        lo_b, hi_b = w_m, cap_hi
+                        for _ in range(52):
+                            mid = 0.5 * (lo_b + hi_b)
+                            if -_single_env(mid)[0] <= single_cap:
+                                hi_b = mid
+                            else:
+                                lo_b = mid
+                        w_m = hi_b
+                    else:
+                        w_m = cap_hi
                     clamped_s = True
-            elif w_m < 0.0:
-                lim_neg = -max(0.0, single_cap - rs)
-                if w_m < lim_neg:
-                    w_m = lim_neg
+            elif ew < 0.0 and w_m > ew and e_hi > single_cap + 1e-12:
+                cap_lo = max(ew, -single_cap) if -_single_env(ew)[0] > single_cap + 1e-12 else ew
+                if cap_lo < w_m:
+                    if _single_env(cap_lo)[1] <= single_cap + 1e-12:
+                        lo_b, hi_b = cap_lo, w_m
+                        for _ in range(52):
+                            mid = 0.5 * (lo_b + hi_b)
+                            if _single_env(mid)[1] <= single_cap:
+                                lo_b = mid
+                            else:
+                                hi_b = mid
+                        w_m = lo_b
+                    else:
+                        w_m = cap_lo
                     clamped_s = True
+
             w_out = ((w_m / target_upper_ratio) if target_upper_ratio > 0.0 else 0.0) if clamped_s else w_raw
             if w_out == 0.0:
                 w_out = 0.0
@@ -1118,33 +1265,41 @@ class ExposureCapOverlay:
             all_known_syms.add(tsym)
 
         # 3. Enforce max_gross_leverage across all untouched symbols (incl. resting orders) + targeted symbols
-        #    in marked-equity units, aggregating the min/max envelope across EVERY surviving target per symbol (CR4-01 / CR7-10).
+        #    in marked-equity units, aggregating the min/max envelope across EVERY surviving target per symbol
+        #    with post-target settled-equity updates (CR4-01 / CR7-10 / CR8-04 / CR8-05).
         if clamped_targets:
-            untouched_gross = 0.0
-            for usym in all_known_syms:
-                if usym not in targeted_symbols:
-                    u_lo, u_hi = _post_target_envelope(usym, None)
-                    untouched_gross += max(abs(u_lo), abs(u_hi))
-            allowed_targeted_gross = max(0.0, self.max_gross_leverage - untouched_gross)
             sym_t_lo: dict[str, float] = {}
             sym_t_hi: dict[str, float] = {}
             for t, tw_m in zip(clamped_targets, target_marked):
                 tsym = t.symbol
                 sym_t_lo[tsym] = tw_m if tsym not in sym_t_lo else min(sym_t_lo[tsym], tw_m)
                 sym_t_hi[tsym] = tw_m if tsym not in sym_t_hi else max(sym_t_hi[tsym], tw_m)
+            lo_all, hi_all, rb_all, rs_all, _, _ = _eval_phase_15_16(sym_t_lo, sym_t_hi)
+            untouched_gross = 0.0
+            for usym in all_known_syms:
+                if usym not in targeted_symbols:
+                    u_lo = lo_all.get(usym, 0.0) - rs_all.get(usym, 0.0)
+                    u_hi = hi_all.get(usym, 0.0) + rb_all.get(usym, 0.0)
+                    untouched_gross += max(abs(u_lo), abs(u_hi))
+            allowed_targeted_gross = max(0.0, self.max_gross_leverage - untouched_gross)
             sym_worst: dict[str, float] = {}
             for tsym in targeted_symbols:
-                e_lo, e_hi = _post_target_envelope(tsym, sym_t_lo[tsym], sym_t_hi[tsym])
+                e_lo = lo_all.get(tsym, 0.0) - rs_all.get(tsym, 0.0)
+                e_hi = hi_all.get(tsym, 0.0) + rb_all.get(tsym, 0.0)
                 sym_worst[tsym] = max(abs(e_lo), abs(e_hi))
             total_target_worst = math.fsum(sym_worst.values())
             if total_target_worst > allowed_targeted_gross + 1e-12:
                 # Reserve the unavoidable floor gross from existing positions + resting orders on targeted symbols,
                 # then proportionally scale the incremental target weights within remaining headroom.
+                zero_map = {tsym: 0.0 for tsym in targeted_symbols}
+                lo_z, hi_z, rb_z, rs_z, _, _ = _eval_phase_15_16(zero_map, zero_map)
+                lo_ew, hi_ew, rb_ew, rs_ew, _, _ = _eval_phase_15_16({}, {})
                 base_floors: dict[str, float] = {}
                 inc_contribs: dict[str, float] = {}
                 for tsym in targeted_symbols:
-                    f_lo, f_hi = _post_target_envelope(tsym, 0.0, 0.0)
-                    fl = max(abs(f_lo), abs(f_hi))
+                    fl_z = max(abs(lo_z.get(tsym, 0.0) - rs_z.get(tsym, 0.0)), abs(hi_z.get(tsym, 0.0) + rb_z.get(tsym, 0.0)))
+                    fl_e = max(abs(lo_ew.get(tsym, 0.0) - rs_ew.get(tsym, 0.0)), abs(hi_ew.get(tsym, 0.0) + rb_ew.get(tsym, 0.0)))
+                    fl = fl_z if fl_z <= fl_e else fl_e
                     base_floors[tsym] = fl
                     inc_contribs[tsym] = max(0.0, sym_worst[tsym] - fl)
                 inc_sum = math.fsum(inc_contribs.values())
@@ -1160,10 +1315,10 @@ class ExposureCapOverlay:
                             # scale ONLY the requested increase above that baseline; flat books scale from 0.
                             fl_sym = base_floors[tsym]
                             if w_cur_m > 0.0:
-                                base_pos = max(0.0, fl_sym - rest_buy.get(tsym, 0.0))
+                                base_pos = max(0.0, fl_sym - rb_all.get(tsym, 0.0))
                                 w_scaled_m = (base_pos + (w_cur_m - base_pos) * ratio) if w_cur_m > base_pos else w_cur_m
                             elif w_cur_m < 0.0:
-                                base_neg = max(0.0, fl_sym - rest_sell.get(tsym, 0.0))
+                                base_neg = max(0.0, fl_sym - rs_all.get(tsym, 0.0))
                                 w_scaled_m = -(base_neg + (-w_cur_m - base_neg) * ratio) if (-w_cur_m) > base_neg else w_cur_m
                             else:
                                 w_scaled_m = 0.0
@@ -1186,23 +1341,9 @@ class ExposureCapOverlay:
                     clamped_targets = [replace(t, target_weight=0.0) for t in clamped_targets]
                     target_marked = [0.0] * len(clamped_targets)
 
-        # 4. Seed conservative reachable weight state per symbol (in marked-equity units), separating
-        #    absolute target bounds [base_lo, base_hi] from pending incremental additions (add_buy, add_sell).
-        #    Reachable exposure is [base_lo - add_sell, base_hi + add_buy].
-        #    This guarantees:
-        #      - CR7-05 / CR7-06 / CR7-10: unified marked-equity accounting with dynamic settled_equity profit updates.
-        #      - CR5-05: protective reductions adjust inner bound toward 0.0 for opposing orders.
-        #      - CR4-01: reserve min/max across every surviving target per symbol (so on_change cannot bypass cap).
-        #      - CR3-22: pending buy/sell increments are reserved AFTER any new target_weight fill.
-        #      - CR2-29: resting orders reserved before targets and carried into intent budget.
-        #      - CR1-32: single shared exposure budget across targets + intents in the same output.
-        #      - CR1-31: reducing orders never release exposure headroom before filling.
-        #      - CR1-29: contract_value multiplier applied symmetrically to contracts orders.
-        #      - CR1-33: unpriceable contracts orders fail closed (blocked) rather than bypassing cap.
-        base_lo: dict[str, float] = {}
-        base_hi: dict[str, float] = {}
-        add_buy: dict[str, float] = {}
-        add_sell: dict[str, float] = {}
+        # 4. Seed conservative reachable weight state per symbol (in marked-equity units) from the exact
+        #    post-target Phase 1.5/1.6 evaluator, separating absolute target bounds [base_lo, base_hi]
+        #    from pending incremental additions (fixed + dynamic resting equity_fraction orders).
         tracked_syms: set[str] = set(all_known_syms)
         target_lo_by_sym: dict[str, float] = {}
         target_hi_by_sym: dict[str, float] = {}
@@ -1222,36 +1363,62 @@ class ExposureCapOverlay:
             t_hi_m = max(t_cands)
             target_lo_by_sym[tsym] = t_lo_m if tsym not in target_lo_by_sym else min(target_lo_by_sym[tsym], t_lo_m)
             target_hi_by_sym[tsym] = t_hi_m if tsym not in target_hi_by_sym else max(target_hi_by_sym[tsym], t_hi_m)
-        for sym in all_known_syms:
-            ew = existing_weights.get(sym, 0.0)
-            b_lo = ew
-            b_hi = ew
-            if sym in target_lo_by_sym and target_lo_by_sym[sym] < b_lo:
-                b_lo = target_lo_by_sym[sym]
-            if sym in target_hi_by_sym and target_hi_by_sym[sym] > b_hi:
-                b_hi = target_hi_by_sym[sym]
-            if sym in rest_tw_lo and rest_tw_lo[sym] < b_lo:
-                b_lo = rest_tw_lo[sym]
-            if sym in rest_tw_hi and rest_tw_hi[sym] > b_hi:
-                b_hi = rest_tw_hi[sym]
-            b_lo, b_hi = _apply_protective_reductions(sym, b_lo, b_hi)
-            base_lo[sym] = b_lo
-            base_hi[sym] = b_hi
-            add_buy[sym] = rest_buy.get(sym, 0.0)
-            add_sell[sym] = rest_sell.get(sym, 0.0)
 
-        def _sym_worst_abs(sym: str) -> float:
-            lo_s = base_lo.get(sym, 0.0) - add_sell.get(sym, 0.0)
-            hi_s = base_hi.get(sym, 0.0) + add_buy.get(sym, 0.0)
+        base_lo, base_hi, _, _, init_r_up, _ = _eval_phase_15_16(target_lo_by_sym, target_hi_by_sym)
+        add_buy_fixed: dict[str, float] = {sym: rest_buy_fixed.get(sym, 0.0) for sym in all_known_syms}
+        add_sell_fixed: dict[str, float] = {sym: rest_sell_fixed.get(sym, 0.0) for sym in all_known_syms}
+        has_dyn_rest_ef = bool(rest_ef_buy or rest_ef_sell)
+
+        def _cur_intent_ratios(
+            extra_lo: tuple[str, float] | None = None,
+            extra_hi: tuple[str, float] | None = None,
+            extra_sell: tuple[str, float] | None = None,
+            extra_buy: tuple[str, float] | None = None,
+        ) -> tuple[float, float]:
+            def _lo_s(s: str) -> float:
+                bl = base_lo.get(s, 0.0)
+                if extra_lo is not None and s == extra_lo[0] and extra_lo[1] < bl:
+                    bl = extra_lo[1]
+                asf = add_sell_fixed.get(s, 0.0) + (extra_sell[1] if (extra_sell is not None and s == extra_sell[0]) else 0.0)
+                return bl - asf
+
+            def _hi_s(s: str) -> float:
+                bh = base_hi.get(s, 0.0)
+                if extra_hi is not None and s == extra_hi[0] and extra_hi[1] > bh:
+                    bh = extra_hi[1]
+                abf = add_buy_fixed.get(s, 0.0) + (extra_buy[1] if (extra_buy is not None and s == extra_buy[0]) else 0.0)
+                return bh + abf
+
+            return _settled_ratios_for_bounds(_lo_s, _hi_s)
+
+        def _add_buy_total(sym: str, r_up: float) -> float:
+            return add_buy_fixed.get(sym, 0.0) + rest_ef_buy.get(sym, 0.0) * r_up
+
+        def _add_sell_total(sym: str, r_up: float) -> float:
+            return add_sell_fixed.get(sym, 0.0) + rest_ef_sell.get(sym, 0.0) * r_up
+
+        def _apply_all_protective_to_target(sym: str, lo_val: float, hi_val: float, r_up: float) -> tuple[float, float]:
+            lo_val, hi_val = _apply_red_maps(
+                sym, lo_val, hi_val, mkt_red_sell, mkt_red_buy, mkt_red_sell_floor, mkt_red_buy_ceil
+            )
+            lo_val, hi_val = _apply_red_maps(
+                sym, lo_val, hi_val, post_red_sell_fixed, post_red_buy_fixed, post_red_sell_floor, post_red_buy_ceil
+            )
+            for psym, pside, raw_ef in post_prot_ef_orders:
+                if psym == sym:
+                    w_red = raw_ef * r_up
+                    if pside == "sell" and lo_val > 0.0:
+                        lo_val = max(0.0, lo_val - w_red)
+                    elif pside == "buy" and hi_val < 0.0:
+                        hi_val = min(0.0, hi_val + w_red)
+            return lo_val, hi_val
+
+        def _sym_worst_abs(sym: str, r_up: float) -> float:
+            lo_s = base_lo.get(sym, 0.0) - _add_sell_total(sym, r_up)
+            hi_s = base_hi.get(sym, 0.0) + _add_buy_total(sym, r_up)
             a_lo = -lo_s if lo_s < 0.0 else lo_s
             a_hi = -hi_s if hi_s < 0.0 else hi_s
             return a_hi if a_hi >= a_lo else a_lo
-
-        def _cur_intent_ratios() -> tuple[float, float]:
-            return _settled_ratios_for_bounds(
-                lambda s: base_lo.get(s, 0.0) - add_sell.get(s, 0.0),
-                lambda s: base_hi.get(s, 0.0) + add_buy.get(s, 0.0),
-            )
 
         clamped_intents: list[OrderIntent] = []
 
@@ -1261,17 +1428,17 @@ class ExposureCapOverlay:
                 continue
 
             sym = intent.symbol
+            cur_upper_ratio, cur_lower_ratio = _cur_intent_ratios()
             b_lo = base_lo.get(sym, 0.0)
             b_hi = base_hi.get(sym, 0.0)
-            ab = add_buy.get(sym, 0.0)
-            as_ = add_sell.get(sym, 0.0)
+            ab = _add_buy_total(sym, cur_upper_ratio)
+            as_ = _add_sell_total(sym, cur_upper_ratio)
             lo = b_lo - as_
             hi = b_hi + ab
-            other_gross = math.fsum(_sym_worst_abs(s) for s in tracked_syms if s != sym)
+            other_gross = math.fsum(_sym_worst_abs(s, cur_upper_ratio) for s in tracked_syms if s != sym)
             max_abs_sym = min(single_cap, max(0.0, self.max_gross_leverage - other_gross))
 
             if intent.qty_mode == "target_weight":
-                cur_upper_ratio, cur_lower_ratio = _cur_intent_ratios()
                 raw_w = intent.qty_value
                 raw_w_m = raw_w * cur_upper_ratio
                 if raw_w == 0.0:
@@ -1302,6 +1469,57 @@ class ExposureCapOverlay:
                         desired = raw_w
                 if desired == 0.0:
                     desired = 0.0
+                # CR8-05: When resting equity_fraction orders exist, ensure a profit-realizing
+                # target_weight reduction cannot enlarge a resting opposing order past max_abs_sym.
+                if has_dyn_rest_ef and cur_upper_ratio > 0.0:
+                    ew_s = existing_weights.get(sym, 0.0)
+                    inst_ml_chk = _inst_max_leverage(sym)
+
+                    def _tw_post_env(cand_w: float) -> tuple[float, float]:
+                        if eff_enforce_inst_lev is True and inst_ml_chk is not None:
+                            ev_t: tuple[float, ...] = (max(-inst_ml_chk, min(inst_ml_chk, cand_w)),)
+                        elif eff_enforce_inst_lev is False or inst_ml_chk is None:
+                            ev_t = (cand_w,)
+                        else:
+                            ec_t = max(-inst_ml_chk, min(inst_ml_chk, cand_w))
+                            ev_t = (cand_w, ec_t) if ec_t != cand_w else (cand_w,)
+                        cm_t = [v * r for v in ev_t for r in (cur_lower_ratio, cur_upper_ratio)]
+                        lp, hp = min(cm_t), max(cm_t)
+                        ru_t, _ = _cur_intent_ratios(extra_lo=(sym, lp), extra_hi=(sym, hp))
+                        la, ha = _apply_all_protective_to_target(sym, lp, hp, ru_t)
+                        bl_t = la if la < b_lo else b_lo
+                        bh_t = ha if ha > b_hi else b_hi
+                        return bl_t - _add_sell_total(sym, ru_t), bh_t + _add_buy_total(sym, ru_t)
+
+                    tw_lo_chk, tw_hi_chk = _tw_post_env(desired)
+                    if intent.side == "sell" and ew_s > 0.0 and -tw_lo_chk > max_abs_sym + 1e-12:
+                        hi_w = ew_s / cur_upper_ratio
+                        if hi_w > desired:
+                            if -_tw_post_env(hi_w)[0] <= max_abs_sym + 1e-12:
+                                lo_b, hi_b = desired, hi_w
+                                for _ in range(48):
+                                    mid = 0.5 * (lo_b + hi_b)
+                                    if -_tw_post_env(mid)[0] <= max_abs_sym:
+                                        hi_b = mid
+                                    else:
+                                        lo_b = mid
+                                desired = hi_b
+                            else:
+                                desired = hi_w
+                    elif intent.side == "buy" and ew_s < 0.0 and tw_hi_chk > max_abs_sym + 1e-12:
+                        lo_w = ew_s / cur_upper_ratio
+                        if lo_w < desired:
+                            if _tw_post_env(lo_w)[1] <= max_abs_sym + 1e-12:
+                                lo_b, hi_b = lo_w, desired
+                                for _ in range(48):
+                                    mid = 0.5 * (lo_b + hi_b)
+                                    if _tw_post_env(mid)[1] <= max_abs_sym:
+                                        lo_b = mid
+                                    else:
+                                        hi_b = mid
+                                desired = lo_b
+                            else:
+                                desired = lo_w
                 clamped_intents.append(replace(intent, qty_value=desired))
                 tracked_syms.add(sym)
                 # CR7-05: Convert the effective target (after optional instrument leverage clamp) into
@@ -1315,17 +1533,19 @@ class ExposureCapOverlay:
                     eff_cl_c = max(-inst_ml_c, min(inst_ml_c, desired))
                     eff_vals_c = (desired, eff_cl_c) if eff_cl_c != desired else (desired,)
                 cand_m_c = [v * r for v in eff_vals_c for r in (cur_lower_ratio, cur_upper_ratio)]
-                d_lo, d_hi = _apply_protective_reductions(sym, min(cand_m_c), max(cand_m_c))
+                d_lo_pre, d_hi_pre = min(cand_m_c), max(cand_m_c)
+                post_r_up, _ = _cur_intent_ratios(extra_lo=(sym, d_lo_pre), extra_hi=(sym, d_hi_pre))
+                d_lo, d_hi = _apply_all_protective_to_target(sym, d_lo_pre, d_hi_pre, post_r_up)
                 base_lo[sym] = d_lo if d_lo < b_lo else b_lo
                 base_hi[sym] = d_hi if d_hi > b_hi else b_hi
-                add_buy.setdefault(sym, ab)
-                add_sell.setdefault(sym, as_)
+                add_buy_fixed.setdefault(sym, rest_buy_fixed.get(sym, 0.0))
+                add_sell_fixed.setdefault(sym, rest_sell_fixed.get(sym, 0.0))
                 continue
 
             if intent.qty_mode == "equity_fraction":
                 # CR7-06: Size against the current upper settled-equity ratio (reflecting any preceding
                 # profit-realizing reductions in the same bar) and honor known instrument leverage caps.
-                cur_ef_ratio, _ = _cur_intent_ratios()
+                cur_ef_ratio = cur_upper_ratio
                 eff_ef = intent.qty_value
                 if eff_enforce_inst_lev is True:
                     inst_ml_e = _inst_max_leverage(sym)
@@ -1333,39 +1553,69 @@ class ExposureCapOverlay:
                         eff_ef = inst_ml_e
                 w = eff_ef * cur_ef_ratio
                 if intent.side == "buy":
-                    if hi + w <= max_abs_sym + 1e-12:
+                    if has_dyn_rest_ef:
+                        r_after_b, _ = _cur_intent_ratios(extra_buy=(sym, w))
+                        hi_after_b = b_hi + _add_buy_total(sym, r_after_b) + w
+                    else:
+                        hi_after_b = hi + w
+                    if hi_after_b <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
                         tracked_syms.add(sym)
-                        add_buy[sym] = ab + w
+                        add_buy_fixed[sym] = add_buy_fixed.get(sym, 0.0) + w
                         base_lo.setdefault(sym, b_lo)
                         base_hi.setdefault(sym, b_hi)
-                        add_sell.setdefault(sym, as_)
+                        add_sell_fixed.setdefault(sym, rest_sell_fixed.get(sym, 0.0))
                     else:
                         allowed_w = max_abs_sym - hi
+                        if has_dyn_rest_ef and allowed_w > 1e-12:
+                            lo_b, hi_b = 0.0, min(w, allowed_w)
+                            for _ in range(48):
+                                mid = 0.5 * (lo_b + hi_b)
+                                r_m, _ = _cur_intent_ratios(extra_buy=(sym, mid))
+                                if b_hi + _add_buy_total(sym, r_m) + mid <= max_abs_sym:
+                                    lo_b = mid
+                                else:
+                                    hi_b = mid
+                            allowed_w = lo_b
                         if allowed_w > 1e-12 and cur_ef_ratio > 0.0:
                             clamped_intents.append(replace(intent, qty_value=allowed_w / cur_ef_ratio))
                             tracked_syms.add(sym)
-                            add_buy[sym] = ab + allowed_w
+                            add_buy_fixed[sym] = add_buy_fixed.get(sym, 0.0) + allowed_w
                             base_lo.setdefault(sym, b_lo)
                             base_hi.setdefault(sym, b_hi)
-                            add_sell.setdefault(sym, as_)
+                            add_sell_fixed.setdefault(sym, rest_sell_fixed.get(sym, 0.0))
                 else:
-                    if -(lo - w) <= max_abs_sym + 1e-12:
+                    if has_dyn_rest_ef:
+                        r_after_s, _ = _cur_intent_ratios(extra_sell=(sym, w))
+                        lo_after_s = b_lo - _add_sell_total(sym, r_after_s) - w
+                    else:
+                        lo_after_s = lo - w
+                    if -lo_after_s <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
                         tracked_syms.add(sym)
-                        add_sell[sym] = as_ + w
+                        add_sell_fixed[sym] = add_sell_fixed.get(sym, 0.0) + w
                         base_lo.setdefault(sym, b_lo)
                         base_hi.setdefault(sym, b_hi)
-                        add_buy.setdefault(sym, ab)
+                        add_buy_fixed.setdefault(sym, rest_buy_fixed.get(sym, 0.0))
                     else:
                         allowed_w = max_abs_sym + lo
+                        if has_dyn_rest_ef and allowed_w > 1e-12:
+                            lo_b, hi_b = 0.0, min(w, allowed_w)
+                            for _ in range(48):
+                                mid = 0.5 * (lo_b + hi_b)
+                                r_m, _ = _cur_intent_ratios(extra_sell=(sym, mid))
+                                if -(b_lo - _add_sell_total(sym, r_m) - mid) <= max_abs_sym:
+                                    lo_b = mid
+                                else:
+                                    hi_b = mid
+                            allowed_w = lo_b
                         if allowed_w > 1e-12 and cur_ef_ratio > 0.0:
                             clamped_intents.append(replace(intent, qty_value=allowed_w / cur_ef_ratio))
                             tracked_syms.add(sym)
-                            add_sell[sym] = as_ + allowed_w
+                            add_sell_fixed[sym] = add_sell_fixed.get(sym, 0.0) + allowed_w
                             base_lo.setdefault(sym, b_lo)
                             base_hi.setdefault(sym, b_hi)
-                            add_buy.setdefault(sym, ab)
+                            add_buy_fixed.setdefault(sym, rest_buy_fixed.get(sym, 0.0))
                 continue
 
             if intent.qty_mode == "contracts":
@@ -1376,41 +1626,71 @@ class ExposureCapOverlay:
                 mult = _contract_multiplier(ctx, sym)
                 order_weight = (intent.qty_value * mult * ref_px) / equity
                 if intent.side == "buy":
-                    if hi + order_weight <= max_abs_sym + 1e-12:
+                    if has_dyn_rest_ef:
+                        r_after_cb, _ = _cur_intent_ratios(extra_buy=(sym, order_weight))
+                        hi_after_cb = b_hi + _add_buy_total(sym, r_after_cb) + order_weight
+                    else:
+                        hi_after_cb = hi + order_weight
+                    if hi_after_cb <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
                         tracked_syms.add(sym)
-                        add_buy[sym] = ab + order_weight
+                        add_buy_fixed[sym] = add_buy_fixed.get(sym, 0.0) + order_weight
                         base_lo.setdefault(sym, b_lo)
                         base_hi.setdefault(sym, b_hi)
-                        add_sell.setdefault(sym, as_)
+                        add_sell_fixed.setdefault(sym, rest_sell_fixed.get(sym, 0.0))
                     else:
                         allowed_weight = max_abs_sym - hi
+                        if has_dyn_rest_ef and allowed_weight > 1e-12:
+                            lo_b, hi_b = 0.0, min(order_weight, allowed_weight)
+                            for _ in range(48):
+                                mid = 0.5 * (lo_b + hi_b)
+                                r_m, _ = _cur_intent_ratios(extra_buy=(sym, mid))
+                                if b_hi + _add_buy_total(sym, r_m) + mid <= max_abs_sym:
+                                    lo_b = mid
+                                else:
+                                    hi_b = mid
+                            allowed_weight = lo_b
                         allowed_qty = (allowed_weight * equity) / (mult * ref_px)
                         if allowed_qty > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_qty))
                             tracked_syms.add(sym)
-                            add_buy[sym] = ab + allowed_weight
+                            add_buy_fixed[sym] = add_buy_fixed.get(sym, 0.0) + allowed_weight
                             base_lo.setdefault(sym, b_lo)
                             base_hi.setdefault(sym, b_hi)
-                            add_sell.setdefault(sym, as_)
+                            add_sell_fixed.setdefault(sym, rest_sell_fixed.get(sym, 0.0))
                 else:
-                    if -(lo - order_weight) <= max_abs_sym + 1e-12:
+                    if has_dyn_rest_ef:
+                        r_after_cs, _ = _cur_intent_ratios(extra_sell=(sym, order_weight))
+                        lo_after_cs = b_lo - _add_sell_total(sym, r_after_cs) - order_weight
+                    else:
+                        lo_after_cs = lo - order_weight
+                    if -lo_after_cs <= max_abs_sym + 1e-12:
                         clamped_intents.append(intent)
                         tracked_syms.add(sym)
-                        add_sell[sym] = as_ + order_weight
+                        add_sell_fixed[sym] = add_sell_fixed.get(sym, 0.0) + order_weight
                         base_lo.setdefault(sym, b_lo)
                         base_hi.setdefault(sym, b_hi)
-                        add_buy.setdefault(sym, ab)
+                        add_buy_fixed.setdefault(sym, rest_buy_fixed.get(sym, 0.0))
                     else:
                         allowed_weight = max_abs_sym + lo
+                        if has_dyn_rest_ef and allowed_weight > 1e-12:
+                            lo_b, hi_b = 0.0, min(order_weight, allowed_weight)
+                            for _ in range(48):
+                                mid = 0.5 * (lo_b + hi_b)
+                                r_m, _ = _cur_intent_ratios(extra_sell=(sym, mid))
+                                if -(b_lo - _add_sell_total(sym, r_m) - mid) <= max_abs_sym:
+                                    lo_b = mid
+                                else:
+                                    hi_b = mid
+                            allowed_weight = lo_b
                         allowed_qty = (allowed_weight * equity) / (mult * ref_px)
                         if allowed_qty > 1e-12:
                             clamped_intents.append(replace(intent, qty_value=allowed_qty))
                             tracked_syms.add(sym)
-                            add_sell[sym] = as_ + allowed_weight
+                            add_sell_fixed[sym] = add_sell_fixed.get(sym, 0.0) + allowed_weight
                             base_lo.setdefault(sym, b_lo)
                             base_hi.setdefault(sym, b_hi)
-                            add_buy.setdefault(sym, ab)
+                            add_buy_fixed.setdefault(sym, rest_buy_fixed.get(sym, 0.0))
 
         return StrategyOutput(
             intents=tuple(clamped_intents),

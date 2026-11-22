@@ -2470,20 +2470,21 @@ class _SimAccount:
 
                 for e_phase, _, _, qo in eligible_entries:
                     if e_phase > 0 and not open_only_reduces_expired:
-                        # Transitioning past bar_open into intrabar fills (CR4-04):
-                        # if an at-open entry opened/increased exposure, resolve eligible open_only
-                        # reductions at bar_open first, then expire all remaining eligible open_only
-                        # reductions before any intrabar entry runs (preserving session_gate deferral).
+                        # Transitioning past bar_open into intrabar fills (CR4-04 / CR5-07 / CR8-06):
+                        # if an at-open entry opened/increased exposure, resolve ALL eligible protective
+                        # reductions (both open_only AND GTC!) at bar_open first — matching Step 1.5's
+                        # bar_open pass for already-open positions — then expire all remaining missed
+                        # eligible open_only reductions before any intrabar entry runs (preserving
+                        # session_gate deferral and the post-fill envelope for intrabar entries).
                         if any_open_entry_filled and self.pos_qty != 0.0 and self.pending_reduce_orders:
-                            has_elig_oo = any(
-                                getattr(q_r.intent, "time_in_force", "gtc") == "open_only"
-                                and (
+                            has_elig_reduce = any(
+                                (
                                     q_r.intent.session_gate is None
                                     or q_r.intent.session_gate.is_allowed(bar_open_ms)
                                 )
                                 for q_r in self.pending_reduce_orders
                             )
-                            if has_elig_oo:
+                            if has_elig_reduce:
                                 liqs_before_oo = self.liquidations
                                 self.process_protective_exits_with_orders(
                                     i,
@@ -2508,7 +2509,7 @@ class _SimAccount:
                                     raw_bar_open=bar_open,
                                 )
                                 # CR5-07: Cancel all remaining queued entries if the opening transition liquidated
-                                # the position (do NOT cancel on an ordinary non-liquidation open_only exit).
+                                # the position (do NOT cancel on an ordinary non-liquidation protective exit).
                                 if self.liquidations > liqs_before_oo:
                                     liquidated_in_p1_6 = True
                                     exited_existing_this_bar = True
