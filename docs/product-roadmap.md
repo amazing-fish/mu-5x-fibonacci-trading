@@ -1,5 +1,7 @@
 # 产品路线：先验证信号，再完成模拟盘闭环
 
+> **对账基线（2026-11-28）**：`main @` [75aeaff5](https://github.com/amazing-fish/mu-5x-fibonacci-trading/commit/75aeaff5b8920f2750eec7fb0a3fa7be8b5ff791)（已合并 Phase 1 [#133](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/133) / PR [#135](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/135) 与 Phase 2 [#136](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/136) / PR [#137](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/137)）。
+
 产品目标来自 [#73](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/73)：S1 用可复核信号和网易邮件辅助人工交易；S2 在 S1 验收后建立稳定的受控 OKX Demo。Production 留在 [#7](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/7)，当前不启用。
 
 模块当前实现和合并证据集中在[架构与建设现状](architecture.md)。本文只保留交付依赖和验收，不用 Issue 是否开放、代码量或旧回测数字推算完成率。Issue 正文可能保留当时的状态快照，当前完成度需对照实际合并提交。
@@ -8,6 +10,7 @@
 
 | 交付线 | Issue 归属 | 后续验收与依赖 |
 |---|---|---|
+| 统一多空实验室、6-Gate 发现与策略 edge 门禁 | [#133](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/133)（已完成，[PR #135](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/135)）、[#136](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/136)（已完成，[PR #137](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/137)）、[#129](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/129)（仍开放，待 Phase 3 衔接） | Phase 1/2 已合并 `InstrumentSpec`/`CostModel`、`FundingSeries`、因果 `MarketView`、同源 `Strategy` 协议、统一多空回测引擎与 `mu_strategy/lab/` 6-Gate 单标的发现工作台（并清理旧 `mu_strategy/experiments/`）。**[#129](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/129) 仍缺**：独立只读 `python -m mu_strategy.commands.edge_gate` 入口、全可信 manifest 多标的横截面 OOS 评估（均值分位±SE、`z >= 2`、`>90` 分位计数与 `>50%` 跑赢 1x 持有比例）、引擎级合成路径零分布（交易日 block bootstrap / 去漂移打乱重跑同一回测引擎 ≥200 次，非当前收益曲线符号翻转近似）、波动缩放持有基准及 `docs/edge-gate.md`。单标的 `MU-USDT-SWAP` 发现结果为 `GO=0 / CONDITIONAL=0 / NO_GO=40`，严格保持研究与执行隔离，不得跳过 S1 前瞻或进入 `#100` Demo。 |
 | 研究结果可解释、可重复 | [#83](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/83)、[#88](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/88)、[#96](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/96) | 保留已完成的固定 generation、robustness 和杠杆披露；补齐全 registry 同快照比较、剩余收益标签和解析错误契约。 |
 | 持续运行与真实邮件验收 | [#98](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/98)、[#99](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/99)、[#107](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/107) | 信号服务、邮件和上市边界代码已合并。分别核对受控 SMTP 接受/收件箱、常驻运行和故障恢复证据；代码交付不替代运维验收。 |
 | 完整持仓输入与管理提醒 | [#85](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/85)、[#90](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/90) | baseline 已接人工完整配置、锚点、初始止损、实际杠杆、逐笔买入到阶段的映射，并按需复用共享规则。剩余卖出后映射、延迟 transition、可信事件持久化/失效与邮件接入；OKX 聚合仓位的真实杠杆来源另归 #90。 |
@@ -54,3 +57,14 @@ S1/S2 描述用户得到的产品能力；Stage 0–4 描述执行权限与成�
 ## 可分离后续项
 
 [#101](https://github.com/amazing-fish/mu-5x-fibonacci-trading/issues/101) 的候选族解耦只在真实扩展需求下推进，不建设通用策略平台。候选池、跨标的证据和数据驻留管理也不能仅为目录完整而提前扩张；按实际研究、运行需求独立评估。
+
+- **Phase 1/2 对账更新**：[PR #137](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/137) 已删除旧 `mu_strategy/experiments/`（含原硬编码 `overnight_seasonality` / `time_series_momentum` / `baseline` 的 `strategy_ladder` 结论读取路径）；Phase 1/2 新增的 `StrategyFamilyRegistry` 与 `mu_strategy.lab` 发现目录（`phase2.discovery.v1` / `phase2.recipe.v1`）在不修改旧执行侧注册表的前提下完成研究层解耦。
+- **仍保留 #101 开放的原因**：旧执行侧 `mu_strategy/strategies/registry.py`（`StrategyRuleDescriptor` 的 `side == "buy"` 约束）与 `mu_strategy/research/strategy_releases.py`（37 字段 `StrategyConfigPayloadV1`/`V2`）仍维持既有契约；仅当已通过发现与 edge 门禁的策略确实需要进入执行侧发布时才按最小范围拆分，不提前重构为通用平台。
+
+## Phase 3 规划：多标的横截面发现与 #129 门禁衔接
+
+在 `#133`（Phase 1）与 `#136`（Phase 2）落地主干的基础上，下一阶段聚焦 **Phase 3 多标的横截面发现与 `#129` edge 门禁闭环**，详见[Phase 3 多标的横截面发现方案](plans/2026-11-28-phase3-cross-sectional-discovery-design.md)：
+
+- **只读多标的数据面板**：基于 `TrustedDataStore` pinned generation 全量可用标的与显式资金费率输入（缺省费率按 `#129` 显式默认 8%/年或参数化，禁止静默归零），零 `.bar_cache` 写盘、零联网、零下单。
+- **引擎级合成路径零分布**：对每个标的以交易日 block bootstrap 与去漂移打乱路径重跑同一回测引擎（`>=200` 次、固定 seed 可复现），显式禁用对追踪止损存在正偏倚的“固定持仓期随机放置”检验。
+- **横截面统计与双基准**：计算全样本均值分位±SE（`z >= 2`）、`>90` 分位标的数量、跑赢同窗 1x 持有比例（`>50%`）、时间聚类修正与波动率匹配持有基准，产出独立 `python -m mu_strategy.commands.edge_gate`、`docs/edge-gate.md` 与 `mu_strategy.lab.cli discover-panel` 离线 HTML 面板（纯 Python 3.12 标准库）。

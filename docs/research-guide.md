@@ -14,31 +14,25 @@
 
 ## 当前快照上的回测与实验
 
-进一步的[跨机制策略与资金组合分析](mu-portfolio-analysis.md)覆盖全部已注册策略和小时趋势/回归信号，并在统一1x配置后比较资金分配、相关性及独立最终分段。`python -B -m mu_strategy.experiments.portfolio_research --help` 是复跑入口。
-
-2026-09-13 的[趋势过滤与退出优化](mu-strategy-optimization.md)提供固定 8 配置实验命令与完整结果。新增 `baseline_green_only_wide` 为显式选择的观察候选，默认策略集合不变；另保留已有平滑止损预设作收益路线对照。
+> **模块演进说明**：[PR #137](https://github.com/amazing-fish/mu-5x-fibonacci-trading/pull/137) 已移除旧版 `mu_strategy/experiments/` 目录，由只读策略发现工作台 `mu_strategy/lab/`（`python -B -m mu_strategy.lab.cli discover`）统一承接。下方[跨机制策略与资金组合分析](mu-portfolio-analysis.md)与[趋势过滤与退出优化](mu-strategy-optimization.md)保留作为历史研究记录文档。
 
 先按[行情指南](data-guide.md)完成独立刷新。以下入口都只读可信缓存，不接受旧 `--refresh` / `--source` / `--trusted-data` 参数，不联网补齐数据。
 
 ```powershell
 python -B -m mu_strategy.cli --days 180 --strategy baseline --report reports/live/mu_okx_backtest.md
 python -B -m mu_strategy.visualize --days 180 --strategy baseline --chart-interval 1h --output reports/live/mu_okx_backtest.html
-python -B -m mu_strategy.experiments.walk_forward --window-days 14 --windows 2 --report reports/live/wf.md --html-report reports/live/wf.html
-python -B -m mu_strategy.experiments.fibonacci_pullback --days 60 --report reports/live/fib.md
-python -B -m mu_strategy.experiments.strategy_ladder --window-days 14 --windows 2 --report reports/live/ladder.md --html-report reports/live/ladder.html --conclusion-index reports/live/ladder.json
+python -B -m mu_strategy.lab.cli discover --data-dir data/live --symbol MU-USDT-SWAP --interval 1h --output-html reports/live/phase2-discovery-workbench.html
 ```
-
-Fibonacci 扫描和 walk-forward 是重新研究参数、比较策略的工具，不等于已经完成当前固定策略的标准验收。Fibonacci 非 OKX 的 `AssetSpec.source` 会被拒绝。独立 walk-forward 窗口不能拼接重置后的权益曲线计算总回撤。
 
 ## 固定历史 generation 回放
 
-普通回测、HTML 可视化和候选 ladder 支持显式 `--generation-id`。先将下列变量设置为**本地真实保留且可验证的 generation ID**，不要直接使用别人某次报告里的 ID。
+普通回测、HTML 可视化和 Phase 2 策略发现支持显式 `--generation-id`。先将下列变量设置为**本地真实保留且可验证的 generation ID**，不要直接使用别人某次报告里的 ID。
 
 ```powershell
 $generationId = '<existing_generation_id>'
 python -B -m mu_strategy.cli --generation-id $generationId --days 14 --report reports/live/replay.md
 python -B -m mu_strategy.visualize --generation-id $generationId --days 14 --output reports/live/replay.html
-python -B -m mu_strategy.experiments.strategy_ladder --generation-id $generationId --window-days 14 --windows 2 --report reports/live/ladder-replay.md --html-report reports/live/ladder-replay.html --conclusion-index reports/live/ladder-replay.json
+python -B -m mu_strategy.lab.cli discover --data-dir data/live --generation-id $generationId --symbol MU-USDT-SWAP --interval 1h --output-html reports/live/phase2-discovery-replay.html
 ```
 
 历史模式经 [research.historical_data](../mu_strategy/research/historical_data.py) 唯一 reader 读取指定快照，不读 `current.json`，不按本轮时钟判断历史过期。未知 ID、路径、manifest/hash、时序、未收盘数据或覆盖错误仍失败。schema-v3 flat 与 v4 segmented 都保留严格验证；不会联网补数据或回退 current。
