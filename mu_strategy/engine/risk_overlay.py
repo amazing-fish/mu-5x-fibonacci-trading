@@ -1646,24 +1646,46 @@ class ExposureCapOverlay:
                         resolved_step3 = True
                         break
                 if not resolved_step3:
+                    # CR13-01: Every emitted fallback MUST satisfy both per-symbol caps and the gross cap
+                    # (never exceeding max_gross_leverage when the no-target envelope fits, and never worse
+                    # than the no-target envelope under a pre-existing breach).
+                    u_base, tot_base, _, _, _, _ = _eval_targets_gross(())
+                    no_target_gross = u_base + tot_base
+                    fallback_gross_cap = (
+                        self.max_gross_leverage
+                        if no_target_gross <= self.max_gross_leverage + 1e-12
+                        else no_target_gross
+                    )
+                    accepted_fallback = False
                     cand_h1 = _pull_toward_hold(1.0, omit_reversals=True)
                     u_h1, tot_h1, _, single_ok_h1, _, _ = _eval_targets_gross(cand_h1)
-                    if single_ok_h1 and (u_h1 + tot_h1 < u_fin + tot_fin - 1e-12 or not single_ok_fin):
+                    if (
+                        single_ok_h1
+                        and u_h1 + tot_h1 <= fallback_gross_cap + 1e-12
+                        and (u_h1 + tot_h1 < u_fin + tot_fin - 1e-12 or not single_ok_fin)
+                    ):
                         clamped_targets = cand_h1
-                    elif allowed_targeted_gross <= 1e-12 and single_ok_fin:
+                        accepted_fallback = True
+                    if not accepted_fallback and allowed_targeted_gross <= 1e-12 and single_ok_fin:
                         z_t = [st for t_item in clamped_targets if (st := _safe_replace_target(t_item, 0.0)) is not None]
                         uz, tz, _, single_ok_z, _, _ = _eval_targets_gross(z_t)
-                        if single_ok_z and uz + tz < u_fin + tot_fin - 1e-12:
+                        if (
+                            single_ok_z
+                            and uz + tz <= fallback_gross_cap + 1e-12
+                            and uz + tz < u_fin + tot_fin - 1e-12
+                        ):
                             clamped_targets = z_t
-                    else:
-                        # Final fail-closed fallback for CR10-03: drop targets from the back until all single caps hold.
-                        trimmed = list(clamped_targets)
-                        while trimmed:
-                            _, _, _, s_ok_tr, _, _ = _eval_targets_gross(trimmed)
-                            if s_ok_tr:
-                                break
-                            trimmed.pop()
-                        clamped_targets = trimmed
+                            accepted_fallback = True
+                    if not accepted_fallback:
+                        # Final fail-closed fallback (CR10-03 / CR13-01): retain only a compliant subset
+                        # satisfying both single caps and fallback_gross_cap (restoring [] if none fits).
+                        kept_step3: list[TargetPosition] = []
+                        for t_item in clamped_targets:
+                            trial = kept_step3 + [t_item]
+                            u_tr, tot_tr, _, s_ok_tr, _, _ = _eval_targets_gross(trial)
+                            if s_ok_tr and u_tr + tot_tr <= fallback_gross_cap + 1e-12:
+                                kept_step3 = trial
+                        clamped_targets = kept_step3
                 targeted_symbols = {t_item.symbol for t_item in clamped_targets}
 
         # 4. Seed conservative reachable weight state per symbol (in marked-equity units) from the exact

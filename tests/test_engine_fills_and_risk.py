@@ -2094,6 +2094,74 @@ class RiskOverlayTests(unittest.TestCase):
         self.assertEqual(1, len(res_ef.intents))
         self.assertAlmostEqual(8.0 / 23.0, res_ef.intents[0].qty_value, places=6)
 
+    def test_exposure_cap_step3_fallback_enforces_gross_cap_cr13_01(self) -> None:
+        sym_a = "MU-USDT-SWAP"
+        sym_b = "ETH-USDT-SWAP"
+        sym_c = "BTC-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_a = _make_bar_series([100.0] * 5, symbol=sym_a, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_b = _make_bar_series([100.0] * 5, symbol=sym_b, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_c = _make_bar_series([100.0] * 5, symbol=sym_c, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym_a, "1h"): bars_a, (sym_b, "1h"): bars_b, (sym_c, "1h"): bars_c}, now_ms=t0)
+        inst_5x = okx_swap_spec(sym_a, tick_size=Decimal("0.01"), max_leverage=5.0)
+
+        # Construct exact CR13-01 scenario:
+        # - Marked equity = 10_000, settled equity = 10_000 (C has 10 contracts long @ 400 -> -3_000 unrealized,
+        #   so a reduce_only market sell on C lowers target_lower_ratio to 0.7 while target_upper_ratio stays 1.0!).
+        # - A and B each hold 0.6x long with a 1.2x resting sell (no-target gross = 0.6 + 0.6 + 0.1 = 1.3 <= 1.4!).
+        # - Targets A=+0.2, B=+0.2 get pulled in Step 2 to 2/7 (~0.2857, worst 1.0 each -> pre-fallback gross 2.1).
+        # - cand_h1 pulls A and B to hold_w = 0.6/0.7 = 6/7 (~0.8571 each -> cand_h1 gross 1.8143 < 2.1, yet > 1.4!).
+        pos_abc = {
+            sym_a: PositionView(sym_a, qty=60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6),
+            sym_b: PositionView(sym_b, qty=60.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=6_000.0, leverage=0.6),
+            sym_c: PositionView(sym_c, qty=10.0, avg_entry_price=400.0, unrealized_pnl=-3_000.0, notional=1_000.0, leverage=0.1),
+        }
+        rest_a = OrderIntent("ra120", sym_a, "sell", "limit", "contracts", 120.0, limit_price=100.0)
+        rest_b = OrderIntent("rb120", sym_b, "sell", "limit", "contracts", 120.0, limit_price=100.0)
+        ro_c = OrderIntent("roc", sym_c, "sell", "market", "close_all", 1.0, reduce_only=True)
+        ctx = BarContext(
+            now_ms=t0,
+            symbol=sym_a,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 10_000.0, pos_abc, (rest_a, rest_b), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        out = StrategyOutput(
+            targets=(TargetPosition(sym_a, 0.2), TargetPosition(sym_b, 0.2)),
+            intents=(ro_c,),
+        )
+
+        # 1. Under max_gross_leverage=1.4: neither cand_h1 (1.8143) nor pre-fallback (2.1) nor any single
+        #    target (1.7) satisfies 1.4 -> MUST restore the compliant no-target envelope (targets == ())!
+        ov_14 = ExposureCapOverlay(1.4, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        res_14 = ov_14.filter(ctx, out)
+        self.assertEqual((), res_14.targets)
+
+        # 2. Under max_gross_leverage=1.75: cand_h1 (1.8143) STILL exceeds 1.75 and MUST be rejected,
+        #    while keeping just [A] has gross 1.0 + 0.6 + 0.1 = 1.70 <= 1.75 -> emits compliant [A]!
+        ov_175 = ExposureCapOverlay(1.75, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        res_175 = ov_175.filter(ctx, out)
+        self.assertEqual(1, len(res_175.targets))
+        self.assertEqual(sym_a, res_175.targets[0].symbol)
+        self.assertAlmostEqual(0.2 / 0.7, res_175.targets[0].target_weight, places=6)
+
+        # 3. Pre-existing gross breach (no_target_gross = 1.8 > 1.4): risk-reducing flatten that does NOT
+        #    worsen no_target_gross (1.8 <= 1.8) is still admitted cleanly!
+        pos_over = {
+            sym_a: PositionView(sym_a, qty=100.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=10_000.0, leverage=1.0),
+            sym_b: PositionView(sym_b, qty=80.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=8_000.0, leverage=0.8),
+        }
+        ctx_over = BarContext(
+            now_ms=t0,
+            symbol=sym_b,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 10_000.0, pos_over, (), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        res_over = ov_14.filter(ctx_over, StrategyOutput(targets=(TargetPosition(sym_b, 0.0),)))
+        self.assertEqual(1, len(res_over.targets))
+        self.assertAlmostEqual(0.0, res_over.targets[0].target_weight, places=9)
+
 
 if __name__ == "__main__":
     unittest.main()
