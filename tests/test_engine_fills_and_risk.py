@@ -2005,6 +2005,95 @@ class RiskOverlayTests(unittest.TestCase):
             ).intents,
         )
 
+    def test_exposure_cap_other_symbol_per_side_signed_bounds_cr12_01_and_cr12_02(self) -> None:
+        sym = "MU-USDT-SWAP"
+        sym_b = "ETH-USDT-SWAP"
+        sym_c = "BTC-USDT-SWAP"
+        t0 = _utc_ms(2026, 6, 11, 14, 0)
+        bars_mu = _make_bar_series([100.0] * 5, symbol=sym, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_eth = _make_bar_series([100.0] * 5, symbol=sym_b, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        bars_btc = _make_bar_series([100.0] * 5, symbol=sym_c, interval="1h", start_ms=t0 - 5 * 3_600_000)
+        mv = MarketView({(sym, "1h"): bars_mu, (sym_b, "1h"): bars_eth, (sym_c, "1h"): bars_btc}, now_ms=t0)
+        inst_5x = okx_swap_spec(sym, tick_size=Decimal("0.01"), max_leverage=5.0)
+        ov = ExposureCapOverlay(3.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+
+        # Symbol B has pre-existing long bound +1.20 (> 1.0x single cap) AND resting short target_weight -1.15
+        # (-0.92x at settled=8_000). Reducing profitable long A (80 @ 75 -> settled 9_000) widens B's short
+        # bound from -0.92 to -1.035 (NEW short-side breach!) while B's max(|lo|, |hi|) stays 1.20!
+        pos_ab = {
+            sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8),
+            sym_b: PositionView(sym_b, qty=120.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=12_000.0, leverage=1.2),
+        }
+        rest_b_short = OrderIntent("rb_tw", sym_b, "sell", "limit", "target_weight", -1.15, limit_price=100.0)
+        ctx_ab = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 8_000.0, pos_ab, (rest_b_short,), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+
+        # 1. CR12-02 Step 2: TargetPosition(A, +0.5) MUST be pulled to exact 15/23 (B short bound == -1.000x),
+        #    while TargetPosition(A, +0.8) (B short bound -0.966x <= 1.0) passes unchanged!
+        res_tp = ov.filter(ctx_ab, StrategyOutput(targets=(TargetPosition(sym, 0.5),)))
+        self.assertEqual(1, len(res_tp.targets))
+        self.assertAlmostEqual(15.0 / 23.0, res_tp.targets[0].target_weight, places=6)
+        res_tp_ok = ov.filter(ctx_ab, StrategyOutput(targets=(TargetPosition(sym, 0.8),)))
+        self.assertAlmostEqual(0.8, res_tp_ok.targets[0].target_weight, places=9)
+
+        # 2. CR12-02 Step 3 (joint multi-target): A and C each long 80 @ 75 (settled=6_000 -> B pre-bounds (-0.69, +1.20));
+        #    reducing BOTH A and C to 0.0 would raise settled to 10_000 (B short bound -1.15 < -1.0!) -> pulled back
+        #    so realized profit <= 10_000/1.15 - 6_000 = 2695.652 -> remaining A+C contracts == 160 - 2695.652/25!
+        pos_abc = {
+            sym: PositionView(sym, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8),
+            sym_c: PositionView(sym_c, qty=80.0, avg_entry_price=75.0, unrealized_pnl=2_000.0, notional=8_000.0, leverage=0.8),
+            sym_b: PositionView(sym_b, qty=120.0, avg_entry_price=100.0, unrealized_pnl=0.0, notional=12_000.0, leverage=1.2),
+        }
+        ctx_abc = BarContext(
+            now_ms=t0,
+            symbol=sym,
+            market=mv,
+            portfolio=PortfolioView(10_000.0, 6_000.0, pos_abc, (rest_b_short,), 10_000.0, 10_000.0),
+            instrument=inst_5x,
+        )
+        ov_4x = ExposureCapOverlay(4.0, 1.0, sizing_basis="settled_equity", enforce_instrument_max_leverage=True)
+        res_joint = ov_4x.filter(ctx_abc, StrategyOutput(targets=(TargetPosition(sym, 0.0), TargetPosition(sym_c, 0.0))))
+        self.assertEqual(2, len(res_joint.targets))
+        rem_contracts = (res_joint.targets[0].target_weight + res_joint.targets[1].target_weight) * 60.0
+        self.assertAlmostEqual(160.0 - (10_000.0 / 1.15 - 6_000.0) / 25.0, rem_contracts, places=4)
+
+        # 3. CR12-01 Step 4: target_weight, contracts, and equity_fraction sell intents on A all catch B's short breach!
+        res_tw = ov.filter(
+            ctx_ab,
+            StrategyOutput(intents=(OrderIntent("tw05", sym, "sell", "market", "target_weight", 0.5),)),
+        )
+        self.assertEqual(1, len(res_tw.intents))
+        self.assertAlmostEqual(15.0 / 23.0, res_tw.intents[0].qty_value, places=6)
+        res_tw_ok = ov.filter(
+            ctx_ab,
+            StrategyOutput(intents=(OrderIntent("tw08", sym, "sell", "market", "target_weight", 0.8),)),
+        )
+        self.assertAlmostEqual(0.8, res_tw_ok.intents[0].qty_value, places=9)
+
+        res_c = ov.filter(
+            ctx_ab,
+            StrategyOutput(intents=(OrderIntent("ms40", sym, "sell", "market", "contracts", 40.0),)),
+        )
+        self.assertEqual(1, len(res_c.intents))
+        self.assertAlmostEqual(640.0 / 23.0, res_c.intents[0].qty_value, places=5)
+        res_c_ok = ov.filter(
+            ctx_ab,
+            StrategyOutput(intents=(OrderIntent("ms20", sym, "sell", "market", "contracts", 20.0),)),
+        )
+        self.assertAlmostEqual(20.0, res_c_ok.intents[0].qty_value, places=9)
+
+        res_ef = ov.filter(
+            ctx_ab,
+            StrategyOutput(intents=(OrderIntent("ef05", sym, "sell", "market", "equity_fraction", 0.5),)),
+        )
+        self.assertEqual(1, len(res_ef.intents))
+        self.assertAlmostEqual(8.0 / 23.0, res_ef.intents[0].qty_value, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

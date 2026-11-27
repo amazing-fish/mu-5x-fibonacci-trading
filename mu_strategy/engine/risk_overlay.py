@@ -1325,12 +1325,30 @@ class ExposureCapOverlay:
             }
             return lo_15, hi_15, rb_eff, rs_eff, r_up_16, r_lo_16
 
-        # Baseline per-symbol worst-case exposure BEFORE admitting any targets (CR10-03).
+        # Baseline per-symbol signed exposure bounds (lo, hi) BEFORE admitting any targets (CR10-03 / CR12-02).
         lo_base_0, hi_base_0, rb_base_0, rs_base_0, _, _ = _eval_phase_15_16({}, {})
-        base_sym_worst_0: dict[str, float] = {
-            s: max(abs(lo_base_0.get(s, 0.0) - rs_base_0.get(s, 0.0)), abs(hi_base_0.get(s, 0.0) + rb_base_0.get(s, 0.0)))
+        base_sym_bounds_0: dict[str, tuple[float, float]] = {
+            s: (
+                lo_base_0.get(s, 0.0) - rs_base_0.get(s, 0.0),
+                hi_base_0.get(s, 0.0) + rb_base_0.get(s, 0.0),
+            )
             for s in all_known_syms
         }
+
+        def _sym_sides_single_ok(
+            sym_s: str,
+            lo_s: float,
+            hi_s: float,
+            pre_bounds: Mapping[str, tuple[float, float]],
+            tol: float = 0.0,
+        ) -> bool:
+            """Check long and short exposure sides independently against single_cap and pre-existing bounds (CR12-01 / CR12-02)."""
+            pre_lo, pre_hi = pre_bounds.get(sym_s, (0.0, 0.0))
+            if hi_s > single_cap + tol and hi_s > pre_hi + 1e-12:
+                return False
+            if (-lo_s) > single_cap + tol and (-lo_s) > (-pre_lo) + 1e-12:
+                return False
+            return True
 
         def _other_syms_single_ok(
             l15: Mapping[str, float],
@@ -1346,8 +1364,9 @@ class ExposureCapOverlay:
             for s in all_known_syms:
                 if s == exclude_sym:
                     continue
-                ws = max(abs(l15.get(s, 0.0) - rse.get(s, 0.0)), abs(h15.get(s, 0.0) + rbe.get(s, 0.0)))
-                if ws > single_cap + tol and ws > base_sym_worst_0.get(s, 0.0) + 1e-12:
+                o_lo = l15.get(s, 0.0) - rse.get(s, 0.0)
+                o_hi = h15.get(s, 0.0) + rbe.get(s, 0.0)
+                if not _sym_sides_single_ok(s, o_lo, o_hi, base_sym_bounds_0, tol=tol):
                     return False
             return True
 
@@ -1497,15 +1516,17 @@ class ExposureCapOverlay:
                 all_single_ok = True
                 for us in all_known_syms:
                     if us not in active_tsyms:
-                        uw = max(abs(la.get(us, 0.0) - rsa.get(us, 0.0)), abs(ha.get(us, 0.0) + rba.get(us, 0.0)))
-                        u_gross += uw
-                        if uw > single_cap + tol and uw > base_sym_worst_0.get(us, 0.0) + 1e-12:
+                        u_lo = la.get(us, 0.0) - rsa.get(us, 0.0)
+                        u_hi = ha.get(us, 0.0) + rba.get(us, 0.0)
+                        u_gross += max(abs(u_lo), abs(u_hi))
+                        if not _sym_sides_single_ok(us, u_lo, u_hi, base_sym_bounds_0, tol=tol):
                             all_single_ok = False
                 sw: dict[str, float] = {}
                 for ts in active_tsyms:
-                    tw = max(abs(la.get(ts, 0.0) - rsa.get(ts, 0.0)), abs(ha.get(ts, 0.0) + rba.get(ts, 0.0)))
-                    sw[ts] = tw
-                    if tw > single_cap + tol and tw > base_sym_worst_0.get(ts, 0.0) + 1e-12:
+                    t_lo = la.get(ts, 0.0) - rsa.get(ts, 0.0)
+                    t_hi = ha.get(ts, 0.0) + rba.get(ts, 0.0)
+                    sw[ts] = max(abs(t_lo), abs(t_hi))
+                    if not _sym_sides_single_ok(ts, t_lo, t_hi, base_sym_bounds_0, tol=tol):
                         all_single_ok = False
                 return u_gross, math.fsum(sw.values()), sw, all_single_ok, rba, rsa
 
@@ -1784,18 +1805,16 @@ class ExposureCapOverlay:
 
             return r_up, r_lo, ef_b, ef_s, eff_blo, eff_bhi
 
-        def _sym_worst_abs(
+        def _sym_signed_bounds(
             sym_w: str,
             ef_b: Mapping[str, float],
             ef_s: Mapping[str, float],
             blo_map: Mapping[str, float] = base_lo,
             bhi_map: Mapping[str, float] = base_hi,
-        ) -> float:
+        ) -> tuple[float, float]:
             lo_s = blo_map.get(sym_w, 0.0) - (add_sell_fixed.get(sym_w, 0.0) + ef_s.get(sym_w, 0.0))
             hi_s = bhi_map.get(sym_w, 0.0) + (add_buy_fixed.get(sym_w, 0.0) + ef_b.get(sym_w, 0.0))
-            a_lo = -lo_s if lo_s < 0.0 else lo_s
-            a_hi = -hi_s if hi_s < 0.0 else hi_s
-            return a_hi if a_hi >= a_lo else a_lo
+            return lo_s, hi_s
 
         def _other_portfolio_check(
             sym_chk: str,
@@ -1805,18 +1824,20 @@ class ExposureCapOverlay:
             ef_s_after: Mapping[str, float],
             blo_after: Mapping[str, float],
             bhi_after: Mapping[str, float],
-            cur_sym_worst: Mapping[str, float],
+            cur_sym_bounds: Mapping[str, tuple[float, float]],
             other_before: float,
             tol: float = 0.0,
         ) -> tuple[bool, float]:
-            """Verify cross-symbol single_cap & total gross (CR10-05); returns (ok, other_gross_after)."""
+            """Verify cross-symbol per-side single_cap & total gross (CR10-05 / CR12-01); returns (ok, other_gross_after)."""
             other_after = 0.0
             for s in tracked_syms:
                 if s == sym_chk:
                     continue
-                sw_after = _sym_worst_abs(s, ef_b_after, ef_s_after, blo_after, bhi_after)
-                other_after += sw_after
-                if sw_after > cur_sym_worst.get(s, 0.0) + 1e-12 and sw_after > single_cap + tol:
+                o_lo, o_hi = _sym_signed_bounds(s, ef_b_after, ef_s_after, blo_after, bhi_after)
+                a_lo = -o_lo if o_lo < 0.0 else o_lo
+                a_hi = -o_hi if o_hi < 0.0 else o_hi
+                other_after += a_hi if a_hi >= a_lo else a_lo
+                if not _sym_sides_single_ok(s, o_lo, o_hi, cur_sym_bounds, tol=tol):
                     return False, other_after
             if other_after > other_before + 1e-12:
                 sym_w_after = max(-sym_lo_after if sym_lo_after < 0.0 else sym_lo_after, -sym_hi_after if sym_hi_after < 0.0 else sym_hi_after)
@@ -1832,11 +1853,11 @@ class ExposureCapOverlay:
             b_hi_t: float,
             cur_lo_r: float,
             cur_up_r: float,
-            cur_sym_worst: Mapping[str, float],
+            cur_sym_bounds: Mapping[str, tuple[float, float]],
             other_before: float,
             tol: float = 0.0,
         ) -> tuple[float, float, bool]:
-            """Evaluate a candidate target_weight intent across the full portfolio envelope (CR10-05 / CR11-01 / CR11-02)."""
+            """Evaluate a candidate target_weight intent across the full portfolio envelope (CR10-05 / CR11-01 / CR11-02 / CR12-01)."""
             lp, hp = _expand_tw_interval(sym_t, cand_w, cur_lo_r, cur_up_r)
             ru_t, _, _, _, _, _ = _step4_state(extra_lo=(sym_t, lp), extra_hi=(sym_t, hp))
             la, ha = _apply_all_protective_to_target(sym_t, lp, hp, ru_t)
@@ -1846,7 +1867,7 @@ class ExposureCapOverlay:
             lo_t = blo_t.get(sym_t, bl_t) - (add_sell_fixed.get(sym_t, 0.0) + ef_st.get(sym_t, 0.0))
             hi_t = bhi_t.get(sym_t, bh_t) + (add_buy_fixed.get(sym_t, 0.0) + ef_bt.get(sym_t, 0.0))
             pf_ok, other_after = _other_portfolio_check(
-                sym_t, lo_t, hi_t, ef_bt, ef_st, blo_t, bhi_t, cur_sym_worst, other_before, tol=tol
+                sym_t, lo_t, hi_t, ef_bt, ef_st, blo_t, bhi_t, cur_sym_bounds, other_before, tol=tol
             )
             if not pf_ok:
                 return lo_t, hi_t, False
@@ -1864,13 +1885,13 @@ class ExposureCapOverlay:
             b_hi_o: float,
             lo_before: float,
             hi_before: float,
-            cur_sym_worst: Mapping[str, float],
+            cur_sym_bounds: Mapping[str, tuple[float, float]],
             other_before: float,
             extra_fixed_w: float = 0.0,
             extra_ef_val: float = 0.0,
             tol: float = 0.0,
         ) -> bool:
-            """Check full-portfolio cap for a candidate contracts or equity_fraction order (CR10-04 / CR10-05)."""
+            """Check full-portfolio cap for a candidate contracts or equity_fraction order (CR10-04 / CR10-05 / CR12-01)."""
             _, _, ef_b_d, ef_s_d, blo_d, bhi_d = _step4_state(
                 extra_buy=(sym_o, extra_fixed_w) if (side_str == "buy" and extra_fixed_w > 0.0) else None,
                 extra_sell=(sym_o, extra_fixed_w) if (side_str == "sell" and extra_fixed_w > 0.0) else None,
@@ -1887,7 +1908,7 @@ class ExposureCapOverlay:
                 + (extra_fixed_w if side_str == "buy" else 0.0)
             )
             pf_ok, other_d = _other_portfolio_check(
-                sym_o, lo_d, hi_d, ef_b_d, ef_s_d, blo_d, bhi_d, cur_sym_worst, other_before, tol=tol
+                sym_o, lo_d, hi_d, ef_b_d, ef_s_d, blo_d, bhi_d, cur_sym_bounds, other_before, tol=tol
             )
             if not pf_ok:
                 return False
@@ -1919,8 +1940,8 @@ class ExposureCapOverlay:
             as_ = add_sell_fixed.get(sym, 0.0) + cur_ef_s.get(sym, 0.0)
             lo = b_lo - as_
             hi = b_hi + ab
-            cur_sym_worst = {s: _sym_worst_abs(s, cur_ef_b, cur_ef_s, cur_blo, cur_bhi) for s in tracked_syms}
-            other_gross = math.fsum(v for s, v in cur_sym_worst.items() if s != sym)
+            cur_sym_bounds = {s: _sym_signed_bounds(s, cur_ef_b, cur_ef_s, cur_blo, cur_bhi) for s in tracked_syms}
+            other_gross = math.fsum(max(abs(b[0]), abs(b[1])) for s, b in cur_sym_bounds.items() if s != sym)
             max_abs_sym = min(single_cap, max(0.0, self.max_gross_leverage - other_gross))
 
             if intent.qty_mode == "target_weight":
@@ -1967,7 +1988,7 @@ class ExposureCapOverlay:
                         b_hi_t=b_hi,
                         cur_lo_r=cur_lower_ratio,
                         cur_up_r=cur_upper_ratio,
-                        cur_sym_worst=cur_sym_worst,
+                        cur_sym_bounds=cur_sym_bounds,
                         other_before=other_gross,
                         tol=1e-12,
                     )
@@ -1980,7 +2001,7 @@ class ExposureCapOverlay:
                             b_hi_t=b_hi,
                             cur_lo_r=cur_lower_ratio,
                             cur_up_r=cur_upper_ratio,
-                            cur_sym_worst=cur_sym_worst,
+                            cur_sym_bounds=cur_sym_bounds,
                             other_before=other_gross,
                             tol=1e-12,
                         )[1] > max_abs_sym + 1e-12:
@@ -1994,7 +2015,7 @@ class ExposureCapOverlay:
                                     b_hi_t=b_hi,
                                     cur_lo_r=cur_lower_ratio,
                                     cur_up_r=cur_upper_ratio,
-                                    cur_sym_worst=cur_sym_worst,
+                                    cur_sym_bounds=cur_sym_bounds,
                                     other_before=other_gross,
                                 )[1] <= max_abs_sym:
                                     lo_c = mid
@@ -2009,7 +2030,7 @@ class ExposureCapOverlay:
                                 b_hi_t=b_hi,
                                 cur_lo_r=cur_lower_ratio,
                                 cur_up_r=cur_upper_ratio,
-                                cur_sym_worst=cur_sym_worst,
+                                cur_sym_bounds=cur_sym_bounds,
                                 other_before=other_gross,
                                 tol=1e-12,
                             )
@@ -2024,7 +2045,7 @@ class ExposureCapOverlay:
                                         b_hi_t=b_hi,
                                         cur_lo_r=cur_lower_ratio,
                                         cur_up_r=cur_upper_ratio,
-                                        cur_sym_worst=cur_sym_worst,
+                                        cur_sym_bounds=cur_sym_bounds,
                                         other_before=other_gross,
                                     )
                                     if -m_lo_v <= max_abs_sym and m_pf_v:
@@ -2043,7 +2064,7 @@ class ExposureCapOverlay:
                             b_hi_t=b_hi,
                             cur_lo_r=cur_lower_ratio,
                             cur_up_r=cur_upper_ratio,
-                            cur_sym_worst=cur_sym_worst,
+                            cur_sym_bounds=cur_sym_bounds,
                             other_before=other_gross,
                             tol=1e-12,
                         )[0] > max_abs_sym + 1e-12:
@@ -2057,7 +2078,7 @@ class ExposureCapOverlay:
                                     b_hi_t=b_hi,
                                     cur_lo_r=cur_lower_ratio,
                                     cur_up_r=cur_upper_ratio,
-                                    cur_sym_worst=cur_sym_worst,
+                                    cur_sym_bounds=cur_sym_bounds,
                                     other_before=other_gross,
                                 )[0] <= max_abs_sym:
                                     hi_c = mid
@@ -2072,7 +2093,7 @@ class ExposureCapOverlay:
                                 b_hi_t=b_hi,
                                 cur_lo_r=cur_lower_ratio,
                                 cur_up_r=cur_upper_ratio,
-                                cur_sym_worst=cur_sym_worst,
+                                cur_sym_bounds=cur_sym_bounds,
                                 other_before=other_gross,
                                 tol=1e-12,
                             )
@@ -2087,7 +2108,7 @@ class ExposureCapOverlay:
                                         b_hi_t=b_hi,
                                         cur_lo_r=cur_lower_ratio,
                                         cur_up_r=cur_upper_ratio,
-                                        cur_sym_worst=cur_sym_worst,
+                                        cur_sym_bounds=cur_sym_bounds,
                                         other_before=other_gross,
                                     )
                                     if m_hi_v <= max_abs_sym and m_pf_v:
@@ -2106,7 +2127,7 @@ class ExposureCapOverlay:
                         b_hi_t=b_hi,
                         cur_lo_r=cur_lower_ratio,
                         cur_up_r=cur_upper_ratio,
-                        cur_sym_worst=cur_sym_worst,
+                        cur_sym_bounds=cur_sym_bounds,
                         other_before=other_gross,
                         tol=1e-12,
                     )
@@ -2184,7 +2205,7 @@ class ExposureCapOverlay:
                     b_hi_o=b_hi,
                     lo_before=lo,
                     hi_before=hi,
-                    cur_sym_worst=cur_sym_worst,
+                    cur_sym_bounds=cur_sym_bounds,
                     other_before=other_gross,
                     extra_ef_val=eff_ef,
                     tol=1e-12,
@@ -2214,7 +2235,7 @@ class ExposureCapOverlay:
                                 b_hi_o=b_hi,
                                 lo_before=lo,
                                 hi_before=hi,
-                                cur_sym_worst=cur_sym_worst,
+                                cur_sym_bounds=cur_sym_bounds,
                                 other_before=other_gross,
                                 extra_ef_val=mid_ef,
                             ):
@@ -2251,7 +2272,7 @@ class ExposureCapOverlay:
                             b_hi_o=b_hi,
                             lo_before=lo,
                             hi_before=hi,
-                            cur_sym_worst=cur_sym_worst,
+                            cur_sym_bounds=cur_sym_bounds,
                             other_before=other_gross,
                             extra_fixed_w=order_weight,
                             tol=1e-12,
@@ -2279,7 +2300,7 @@ class ExposureCapOverlay:
                                     b_hi_o=b_hi,
                                     lo_before=lo,
                                     hi_before=hi,
-                                    cur_sym_worst=cur_sym_worst,
+                                    cur_sym_bounds=cur_sym_bounds,
                                     other_before=other_gross,
                                     extra_fixed_w=mid,
                                 ):
@@ -2304,7 +2325,7 @@ class ExposureCapOverlay:
                             b_hi_o=b_hi,
                             lo_before=lo,
                             hi_before=hi,
-                            cur_sym_worst=cur_sym_worst,
+                            cur_sym_bounds=cur_sym_bounds,
                             other_before=other_gross,
                             extra_fixed_w=order_weight,
                             tol=1e-12,
@@ -2332,7 +2353,7 @@ class ExposureCapOverlay:
                                     b_hi_o=b_hi,
                                     lo_before=lo,
                                     hi_before=hi,
-                                    cur_sym_worst=cur_sym_worst,
+                                    cur_sym_bounds=cur_sym_bounds,
                                     other_before=other_gross,
                                     extra_fixed_w=mid,
                                 ):
