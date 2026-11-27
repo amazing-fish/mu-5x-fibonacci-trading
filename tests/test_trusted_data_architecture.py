@@ -1297,8 +1297,8 @@ class TrustedDemoConsumerTests(unittest.TestCase):
                 "mu_strategy/viz/backtest.py",
                 "mu_strategy/demo_trading.py",
                 "mu_strategy/commands/okx_demo_loop.py",
-                "mu_strategy/experiments/fibonacci_pullback.py",
-                "mu_strategy/experiments/walk_forward.py",
+                "mu_strategy/lab/discovery.py",
+                "mu_strategy/lab/cli.py",
             )
         }
         for relative_path, needles in forbidden.items():

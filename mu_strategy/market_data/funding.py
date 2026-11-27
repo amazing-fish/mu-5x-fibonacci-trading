@@ -696,25 +696,25 @@ class FundingSeries:
                     pass
 
     @classmethod
-    def from_json_file(
+    def from_json_text(
         cls,
-        path: Path | str,
+        text: str,
         *,
         instrument_id: str | None = None,
         allow_legacy_okx_funding_rate: bool = False,
+        source_label: str = "<memory>",
     ) -> "FundingSeries":
-        """Load a FundingSeries from canonical JSON or raw OKX/Binance funding archive JSON.
+        """Parse a FundingSeries from canonical JSON or raw OKX/Binance funding archive text.
 
         For OKX archives, ``realizedRate`` is required by default so predicted
         ``fundingRate`` values are never silently treated as realized settlements;
         pass ``allow_legacy_okx_funding_rate=True`` only for legacy archives that
         explicitly store actual settled rates in ``fundingRate``.
         """
-        target = Path(path)
         try:
-            raw = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise ValueError(f"failed to load funding JSON from {target}: {exc}") from exc
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"failed to load funding JSON from {source_label}: {exc}") from exc
 
         if isinstance(raw, dict) and "events" in raw:
             version = raw.get("schema_version")
@@ -809,7 +809,34 @@ class FundingSeries:
             parsed = _parse_binance_rows(raw, expected_symbol=sym)
             return cls.from_events(resolved_id, parsed, sort=True)
 
-        raise ValueError(f"unrecognized funding JSON format in {target}")
+        raise ValueError(f"unrecognized funding JSON format in {source_label}")
+
+    @classmethod
+    def from_json_file(
+        cls,
+        path: Path | str,
+        *,
+        instrument_id: str | None = None,
+        allow_legacy_okx_funding_rate: bool = False,
+    ) -> "FundingSeries":
+        """Load a FundingSeries from canonical JSON or raw OKX/Binance funding archive JSON.
+
+        For OKX archives, ``realizedRate`` is required by default so predicted
+        ``fundingRate`` values are never silently treated as realized settlements;
+        pass ``allow_legacy_okx_funding_rate=True`` only for legacy archives that
+        explicitly store actual settled rates in ``fundingRate``.
+        """
+        target = Path(path)
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError(f"failed to load funding JSON from {target}: {exc}") from exc
+        return cls.from_json_text(
+            text,
+            instrument_id=instrument_id,
+            allow_legacy_okx_funding_rate=allow_legacy_okx_funding_rate,
+            source_label=str(target),
+        )
 
     @classmethod
     def require_or_sensitivity_series(

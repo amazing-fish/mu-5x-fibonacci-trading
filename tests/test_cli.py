@@ -14,13 +14,13 @@ class CliTests(unittest.TestCase):
     def test_fee_profile_help_renders_literal_percent_signs(self):
         from mu_strategy import cli
         from mu_strategy.commands import all_existing_data_backtests
-        from mu_strategy.experiments import walk_forward
+        from mu_strategy.lab import cli as lab_cli
         from mu_strategy.viz import backtest as viz_backtest
 
         for module, program_name in (
             (cli, "mu_strategy.cli"),
             (viz_backtest, "mu_strategy.visualize"),
-            (walk_forward, "mu_strategy.experiments.walk_forward"),
+            (lab_cli, "mu_strategy.lab.cli"),
             (all_existing_data_backtests, "mu_strategy.all_existing_data_backtests"),
         ):
             with self.subTest(program_name=program_name):
