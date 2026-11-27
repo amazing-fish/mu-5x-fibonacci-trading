@@ -23,6 +23,7 @@ ENGINE_FORBIDDEN_IMPORTS = FORBIDDEN_IMPORTS + (
     "mu_strategy.market_data.trusted_data.refresh",
     "mu_strategy.backtest",
     "mu_strategy.experiments",
+    "mu_strategy.lab",
     "mu_strategy.entry",
     "mu_strategy.execution",
 )
@@ -217,6 +218,7 @@ class NoApplicationAdapters(importlib.abc.MetaPathFinder):
             "mu_strategy.notifications",
             "mu_strategy.market_data.service",
             "mu_strategy.market_data.trusted_data.refresh",
+            "mu_strategy.lab",
             "smtplib",
         )
         if any(fullname == name or fullname.startswith(name + ".") for name in forbidden):
@@ -239,6 +241,27 @@ import mu_strategy.engine
             timeout=15,
         )
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_lower_layers_never_import_lab(self):
+        violations: list[str] = []
+        for package_name in ("core", "market_data", "strategies", "engine"):
+            package_dir = PACKAGE_ROOT / package_name
+            self.assertTrue(package_dir.is_dir(), f"mu_strategy/{package_name} package must exist")
+            for path in sorted(package_dir.rglob("*.py")):
+                source = path.read_text(encoding="utf-8")
+                package = ".".join(path.relative_to(REPO_ROOT).parts[:-1])
+                for line_number, statement in _forbidden_import_statements(
+                    source,
+                    package=package,
+                    forbidden_imports=("mu_strategy.lab",),
+                ):
+                    violations.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
+
+        self.assertEqual(
+            [],
+            violations,
+            "Forbidden mu_strategy.lab imports in lower layers:\n" + "\n".join(violations),
+        )
 
 
 def _forbidden_import_statements(

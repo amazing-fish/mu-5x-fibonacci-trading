@@ -1,4 +1,4 @@
-"""Pure robustness metrics shared by backtests and strategy experiments.
+"""Pure robustness metrics shared by backtests and strategy lab evaluations.
 
 Trade-based metrics define net PnL as ``Trade.pnl``.  The backtest stores PnL
 after entry and exit fees in that field; ``Trade.fees`` records those same fees

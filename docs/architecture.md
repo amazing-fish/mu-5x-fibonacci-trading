@@ -19,7 +19,7 @@ doc_kind: reference
 |---|---|---|
 | **可信行情**：输入是否完整、同源、可重放 | `market_data.trusted_data` 分开刷新和读取；v4 月分段、hash/时序/多周期校验、固定 generation、上市月起点验证均有实现，研究和扫描已消费。 | 数据驻留、GC 不在当前实现。#107 的冷启动代码已合并，Issue 仍开放；运维验收须另查。 |
 | **策略规则**：同样输入是否得到同样判断 | `strategy.py` 提供固定配置、指标过滤和入场规则；`strategies.registry` 统一名称/别名/默认集合，并读取独立标的日历配置；`core.trading_calendar` 为扫描、回测、加仓与风险检查提供共同的时段交集；`position_rules` 被回测、shadow 和人工 baseline 复核复用。 | 人工复核只支持明确映射的有效买入和 baseline；卖出后状态、延迟 transition 与管理邮件仍归 #85。 |
-| **回测与实验**：假设如何被检验 | `backtest.py` 承担 OHLC 成交和权益模拟；walk-forward、Fibonacci 扫描、候选 ladder 均有入口。普通回测/HTML/ladder 支持固定历史 generation。 | 全 registry 的同快照 robustness 比较未完成（#83）；部分 HTML/walk-forward 单笔收益标签待明确（#88）。 |
+| **回测与实验**：假设如何被检验 | `backtest.py` 承担 OHLC 成交和权益模拟；Phase 2 起 `mu_strategy/lab/`（6-Gate 策略发现引擎与离线 HTML 工作台 `mu_strategy.lab.cli`）已取代旧版 `mu_strategy/experiments/`。普通回测/HTML 支持固定历史 generation。 | 全 registry 的同快照 robustness 比较未完成（#83）；部分 HTML 单笔收益标签待明确（#88）。 |
 | **研究解释与结论**：收益靠什么、是否可比较 | `research.robustness` 提供基准、top-N 集中度、stage 分布；`research.historical_data` 与 `research.strategy_releases` 提供固定 generation 回放和规范配置编解码；ladder 披露实际配置杠杆和账户收益。 | 短样本、不同风险预算及样本外/前瞻证据仍归 #99；reader 异常边界 #96，候选名单解耦 #101。 |
 | **候选标的选择**：固定策略应用到谁 | `selection.basket.rank_candidates` 提供离线候选行排序；实时 universe 由可信 manifest 和 watchlist 提供。 | 只有基础排序，尚无完整候选池状态、跨标的证据与自动选优闭环；不能把 Top universe 当策略选股结果。扩展依 #73/#99 的实际研究需求。 |
 | **扫描、运行与健康**：实时判断能否稳定产生证据 | `readonly_scan.ScanBatch` 为服务与 Demo dry-run 共用固定 context、加载门禁和 `ScanCycle` 编排；`stage0` 只持久化已完成结果；`signal_service` 直接接收 cycle，调度刷新和扫描，`service_health` 区分数据、扫描、写盘、进程状态。 | #62/#97 的代码交付已完成；长期稳定性不由一次运行或进程存活证明，归 #99。Demo 展示/计划、shadow 与 confirmed 执行仍由 Demo 应用负责。 |
@@ -73,7 +73,7 @@ flowchart LR
 |---|---|---|
 | 数据与上市边界 | [refresh](../mu_strategy/market_data/trusted_data/refresh.py)、[load](../mu_strategy/market_data/trusted_data/load.py) | [分段存储](../tests/test_trusted_segmented_storage.py)、[上市时间](../tests/test_okx_listing_time.py) |
 | 策略与回测 | [registry](../mu_strategy/strategies/registry.py)、[position_rules](../mu_strategy/strategies/position_rules.py)、[backtest](../mu_strategy/backtest.py) | [规则](../tests/test_position_rules.py)、[registry](../tests/test_strategy_registry.py) |
-| 研究与选择 | [robustness](../mu_strategy/research/robustness.py)、[ladder](../mu_strategy/experiments/strategy_ladder.py)、[basket](../mu_strategy/selection/basket.py) | [研究选择](../tests/test_research_selection.py)、[ladder](../tests/test_strategy_ladder.py) |
+| 研究与选择 | [robustness](../mu_strategy/research/robustness.py)、[lab discovery](../mu_strategy/lab/discovery.py)、[lab CLI](../mu_strategy/lab/cli.py)、[basket](../mu_strategy/selection/basket.py) | [研究选择](../tests/test_research_selection.py)、[lab 发现](../tests/test_lab_gates_and_discovery.py)、[lab 工作台](../tests/test_lab_workbench_and_cli.py) |
 | 扫描与运行 | [readonly_scan](../mu_strategy/readonly_scan.py)、[scan_cycle](../mu_strategy/scan_cycle.py)、[signal_service](../mu_strategy/signal_service.py) | [完整输出表征](../tests/test_readonly_scan_equivalence.py)、[严格 reader](../tests/test_readonly_scan_reader.py)、[依赖约束](../tests/test_architecture_dependencies.py)、[服务](../tests/test_signal_service.py) |
 | 通知与人工台账 | [notifications](../mu_strategy/notifications/service.py)、[manual_positions](../mu_strategy/manual_positions.py) | [通知测试入口](email-alerts.md)、[持仓状态](../tests/test_position_state.py) |
 | 人工持仓规则复核 | [position_management](../mu_strategy/position_management.py)、[复核页面](../mu_strategy/viz/position_ledger.py) | [输入、行情与页面回归](../tests/test_position_management.py) |
@@ -94,7 +94,7 @@ flowchart LR
 | [月分段设计](plans/2026-07-28-trusted-generation-segmented-storage-design.md) / [发布设计](plans/2026-07-12-strategy-release-provenance-design.md) | 设计来源与不变量；不能据日期认定失效，也不作为实时状态清单 |
 | [历史参数](fibonacci-preferred-parameters.md) / [旧实施计划](archive/legacy-plans/README.md) | 历史背景，不作为当前策略有效性的证据 |
 
-`mu_strategy.data`、`strategy`、`visualize`、`cli` 的既有导入入口保留（walk-forward 入口位于 `mu_strategy.experiments.walk_forward`）；扁平模块并不表示相应职责不存在。CLI/visualize 的导入路径兼容不恢复旧数据行为。
+`mu_strategy.data`、`strategy`、`visualize`、`cli` 的既有导入入口保留（Phase 2 起 `mu_strategy/lab/` 与 `mu_strategy.lab.cli` 已取代旧版 `mu_strategy/experiments/`）；扁平模块并不表示相应职责不存在。CLI/visualize 的导入路径兼容不恢复旧数据行为。
 
 <a id="filesystem-durability"></a>
 <a id="data"></a>

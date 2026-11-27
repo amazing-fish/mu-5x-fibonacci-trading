@@ -43,6 +43,9 @@ python -m mu_strategy.commands.refresh_market_data --data-dir data\live --html-o
 python -m mu_strategy.cli --days 180 --strategy baseline --report reports\live\mu_okx_backtest.md
 python -m mu_strategy.visualize --days 180 --strategy baseline --output reports\live\mu_backtest.html
 
+# Phase 2 策略发现工作台（mu_strategy/lab/ 已取代旧版 mu_strategy/experiments/）
+python -m mu_strategy.lab.cli discover --data-dir data\live --output-html reports\live\phase2-discovery-workbench.html
+
 # Demo 扫描 dry-run（纯离线：不读私钥、不联网、不下单；仅在显式加 --fetch-instrument-sizing 时查公开合约规格）
 python -m mu_strategy.commands.okx_demo_loop --once --dry-run --limit 10 --days 1 --data-dir data\live
 ```

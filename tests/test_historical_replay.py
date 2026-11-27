@@ -10,7 +10,7 @@ from unittest.mock import patch
 from mu_strategy import cli
 from mu_strategy.canonical import canonical_sha256
 from mu_strategy.commands import okx_demo_loop
-from mu_strategy.experiments import strategy_ladder
+from mu_strategy.lab import cli as lab_cli
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore, candles_content_sha256
 from mu_strategy.research.historical_data import HistoricalGenerationError, load_historical_window
 from mu_strategy.viz import backtest as viz_backtest
@@ -99,7 +99,6 @@ class HistoricalReplayTests(unittest.TestCase):
         for name, module, extra, filenames in (
             ('cli', cli, ['--days', '2', '--report', 'report.md'], ('report.md',)),
             ('visualize', viz_backtest, ['--days', '2', '--output', 'report.html'], ('report.html',)),
-            ('ladder', strategy_ladder, ['--window-days', '1', '--windows', '2', '--report', 'ladder.md', '--html-report', 'ladder.html', '--conclusion-index', 'conclusions.json'], ('ladder.md', 'ladder.html', 'conclusions.json')),
         ):
             with self.subTest(entry=name), TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -126,12 +125,65 @@ class HistoricalReplayTests(unittest.TestCase):
                     self.assertEqual(first, {path: (root / path).read_bytes() for path in filenames})
                 after = file_bytes(data)
                 self.assertEqual({k:v for k,v in before.items() if k != 'current.json'}, {k:v for k,v in after.items() if k != 'current.json'})
-                for filename, content in first.items():
+                for content in first.values():
                     text = content.decode('utf-8')
-                    if filename != 'conclusions.json':
-                        for label in ('historical_replay', RUN_ID, 'code_sha256', 'configuration_sha256', 'content_sha256_by_interval', 'start_ms', 'end_ms'):
-                            self.assertIn(label, text)
-                        self.assertNotIn(str(data), text)
+                    for label in ('historical_replay', RUN_ID, 'code_sha256', 'configuration_sha256', 'content_sha256_by_interval', 'start_ms', 'end_ms'):
+                        self.assertIn(label, text)
+                    self.assertNotIn(str(data), text)
+
+    def test_lab_cli_replays_generation_without_pointer_clock_network_or_data_writes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = copy_generation(root)
+            pointer = data / 'current.json'
+            pointer.write_text('malformed current pointer', encoding='utf-8')
+            before = file_bytes(data)
+            out_json = root / 'lab.json'
+            out_html = root / 'lab.html'
+            out_recipe = root / 'recipe.json'
+            argv = [
+                'mu_strategy.lab.cli',
+                'discover',
+                '--generation-id', RUN_ID,
+                '--data-dir', str(data),
+                '--days', '14',
+                '--families', 'ts_momentum',
+                '--overlays', 'none',
+                '--folds', '2',
+                '--purge-bars', '6',
+                '--output-json', str(out_json),
+                '--output-html', str(out_html),
+                '--recipe-out', str(out_recipe),
+            ]
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(TrustedDataStore, 'read_manifest', side_effect=AssertionError('current pointer used')))
+                stack.enter_context(patch.object(TrustedDataStore, 'write_csv', side_effect=AssertionError('csv writer used')))
+                stack.enter_context(patch.object(TrustedDataStore, 'write_segmented_dataset', side_effect=AssertionError('data writer used')))
+                stack.enter_context(patch.object(TrustedDataStore, 'write_generation_manifest', side_effect=AssertionError('manifest writer used')))
+                stack.enter_context(patch('mu_strategy.market_data.trusted_data.contracts.SystemClock.now_ms', side_effect=AssertionError('wall clock used')))
+                stack.enter_context(patch('urllib.request.urlopen', side_effect=AssertionError('network used')))
+                stack.enter_context(patch('sys.argv', argv))
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                self.assertEqual(0, lab_cli.main())
+                first_json = json.loads(out_json.read_text(encoding='utf-8'))
+                first_recipe = out_recipe.read_bytes()
+                first_html = out_html.read_text(encoding='utf-8')
+                pointer.write_text('{"run_id":"different"}', encoding='utf-8')
+                self.assertEqual(0, lab_cli.main())
+                second_json = json.loads(out_json.read_text(encoding='utf-8'))
+                second_recipe = out_recipe.read_bytes()
+            after = file_bytes(data)
+            self.assertEqual({k: v for k, v in before.items() if k != 'current.json'}, {k: v for k, v in after.items() if k != 'current.json'})
+            self.assertFalse((data / '.bar_cache').exists())
+            self.assertFalse((root / '.bar_cache').exists())
+            self.assertEqual(first_recipe, second_recipe)
+            recipe_obj = json.loads(first_recipe.decode('utf-8'))
+            self.assertTrue(recipe_obj['dry_run_only'])
+            self.assertFalse(recipe_obj['live_orders_allowed'])
+            first_json.pop('runtime_ms', None)
+            second_json.pop('runtime_ms', None)
+            self.assertEqual(first_json, second_json)
+            self.assertNotIn(str(data), first_html)
 
     def test_hash_status_and_timing_failures_do_not_write_reports(self):
         for failure in ('hash', 'failed', 'unusable', 'gap', 'future', 'missing'):

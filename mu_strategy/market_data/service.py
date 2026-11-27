@@ -6,7 +6,7 @@ from mu_strategy.market_data.trusted_data.load import (
     load_trusted_candle_bundle,
 )
 
-# Backwards-compatible alias kept for cache-only consumers (cli, viz, experiments).
+# Backwards-compatible alias kept for cache-only consumers (cli, viz, lab).
 refresh_trusted_candle_bundle = load_trusted_candle_bundle
 
 __all__ = [
