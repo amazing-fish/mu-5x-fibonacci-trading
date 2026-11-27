@@ -72,8 +72,8 @@ Phase 1 与 Phase 2 已将单标的回测引擎、合约/成本/资金费率建�
 设共有 $N \ge \text{min\_symbols}$ 个标的参与评估（其中硬性下限 $\text{min\_symbols} \ge 2$，默认 $4$；因 $N=1$ 时零分布均匀分位的标准差约 $100/\sqrt{12}\approx 28.87$，即便实测排第一也有 $z_{\text{corr}} \le 50/28.87 \approx 1.73 < 2.0$，故在面板准入期即拒绝单标的输入。面板零分布采用**跨标的日期块同步抽样**：第 $m=1\dots M$ 次抽样对所有标的共用同一交易日块索引序列，保留标的间的同期横截面相关性）：
 - **相关性校正分位标准误与 $z_{\text{corr}}$**：先在每条同步零分布面板抽样 $m$ 上计算横截面平均经验分位 $\bar{p}^{(m)} = \frac{1}{N}\sum_{i=1}^N p_i^{(m)}$（其中 $p_i^{(m)}$ 为标的 $i$ 第 $m$ 条合成路径相对于该标的其余 $M-1$ 条合成路径的经验分位），再计算同步零抽样的经验标准误 $\text{SE}_{\text{corr}} = \operatorname{std}(\{\bar{p}^{(m)}\}_{m=1}^M)$，并与朴素独立标准误 $\text{SE}_{\text{naive}} = s_p / \sqrt{N}$ 取上限以保持 fail-closed：
   $$z_{\text{corr}} = \frac{\bar{p} - 50}{\max(\text{SE}_{\text{corr}},\, \text{SE}_{\text{naive}})}$$
-  `SE_naive` 与 `z_naive` 仅作诊断列示，不单独用于放行判定。
-- **时间聚类推断（Time-Clustered Inference）**：为消除多标的同期市场 Beta 共振导致的 $t$ 值约 $2\times$ 虚高，按日历周期 $t$（如每个交易日）构建横截面超额收益序列 $d_t = \frac{1}{N_t}\sum_{i \in S_t} (r_{i,t}^{\text{strat}} - r_{i,t}^{\text{bh}})$，采用 Newey-West / 块聚类标准误计算聚类 $t_{\text{cluster}}$，并与同期相关性诊断一并纳入判定与报告。
+  若分母 $\max(\text{SE}_{\text{corr}},\, \text{SE}_{\text{naive}}) \le 0$ 或非有限（如零成交、平盘价格序列导致全部合成路径打平），严禁执行除法，`z_corr` 置为 `null` 并直接返回带明确原因（`zero_or_non_finite_se`）的 `FAIL` 报告。`SE_naive` 与 `z_naive` 仅作诊断列示，不单独用于放行判定。
+- **时间聚类推断（Time-Clustered Inference）**：为消除多标的同期市场 Beta 共振导致的 $t$ 值约 $2\times$ 虚高，按日历周期 $t$（如每个交易日）构建横截面超额收益序列 $d_t = \frac{1}{N_t}\sum_{i \in S_t} (r_{i,t}^{\text{strat}} - r_{i,t}^{\text{bh}})$，采用 Newey-West / 块聚类标准误计算聚类 $t_{\text{cluster}}$（若聚类标准误 $\le 0$ 或非有限同样不作除法并返回 `FAIL`），并与同期相关性诊断一并纳入判定与报告。
 - **尾部与胜率计数**：
   - 分位 `> 90` 的标的个数 vs 零假设期望值 $N \times 0.1$。
   - 扣费与扣资金费后跑赢同窗 1x 持有的标的数量及比例 $k / N$。
