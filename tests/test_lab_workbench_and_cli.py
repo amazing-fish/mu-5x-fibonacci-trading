@@ -652,6 +652,81 @@ class LabCliTests(unittest.TestCase):
                 eff["stress_scenarios"],
             )
 
+    def test_cli_reads_candles_and_funding_once_and_pins_provenance_hash_to_parsed_snapshot(self):
+        # P2R2-01: single snapshot capture + hash eliminates TOCTOU between hashing and parsing
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candles = _synthetic_candles(240)
+            csv_path = root / "candles_1h.csv"
+            write_csv(candles, csv_path)
+            funding = FundingSeries.synthetic_constant_apr(
+                "okx:MU-USDT-SWAP",
+                start_ms=candles[0].open_time_ms - _HOUR_MS,
+                end_ms=candles[-1].open_time_ms + _HOUR_MS,
+                interval_hours=8,
+                apr=0.10,
+            )
+            funding_path = root / "funding.json"
+            funding.to_json_file(funding_path)
+
+            expected_csv_sha = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+            expected_funding_sha = hashlib.sha256(funding_path.read_bytes()).hexdigest()
+
+            real_snapshot = lab_cli._read_file_snapshot
+            reads: list[Path] = []
+
+            def snapshot_then_corrupt_disk(path: Path) -> tuple[bytes, str]:
+                resolved = path.resolve()
+                reads.append(resolved)
+                data, digest = real_snapshot(path)
+                # Mutate the on-disk file immediately after the single snapshot read:
+                # if discovery re-read the file later, parsing would crash on corrupted bytes!
+                path.write_text("CORRUPTED_AFTER_SNAPSHOT", encoding="utf-8")
+                return data, digest
+
+            out_json = root / "out" / "single_read.json"
+            with (
+                patch.object(lab_cli, "_read_file_snapshot", side_effect=snapshot_then_corrupt_disk),
+                patch.object(FundingSeries, "from_json_file", side_effect=AssertionError("must use from_json_text")),
+                redirect_stdout(io.StringIO()),
+            ):
+                rc = lab_cli.main(
+                    [
+                        "discover",
+                        "--data-dir",
+                        str(root / "unused_live"),
+                        "--candles-file",
+                        str(csv_path),
+                        "--funding-file",
+                        str(funding_path),
+                        "--families",
+                        "ts_momentum",
+                        "--overlays",
+                        "none",
+                        "--folds",
+                        "2",
+                        "--purge-bars",
+                        "6",
+                        "--output-json",
+                        str(out_json),
+                    ]
+                )
+
+            self.assertEqual(0, rc)
+            self.assertEqual([csv_path.resolve(), funding_path.resolve()], reads)
+            payload = json.loads(out_json.read_text(encoding="utf-8"))
+            self.assertEqual(expected_csv_sha, payload["provenance"]["dataset_sha256"])
+            self.assertEqual(expected_funding_sha, payload["provenance"]["funding_sha256"])
+            self.assertTrue(payload["funding_verified"])
+
+            # Verify invalid UTF-8 bytes in input fail cleanly with exit code 2
+            bad_csv = root / "bad_utf8.csv"
+            bad_csv.write_bytes(b"\xff\xfe\x00invalid")
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as exc:
+                    lab_cli.main(["discover", "--data-dir", str(root / "unused_live"), "--candles-file", str(bad_csv)])
+            self.assertEqual(2, exc.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()

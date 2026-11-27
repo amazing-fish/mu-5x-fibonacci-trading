@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import math
 import time
 from types import MappingProxyType
@@ -1034,6 +1034,8 @@ def discover_strategies(
         "stress_apr": _jnum(cfg.stress_apr, 4),
         "stress_scenarios": list(_STRESS_SCENARIO_IDS),
         "cost_model": cost_model.to_dict(),
+        "gate_config": asdict(gate_cfg),
+        "instrument": instrument.to_dict(),
     }
     return DiscoveryReport(
         symbol=instrument.symbol, interval=series.interval, starting_equity=cfg.starting_equity,

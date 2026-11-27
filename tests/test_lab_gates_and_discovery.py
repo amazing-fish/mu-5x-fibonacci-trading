@@ -561,6 +561,50 @@ class DiscoveryEngineIntegrationTests(unittest.TestCase):
         self.assertEqual("flat", nogo_recipe["best_rejected_candidate"]["params"]["note"])
         json.dumps(nogo_recipe, allow_nan=False)
 
+    def test_effective_config_serializes_gate_config_and_instrument_spec(self) -> None:
+        # P2R2-02 regression: custom GateConfig and InstrumentSpec must appear in effective_config.
+        series = _synthetic_series(n_bars=1000, symbol="ETH-USDT-SWAP")
+        custom_inst = okx_swap_spec(
+            "ETH-USDT-SWAP",
+            tick_size="0.05",
+            lot_size="0.1",
+            min_size="0.2",
+            contract_value="0.1",
+            max_leverage=10.0,
+            funding_interval_hours=8,
+        )
+        custom_gate = GateConfig(min_dsr_warn=0.90, max_drawdown=0.18, min_oos_trades=20)
+        entry = StrategyCatalogEntry(
+            "singleton_eth",
+            "Singleton ETH",
+            lambda _p: _DummyWeightStrategy(weight=0.0),
+            ParamSpace((ParamSpec("weight", "float", 0.0, choices=(0.0,)),)),
+        )
+        report = discover_strategies(
+            series,
+            custom_inst,
+            CostModel.okx_default(),
+            funding=_synthetic_funding(series, custom_inst.instrument_id),
+            catalog=[entry],
+            config=DiscoveryConfig(
+                overlay_names=("none",),
+                stress_apr=0.25,
+                gate_config=custom_gate,
+            ),
+        )
+        payload = report.to_dict()
+        json.dumps(payload, allow_nan=False)
+        eff = payload["effective_config"]
+        self.assertIn("gate_config", eff)
+        self.assertIn("instrument", eff)
+        self.assertEqual(0.90, eff["gate_config"]["min_dsr_warn"])
+        self.assertEqual(0.18, eff["gate_config"]["max_drawdown"])
+        self.assertEqual(20, eff["gate_config"]["min_oos_trades"])
+        self.assertEqual(0.25, eff["gate_config"]["stress_apr"])
+        self.assertEqual(custom_inst.to_dict(), eff["instrument"])
+        self.assertEqual("0.05", eff["instrument"]["tick_size"])
+        self.assertEqual(10.0, eff["instrument"]["max_leverage"])
+
 
 if __name__ == "__main__":
     unittest.main()

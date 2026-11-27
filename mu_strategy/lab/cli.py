@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 from mu_strategy.core.instrument import CostModel, FixedTicks, InstrumentSpec, okx_swap_spec, spot_spec
-from mu_strategy.data import read_csv
+from mu_strategy.data import read_csv_text
 from mu_strategy.market_data.bar_series import BarSeries
 from mu_strategy.market_data.funding import FundingSeries
 from mu_strategy.market_data.trusted_data.contracts import AvailabilityState, IntegrityState, ManifestSchemaError
@@ -44,12 +44,9 @@ def _guard_output_not_overwriting_input(output_path: Path | None, input_path: Pa
         raise ValueError(f"refusing to overwrite input {label}: {output_path}")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _read_file_snapshot(path: Path) -> tuple[bytes, str]:
+    raw = path.read_bytes()
+    return raw, hashlib.sha256(raw).hexdigest()
 
 
 def _resolve_code_revision() -> str:
@@ -102,8 +99,12 @@ def _load_bar_series_with_hash(
     """Load candles strictly in memory with ZERO disk writes, ZERO .bar_cache, and ZERO network calls."""
     dataset_sha256: str | None
     if candles_file is not None:
-        dataset_sha256 = _sha256_file(candles_file)
-        candles = read_csv(candles_file)
+        raw_bytes, dataset_sha256 = _read_file_snapshot(candles_file)
+        try:
+            candles_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"failed to decode candles CSV {candles_file}: {exc}") from exc
+        candles = read_csv_text(candles_text)
     else:
         store = TrustedDataStore(data_dir=data_dir)
         manifest_result = (
@@ -342,12 +343,19 @@ def _run_discover(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             days=args.days,
         )
         cost_model = _build_cost_model(args.fee_profile)
-        funding_sha256 = _sha256_file(args.funding_file) if args.funding_file is not None else None
-        funding = (
-            FundingSeries.from_json_file(args.funding_file, instrument_id=instrument.instrument_id)
-            if args.funding_file is not None
-            else None
-        )
+        funding_sha256: str | None = None
+        funding: FundingSeries | None = None
+        if args.funding_file is not None:
+            raw_funding, funding_sha256 = _read_file_snapshot(args.funding_file)
+            try:
+                funding_text = raw_funding.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"failed to decode funding JSON {args.funding_file}: {exc}") from exc
+            funding = FundingSeries.from_json_text(
+                funding_text,
+                instrument_id=instrument.instrument_id,
+                source_label=str(args.funding_file),
+            )
         provenance: dict[str, Any] = {
             "dataset_sha256": dataset_sha256,
             "funding_sha256": funding_sha256,
