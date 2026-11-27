@@ -8,13 +8,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "mu_strategy"
-SCANNED_PACKAGES = ("core", "entry", "execution", "strategies")
+SCANNED_PACKAGES = ("core", "engine", "entry", "execution", "strategies")
 FORBIDDEN_IMPORTS = (
     "mu_strategy.cli",
     "mu_strategy.commands",
     "mu_strategy.viz",
     "mu_strategy.live",
     "mu_strategy.demo_trading",
+)
+ENGINE_FORBIDDEN_IMPORTS = FORBIDDEN_IMPORTS + (
+    "mu_strategy.notifications",
+    "smtplib",
+    "mu_strategy.market_data.service",
+    "mu_strategy.market_data.trusted_data.refresh",
+    "mu_strategy.backtest",
+    "mu_strategy.experiments",
+    "mu_strategy.entry",
+    "mu_strategy.execution",
+)
+STRATEGY_PROTOCOL_FORBIDDEN_IMPORTS = ENGINE_FORBIDDEN_IMPORTS + (
+    "mu_strategy.engine",
 )
 LOW_LEVEL_DEPENDENCY_RULES = (
     (Path("models.py"), ("mu_strategy",)),
@@ -131,6 +144,101 @@ with TemporaryDirectory() as directory, patch("socket.create_connection", side_e
             violations,
             "Forbidden low-level entry-contract imports:\n" + "\n".join(violations),
         )
+
+    def test_engine_and_strategy_protocol_layers_respect_layer_boundaries(self):
+        violations: list[str] = []
+
+        # Layer 3: mu_strategy/engine/
+        engine_dir = PACKAGE_ROOT / "engine"
+        self.assertTrue(engine_dir.is_dir(), "mu_strategy/engine package must exist")
+        for path in sorted(engine_dir.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            package = ".".join(path.relative_to(REPO_ROOT).parts[:-1])
+            for line_number, statement in _forbidden_import_statements(
+                source,
+                package=package,
+                forbidden_imports=ENGINE_FORBIDDEN_IMPORTS,
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
+
+        # Layer 2: protocol.py, features.py, and strategies/families/
+        layer2_paths = [
+            PACKAGE_ROOT / "strategies" / "protocol.py",
+            PACKAGE_ROOT / "strategies" / "features.py",
+        ]
+        families_dir = PACKAGE_ROOT / "strategies" / "families"
+        self.assertTrue(families_dir.is_dir(), "mu_strategy/strategies/families package must exist")
+        layer2_paths.extend(sorted(families_dir.rglob("*.py")))
+
+        for path in layer2_paths:
+            self.assertTrue(path.is_file(), f"expected Layer 2 module {path}")
+            source = path.read_text(encoding="utf-8")
+            package = ".".join(path.relative_to(REPO_ROOT).parts[:-1])
+            for line_number, statement in _forbidden_import_statements(
+                source,
+                package=package,
+                forbidden_imports=STRATEGY_PROTOCOL_FORBIDDEN_IMPORTS,
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
+
+        # Layer 1: core/instrument.py must stay pure domain (no engine/strategies/market_data/adapters)
+        instrument_path = PACKAGE_ROOT / "core" / "instrument.py"
+        if instrument_path.is_file():
+            source = instrument_path.read_text(encoding="utf-8")
+            for line_number, statement in _forbidden_import_statements(
+                source,
+                package="mu_strategy.core",
+                forbidden_imports=STRATEGY_PROTOCOL_FORBIDDEN_IMPORTS + (
+                    "mu_strategy.strategies",
+                    "mu_strategy.market_data",
+                ),
+            ):
+                violations.append(f"{instrument_path.relative_to(REPO_ROOT).as_posix()}:{line_number}: {statement}")
+
+        self.assertEqual(
+            [],
+            violations,
+            "Forbidden Layer 1/2/3 boundary imports:\n" + "\n".join(violations),
+        )
+
+    def test_engine_and_protocol_imports_cannot_reach_brokers_or_refresh_transitively(self):
+        code = '''
+import importlib.abc
+import sys
+
+class NoApplicationAdapters(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        forbidden = (
+            "mu_strategy.cli",
+            "mu_strategy.commands",
+            "mu_strategy.viz",
+            "mu_strategy.live",
+            "mu_strategy.demo_trading",
+            "mu_strategy.notifications",
+            "mu_strategy.market_data.service",
+            "mu_strategy.market_data.trusted_data.refresh",
+            "smtplib",
+        )
+        if any(fullname == name or fullname.startswith(name + ".") for name in forbidden):
+            raise AssertionError("Layer 1-3 imported forbidden module " + fullname)
+
+sys.meta_path.insert(0, NoApplicationAdapters())
+import mu_strategy.core.instrument
+import mu_strategy.market_data.funding
+import mu_strategy.market_data.bar_series
+import mu_strategy.strategies.protocol
+import mu_strategy.strategies.features
+import mu_strategy.strategies.families
+import mu_strategy.engine
+'''
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
 
 
 def _forbidden_import_statements(
