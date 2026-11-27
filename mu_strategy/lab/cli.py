@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from mu_strategy.core.instrument import CostModel, FixedTicks, InstrumentSpec, okx_swap_spec, spot_spec
@@ -14,7 +16,7 @@ from mu_strategy.market_data.bar_series import BarSeries
 from mu_strategy.market_data.funding import FundingSeries
 from mu_strategy.market_data.trusted_data.contracts import AvailabilityState, IntegrityState, ManifestSchemaError
 from mu_strategy.market_data.trusted_data.store import TrustedDataStore
-from mu_strategy.market_data.utils import DAY_MS
+from mu_strategy.market_data.utils import DAY_MS, interval_to_ms
 from mu_strategy.strategy import FEE_PROFILE_CHOICES
 from mu_strategy.lab.workbench_html import write_workbench_html
 
@@ -33,6 +35,38 @@ def _guard_output_not_in_data_dir(output_path: Path | None, data_dir: Path | Non
     resolved_data = data_dir.resolve(strict=False)
     if resolved_out == resolved_data or resolved_data in resolved_out.parents:
         raise ValueError(f"refusing to write output inside read-only data directory: {output_path}")
+
+
+def _guard_output_not_overwriting_input(output_path: Path | None, input_path: Path | None, label: str) -> None:
+    if output_path is None or input_path is None:
+        return
+    if output_path.resolve(strict=False) == input_path.resolve(strict=False):
+        raise ValueError(f"refusing to overwrite input {label}: {output_path}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_code_revision() -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    rev = proc.stdout.strip()
+    return rev if proc.returncode == 0 and rev else "unknown"
 
 
 def _build_instrument(symbol: str) -> InstrumentSpec:
@@ -56,7 +90,7 @@ def _build_cost_model(fee_profile: str) -> CostModel:
     return CostModel.okx_default()
 
 
-def _load_bar_series_readonly(
+def _load_bar_series_with_hash(
     *,
     symbol: str,
     interval: str,
@@ -64,9 +98,11 @@ def _load_bar_series_readonly(
     candles_file: Path | None,
     generation_id: str | None,
     days: int | None,
-) -> BarSeries:
+) -> tuple[BarSeries, str | None]:
     """Load candles strictly in memory with ZERO disk writes, ZERO .bar_cache, and ZERO network calls."""
+    dataset_sha256: str | None
     if candles_file is not None:
+        dataset_sha256 = _sha256_file(candles_file)
         candles = read_csv(candles_file)
     else:
         store = TrustedDataStore(data_dir=data_dir)
@@ -95,7 +131,7 @@ def _load_bar_series_readonly(
                 f"trusted dataset ({symbol}, {interval}) is unavailable or invalid "
                 f"(availability={health.availability.value}, integrity={health.integrity.value})"
             )
-        candles, _ = store.read_generation_dataset_with_hash(
+        candles, computed_sha256 = store.read_generation_dataset_with_hash(
             snapshot,
             symbol=symbol,
             interval=interval,
@@ -104,16 +140,40 @@ def _load_bar_series_readonly(
             verify_logical=True,
             compute_hash=True,
         )
+        dataset_sha256 = computed_sha256 or health.content_sha256
     if not candles:
         raise ValueError(f"no candles loaded for {symbol} ({interval})")
     if days is not None:
         if days <= 0:
             raise ValueError("--days must be positive")
-        cutoff_ms = candles[-1].open_time_ms - (days * DAY_MS)
+        bar_ms = interval_to_ms(interval)
+        last_close_ms = candles[-1].open_time_ms + bar_ms
+        cutoff_ms = last_close_ms - (days * DAY_MS)
         candles = [c for c in candles if c.open_time_ms >= cutoff_ms]
         if not candles:
             raise ValueError(f"no candles within requested {days}-day window")
-    return BarSeries.from_candles(symbol, interval, candles)
+    return BarSeries.from_candles(symbol, interval, candles), dataset_sha256
+
+
+def _load_bar_series_readonly(
+    *,
+    symbol: str,
+    interval: str,
+    data_dir: Path,
+    candles_file: Path | None,
+    generation_id: str | None,
+    days: int | None,
+) -> BarSeries:
+    """Load candles strictly in memory (compatibility wrapper returning only BarSeries)."""
+    series, _ = _load_bar_series_with_hash(
+        symbol=symbol,
+        interval=interval,
+        data_dir=data_dir,
+        candles_file=candles_file,
+        generation_id=generation_id,
+        days=days,
+    )
+    return series
 
 
 def _format_summary_table(report_dict: Mapping[str, Any]) -> str:
@@ -242,10 +302,11 @@ def _run_discover(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     if not args.dry_run:
         parser.error("live order execution is forbidden in mu_strategy.lab.cli; --dry-run must remain enabled")
 
-    guard_dir = None if args.candles_file is not None else args.data_dir
     try:
         for out_path in (args.output_html, args.output_json, args.recipe_out):
-            _guard_output_not_in_data_dir(out_path, guard_dir)
+            _guard_output_not_in_data_dir(out_path, args.data_dir)
+            _guard_output_not_overwriting_input(out_path, args.candles_file, "--candles-file")
+            _guard_output_not_overwriting_input(out_path, args.funding_file, "--funding-file")
         selected_overlays = _parse_csv_tokens(args.overlays)
         available_overlays = overlay_presets()
         unknown_overlays = [name for name in selected_overlays if name not in available_overlays]
@@ -272,7 +333,7 @@ def _run_discover(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 )
             catalog = tuple(by_id[name] for name in requested)
 
-        series = _load_bar_series_readonly(
+        series, dataset_sha256 = _load_bar_series_with_hash(
             symbol=args.symbol,
             interval=args.interval,
             data_dir=args.data_dir,
@@ -281,11 +342,21 @@ def _run_discover(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             days=args.days,
         )
         cost_model = _build_cost_model(args.fee_profile)
+        funding_sha256 = _sha256_file(args.funding_file) if args.funding_file is not None else None
         funding = (
             FundingSeries.from_json_file(args.funding_file, instrument_id=instrument.instrument_id)
             if args.funding_file is not None
             else None
         )
+        provenance: dict[str, Any] = {
+            "dataset_sha256": dataset_sha256,
+            "funding_sha256": funding_sha256,
+            "code_revision": _resolve_code_revision(),
+            "fee_profile": args.fee_profile,
+            "data_source": "candles_file" if args.candles_file is not None else "trusted_store",
+            "generation_id": args.generation_id,
+            "days": args.days,
+        }
         config = DiscoveryConfig(
             n_folds=args.folds,
             purge_bars=args.purge_bars,
@@ -298,6 +369,7 @@ def _run_discover(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             funding=funding,
             catalog=catalog,
             config=config,
+            provenance=provenance,
         )
     except (ValueError, KeyError, FileNotFoundError, ManifestSchemaError) as exc:
         parser.error(str(exc))

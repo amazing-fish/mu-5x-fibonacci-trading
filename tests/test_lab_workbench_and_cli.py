@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import math
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -123,10 +126,122 @@ def _sample_report_dict() -> dict:
                 "folds": [
                     {"fold_index": 0, "oos_total_return": 0.08, "oos_sharpe": 1.3, "oos_max_drawdown": 0.09, "oos_trades": 9}
                 ],
+                "stress_scenarios": [
+                    {"scenario_id": "slippage_10bp", "label": "Slippage +10bp", "available": True, "passed": True, "total_return": 0.19, "liquidations": 0, "detail": "ok"},
+                    {"scenario_id": "funding_0pct_apr", "label": "Funding 0% APR", "available": True, "passed": True, "total_return": 0.25, "liquidations": 0, "detail": "ok"},
+                    {"scenario_id": "funding_15pct_apr", "label": "Funding +15% APR", "available": True, "passed": True, "total_return": 0.20, "liquidations": 0, "detail": "ok"},
+                    {"scenario_id": "funding_30pct_apr", "label": "Funding +30% APR", "available": True, "passed": False, "total_return": -0.02, "liquidations": 0, "detail": "negative"},
+                ],
                 "curve": [[1775000000000, 10000.0], [1780000000000, 11100.0], [1785000000000, 12400.0]],
             }
         ],
     }
+
+
+def _run_workbench_dom_probe(html_doc: str, *, expand_first: bool = False, collapse_after: bool = False) -> dict:
+    """Execute the standalone workbench inline script in a lightweight Node DOM harness."""
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node executable not available for DOM probe")
+    harness = r"""
+const fs = require("fs");
+const html = fs.readFileSync(0, "utf8");
+const opts = JSON.parse(process.argv[1]);
+const dataMatch = html.match(/<script id="discovery-data" type="application\/json">([\s\S]*?)<\/script>/);
+if (!dataMatch) throw new Error("missing discovery-data");
+const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+if (scripts.length !== 1) throw new Error("expected 1 inline script");
+
+const elements = new Map();
+function makeEl(id, tag = "div", attrs = {}) {
+  const listeners = {};
+  const classSet = new Set();
+  const el = {
+    id, tag, dataset: { ...attrs }, _html: "", _cache: {}, textContent: "", value: "", style: {}, focused: false,
+    classList: {
+      add: (c) => classSet.add(c),
+      remove: (c) => classSet.delete(c),
+      toggle: (c, f) => (f === undefined ? (classSet.has(c) ? classSet.delete(c) : classSet.add(c)) : (f ? classSet.add(c) : classSet.delete(c))),
+    },
+    set innerHTML(v) { this._html = String(v); this._cache = {}; },
+    get innerHTML() { return this._html; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k]; },
+    focus() { this.focused = true; },
+    addEventListener(ev, fn) { (listeners[ev] ||= []).push(fn); },
+    dispatch(ev, obj = {}) { (listeners[ev] || []).forEach((fn) => fn({ target: el, stopPropagation() {}, ...obj })); },
+    querySelectorAll(sel) {
+      if (this._cache[sel]) return this._cache[sel];
+      if (sel === ".leg-item") {
+        this._cache[sel] = [...this._html.matchAll(/data-key="([^"]+)"/g)].map((m) => makeEl("", "button", { key: m[1] }));
+        return this._cache[sel];
+      }
+      if (sel === "button.row-toggle") {
+        const out = [];
+        for (const m of this._html.matchAll(/<button[^>]*class="row-toggle"[^>]*data-id="([^"]+)"[^>]*aria-expanded="([^"]+)"[^>]*>/g)) {
+          const b = makeEl("", "button", { id: m[1] });
+          b.setAttribute("aria-expanded", m[2]);
+          out.push(b);
+        }
+        this._cache[sel] = out;
+        return out;
+      }
+      if (sel === "tr.cand-row") {
+        this._cache[sel] = [...this._html.matchAll(/<tr class="cand-row[^"]*" data-id="([^"]+)"/g)].map((m) => makeEl("", "tr", { id: m[1] }));
+        return this._cache[sel];
+      }
+      return [];
+    },
+    getBoundingClientRect() { return { left: 0, width: 1120, top: 0, height: 270 }; },
+  };
+  if (id) elements.set(id, el);
+  return el;
+}
+["headerSub","kpiGrid","themeBtn","scaleLinearBtn","scaleLogBtn","resetLegendBtn","chartLegend","chartWrap","equitySvg","ddSvg","chartTip","candCount","searchBox","matrixBody","attrTarget","attrPanel","copyRecipeBtn","recipeBanner","recipeBox","eqCross","ddCross","eqHit","ddHit"].forEach((id) => makeEl(id));
+elements.set("discovery-data", { textContent: dataMatch[1] });
+const filterBtns = ["ALL","GO","CONDITIONAL","NO_GO"].map((f) => makeEl("", "button", { filter: f }));
+const sortThs = ["rank","name","total_return","max_drawdown","sharpe","dsr","calmar","trades","liquidations","verdict"].map((s) => makeEl("", "th", { sort: s }));
+const document = {
+  documentElement: { setAttribute(k, v) { this[k] = v; } },
+  getElementById: (id) => elements.get(id) || makeEl(id),
+  querySelectorAll: (sel) => (sel === "[data-filter]" ? filterBtns : (sel === "th[data-sort]" ? sortThs : [])),
+  createElement: (tag) => makeEl("", tag),
+  body: { appendChild() {}, removeChild() {} },
+};
+const navigator = { clipboard: { writeText: () => Promise.resolve() } };
+new Function("document", "navigator", scripts[0])(document, navigator);
+
+const matrixBody = elements.get("matrixBody");
+const beforeHtml = matrixBody.innerHTML;
+let expandedHtml = null;
+let collapsedHtml = null;
+const initialBtns = matrixBody.querySelectorAll("button.row-toggle");
+if (opts.expand_first && initialBtns.length > 0) {
+  initialBtns[0].dispatch("click");
+  expandedHtml = matrixBody.innerHTML;
+  const expandedBtns = matrixBody.querySelectorAll("button.row-toggle");
+  if (opts.collapse_after && expandedBtns.length > 0) {
+    expandedBtns[0].dispatch("click");
+    collapsedHtml = matrixBody.innerHTML;
+  }
+}
+console.log(JSON.stringify({
+  beforeHtml,
+  expandedHtml,
+  collapsedHtml,
+  recipeBannerHtml: elements.get("recipeBanner").innerHTML,
+  recipeBoxText: elements.get("recipeBox").textContent,
+}));
+"""
+    proc = subprocess.run(
+        [node, "-e", harness, json.dumps({"expand_first": expand_first, "collapse_after": collapse_after})],
+        input=html_doc,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 class WorkbenchHtmlTests(unittest.TestCase):
@@ -203,6 +318,47 @@ class WorkbenchHtmlTests(unittest.TestCase):
         self.assertIn("MU-USDT-SWAP", rendered)
         self.assertNotIn("http://", rendered)
         self.assertNotIn("https://", rendered)
+
+    def test_workbench_disclosure_button_stress_matrix_and_fail_closed_verdict(self):
+        # P2R1-10 & P2R1-11 (perp all 4 scenarios + keyboard disclosure button + aria-expanded)
+        perp_html = render_workbench_html(_sample_report_dict())
+        perp_dom = _run_workbench_dom_probe(perp_html, expand_first=True, collapse_after=True)
+        self.assertIn('class="row-toggle"', perp_dom["beforeHtml"])
+        self.assertIn('aria-expanded="false"', perp_dom["beforeHtml"])
+        self.assertIn('aria-expanded="true"', perp_dom["expandedHtml"])
+        for label in ("Stress Matrix", "Slippage +10bp", "Funding 0% APR", "Funding +15% APR", "Funding +30% APR"):
+            self.assertIn(label, perp_dom["expandedHtml"])
+        self.assertIn('aria-expanded="false"', perp_dom["collapsedHtml"])
+        self.assertNotIn("detail-row", perp_dom["collapsedHtml"])
+
+        # P2R1-11 (spot unavailable funding scenarios explicitly rendered as N/A + empty stress graceful)
+        spot_payload = _sample_report_dict()
+        spot_payload["candidates"][0]["stress_scenarios"] = [
+            {"scenario_id": "slippage_10bp", "label": "Slippage +10bp", "available": True, "passed": True, "total_return": 0.15, "liquidations": 0, "detail": "ok"},
+            {"scenario_id": "funding_0pct_apr", "label": "Funding 0% APR", "available": False, "passed": None, "total_return": None, "liquidations": None, "detail": "N/A — spot instrument"},
+            {"scenario_id": "funding_15pct_apr", "label": "Funding +15% APR", "available": False, "passed": None, "total_return": None, "liquidations": None, "detail": "N/A — spot instrument"},
+            {"scenario_id": "funding_30pct_apr", "label": "Funding +30% APR", "available": False, "passed": None, "total_return": None, "liquidations": None, "detail": "N/A — spot instrument"},
+        ]
+        spot_dom = _run_workbench_dom_probe(render_workbench_html(spot_payload), expand_first=True)
+        self.assertEqual(3, spot_dom["expandedHtml"].count(">N/A<"))
+        self.assertIn("N/A — spot instrument", spot_dom["expandedHtml"])
+        self.assertNotIn("NaN", spot_dom["expandedHtml"])
+
+        missing_stress = _sample_report_dict()
+        missing_stress["candidates"][0].pop("stress_scenarios", None)
+        missing_dom = _run_workbench_dom_probe(render_workbench_html(missing_stress), expand_first=True)
+        self.assertIn("No stress scenario data.", missing_dom["expandedHtml"])
+
+        # P2R1-12: recipe={} / unknown verdict MUST fail closed (never render green GO banner)
+        empty_report = {**_sample_report_dict(), "candidates": []}
+        for bad_recipe in ({}, {"verdict": "UNKNOWN"}):
+            with self.subTest(recipe=bad_recipe):
+                dom = _run_workbench_dom_probe(render_workbench_html(empty_report, recipe=bad_recipe))
+                self.assertIn("UNVERIFIED VERDICT", dom["recipeBannerHtml"])
+                self.assertNotIn("Candidate passed all 6 gates", dom["recipeBannerHtml"])
+
+        go_dom = _run_workbench_dom_probe(render_workbench_html(_sample_report_dict(), recipe={"verdict": "GO"}))
+        self.assertIn("GO: Candidate passed all 6 gates", go_dom["recipeBannerHtml"])
 
 
 class LabCliTests(unittest.TestCase):
@@ -379,6 +535,122 @@ class LabCliTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(0, rc_replay)
+
+    def test_days_trailing_window_uses_final_close_boundary_exact_24_bars(self):
+        # P2R1-01: 48 hourly bars trimmed to --days 1 must retain exactly 24 bars (not 25)
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "candles_48h.csv"
+            candles = _synthetic_candles(48)
+            write_csv(candles, csv_path)
+            series_1d = lab_cli._load_bar_series_readonly(
+                symbol="MU-USDT-SWAP",
+                interval="1h",
+                data_dir=Path(tmp) / "unused_live",
+                candles_file=csv_path,
+                generation_id=None,
+                days=1,
+            )
+            self.assertEqual(24, len(series_1d))
+            self.assertEqual(candles[24].open_time_ms, series_1d.open_times[0])
+            self.assertEqual(candles[47].open_time_ms, series_1d.open_times[-1])
+
+            series_2d = lab_cli._load_bar_series_readonly(
+                symbol="MU-USDT-SWAP",
+                interval="1h",
+                data_dir=Path(tmp) / "unused_live",
+                candles_file=csv_path,
+                generation_id=None,
+                days=2,
+            )
+            self.assertEqual(48, len(series_2d))
+
+    def test_cli_guards_data_dir_with_candles_file_and_rejects_input_overwrites(self):
+        # P2R1-02 & P2R1-03
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "live"
+            data_dir.mkdir()
+            pointer = data_dir / "current.json"
+            pointer.write_text('{"schema_version":1}', encoding="utf-8")
+
+            candles = _synthetic_candles(240)
+            csv_path = root / "candles_1h.csv"
+            write_csv(candles, csv_path)
+            funding = FundingSeries.synthetic_constant_apr(
+                "okx:MU-USDT-SWAP",
+                start_ms=candles[0].open_time_ms - _HOUR_MS,
+                end_ms=candles[-1].open_time_ms + _HOUR_MS,
+                interval_hours=8,
+                apr=0.10,
+            )
+            funding_path = root / "funding.json"
+            funding.to_json_file(funding_path)
+
+            data_before = _snapshot_tree(data_dir)
+            csv_before = csv_path.read_bytes()
+            funding_before = funding_path.read_bytes()
+
+            blocked_cases = (
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--output-json", str(pointer)],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--output-html", str(data_dir / "x.html")],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--recipe-out", str(data_dir / "r.json")],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--output-json", str(csv_path)],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--output-html", str(csv_path)],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--funding-file", str(funding_path), "--output-json", str(funding_path)],
+                ["discover", "--data-dir", str(data_dir), "--candles-file", str(csv_path), "--funding-file", str(funding_path), "--recipe-out", str(funding_path)],
+            )
+            for argv in blocked_cases:
+                with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exc:
+                        lab_cli.main(argv)
+                    self.assertEqual(2, exc.exception.code)
+
+            self.assertEqual(data_before, _snapshot_tree(data_dir))
+            self.assertEqual(csv_before, csv_path.read_bytes())
+            self.assertEqual(funding_before, funding_path.read_bytes())
+
+            # External output path + provenance/effective_config check (P2R1-02 + P2R1-04)
+            out_json = root / "out" / "report.json"
+            with redirect_stdout(io.StringIO()):
+                rc = lab_cli.main(
+                    [
+                        "discover",
+                        "--data-dir",
+                        str(data_dir),
+                        "--candles-file",
+                        str(csv_path),
+                        "--funding-file",
+                        str(funding_path),
+                        "--families",
+                        "ts_momentum",
+                        "--overlays",
+                        "none",
+                        "--folds",
+                        "2",
+                        "--purge-bars",
+                        "6",
+                        "--fee-profile",
+                        "limit",
+                        "--output-json",
+                        str(out_json),
+                    ]
+                )
+            self.assertEqual(0, rc)
+            self.assertEqual(data_before, _snapshot_tree(data_dir))
+            payload = json.loads(out_json.read_text(encoding="utf-8"))
+            prov = payload["provenance"]
+            self.assertEqual(hashlib.sha256(csv_before).hexdigest(), prov["dataset_sha256"])
+            self.assertEqual(hashlib.sha256(funding_before).hexdigest(), prov["funding_sha256"])
+            self.assertTrue(prov["code_revision"] and prov["code_revision"] != "unknown")
+            self.assertEqual("limit", prov["fee_profile"])
+            self.assertEqual("candles_file", prov["data_source"])
+            eff = payload["effective_config"]
+            self.assertEqual(6, eff["purge_bars"])
+            self.assertEqual(2.0, eff["cost_model"]["taker_fee_bps"])
+            self.assertEqual(
+                ["slippage_10bp", "funding_0pct_apr", "funding_15pct_apr", "funding_30pct_apr"],
+                eff["stress_scenarios"],
+            )
 
 
 if __name__ == "__main__":

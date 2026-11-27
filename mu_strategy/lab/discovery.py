@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import math
 import time
+from types import MappingProxyType
 from typing import Any, Literal
 
 from mu_strategy.core.instrument import CostModel, InstrumentSpec, spot_spec
@@ -19,7 +20,12 @@ from mu_strategy.engine.metrics import (
 )
 from mu_strategy.engine.risk_overlay import DrawdownCircuitBreaker, RiskOverlay, VolTargetOverlay
 from mu_strategy.engine.simulator import Simulator, SimulatorConfig
-from mu_strategy.lab.gates import GateConfig, SixGateEvaluation, evaluate_six_gates
+from mu_strategy.lab.gates import (
+    GateConfig,
+    SixGateEvaluation,
+    compute_null_distribution_pvalue,
+    evaluate_six_gates,
+)
 from mu_strategy.market_data.bar_series import BarSeries
 from mu_strategy.market_data.funding import FundingSeries
 from mu_strategy.strategies.families import (
@@ -42,6 +48,7 @@ __all__ = [
     "DiscoveryConfig",
     "DiscoveryReport",
     "StrategyCatalogEntry",
+    "StressScenarioResult",
     "WalkForwardFold",
     "build_walk_forward_folds",
     "default_strategy_catalog",
@@ -52,6 +59,21 @@ __all__ = [
 
 _MS_PER_DAY = 86_400_000
 _VERDICT_RANK = {"GO": 0, "CONDITIONAL": 1, "NO_GO": 2}
+_STRESS_SCENARIO_IDS = ("slippage_10bp", "funding_0pct_apr", "funding_15pct_apr", "funding_30pct_apr")
+_FUNDING_STRESS_SPECS = (
+    ("funding_0pct_apr", "Funding 0% APR", 0.0),
+    ("funding_15pct_apr", "Funding +15% APR", 0.15),
+    ("funding_30pct_apr", "Funding +30% APR", 0.30),
+)
+_PROVENANCE_KEYS = (
+    "dataset_sha256",
+    "funding_sha256",
+    "code_revision",
+    "fee_profile",
+    "data_source",
+    "generation_id",
+    "days",
+)
 
 
 def _jnum(value: float | None, digits: int = 6) -> float | None:
@@ -128,14 +150,28 @@ def _slice_bar_series(series: BarSeries, start: int, end: int) -> BarSeries:
     )
 
 
-def _shift_funding_apr(base_funding: FundingSeries, delta_apr: float, interval_hours: int) -> FundingSeries:
-    delta_rate = float(delta_apr) / ((365.0 * 24.0) / float(interval_hours))
-    return FundingSeries(
-        instrument_id=base_funding.instrument_id,
-        timestamps_ms=base_funding.timestamps_ms,
-        rates=[float(r) + delta_rate for r in base_funding.rates],
-        settlement_interval_hours=interval_hours,
-    )
+@dataclass(frozen=True, slots=True)
+class StressScenarioResult:
+    """Per-scenario execution or funding stress outcome (or explicit N/A for spot)."""
+
+    scenario_id: str
+    label: str
+    available: bool
+    passed: bool | None
+    total_return: float | None
+    liquidations: int | None
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "label": self.label,
+            "available": self.available,
+            "passed": self.passed,
+            "total_return": _jnum(self.total_return, 6),
+            "liquidations": self.liquidations,
+            "detail": self.detail,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +183,11 @@ class StrategyCatalogEntry:
     factory: Callable[[Mapping[str, Any]], Strategy]
     param_space: ParamSpace
     description: str = ""
+    fixed_params: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fixed_params, MappingProxyType):
+            object.__setattr__(self, "fixed_params", MappingProxyType(dict(self.fixed_params)))
 
 
 def default_strategy_catalog(
@@ -155,55 +196,82 @@ def default_strategy_catalog(
     interval: str = "1h",
     allow_short: bool = True,
 ) -> tuple[StrategyCatalogEntry, ...]:
-    """Return the 4 Phase 1 strategy families with compact 20-point grids (<10s on 262d)."""
+    """Return the 4 Phase 1 strategy families with compact 20-point grids and explicit fixed_params."""
     side: Literal["buy", "long_short"] = "long_short" if allow_short else "buy"
+    ts_fixed: dict[str, Any] = {"interval": interval, "side_mode": side, "target_weight": 1.0}
+    don_fixed: dict[str, Any] = {
+        "interval": interval,
+        "exit_period": 12,
+        "atr_period": 14,
+        "side_mode": side,
+        "target_weight": 1.0,
+    }
+    mr_fixed: dict[str, Any] = {
+        "interval": interval,
+        "rsi_period": 14,
+        "exit_z": 0.25,
+        "rsi_oversold": 35.0,
+        "rsi_overbought": 65.0,
+        "max_ann_vol": 1.5,
+        "stop_atr_mult": 3.0,
+        "side_mode": side,
+        "target_weight": 1.0,
+    }
+    fib_fixed: dict[str, Any] = {
+        "symbol": symbol,
+        "primary_interval": interval,
+        "regime_interval": interval,
+        "entry_execution": "second_pullback",
+        "second_pullback_wait_bars": 8,
+        "initial_stop_pct": 0.03,
+        "min_stop_pct": 0.008,
+        "leverage": 2.0,
+        "use_session_window": False,
+    }
     return (
         StrategyCatalogEntry(
             "ts_momentum",
             "Time-Series Momentum",
-            lambda p: TSMomentumStrategy(TSMomentumParams(interval=interval, side_mode=side, target_weight=1.0, **p)),
+            lambda p, fp=ts_fixed: TSMomentumStrategy(TSMomentumParams(**{**fp, **p})),
             ParamSpace((
                 ParamSpec("lookback_bars", "int", 96, choices=(48, 96, 168)),
                 ParamSpec("deadband_return", "float", 0.0, choices=(0.0, 0.02)),
             )),
             "Trailing return momentum with neutral deadband (6 grid points).",
+            fixed_params=ts_fixed,
         ),
         StrategyCatalogEntry(
             "donchian_atr",
             "Donchian Breakout + ATR Stop",
-            lambda p: DonchianATRStrategy(DonchianATRParams(interval=interval, exit_period=12, atr_period=14, side_mode=side, target_weight=1.0, **p)),
+            lambda p, fp=don_fixed: DonchianATRStrategy(DonchianATRParams(**{**fp, **p})),
             ParamSpace((
                 ParamSpec("entry_period", "int", 48, choices=(24, 48, 72)),
                 ParamSpec("atr_stop_mult", "float", 3.5, choices=(2.0, 3.5)),
             )),
             "Donchian channel breakout with monotone ATR trailing stop (6 grid points).",
+            fixed_params=don_fixed,
         ),
         StrategyCatalogEntry(
             "mean_reversion",
             "RSI + Z-Score Mean Reversion",
-            lambda p: MeanReversionStrategy(MeanReversionParams(
-                interval=interval, rsi_period=14, exit_z=0.25, rsi_oversold=35.0, rsi_overbought=65.0,
-                max_ann_vol=1.5, stop_atr_mult=3.0, side_mode=side, target_weight=1.0, **p,
-            )),
+            lambda p, fp=mr_fixed: MeanReversionStrategy(MeanReversionParams(**{**fp, **p})),
             ParamSpace((
                 ParamSpec("zscore_period", "int", 20, choices=(20, 40)),
                 ParamSpec("entry_z", "float", 2.5, choices=(1.75, 2.5)),
             )),
             "RSI + rolling Z-score mean reversion with ATR stop (4 grid points).",
+            fixed_params=mr_fixed,
         ),
         StrategyCatalogEntry(
             "fibonacci_pullback",
             "Fibonacci Pullback (Multi-Stage)",
-            lambda p: FibonacciPullbackStrategy(FibonacciPullbackParams(
-                symbol=symbol, primary_interval=interval, regime_interval=interval,
-                entry_execution="second_pullback", second_pullback_wait_bars=8,
-                initial_stop_pct=0.03, min_stop_pct=0.008, leverage=2.0, use_session_window=False, **p,
-            )),
+            lambda p, fp=fib_fixed: FibonacciPullbackStrategy(FibonacciPullbackParams(**{**fp, **p})),
             ParamSpace((
                 ParamSpec("fib_lookback", "int", 24, choices=(24, 48)),
                 ParamSpec("atr_stop_multiplier", "float", 1.0, choices=(1.0, 2.0)),
             )),
             "Multi-stage Fibonacci pullback with ATR stop floor (4 grid points).",
+            fixed_params=fib_fixed,
         ),
     )
 
@@ -364,7 +432,7 @@ class CandidateFoldResult:
 
 @dataclass(frozen=True, slots=True)
 class CandidateResult:
-    """Complete OOS walk-forward evaluation, attribution, and 6-Gate verdict for one candidate."""
+    """Complete OOS walk-forward evaluation, attribution, stress matrix, and 6-Gate verdict."""
 
     candidate_id: str
     family_id: str
@@ -396,14 +464,19 @@ class CandidateResult:
     gates: SixGateEvaluation
     folds: tuple[CandidateFoldResult, ...]
     curve: tuple[tuple[int, float], ...] = ()
+    stress_scenarios: tuple[StressScenarioResult, ...] = ()
+    swept_params: dict[str, Any] = field(default_factory=dict)
+    catalog_entry_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "candidate_id": self.candidate_id,
             "family_id": self.family_id,
+            "catalog_entry_id": self.catalog_entry_id or self.family_id,
             "display_name": self.display_name,
             "overlay_preset": self.overlay_preset,
             "params": dict(self.params),
+            "swept_params": dict(self.swept_params),
             "metrics": {
                 "starting_equity": _jnum(self.starting_equity, 2),
                 "ending_equity": _jnum(self.ending_equity, 2),
@@ -420,6 +493,8 @@ class CandidateResult:
                 "time_in_market": _jnum(self.time_in_market, 4),
                 "liquidations": self.liquidations,
                 "dsr": _jnum(self.gates.dsr, 4),
+                "null_p_value": _jnum(self.gates.null_p_value, 4),
+                "null_passed": self.gates.null_passed,
                 "positive_fold_ratio": _jnum(self.positive_fold_ratio, 4),
                 "neighbor_pass_ratio": _jnum(self.neighbor_pass_ratio, 4),
                 "stress_passed": self.stress_passed,
@@ -430,6 +505,7 @@ class CandidateResult:
             },
             "attribution": _attr_dict(self.attribution),
             "gates": self.gates.to_dict(),
+            "stress_scenarios": [sc.to_dict() for sc in self.stress_scenarios],
             "folds": [f.to_dict() for f in self.folds],
             "curve": [[ts, eq] for ts, eq in self.curve],
         }
@@ -455,6 +531,8 @@ class DiscoveryReport:
     folds: tuple[WalkForwardFold, ...]
     candidates: tuple[CandidateResult, ...]
     schema_version: str = "phase2.discovery.v1"
+    provenance: dict[str, Any] = field(default_factory=dict)
+    effective_config: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         counts = {"GO": 0, "CONDITIONAL": 0, "NO_GO": 0}
@@ -473,6 +551,8 @@ class DiscoveryReport:
             "runtime_ms": _jnum(self.runtime_ms, 2),
             "funding_verified": self.funding_verified,
             "stress_apr": _jnum(self.stress_apr, 4),
+            "provenance": dict(self.provenance),
+            "effective_config": dict(self.effective_config),
             "verdict_counts": counts,
             "benchmarks": {"spot_1x": self.spot_1x.to_dict(), "perp_1x": self.perp_1x.to_dict()},
             "folds": [f.to_dict() for f in self.folds],
@@ -487,18 +567,31 @@ def _resolve_funding_scenarios(
     funding: FundingSeries | None,
     *,
     first_oos_start: int,
-    stress_apr: float,
-) -> tuple[bool, FundingSeries | None, tuple[FundingSeries, ...]]:
+) -> tuple[bool, bool, FundingSeries | None, tuple[tuple[str, str, float, FundingSeries], ...]]:
+    """Return (funding_verified, base_is_synth_zero, base_funding, funding_stress_series)."""
     if not instrument.is_perp or instrument.funding_interval_hours is None:
-        return True, None, ()
+        return True, False, None, ()
     hours = instrument.funding_interval_hours
     full_start, oos_start, end_ms = int(series.open_times[0]), int(series.open_times[first_oos_start]), int(series.close_times[-1])
 
+    synth_scenarios = tuple(
+        (
+            sc_id,
+            sc_label,
+            apr,
+            FundingSeries.synthetic_constant_apr(
+                instrument.instrument_id,
+                start_ms=full_start,
+                end_ms=end_ms,
+                interval_hours=hours,
+                apr=apr,
+            ),
+        )
+        for sc_id, sc_label, apr in _FUNDING_STRESS_SPECS
+    )
+
     if funding is None or len(funding) == 0:
-        base = FundingSeries.synthetic_constant_apr(instrument.instrument_id, start_ms=full_start, end_ms=end_ms, interval_hours=hours, apr=0.0)
-        plus = FundingSeries.synthetic_constant_apr(instrument.instrument_id, start_ms=full_start, end_ms=end_ms, interval_hours=hours, apr=stress_apr)
-        minus = FundingSeries.synthetic_constant_apr(instrument.instrument_id, start_ms=full_start, end_ms=end_ms, interval_hours=hours, apr=-stress_apr)
-        return False, base, (plus, minus)
+        return False, True, synth_scenarios[0][3], synth_scenarios
 
     if funding.instrument_id != instrument.instrument_id:
         raise ValueError(f"FundingSeries instrument_id {funding.instrument_id!r} != {instrument.instrument_id!r}")
@@ -509,7 +602,7 @@ def _resolve_funding_scenarios(
             base_series = funding.fill_gaps_with_apr(start_ms=full_start, end_ms=end_ms, interval_hours=hours, apr=0.0)
         except ValueError:
             base_series = funding.fill_gaps_with_apr(start_ms=full_start, end_ms=end_ms, interval_hours=hours, apr=0.0, phase_ms=0)
-    return funding_verified, base_series, (_shift_funding_apr(base_series, +stress_apr, hours), _shift_funding_apr(base_series, -stress_apr, hours))
+    return funding_verified, False, base_series, synth_scenarios
 
 
 def _stitch_fold_results(
@@ -521,7 +614,7 @@ def _stitch_fold_results(
     interval: str,
     strategy_id: str,
 ) -> SimulationResult:
-    """Compound sequential OOS fold equity curves while preserving exact PnL attribution."""
+    """Compound sequential OOS fold equity curves, attribution, and trade amounts cleanly."""
     running = float(starting_equity)
     curve: list[tuple[int, float]] = []
     trades = []
@@ -539,7 +632,24 @@ def _stitch_fold_results(
         in_mkt += int(round(res.time_in_market_pct * res.bars_scored))
         scored += res.bars_scored
         liqs += res.liquidations
-        trades.extend(res.trades)
+        if scale > 0.0:
+            for tr in res.trades:
+                s_gross = tr.gross_pnl * scale
+                s_fees = tr.fees * scale
+                s_slip = tr.slippage * scale
+                s_fund = tr.funding_pnl * scale
+                s_net = math.fsum((s_gross, -s_fees, -s_slip, s_fund))
+                trades.append(
+                    replace(
+                        tr,
+                        qty=tr.qty * scale,
+                        gross_pnl=s_gross,
+                        fees=s_fees,
+                        slippage=s_slip,
+                        funding_pnl=s_fund,
+                        net_pnl=s_net,
+                    )
+                )
         if running > 0.0 and starting_equity > 0.0:
             running = max(0.0, running * (res.ending_equity / starting_equity))
     return compute_simulation_metrics(
@@ -588,20 +698,32 @@ def _benchmark_from_sim(label: str, res: SimulationResult) -> BenchmarkSummary:
     )
 
 
+def _normalize_provenance(provenance: Mapping[str, Any] | None) -> dict[str, Any]:
+    out: dict[str, Any] = {key: None for key in _PROVENANCE_KEYS}
+    if provenance:
+        for key, value in provenance.items():
+            out[str(key)] = value
+    return out
+
+
 @dataclass(slots=True)
 class _RawCandidate:
     candidate_id: str
     family_id: str
+    catalog_entry_id: str
     display_name: str
     overlay_preset: str
     params: dict[str, Any]
+    swept_params: dict[str, Any]
     grid_coord: tuple[int, ...]
     stitched: SimulationResult
     is_sharpe: float
     positive_fold_ratio: float
+    stress_scenarios: tuple[StressScenarioResult, ...]
     stress_passed: bool
     stress_liquidations: int
     stress_worst_return: float
+    null_p_value: float
     n_obs: int
     return_skew: float
     return_excess_kurtosis: float
@@ -638,6 +760,95 @@ def _compute_neighbor_ratios(raw_candidates: Sequence[_RawCandidate], gate_cfg: 
     return ratios
 
 
+def _evaluate_stress_suite(
+    *,
+    strategy: Strategy,
+    overlays: Sequence[RiskOverlay],
+    oos_sims: Sequence[Simulator],
+    slippage_sims: Sequence[Simulator],
+    oos_slices: Sequence[BarSeries],
+    oos_caches: Sequence[FeatureCache],
+    base_funding: FundingSeries | None,
+    base_is_synth_zero: bool,
+    funding_stress_specs: Sequence[tuple[str, str, float, FundingSeries]],
+    stitched: SimulationResult,
+    starting_equity: float,
+    interval_ms: int,
+    symbol: str,
+    interval: str,
+    family_id: str,
+) -> tuple[tuple[StressScenarioResult, ...], bool, int, float]:
+    """Evaluate all 4 canonical stress scenarios (10bp slippage + 0%/15%/30% APR funding)."""
+    n_folds = len(oos_slices)
+    scenarios: list[StressScenarioResult] = []
+
+    slip_res = _stitch_fold_results(
+        [slippage_sims[k].run(strategy, oos_slices[k], funding=base_funding, overlays=overlays, feature_cache=oos_caches[k]) for k in range(n_folds)],
+        starting_equity=starting_equity,
+        interval_ms=interval_ms,
+        symbol=symbol,
+        interval=interval,
+        strategy_id=family_id,
+    )
+    slip_pass = slip_res.liquidations == 0 and slip_res.total_return_pct > 0.0
+    scenarios.append(
+        StressScenarioResult(
+            scenario_id="slippage_10bp",
+            label="Slippage +10bp",
+            available=True,
+            passed=slip_pass,
+            total_return=slip_res.total_return_pct,
+            liquidations=slip_res.liquidations,
+            detail=f"Return {slip_res.total_return_pct * 100.0:+.2f}%, Liq={slip_res.liquidations}",
+        )
+    )
+
+    if funding_stress_specs:
+        for sc_id, sc_label, apr, f_series in funding_stress_specs:
+            if apr == 0.0 and base_is_synth_zero:
+                sc_res = stitched
+            else:
+                sc_res = _stitch_fold_results(
+                    [oos_sims[k].run(strategy, oos_slices[k], funding=f_series, overlays=overlays, feature_cache=oos_caches[k]) for k in range(n_folds)],
+                    starting_equity=starting_equity,
+                    interval_ms=interval_ms,
+                    symbol=symbol,
+                    interval=interval,
+                    strategy_id=family_id,
+                )
+            sc_pass = sc_res.liquidations == 0 and sc_res.total_return_pct > 0.0
+            scenarios.append(
+                StressScenarioResult(
+                    scenario_id=sc_id,
+                    label=sc_label,
+                    available=True,
+                    passed=sc_pass,
+                    total_return=sc_res.total_return_pct,
+                    liquidations=sc_res.liquidations,
+                    detail=f"Return {sc_res.total_return_pct * 100.0:+.2f}%, Liq={sc_res.liquidations}",
+                )
+            )
+    else:
+        for sc_id, sc_label, _ in _FUNDING_STRESS_SPECS:
+            scenarios.append(
+                StressScenarioResult(
+                    scenario_id=sc_id,
+                    label=sc_label,
+                    available=False,
+                    passed=None,
+                    total_return=None,
+                    liquidations=None,
+                    detail="N/A — spot instrument",
+                )
+            )
+
+    avail = [sc for sc in scenarios if sc.available]
+    stress_passed = bool(avail) and all(sc.passed is True for sc in avail)
+    stress_liqs = sum(sc.liquidations or 0 for sc in avail)
+    stress_worst = min(sc.total_return for sc in avail if sc.total_return is not None)
+    return tuple(scenarios), stress_passed, stress_liqs, stress_worst
+
+
 def discover_strategies(
     series: BarSeries,
     instrument: InstrumentSpec,
@@ -645,8 +856,9 @@ def discover_strategies(
     funding: FundingSeries | None = None,
     catalog: Sequence[StrategyCatalogEntry] | None = None,
     config: DiscoveryConfig | None = None,
+    provenance: Mapping[str, Any] | None = None,
 ) -> DiscoveryReport:
-    """Run purged walk-forward strategy discovery across families, overlays, and stress bands."""
+    """Run purged walk-forward strategy discovery across families, overlays, and stress suite."""
     t0 = time.perf_counter()
     cfg = config if config is not None else DiscoveryConfig()
     if series.symbol != instrument.symbol:
@@ -658,8 +870,8 @@ def discover_strategies(
     oos_days = max(0.0, (oos_end_ms - oos_start_ms) / float(_MS_PER_DAY))
     annualization_factor = MS_PER_YEAR / float(series.interval_ms)
 
-    funding_verified, base_funding, stress_fundings = _resolve_funding_scenarios(
-        series, instrument, funding, first_oos_start=first_oos_start, stress_apr=cfg.stress_apr,
+    funding_verified, base_is_synth_zero, base_funding, funding_stress_specs = _resolve_funding_scenarios(
+        series, instrument, funding, first_oos_start=first_oos_start,
     )
 
     is_anchored = cfg.walk_forward_mode == "anchored"
@@ -672,8 +884,9 @@ def discover_strategies(
 
     is_sim = Simulator(instrument, cost_model, SimulatorConfig(starting_equity=cfg.starting_equity, close_on_end=True, funding_gap_policy="allow_partial"))
     oos_sims = tuple(Simulator(instrument, cost_model, SimulatorConfig(starting_equity=cfg.starting_equity, warmup_bars=f.oos_start, close_on_end=True)) for f in folds)
-    spot_stress_sims = () if instrument.is_perp else tuple(
-        Simulator(instrument, cost_model.scaled(1.5), SimulatorConfig(starting_equity=cfg.starting_equity, warmup_bars=f.oos_start, close_on_end=True))
+    slippage_cost = replace(cost_model, half_spread_bps=cost_model.half_spread_bps + 10.0)
+    slippage_sims = tuple(
+        Simulator(instrument, slippage_cost, SimulatorConfig(starting_equity=cfg.starting_equity, warmup_bars=f.oos_start, close_on_end=True))
         for f in folds
     )
 
@@ -712,9 +925,11 @@ def discover_strategies(
         val_idx = tuple({val: idx for idx, val in enumerate(spec.grid_values())} for spec in entry.param_space.specs)
         for p_idx, params in enumerate(entry.param_space.iter_valid_grid()):
             coord = tuple(val_idx[d][params[spec_names[d]]] for d in range(len(spec_names)))
+            swept_params = dict(params)
+            effective_params = {**entry.fixed_params, **swept_params}
             for overlay_name in cfg.overlay_names:
                 overlays = overlay_presets()[overlay_name]
-                strategy = entry.factory(params)
+                strategy = entry.factory(swept_params)
 
                 if is_anchored and anchored_is_slice is not None and anchored_is_cache is not None:
                     full_is = is_sim.run(strategy, anchored_is_slice, funding=base_funding, overlays=overlays, feature_cache=anchored_is_cache)
@@ -740,37 +955,31 @@ def discover_strategies(
                 mean_is_sharpe = math.fsum(sh for sh, _ in is_fold_metrics) / len(is_fold_metrics)
                 pos_fold_ratio = sum(1 for f in fold_summaries if f.oos_total_return > 0.0) / len(fold_summaries)
                 n_obs, skew, excess_kurt = _return_moments(stitched.equity_curve)
+                null_p = compute_null_distribution_pvalue(stitched.equity_curve)
 
-                # Symmetric +/-stress_apr shock cannot rescue a non-positive base return or existing liquidation.
-                stress_liqs = stitched.liquidations
-                stress_worst_ret = stitched.total_return_pct
-                if stitched.total_return_pct > 0.0 and stitched.liquidations == 0:
-                    stress_liqs = 0
-                    if instrument.is_perp and stress_fundings:
-                        s_rets: list[float] = []
-                        for sf in stress_fundings:
-                            sf_st = _stitch_fold_results(
-                                [oos_sims[k].run(strategy, oos_slices[k], funding=sf, overlays=overlays, feature_cache=oos_caches[k]) for k in range(len(folds))],
-                                starting_equity=cfg.starting_equity, interval_ms=series.interval_ms,
-                                symbol=instrument.symbol, interval=series.interval, strategy_id=entry.family_id,
-                            )
-                            stress_liqs += sf_st.liquidations
-                            s_rets.append(sf_st.total_return_pct)
-                        stress_worst_ret = min(s_rets)
-                    elif spot_stress_sims:
-                        sp_st = _stitch_fold_results(
-                            [spot_stress_sims[k].run(strategy, oos_slices[k], funding=None, overlays=overlays, feature_cache=oos_caches[k]) for k in range(len(folds))],
-                            starting_equity=cfg.starting_equity, interval_ms=series.interval_ms,
-                            symbol=instrument.symbol, interval=series.interval, strategy_id=entry.family_id,
-                        )
-                        stress_liqs = sp_st.liquidations
-                        stress_worst_ret = sp_st.total_return_pct
+                stress_scenarios, stress_passed, stress_liqs, stress_worst_ret = _evaluate_stress_suite(
+                    strategy=strategy,
+                    overlays=overlays,
+                    oos_sims=oos_sims,
+                    slippage_sims=slippage_sims,
+                    oos_slices=oos_slices,
+                    oos_caches=oos_caches,
+                    base_funding=base_funding,
+                    base_is_synth_zero=base_is_synth_zero,
+                    funding_stress_specs=funding_stress_specs,
+                    stitched=stitched,
+                    starting_equity=cfg.starting_equity,
+                    interval_ms=series.interval_ms,
+                    symbol=instrument.symbol,
+                    interval=series.interval,
+                    family_id=entry.family_id,
+                )
 
                 raw_candidates.append(_RawCandidate(
-                    f"{entry.family_id}#{p_idx:02d}|{overlay_name}", entry.family_id, entry.display_name, overlay_name,
-                    dict(params), coord, stitched, mean_is_sharpe, pos_fold_ratio,
-                    (stress_liqs == 0 and stress_worst_ret > 0.0), stress_liqs, stress_worst_ret,
-                    n_obs, skew, excess_kurt, fold_summaries,
+                    f"{entry.family_id}#{p_idx:02d}|{overlay_name}", entry.family_id, entry.family_id, entry.display_name, overlay_name,
+                    effective_params, swept_params, coord, stitched, mean_is_sharpe, pos_fold_ratio,
+                    stress_scenarios, stress_passed, stress_liqs, stress_worst_ret,
+                    null_p, n_obs, skew, excess_kurt, fold_summaries,
                 ))
 
     n_trials = len(raw_candidates)
@@ -788,7 +997,8 @@ def discover_strategies(
             positive_fold_ratio=raw.positive_fold_ratio, is_sharpe=raw.is_sharpe, is_perp=instrument.is_perp,
             funding_verified=funding_verified, stress_passed=raw.stress_passed, stress_liquidations=raw.stress_liquidations,
             spot_oos_sharpe=spot_1x.sharpe, spot_oos_max_drawdown=spot_1x.max_drawdown,
-            neighbor_pass_ratio=nbr_ratio, annualization_factor=annualization_factor, config=gate_cfg,
+            neighbor_pass_ratio=nbr_ratio, null_p_value=raw.null_p_value,
+            annualization_factor=annualization_factor, config=gate_cfg,
         )
         cand = CandidateResult(
             raw.candidate_id, raw.family_id, raw.display_name, raw.overlay_preset, raw.params,
@@ -797,6 +1007,9 @@ def discover_strategies(
             st.win_rate, st.profit_factor, st.turnover, st.time_in_market_pct, st.liquidations,
             raw.positive_fold_ratio, nbr_ratio, raw.stress_passed, raw.stress_liquidations, raw.stress_worst_return,
             raw.return_skew, raw.return_excess_kurtosis, st.attribution, gates, raw.folds,
+            stress_scenarios=raw.stress_scenarios,
+            swept_params=raw.swept_params,
+            catalog_entry_id=raw.catalog_entry_id,
         )
         evaluated.append((cand, st.equity_curve))
 
@@ -810,12 +1023,26 @@ def discover_strategies(
         replace(cand, curve=_downsample_daily_curve(raw_curve) if rank < cfg.top_curves else ())
         for rank, (cand, raw_curve) in enumerate(evaluated)
     )
+    effective_config: dict[str, Any] = {
+        "n_folds": cfg.n_folds,
+        "is_ratio": cfg.is_ratio,
+        "purge_bars": cfg.purge_bars,
+        "walk_forward_mode": cfg.walk_forward_mode,
+        "starting_equity": _jnum(cfg.starting_equity, 2),
+        "overlay_names": list(cfg.overlay_names),
+        "family_ids": list(cfg.family_ids) if cfg.family_ids is not None else [e.family_id for e in entries],
+        "stress_apr": _jnum(cfg.stress_apr, 4),
+        "stress_scenarios": list(_STRESS_SCENARIO_IDS),
+        "cost_model": cost_model.to_dict(),
+    }
     return DiscoveryReport(
         symbol=instrument.symbol, interval=series.interval, starting_equity=cfg.starting_equity,
         oos_start_ms=oos_start_ms, oos_end_ms=oos_end_ms, oos_days=oos_days,
         n_folds=len(folds), n_trials=n_trials, runtime_ms=(time.perf_counter() - t0) * 1000.0,
         funding_verified=funding_verified, stress_apr=cfg.stress_apr,
         spot_1x=spot_1x, perp_1x=perp_1x, folds=folds, candidates=final_candidates,
+        provenance=_normalize_provenance(provenance),
+        effective_config=effective_config,
     )
 
 
@@ -835,10 +1062,16 @@ def export_winner_recipe(report: DiscoveryReport) -> dict[str, Any]:
             "strategy": None,
             "best_rejected_candidate": (
                 {
-                    "candidate_id": top.candidate_id, "family_id": top.family_id,
-                    "overlay_preset": top.overlay_preset, "params": dict(top.params),
-                    "passed_count": top.gates.passed_count, "failed_gates": list(top.gates.failed_gates),
-                    "oos_total_return": _jnum(top.oos_total_return, 6), "oos_sharpe": _jnum(top.oos_sharpe, 4),
+                    "candidate_id": top.candidate_id,
+                    "family_id": top.family_id,
+                    "catalog_entry_id": top.catalog_entry_id or top.family_id,
+                    "overlay_preset": top.overlay_preset,
+                    "params": dict(top.params),
+                    "swept_params": dict(top.swept_params),
+                    "passed_count": top.gates.passed_count,
+                    "failed_gates": list(top.gates.failed_gates),
+                    "oos_total_return": _jnum(top.oos_total_return, 6),
+                    "oos_sharpe": _jnum(top.oos_sharpe, 4),
                     "dsr": _jnum(top.gates.dsr, 4),
                 }
                 if top is not None else None
@@ -856,14 +1089,20 @@ def export_winner_recipe(report: DiscoveryReport) -> dict[str, Any]:
         "verdict": top.gates.verdict,
         "warning": None if is_go else f"CONDITIONAL verdict: passed {top.gates.passed_count}/6, failed={list(top.gates.failed_gates)}; review before paper/dry-run.",
         "strategy": {
-            "candidate_id": top.candidate_id, "family_id": top.family_id,
-            "display_name": top.display_name, "overlay_preset": top.overlay_preset, "params": dict(top.params),
+            "candidate_id": top.candidate_id,
+            "family_id": top.family_id,
+            "catalog_entry_id": top.catalog_entry_id or top.family_id,
+            "display_name": top.display_name,
+            "overlay_preset": top.overlay_preset,
+            "params": dict(top.params),
+            "swept_params": dict(top.swept_params),
         },
         "oos_summary": {
             "oos_days": _jnum(report.oos_days, 2), "n_folds": report.n_folds, "n_trials": report.n_trials,
             "oos_total_return": _jnum(top.oos_total_return, 6), "oos_max_drawdown": _jnum(top.oos_max_drawdown, 6),
             "oos_sharpe": _jnum(top.oos_sharpe, 4), "oos_calmar": _jnum(top.oos_calmar, 4),
-            "oos_trades": top.oos_trades, "liquidations": top.liquidations, "dsr": _jnum(top.gates.dsr, 4),
+            "oos_trades": top.oos_trades, "liquidations": top.liquidations,
+            "dsr": _jnum(top.gates.dsr, 4), "null_p_value": _jnum(top.gates.null_p_value, 4),
         },
         "gates": top.gates.to_dict(),
     }

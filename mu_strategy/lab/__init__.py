@@ -9,6 +9,7 @@ from mu_strategy.lab.discovery import (
     DiscoveryConfig,
     DiscoveryReport,
     StrategyCatalogEntry,
+    StressScenarioResult,
     WalkForwardFold,
     build_walk_forward_folds,
     default_strategy_catalog,
@@ -23,6 +24,7 @@ from mu_strategy.lab.gates import (
     SixGateEvaluation,
     Verdict,
     compute_deflated_sharpe_ratio,
+    compute_null_distribution_pvalue,
     evaluate_six_gates,
 )
 
@@ -37,10 +39,12 @@ __all__ = [
     "GateStatus",
     "SixGateEvaluation",
     "StrategyCatalogEntry",
+    "StressScenarioResult",
     "Verdict",
     "WalkForwardFold",
     "build_walk_forward_folds",
     "compute_deflated_sharpe_ratio",
+    "compute_null_distribution_pvalue",
     "default_strategy_catalog",
     "discover_strategies",
     "evaluate_six_gates",

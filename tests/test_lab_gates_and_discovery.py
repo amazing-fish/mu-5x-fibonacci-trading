@@ -2,28 +2,37 @@
 
 from __future__ import annotations
 
+from dataclasses import replace as dc_replace
 import json
 import math
 import unittest
 
 from mu_strategy.core.instrument import CostModel, okx_swap_spec, spot_spec
+from mu_strategy.engine.metrics import CostAttribution, TradeRecord, compute_simulation_metrics
 from mu_strategy.lab import (
     DiscoveryConfig,
     DiscoveryReport,
     GateConfig,
     StrategyCatalogEntry,
+    StressScenarioResult,
     build_walk_forward_folds,
     compute_deflated_sharpe_ratio,
+    compute_null_distribution_pvalue,
     default_strategy_catalog,
     discover_strategies,
     evaluate_six_gates,
     export_winner_recipe,
     overlay_presets,
 )
+from mu_strategy.lab.discovery import _stitch_fold_results
 from mu_strategy.market_data.bar_series import BarSeries
 from mu_strategy.market_data.funding import FundingSeries
 from mu_strategy.models import Candle
-from mu_strategy.strategies.families import TSMomentumParams, TSMomentumStrategy
+from mu_strategy.strategies.families import (
+    FibonacciPullbackParams,
+    TSMomentumParams,
+    TSMomentumStrategy,
+)
 from mu_strategy.strategies.protocol import (
     EMPTY_OUTPUT,
     BarContext,
@@ -47,7 +56,6 @@ def _synthetic_series(
     candles: list[Candle] = []
     px = 100.0
     for i in range(n_bars):
-        # Slow regime waves so trend/breakout and mean-reversion strategies generate real trades.
         wave = 0.0045 * math.sin(i / 45.0) + 0.0025 * math.sin(i / 13.0) + 0.00025
         next_px = max(5.0, px * (1.0 + wave))
         hi = max(px, next_px) * 1.003
@@ -112,7 +120,7 @@ class _DummyWeightStrategy:
         self._step = int(state.get("step", 0))
 
 
-class DeflatedSharpeRatioTests(unittest.TestCase):
+class DeflatedSharpeAndNullDistTests(unittest.TestCase):
     def test_gaussian_single_trial_symmetry_and_monotonicity(self) -> None:
         self.assertAlmostEqual(0.5, compute_deflated_sharpe_ratio(0.0, 2000, 0.0, 0.0, 1), places=12)
         dsr_low = compute_deflated_sharpe_ratio(1.0, 4000, 0.0, 0.0, 1)
@@ -128,7 +136,6 @@ class DeflatedSharpeRatioTests(unittest.TestCase):
         self.assertGreater(dsr_1, dsr_20)
         self.assertGreater(dsr_20, dsr_100)
 
-        # Negative skew and fat tails (high excess kurtosis) reduce DSR for positive Sharpe.
         dsr_gauss = compute_deflated_sharpe_ratio(4.5, 4000, 0.0, 0.0, 10)
         dsr_neg_skew = compute_deflated_sharpe_ratio(4.5, 4000, -2.5, 0.0, 10)
         dsr_fat_tail = compute_deflated_sharpe_ratio(4.5, 4000, 0.0, 20.0, 10)
@@ -145,8 +152,26 @@ class DeflatedSharpeRatioTests(unittest.TestCase):
         self.assertEqual(0.0, compute_deflated_sharpe_ratio(2.0, 1000, 0.0, 0.0, 1, annualization_factor=0.0))
         self.assertEqual(0.0, compute_deflated_sharpe_ratio(True, 1000, 0.0, 0.0, 1))  # type: ignore[arg-type]
         self.assertEqual(0.0, compute_deflated_sharpe_ratio(2.0, True, 0.0, 0.0, 1))  # type: ignore[arg-type]
-        # Extreme skew causing non-positive variance numerator fails closed to 0.0.
         self.assertEqual(0.0, compute_deflated_sharpe_ratio(50.0, 1000, 1000.0, 0.0, 1))
+
+    def test_null_distribution_pvalue_determinism_significance_and_fail_closed(self) -> None:
+        # Strong steady upward drift with jitter -> small significant p-value and deterministic across calls.
+        eq = 10_000.0
+        strong_curve: list[tuple[int, float]] = [(0, eq)]
+        for i in range(1, 720):
+            r = 0.002 + (0.0005 if i % 3 else -0.0003)
+            eq *= 1.0 + r
+            strong_curve.append((i * 3_600_000, eq))
+        p1 = compute_null_distribution_pvalue(strong_curve, block_bars=24, n_permutations=200, seed=42)
+        p2 = compute_null_distribution_pvalue(strong_curve, block_bars=24, n_permutations=200, seed=42)
+        self.assertEqual(p1, p2)
+        self.assertLessEqual(p1, 0.05)
+
+        # Fail closed to 1.0 on flat, losing, too-short, or non-finite curves.
+        self.assertEqual(1.0, compute_null_distribution_pvalue([(0, 100.0), (1, 101.0), (2, 102.0)]))
+        self.assertEqual(1.0, compute_null_distribution_pvalue([(i, 100.0) for i in range(100)]))
+        self.assertEqual(1.0, compute_null_distribution_pvalue([(i, 100.0 - i * 0.1) for i in range(100)]))
+        self.assertEqual(1.0, compute_null_distribution_pvalue([(0, 100.0), (1, float("nan")), (2, 102.0), (3, 103.0)]))
 
 
 class SixGateEvaluationTests(unittest.TestCase):
@@ -172,6 +197,7 @@ class SixGateEvaluationTests(unittest.TestCase):
             "spot_oos_sharpe": 1.0,
             "spot_oos_max_drawdown": -0.30,
             "neighbor_pass_ratio": 0.75,
+            "null_p_value": 0.01,
         }
 
     def test_go_verdict_all_six_pass_and_json_clean(self) -> None:
@@ -179,13 +205,30 @@ class SixGateEvaluationTests(unittest.TestCase):
         self.assertEqual("GO", ev.verdict)
         self.assertEqual(6, ev.passed_count)
         self.assertEqual((), ev.failed_gates)
+        self.assertTrue(ev.null_passed)
+        self.assertAlmostEqual(0.01, ev.null_p_value or 0.0)
         self.assertGreaterEqual(ev.dsr, 0.95)
         payload = ev.to_dict()
         encoded = json.dumps(payload, allow_nan=False)
         self.assertIn('"verdict": "GO"', encoded)
-        # Positive drawdown magnitude produces identical result.
+        self.assertTrue(payload["null_passed"])
+        self.assertEqual(0.01, payload["null_p_value"])
         kw_pos = dict(self._base_go_kwargs(), oos_max_drawdown=0.10, spot_oos_max_drawdown=0.30)
         self.assertEqual(ev.verdict, evaluate_six_gates(**kw_pos).verdict)  # type: ignore[arg-type]
+
+    def test_null_p_value_omitted_or_failing_blocks_go(self) -> None:
+        # P2R1-09: omitted null_p_value fails closed and NEVER returns GO.
+        ev_missing = evaluate_six_gates(**dict(self._base_go_kwargs(), null_p_value=None))  # type: ignore[arg-type]
+        self.assertFalse(ev_missing.null_passed)
+        self.assertIsNone(ev_missing.null_p_value)
+        self.assertNotEqual("GO", ev_missing.verdict)
+        self.assertEqual("WARN", ev_missing.checks[2].status)
+
+        # P2R1-09: failing null_p_value > max_null_p_value blocks G3 PASS and GO.
+        ev_high_p = evaluate_six_gates(**dict(self._base_go_kwargs(), null_p_value=0.25))  # type: ignore[arg-type]
+        self.assertFalse(ev_high_p.null_passed)
+        self.assertNotEqual("GO", ev_high_p.verdict)
+        self.assertEqual("WARN", ev_high_p.checks[2].status)
 
     def test_conditional_verdict_on_soft_gates(self) -> None:
         # 1. G3 WARN (0.80 <= DSR < 0.95) -> CONDITIONAL.
@@ -207,16 +250,20 @@ class SixGateEvaluationTests(unittest.TestCase):
         self.assertEqual(("G6",), ev_g6.failed_gates)
         self.assertEqual("CONDITIONAL", ev_g6.verdict)
 
-    def test_no_go_on_hard_gate_failures_and_spot_dd_value_add(self) -> None:
+    def test_no_go_on_hard_gate_failures_and_unverified_funding(self) -> None:
         # G1 sample insufficiency
         self.assertEqual("NO_GO", evaluate_six_gates(**dict(self._base_go_kwargs(), oos_days=30.0)).verdict)  # type: ignore[arg-type]
         self.assertEqual("NO_GO", evaluate_six_gates(**dict(self._base_go_kwargs(), oos_trades=5)).verdict)  # type: ignore[arg-type]
-        # G2 unverified perp funding + stress fail -> NO_GO; unverified + stress pass -> PASS G2
-        ev_unv = evaluate_six_gates(**dict(self._base_go_kwargs(), funding_verified=False, stress_passed=False))  # type: ignore[arg-type]
+        # P2R1-08: missing/unverified perp funding ALWAYS fails G2 (NO_GO), even when stress_passed=True!
+        ev_unv = evaluate_six_gates(**dict(self._base_go_kwargs(), funding_verified=False, stress_passed=True))  # type: ignore[arg-type]
+        self.assertEqual("FAIL", ev_unv.checks[1].status)
         self.assertIn("G2", ev_unv.failed_gates)
+        self.assertIn("unverified", ev_unv.checks[1].detail)
         self.assertEqual("NO_GO", ev_unv.verdict)
-        ev_unv_ok = evaluate_six_gates(**dict(self._base_go_kwargs(), funding_verified=False, stress_passed=True))  # type: ignore[arg-type]
-        self.assertEqual("PASS", ev_unv_ok.checks[1].status)
+        # Spot does not require perp funding verification.
+        ev_spot = evaluate_six_gates(**dict(self._base_go_kwargs(), is_perp=False, funding_verified=False))  # type: ignore[arg-type]
+        self.assertEqual("PASS", ev_spot.checks[1].status)
+        self.assertEqual("GO", ev_spot.verdict)
         # G4 liquidation -> NO_GO
         ev_liq = evaluate_six_gates(**dict(self._base_go_kwargs(), liquidations=1))  # type: ignore[arg-type]
         self.assertIn("G4", ev_liq.failed_gates)
@@ -237,6 +284,8 @@ class SixGateEvaluationTests(unittest.TestCase):
             GateConfig(min_dsr_go=0.80, min_dsr_warn=0.90)
         with self.assertRaises(ValueError):
             GateConfig(min_neighbor_pass_ratio=0.40, min_neighbor_soft_ratio=0.50)
+        with self.assertRaises(ValueError):
+            GateConfig(max_null_p_value=0.0)
         with self.assertRaises(ValueError):
             GateConfig(min_oos_trades=-1)
         with self.assertRaises(ValueError):
@@ -274,6 +323,7 @@ class WalkForwardAndCatalogTests(unittest.TestCase):
         self.assertGreaterEqual(total_grid_points, 20)
         self.assertLessEqual(total_grid_points, 40)
         for entry in catalog:
+            self.assertTrue(len(entry.fixed_params) > 0)
             strat = entry.factory(entry.param_space.defaults())
             self.assertIsInstance(strat, Strategy)
 
@@ -283,9 +333,44 @@ class WalkForwardAndCatalogTests(unittest.TestCase):
         self.assertEqual((), p1["none"])
         self.assertIsNot(p1["dd20_vol25"][0], p2["dd20_vol25"][0])
 
+    def test_stitch_fold_results_scales_trade_amounts_with_compounded_capital(self) -> None:
+        # P2R1-05 regression: +1000 then -1000 on 10,000 yields equity 9,900 and PF ~0.909 (not 1.0).
+        tr_win = TradeRecord(
+            entry_time_ms=0, exit_time_ms=3_600_000, side="long", entry_price=100.0, exit_price=110.0,
+            qty=100.0, gross_pnl=1000.0, fees=0.0, slippage=0.0, funding_pnl=0.0, net_pnl=1000.0,
+            return_pct=0.10, reason="exit", symbol="MU-USDT-SWAP",
+        )
+        tr_loss = TradeRecord(
+            entry_time_ms=7_200_000, exit_time_ms=10_800_000, side="long", entry_price=100.0, exit_price=90.0,
+            qty=100.0, gross_pnl=-1000.0, fees=0.0, slippage=0.0, funding_pnl=0.0, net_pnl=-1000.0,
+            return_pct=-0.10, reason="exit", symbol="MU-USDT-SWAP",
+        )
+        f1 = compute_simulation_metrics(
+            starting_equity=10_000.0, ending_equity=11_000.0,
+            equity_curve=((0, 10_000.0), (3_600_000, 11_000.0)),
+            trades=(tr_win,),
+            attribution=CostAttribution.from_components(gross_pnl=1000.0, fees=0.0, slippage=0.0, funding_pnl=0.0),
+            interval_ms=3_600_000, symbol="MU-USDT-SWAP", interval="1h", strategy_id="test",
+        )
+        f2 = compute_simulation_metrics(
+            starting_equity=10_000.0, ending_equity=9_000.0,
+            equity_curve=((7_200_000, 10_000.0), (10_800_000, 9_000.0)),
+            trades=(tr_loss,),
+            attribution=CostAttribution.from_components(gross_pnl=-1000.0, fees=0.0, slippage=0.0, funding_pnl=0.0),
+            interval_ms=3_600_000, symbol="MU-USDT-SWAP", interval="1h", strategy_id="test",
+        )
+        stitched = _stitch_fold_results(
+            (f1, f2), starting_equity=10_000.0, interval_ms=3_600_000,
+            symbol="MU-USDT-SWAP", interval="1h", strategy_id="test",
+        )
+        self.assertAlmostEqual(9_900.0, stitched.ending_equity, places=6)
+        self.assertAlmostEqual(-100.0, sum(t.net_pnl for t in stitched.trades), places=6)
+        self.assertAlmostEqual(110.0, stitched.trades[1].qty, places=6)
+        self.assertAlmostEqual(1000.0 / 1100.0, stitched.profit_factor, places=6)
+
 
 class DiscoveryEngineIntegrationTests(unittest.TestCase):
-    def test_discover_strategies_perp_determinism_attribution_and_json_contract(self) -> None:
+    def test_discover_strategies_perp_determinism_stress_suite_and_provenance(self) -> None:
         series = _synthetic_series(n_bars=1800)
         inst = okx_swap_spec("MU-USDT-SWAP")
         funding = _synthetic_funding(series, inst.instrument_id, apr=0.10)
@@ -297,22 +382,37 @@ class DiscoveryEngineIntegrationTests(unittest.TestCase):
             family_ids=("ts_momentum", "donchian_atr"),
             top_curves=3,
         )
+        prov = {
+            "dataset_sha256": "abc123",
+            "funding_sha256": "def456",
+            "code_revision": "deadbeef",
+            "fee_profile": "okx_default",
+            "data_source": "unit_test",
+            "generation_id": "gen-1",
+            "days": 75,
+        }
 
-        report_a = discover_strategies(series, inst, CostModel.okx_default(), funding=funding, config=cfg)
-        report_b = discover_strategies(series, inst, CostModel.okx_default(), funding=funding, config=cfg)
+        report_a = discover_strategies(series, inst, CostModel.okx_default(), funding=funding, config=cfg, provenance=prov)
+        report_b = discover_strategies(series, inst, CostModel.okx_default(), funding=funding, config=cfg, provenance=prov)
         self.assertIsInstance(report_a, DiscoveryReport)
         self.assertTrue(report_a.funding_verified)
-        self.assertEqual(24, report_a.n_trials)  # (6 + 6) * 2 overlays
+        self.assertEqual(24, report_a.n_trials)
 
         dict_a = report_a.to_dict()
         dict_b = report_b.to_dict()
         self.assertEqual("phase2.discovery.v1", dict_a["schema_version"])
+        self.assertEqual(prov, dict_a["provenance"])
+        self.assertEqual(24, dict_a["effective_config"]["purge_bars"])
+        self.assertEqual(
+            ["slippage_10bp", "funding_0pct_apr", "funding_15pct_apr", "funding_30pct_apr"],
+            dict_a["effective_config"]["stress_scenarios"],
+        )
+        self.assertEqual(CostModel.okx_default().to_dict(), dict_a["effective_config"]["cost_model"])
         dict_a["runtime_ms"] = 0.0
         dict_b["runtime_ms"] = 0.0
         self.assertEqual(dict_a, dict_b)
         json.dumps(dict_a, allow_nan=False)
 
-        # Verify top_curves downsampling policy and exact attribution identity on every candidate.
         for idx, cand in enumerate(report_a.candidates):
             if idx < 3:
                 self.assertGreater(len(cand.curve), 1)
@@ -323,46 +423,59 @@ class DiscoveryEngineIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(attr.net_pnl, expected_net, places=5)
             self.assertAlmostEqual(cand.ending_equity - cand.starting_equity, attr.net_pnl, places=4)
             self.assertEqual(3, len(cand.folds))
+            # P2R1-06 & P2R1-11: all 4 scenarios always emitted and available for perp.
+            self.assertEqual(4, len(cand.stress_scenarios))
+            self.assertEqual(
+                ["slippage_10bp", "funding_0pct_apr", "funding_15pct_apr", "funding_30pct_apr"],
+                [sc.scenario_id for sc in cand.stress_scenarios],
+            )
+            self.assertTrue(all(sc.available and isinstance(sc, StressScenarioResult) for sc in cand.stress_scenarios))
+            # P2R1-09: null_p_value computed & wired into gates.
+            self.assertIsNotNone(cand.gates.null_p_value)
 
-    def test_missing_funding_spot_mode_and_neighbor_stability(self) -> None:
+    def test_missing_funding_spot_stress_na_and_neighbor_stability(self) -> None:
         series = _synthetic_series(n_bars=1200, symbol="BTC-USDT-SWAP")
         inst_perp = okx_swap_spec("BTC-USDT-SWAP")
 
-        # Singleton catalog grid -> neighbor_pass_ratio == 1.0, missing funding -> funding_verified=False.
         singleton_entry = StrategyCatalogEntry(
             "singleton_ts",
             "Singleton TSMom",
             lambda p: TSMomentumStrategy(TSMomentumParams(interval="1h", **p)),
             ParamSpace((ParamSpec("lookback_bars", "int", 48, choices=(48,)),)),
+            fixed_params={"interval": "1h"},
         )
         rep_missing = discover_strategies(
-            series,
-            inst_perp,
-            CostModel.okx_default(),
-            funding=None,
-            catalog=[singleton_entry],
-            config=DiscoveryConfig(overlay_names=("none",)),
+            series, inst_perp, CostModel.okx_default(), funding=None,
+            catalog=[singleton_entry], config=DiscoveryConfig(overlay_names=("none",)),
         )
         self.assertFalse(rep_missing.funding_verified)
         self.assertEqual(1, rep_missing.n_trials)
         self.assertEqual(1.0, rep_missing.candidates[0].neighbor_pass_ratio)
+        # Missing perp funding must fail G2 cleanly.
+        self.assertIn("G2", rep_missing.candidates[0].gates.failed_gates)
+        self.assertEqual("NO_GO", rep_missing.candidates[0].gates.verdict)
 
-        # Spot mode works with funding=None and spot_1x == perp_1x.
+        # Spot mode: slippage_10bp available, 3 funding scenarios explicitly unavailable (N/A).
         spot_series = _synthetic_series(n_bars=1200, symbol="BTC-USDT")
         inst_spot = spot_spec("BTC-USDT", venue="okx")
         rep_spot = discover_strategies(
-            spot_series,
-            inst_spot,
-            CostModel.okx_default(),
-            funding=None,
-            catalog=[singleton_entry],
-            config=DiscoveryConfig(overlay_names=("none",)),
+            spot_series, inst_spot, CostModel.okx_default(), funding=None,
+            catalog=[singleton_entry], config=DiscoveryConfig(overlay_names=("none",)),
         )
         self.assertTrue(rep_spot.funding_verified)
         self.assertEqual(rep_spot.spot_1x, rep_spot.perp_1x)
+        spot_scenarios = rep_spot.candidates[0].stress_scenarios
+        self.assertEqual(4, len(spot_scenarios))
+        self.assertTrue(spot_scenarios[0].available)
+        self.assertEqual("slippage_10bp", spot_scenarios[0].scenario_id)
+        for sc in spot_scenarios[1:]:
+            self.assertFalse(sc.available)
+            self.assertIsNone(sc.passed)
+            self.assertIsNone(sc.total_return)
+            self.assertIsNone(sc.liquidations)
+            self.assertIn("spot", sc.detail.lower())
 
-        # 3-point 1D dummy grid where weight=0.0 fails and weight=1.0/-1.0 behave distinctly:
-        # verify exact 1-step neighbor ratios are strictly computed over adjacent indices only.
+        # Exact 1-step neighbor ratios on 3-point 1D grid.
         dummy_entry = StrategyCatalogEntry(
             "dummy_grid",
             "Dummy 1D Grid",
@@ -370,83 +483,83 @@ class DiscoveryEngineIntegrationTests(unittest.TestCase):
             ParamSpace((ParamSpec("weight", "float", 0.0, choices=(0.0, 0.5, 1.0)),)),
         )
         rep_grid = discover_strategies(
-            spot_series,
-            inst_spot,
-            CostModel.zero_cost(),
-            funding=None,
+            spot_series, inst_spot, CostModel.zero_cost(), funding=None,
             catalog=[dummy_entry],
-            config=DiscoveryConfig(
-                overlay_names=("none",),
-                gate_config=GateConfig(min_oos_sharpe=0.0, max_drawdown=1.0),
-            ),
+            config=DiscoveryConfig(overlay_names=("none",), gate_config=GateConfig(min_oos_sharpe=0.0, max_drawdown=1.0)),
         )
         by_w = {c.params["weight"]: c.neighbor_pass_ratio for c in rep_grid.candidates}
-        # Weight 0.0 has 0% return (fails core), while 0.5 and 1.0 have positive return on upward wave:
-        # 0.0's only 1-step neighbor is 0.5 (passes -> 1.0); 0.5's neighbors are 0.0 (fail) & 1.0 (pass -> 0.5);
-        # 1.0's only 1-step neighbor is 0.5 (passes -> 1.0).
         self.assertEqual(1.0, by_w[0.0])
         self.assertAlmostEqual(0.5, by_w[0.5])
         self.assertEqual(1.0, by_w[1.0])
 
-    def test_export_winner_recipe_safety_invariants(self) -> None:
+    def test_export_winner_recipe_preserves_fibonacci_fixed_params_and_safety(self) -> None:
+        # P2R1-07 regression: Fibonacci recipe must preserve leverage=2.0 and use_session_window=False.
         series = _synthetic_series(n_bars=1000)
         inst = okx_swap_spec("MU-USDT-SWAP")
         funding = _synthetic_funding(series, inst.instrument_id)
-        entry = StrategyCatalogEntry(
-            "flat_only",
-            "Always Flat",
-            lambda _p: _DummyWeightStrategy(weight=0.0),
-            ParamSpace((ParamSpec("weight", "float", 0.0, choices=(0.0,)),)),
+        fib_report = discover_strategies(
+            series, inst, CostModel.okx_default(), funding=funding,
+            config=DiscoveryConfig(overlay_names=("none",), family_ids=("fibonacci_pullback",)),
         )
-        report = discover_strategies(
-            series,
-            inst,
-            CostModel.okx_default(),
-            funding=funding,
-            catalog=[entry],
-            config=DiscoveryConfig(overlay_names=("none",)),
-        )
-        recipe = export_winner_recipe(report)
-        self.assertTrue(recipe["dry_run_only"])
-        self.assertFalse(recipe["live_orders_allowed"])
-        self.assertEqual("NO_GO_WARNING", recipe["status"])
-        self.assertEqual("NO_GO", recipe["verdict"])
-        self.assertIsNone(recipe["strategy"])
-        self.assertIsNotNone(recipe["best_rejected_candidate"])
-        json.dumps(recipe, allow_nan=False)
-
-        # Verify GO & CONDITIONAL export paths always enforce dry_run_only & live_orders_allowed=False.
         go_ev = evaluate_six_gates(
             oos_days=180.0, oos_trades=40, oos_total_return=0.45, oos_sharpe=4.0,
             oos_max_drawdown=-0.10, oos_calmar=3.0, liquidations=0, n_obs=8760,
             return_skew=0.0, return_excess_kurtosis=0.0, n_trials=10, positive_fold_ratio=1.0,
             is_sharpe=4.0, is_perp=True, funding_verified=True, stress_passed=True,
-            stress_liquidations=0, spot_oos_sharpe=1.0, spot_oos_max_drawdown=-0.30, neighbor_pass_ratio=1.0,
+            stress_liquidations=0, spot_oos_sharpe=1.0, spot_oos_max_drawdown=-0.30,
+            neighbor_pass_ratio=1.0, null_p_value=0.01,
         )
         cond_ev = evaluate_six_gates(
             oos_days=180.0, oos_trades=40, oos_total_return=0.45, oos_sharpe=4.0,
             oos_max_drawdown=-0.10, oos_calmar=3.0, liquidations=0, n_obs=8760,
             return_skew=0.0, return_excess_kurtosis=0.0, n_trials=10, positive_fold_ratio=1.0,
             is_sharpe=4.0, is_perp=True, funding_verified=True, stress_passed=True,
-            stress_liquidations=0, spot_oos_sharpe=1.0, spot_oos_max_drawdown=-0.30, neighbor_pass_ratio=0.40,
+            stress_liquidations=0, spot_oos_sharpe=1.0, spot_oos_max_drawdown=-0.30,
+            neighbor_pass_ratio=0.40, null_p_value=0.01,
         )
-        from dataclasses import replace as dc_replace
-        go_report = dc_replace(report, candidates=(dc_replace(report.candidates[0], gates=go_ev),))
+        go_report = dc_replace(fib_report, candidates=(dc_replace(fib_report.candidates[0], gates=go_ev),))
         go_recipe = export_winner_recipe(go_report)
         self.assertTrue(go_recipe["dry_run_only"])
         self.assertFalse(go_recipe["live_orders_allowed"])
         self.assertEqual("READY_DRY_RUN", go_recipe["status"])
         self.assertEqual("GO", go_recipe["verdict"])
         self.assertIsNone(go_recipe["warning"])
-        self.assertEqual("flat_only", go_recipe["strategy"]["family_id"])
+        self.assertEqual("fibonacci_pullback", go_recipe["strategy"]["catalog_entry_id"])
+        self.assertIn("fib_lookback", go_recipe["strategy"]["swept_params"])
+        rebuilt = FibonacciPullbackParams(**go_recipe["strategy"]["params"])
+        self.assertEqual(2.0, rebuilt.leverage)
+        self.assertFalse(rebuilt.use_session_window)
+        self.assertEqual("MU-USDT-SWAP", rebuilt.symbol)
+        self.assertEqual("1h", rebuilt.primary_interval)
+        self.assertEqual("1h", rebuilt.regime_interval)
 
-        cond_report = dc_replace(report, candidates=(dc_replace(report.candidates[0], gates=cond_ev),))
+        cond_report = dc_replace(fib_report, candidates=(dc_replace(fib_report.candidates[0], gates=cond_ev),))
         cond_recipe = export_winner_recipe(cond_report)
         self.assertTrue(cond_recipe["dry_run_only"])
         self.assertFalse(cond_recipe["live_orders_allowed"])
         self.assertEqual("CONDITIONAL_DRY_RUN", cond_recipe["status"])
         self.assertEqual("CONDITIONAL", cond_recipe["verdict"])
         self.assertIsNotNone(cond_recipe["warning"])
+
+        # NO_GO warning path also carries full params, swept_params, and catalog_entry_id.
+        flat_entry = StrategyCatalogEntry(
+            "flat_only", "Always Flat", lambda _p: _DummyWeightStrategy(weight=0.0),
+            ParamSpace((ParamSpec("weight", "float", 0.0, choices=(0.0,)),)),
+            fixed_params={"note": "flat"},
+        )
+        nogo_report = discover_strategies(
+            series, inst, CostModel.okx_default(), funding=funding,
+            catalog=[flat_entry], config=DiscoveryConfig(overlay_names=("none",)),
+        )
+        nogo_recipe = export_winner_recipe(nogo_report)
+        self.assertTrue(nogo_recipe["dry_run_only"])
+        self.assertFalse(nogo_recipe["live_orders_allowed"])
+        self.assertEqual("NO_GO_WARNING", nogo_recipe["status"])
+        self.assertEqual("NO_GO", nogo_recipe["verdict"])
+        self.assertIsNone(nogo_recipe["strategy"])
+        self.assertEqual("flat_only", nogo_recipe["best_rejected_candidate"]["catalog_entry_id"])
+        self.assertEqual("flat", nogo_recipe["best_rejected_candidate"]["params"]["note"])
+        json.dumps(nogo_recipe, allow_nan=False)
 
 
 if __name__ == "__main__":

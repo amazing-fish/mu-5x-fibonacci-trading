@@ -179,6 +179,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .pill-pos, .st-PASS, .vd-GO { background: var(--pos-bg); color: var(--pos); border-color: rgba(16,185,129,.35); }
   .pill-warn, .st-WARN, .vd-CONDITIONAL { background: var(--warn-bg); color: var(--warn); border-color: rgba(245,158,11,.35); }
   .pill-neg, .st-FAIL, .vd-NO_GO { background: var(--neg-bg); color: var(--neg); border-color: rgba(244,63,94,.35); }
+  .pill-na, .st-NA { background: var(--card); color: var(--muted); border-color: var(--border-hi); }
+  .row-toggle { display: inline-flex; align-items: center; gap: 6px; background: transparent; border: 1px solid transparent; border-radius: 6px; color: inherit; font: inherit; padding: 2px 6px 2px 2px; cursor: pointer; text-align: left; }
+  .row-toggle:hover { color: var(--accent); }
+  .row-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
+  .row-chevron { display: inline-block; width: 12px; color: var(--muted); font-size: 11px; }
   .btn { background: var(--card); color: var(--text); border: 1px solid var(--border-hi); padding: 6px 12px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; }
   .btn:hover, .btn.active { border-color: var(--accent); color: var(--accent); background: var(--hover); }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -367,6 +372,17 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       failed_gates: Array.isArray(g.failed_gates) ? g.failed_gates : [],
       checks, checkMap,
       folds: Array.isArray(raw.folds) ? raw.folds : [],
+      stress_scenarios: (Array.isArray(raw.stress_scenarios) ? raw.stress_scenarios : [])
+        .filter((s) => s && typeof s === "object")
+        .map((s) => ({
+          scenario_id: String(s.scenario_id || ""),
+          label: String(s.label || s.scenario_id || "Scenario"),
+          available: s.available !== false,
+          passed: typeof s.passed === "boolean" ? s.passed : null,
+          total_return: num(s.total_return),
+          liquidations: num(s.liquidations),
+          detail: String(s.detail || ""),
+        })),
       attribution: {
         price_pnl: num(pick(a, ["gross_pnl", "price_pnl", "gross_price_pnl", "trading_pnl"])) ?? 0,
         funding_pnl: num(pick(a, ["funding_pnl", "net_funding_pnl", "real_funding_pnl"])) ?? 0,
@@ -593,7 +609,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     }
     const gateIds = ["G1", "G2", "G3", "G4", "G5", "G6"];
     let htmlStr = "";
-    for (const c of rows) {
+    for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+      const c = rows[rowIdx];
+      const isExpanded = state.expandedId === c.id;
+      const detailId = "cand-detail-" + rowIdx;
       const gatesHtml = gateIds.map((gid) => {
         const chk = c.checkMap[gid];
         const st = chk ? String(chk.status || "FAIL") : "FAIL";
@@ -603,7 +622,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       const retCls = (c.total_return ?? 0) >= 0 ? "pos" : "neg";
       htmlStr += '<tr class="cand-row' + (state.selectedId === c.id ? " selected" : "") + '" data-id="' + esc(c.id) + '">' +
         "<td>" + esc(fmtInt(c.rank)) + "</td>" +
-        "<td><strong>" + esc(c.display) + '</strong> <span class="muted">· ' + esc(c.overlay) + "</span></td>" +
+        '<td><button type="button" class="row-toggle" data-id="' + esc(c.id) + '" aria-expanded="' + (isExpanded ? "true" : "false") + '" aria-controls="' + detailId + '">' +
+        '<span class="row-chevron" aria-hidden="true">' + (isExpanded ? "&#9662;" : "&#9656;") + "</span>" +
+        "<strong>" + esc(c.display) + '</strong> <span class="muted">· ' + esc(c.overlay) + "</span></button></td>" +
         '<td class="num ' + retCls + '">' + esc(fmtPct(c.total_return, true)) + "</td>" +
         '<td class="num neg">' + esc(fmtPct(c.max_drawdown, false)) + "</td>" +
         '<td class="num">' + esc(fmtNum(c.sharpe, 2)) + "</td>" +
@@ -613,7 +634,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         '<td class="num' + (c.liquidations > 0 ? " neg" : "") + '">' + esc(fmtInt(c.liquidations)) + "</td>" +
         gatesHtml +
         '<td><span class="pill vd-' + esc(c.verdict) + '">' + esc(c.verdict) + "</span></td></tr>";
-      if (state.expandedId === c.id) {
+      if (isExpanded) {
         const checksHtml = c.checks.map((chk) =>
           '<li class="gate-item"><span class="pill st-' + esc(chk.status) + '">' + esc(chk.gate_id) + " " + esc(chk.status) + "</span>" +
           "<span><strong>" + esc(chk.name) + ":</strong> " + esc(chk.detail) + "</span></li>"
@@ -625,22 +646,47 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           '<td class="num">' + esc(fmtPct(pick(f, ["oos_max_drawdown", "max_drawdown"]), false)) + "</td>" +
           '<td class="num">' + esc(fmtInt(pick(f, ["oos_trades", "trades", "trade_count"]))) + "</td></tr>"
         ).join("") : '<tr><td colspan="5" class="muted">No fold details.</td></tr>';
-        htmlStr += '<tr class="detail-row"><td colspan="16"><div class="detail-grid">' +
+        const stressHtml = c.stress_scenarios.length ? c.stress_scenarios.map((sc) => {
+          if (!sc.available) {
+            return "<tr><td>" + esc(sc.label) + '</td><td><span class="pill st-NA">N/A</span></td>' +
+              '<td class="num muted">—</td><td class="num muted">—</td><td class="muted">' + esc(sc.detail || "Not applicable") + "</td></tr>";
+          }
+          const st = sc.passed === true ? "PASS" : "FAIL";
+          const scRetCls = (sc.total_return ?? 0) >= 0 ? "pos" : "neg";
+          return "<tr><td>" + esc(sc.label) + '</td><td><span class="pill st-' + st + '">' + st + "</span></td>" +
+            '<td class="num ' + scRetCls + '">' + esc(fmtPct(sc.total_return, true)) + "</td>" +
+            '<td class="num' + ((sc.liquidations ?? 0) > 0 ? " neg" : "") + '">' + esc(fmtInt(sc.liquidations)) + "</td>" +
+            '<td class="muted">' + esc(sc.detail) + "</td></tr>";
+        }).join("") : '<tr><td colspan="5" class="muted">No stress scenario data.</td></tr>';
+        htmlStr += '<tr class="detail-row" id="' + detailId + '"><td colspan="16"><div class="detail-grid">' +
           '<div><div class="kpi-label">6-Gate Breakdown</div><ul class="gate-list">' + (checksHtml || '<li class="muted">No gate details.</li>') + "</ul></div>" +
+          '<div><div class="kpi-label">Stress Matrix</div><table><thead><tr><th>Scenario</th><th>Status</th><th class="num">OOS Ret</th><th class="num">Liq</th><th>Detail</th></tr></thead><tbody>' + stressHtml + "</tbody></table></div>" +
           '<div><div class="kpi-label">Parameters &amp; Overlay</div><pre class="recipe" style="max-height:140px">' + esc(JSON.stringify({ family_id: c.family, overlay_preset: c.overlay, params: c.params }, null, 2)) + "</pre></div>" +
           '<div><div class="kpi-label">Walk-Forward OOS Folds</div><table><thead><tr><th>Fold</th><th class="num">OOS Ret</th><th class="num">Sharpe</th><th class="num">MaxDD</th><th class="num">Trades</th></tr></thead><tbody>' + foldsHtml + "</tbody></table></div>" +
           "</div></td></tr>";
       }
     }
     body.innerHTML = htmlStr;
-    body.querySelectorAll("tr.cand-row").forEach((tr) => {
-      tr.addEventListener("click", () => {
-        const id = tr.dataset.id;
-        state.selectedId = id;
-        state.expandedId = state.expandedId === id ? null : id;
-        renderMatrix();
-        renderAttribution();
+    const toggleCandidate = (id, restoreFocus) => {
+      state.selectedId = id;
+      state.expandedId = state.expandedId === id ? null : id;
+      renderMatrix();
+      renderAttribution();
+      if (restoreFocus) {
+        const btns = body.querySelectorAll("button.row-toggle");
+        for (const b of btns) {
+          if (b.dataset.id === id && typeof b.focus === "function") { b.focus(); break; }
+        }
+      }
+    };
+    body.querySelectorAll("button.row-toggle").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        if (ev && typeof ev.stopPropagation === "function") ev.stopPropagation();
+        toggleCandidate(btn.dataset.id, true);
       });
+    });
+    body.querySelectorAll("tr.cand-row").forEach((tr) => {
+      tr.addEventListener("click", () => toggleCandidate(tr.dataset.id, false));
     });
   }
 
@@ -673,16 +719,21 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }
 
   function renderRecipe() {
-    const recipe = REPORT.winner_recipe || { dry_run_only: true, live_orders_allowed: false, verdict: "NO_GO" };
+    const recipe = (REPORT.winner_recipe && typeof REPORT.winner_recipe === "object")
+      ? REPORT.winner_recipe
+      : { dry_run_only: true, live_orders_allowed: false, verdict: "NO_GO" };
     const text = JSON.stringify(recipe, null, 2);
     document.getElementById("recipeBox").textContent = text;
     const banner = document.getElementById("recipeBanner");
-    if (recipe.verdict === "NO_GO") {
-      banner.innerHTML = '<div class="warn-banner nogo">NO_GO: No candidate cleared all 6 discovery gates. Dry-run research reference only — never deploy live.</div>';
-    } else if (recipe.verdict === "CONDITIONAL") {
-      banner.innerHTML = '<div class="warn-banner">CONDITIONAL: Hard gates passed; inspect WARN gates before paper-trading promotion.</div>';
-    } else {
+    const verdict = typeof recipe.verdict === "string" ? recipe.verdict : "";
+    if (verdict === "GO") {
       banner.innerHTML = '<div class="warn-banner" style="background:var(--pos-bg);color:var(--pos);border-color:rgba(16,185,129,.35)">GO: Candidate passed all 6 gates. Dry-run recipe only (live_orders_allowed=false).</div>';
+    } else if (verdict === "CONDITIONAL") {
+      banner.innerHTML = '<div class="warn-banner">CONDITIONAL: Hard gates passed; inspect WARN gates before paper-trading promotion.</div>';
+    } else if (verdict === "NO_GO") {
+      banner.innerHTML = '<div class="warn-banner nogo">NO_GO: No candidate cleared all 6 discovery gates. Dry-run research reference only — never deploy live.</div>';
+    } else {
+      banner.innerHTML = '<div class="warn-banner nogo">UNVERIFIED VERDICT: Recipe verdict is missing or unrecognized — fail-closed, dry-run research reference only.</div>';
     }
     const btn = document.getElementById("copyRecipeBtn");
     btn.addEventListener("click", () => {

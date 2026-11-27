@@ -1,9 +1,11 @@
-"""Phase 2 6-Gate quantitative validation and Bailey & Lopez de Prado (2014) DSR."""
+"""Phase 2 6-Gate quantitative validation, Bailey & Lopez de Prado (2014) DSR, and null-distribution test."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import math
+import random
 from typing import Any, Literal
 
 __all__ = [
@@ -13,6 +15,7 @@ __all__ = [
     "SixGateEvaluation",
     "Verdict",
     "compute_deflated_sharpe_ratio",
+    "compute_null_distribution_pvalue",
     "evaluate_six_gates",
 ]
 
@@ -107,6 +110,74 @@ def compute_deflated_sharpe_ratio(
     return min(1.0, max(0.0, _norm_cdf(z))) if math.isfinite(z) else 0.0
 
 
+def compute_null_distribution_pvalue(
+    equity_curve: Sequence[tuple[int, float]],
+    *,
+    block_bars: int = 24,
+    n_permutations: int = 200,
+    seed: int = 42,
+) -> float:
+    """Deterministic block sign-flip permutation p-value (Phipson-Smyth) over OOS bar returns.
+
+    Preserves short-horizon autocorrelation via ``block_bars`` contiguous blocks.
+    Because ``sum(r^2)`` is invariant under sign flips, comparing permuted return sums
+    against the observed return sum is mathematically equivalent to comparing the
+    Sharpe proxy ``sum(r) / sqrt(sum(r^2) + eps)``.
+
+    Fail-closed: returns ``1.0`` on ``< 4`` curve points, invalid parameters,
+    non-finite values, zero variance, or non-positive mean/total return.
+    """
+    if isinstance(block_bars, bool) or not isinstance(block_bars, int) or block_bars < 1:
+        return 1.0
+    if isinstance(n_permutations, bool) or not isinstance(n_permutations, int) or n_permutations < 1:
+        return 1.0
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        return 1.0
+    if len(equity_curve) < 4:
+        return 1.0
+
+    rets: list[float] = []
+    first_eq = equity_curve[0][1]
+    if not _is_finite(first_eq) or float(first_eq) <= 0.0:
+        return 1.0
+    prev_eq = float(first_eq)
+    for _, raw_eq in equity_curve[1:]:
+        if not _is_finite(raw_eq):
+            return 1.0
+        eq = float(raw_eq)
+        if prev_eq <= 0.0:
+            return 1.0
+        rets.append((eq - prev_eq) / prev_eq)
+        prev_eq = eq
+
+    if prev_eq <= float(first_eq):
+        return 1.0
+    n = len(rets)
+    obs_sum = math.fsum(rets)
+    if not math.isfinite(obs_sum) or obs_sum <= 0.0:
+        return 1.0
+    mean_r = obs_sum / n
+    var_sum = math.fsum((r - mean_r) * (r - mean_r) for r in rets)
+    sum_sq = math.fsum(r * r for r in rets)
+    if not math.isfinite(var_sum) or var_sum <= 1e-24 or sum_sq <= 1e-24:
+        return 1.0
+
+    block_sums = tuple(math.fsum(rets[i : i + block_bars]) for i in range(0, n, block_bars))
+    inv_norm = 1.0 / math.sqrt(sum_sq + 1e-24)
+    obs_stat = obs_sum * inv_norm
+    tol = obs_stat - 1e-15
+
+    rng = random.Random(seed)
+    ge_count = 0
+    for _ in range(n_permutations):
+        perm_sum = 0.0
+        for b_sum in block_sums:
+            perm_sum += b_sum if rng.getrandbits(1) else -b_sum
+        if (perm_sum * inv_norm) >= tol:
+            ge_count += 1
+    return (1.0 + ge_count) / (1.0 + n_permutations)
+
+
 @dataclass(frozen=True, slots=True)
 class GateConfig:
     """Thresholds governing the Phase 2 6-Gate quantitative Go/No-Go evaluation."""
@@ -116,6 +187,7 @@ class GateConfig:
     min_oos_sharpe: float = 0.50
     min_dsr_go: float = 0.95
     min_dsr_warn: float = 0.80
+    max_null_p_value: float = 0.05
     min_positive_fold_ratio: float = 0.60
     min_is_oos_retention: float = 0.50
     max_drawdown: float = 0.25
@@ -136,6 +208,7 @@ class GateConfig:
             raise ValueError("min_dsr_warn must be <= min_dsr_go")
         object.__setattr__(self, "min_dsr_go", dsr_go)
         object.__setattr__(self, "min_dsr_warn", dsr_warn)
+        object.__setattr__(self, "max_null_p_value", _check_float(self.max_null_p_value, "max_null_p_value", strict_lo=True, hi=1.0))
         object.__setattr__(self, "min_positive_fold_ratio", _check_float(self.min_positive_fold_ratio, "min_positive_fold_ratio", hi=1.0))
         object.__setattr__(self, "min_is_oos_retention", _check_float(self.min_is_oos_retention, "min_is_oos_retention"))
         object.__setattr__(self, "max_drawdown", _check_float(self.max_drawdown, "max_drawdown", hi=1.0))
@@ -176,13 +249,22 @@ class SixGateEvaluation:
     checks: tuple[GateCheck, ...]
     dsr: float
     failed_gates: tuple[str, ...]
+    null_p_value: float | None = None
+    null_passed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        null_p = (
+            round(float(self.null_p_value), 4)
+            if (self.null_p_value is not None and math.isfinite(self.null_p_value))
+            else None
+        )
         return {
             "verdict": self.verdict,
             "passed_count": self.passed_count,
             "total_gates": len(self.checks),
             "dsr": self.dsr if math.isfinite(self.dsr) else 0.0,
+            "null_p_value": null_p,
+            "null_passed": self.null_passed,
             "failed_gates": list(self.failed_gates),
             "checks": [check.to_dict() for check in self.checks],
         }
@@ -210,6 +292,7 @@ def evaluate_six_gates(
     spot_oos_sharpe: float = 0.0,
     spot_oos_max_drawdown: float = 0.0,
     neighbor_pass_ratio: float = 1.0,
+    null_p_value: float | None = None,
     annualization_factor: float = 8760.0,
     config: GateConfig | None = None,
 ) -> SixGateEvaluation:
@@ -227,43 +310,52 @@ def evaluate_six_gates(
         f"OOS {float(oos_days):.1f}d (min {cfg.min_oos_days:.0f}d), {oos_trades} trades (min {cfg.min_oos_trades})" if _is_finite(oos_days) else "Non-finite OOS duration",
     )
 
-    # G2: Net-of-Cost & Real-Funding Survival (Hard)
+    # G2: Net-of-Cost & Real-Funding Survival (Hard — missing perp funding NEVER waived by stress)
     ret_ok, sh_ok = _is_finite(oos_total_return), _is_finite(oos_sharpe)
-    funding_ok = (not is_perp) or bool(funding_verified) or bool(stress_passed)
+    funding_ok = (not is_perp) or bool(funding_verified)
     g2_pass = ret_ok and sh_ok and float(oos_total_return) > 0.0 and float(oos_sharpe) >= cfg.min_oos_sharpe and funding_ok
     g2_status: GateStatus = "PASS" if g2_pass else "FAIL"
+    funding_label = "n/a (spot)" if not is_perp else ("verified" if funding_verified else "unverified")
     g2 = GateCheck(
         "G2", "Net-of-Cost & Funding Survival", g2_status,
         round(float(oos_sharpe), 4) if sh_ok else None,
         cfg.min_oos_sharpe,
         (
-            f"Return {float(oos_total_return) * 100.0:+.2f}%, Sharpe {float(oos_sharpe):.2f}, "
-            f"funding={'verified' if funding_verified else ('stress-ok' if stress_passed else 'unverified')}"
+            f"Return {float(oos_total_return) * 100.0:+.2f}%, Sharpe {float(oos_sharpe):.2f}, funding={funding_label}"
             if (ret_ok and sh_ok) else "Non-finite return or Sharpe"
         ),
     )
 
-    # G3: Multiple-Testing DSR & Walk-Forward Consistency (Soft WARN -> CONDITIONAL)
+    # G3: Multiple-Testing DSR, Null-Distribution Significance & WF Consistency
     dsr = compute_deflated_sharpe_ratio(oos_sharpe, n_obs, return_skew, return_excess_kurtosis, n_trials, annualization_factor)
     folds_valid = _is_finite(positive_fold_ratio)
     folds_ok = folds_valid and float(positive_fold_ratio) >= cfg.min_positive_fold_ratio
+    null_valid = null_p_value is not None and _is_finite(null_p_value) and 0.0 <= float(null_p_value) <= 1.0
+    resolved_null_p = float(null_p_value) if null_valid else None
+    null_passed = resolved_null_p is not None and resolved_null_p <= cfg.max_null_p_value
+
     retention: float | None = None
     ret_pass = ret_warn = True
     if is_sharpe is not None and _is_finite(is_sharpe) and float(is_sharpe) > 0.0:
         retention = (float(oos_sharpe) / float(is_sharpe)) if sh_ok else 0.0
         ret_pass = retention >= cfg.min_is_oos_retention
         ret_warn = retention >= (cfg.min_is_oos_retention * 0.5)
-    if dsr >= cfg.min_dsr_go and folds_ok and ret_pass:
+    if dsr >= cfg.min_dsr_go and folds_ok and ret_pass and null_passed:
         g3_status: GateStatus = "PASS"
     elif dsr >= cfg.min_dsr_warn and folds_ok and ret_warn:
         g3_status = "WARN"
     else:
         g3_status = "FAIL"
     ret_txt = f", IS->OOS {retention:.2f}x" if retention is not None else ""
+    null_txt = (
+        f", null p={resolved_null_p:.3f} (max {cfg.max_null_p_value:.2f})"
+        if resolved_null_p is not None
+        else ", null p=missing"
+    )
     g3 = GateCheck(
         "G3", "Multiple-Testing DSR & WF Consistency", g3_status,
         round(dsr, 4), cfg.min_dsr_go,
-        f"DSR {dsr:.3f} (N={n_trials}), pos folds {float(positive_fold_ratio) * 100.0:.0f}%{ret_txt}" if folds_valid else "Invalid fold ratio",
+        f"DSR {dsr:.3f} (N={n_trials}), pos folds {float(positive_fold_ratio) * 100.0:.0f}%{ret_txt}{null_txt}" if folds_valid else "Invalid fold ratio",
     )
 
     # G4: Tail Risk & Liquidation (Hard)
@@ -277,7 +369,7 @@ def evaluate_six_gates(
         f"Liq={liquidations}, MaxDD={dd_mag * 100.0:.2f}% (max {cfg.max_drawdown * 100.0:.0f}%), Calmar={float(oos_calmar):.2f}" if (dd_ok and cal_ok) else "Non-finite DD/Calmar",
     )
 
-    # G5: Stress & Spot Benchmark Value-Add (Stress=Hard, Spot Benchmark=Soft WARN)
+    # G5: Stress Suite & Spot Benchmark Value-Add (Stress=Hard, Spot Benchmark=Soft WARN)
     stress_zero_liq = (not isinstance(stress_liquidations, bool)) and isinstance(stress_liquidations, int) and stress_liquidations == 0
     stress_ok = bool(stress_passed) and stress_zero_liq
     sp_sh_ok, sp_dd_ok = _is_finite(spot_oos_sharpe), _is_finite(spot_oos_max_drawdown)
@@ -288,7 +380,7 @@ def evaluate_six_gates(
     g5 = GateCheck(
         "G5", "Stress & Spot Benchmark Value-Add", g5_status,
         round(float(oos_sharpe) - float(spot_oos_sharpe), 4) if (sh_ok and sp_sh_ok) else None,
-        f"stress +/-{cfg.stress_apr * 100.0:.0f}% APR & beat Spot",
+        "10bp slippage & 0/15/30% APR funding + beat Spot",
         (
             f"Stress={'OK' if stress_ok else 'FAIL'} (liq={stress_liquidations}), "
             f"Sharpe {float(oos_sharpe):.2f} vs Spot {float(spot_oos_sharpe):.2f}, "
@@ -316,5 +408,17 @@ def evaluate_six_gates(
         and g5_status in ("PASS", "WARN")
         and (g6_status in ("PASS", "WARN") or (nbr_ok and nbr_val >= cfg.min_neighbor_soft_ratio))
     )
-    verdict: Verdict = "GO" if passed_count == len(checks) else ("CONDITIONAL" if (hard_pass and soft_ok) else "NO_GO")
-    return SixGateEvaluation(verdict=verdict, passed_count=passed_count, checks=checks, dsr=dsr, failed_gates=failed_gates)
+    verdict: Verdict = (
+        "GO"
+        if (passed_count == len(checks) and null_passed)
+        else ("CONDITIONAL" if (hard_pass and soft_ok) else "NO_GO")
+    )
+    return SixGateEvaluation(
+        verdict=verdict,
+        passed_count=passed_count,
+        checks=checks,
+        dsr=dsr,
+        failed_gates=failed_gates,
+        null_p_value=resolved_null_p,
+        null_passed=null_passed,
+    )
